@@ -1,0 +1,10 @@
+.vscode/**
+node_modules/**
+.git/**
+*.vscodeignore
+CHANGELOG.md
+.eslintrc*
+.prettierrc*
+scratchpad/**
+*.sh
+src/**

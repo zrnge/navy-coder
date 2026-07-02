@@ -1,0 +1,288 @@
+{
+  "name": "navy-coder",
+  "displayName": "Navy AI Coder",
+  "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
+  "version": "0.1.0",
+  "publisher": "Zrnge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zrnge/navy-coder"
+  },
+  "homepage": "https://zrnge.com",
+  "bugs": {
+    "url": "https://github.com/zrnge/navy-coder/issues"
+  },
+  "license": "MIT",
+  "preview": true,
+  "keywords": [
+    "ai", "copilot", "agent", "ollama", "openai", "anthropic", "claude",
+    "code assistant", "inline completion", "chat", "deepseek", "gemini"
+  ],
+  "galleryBanner": {
+    "color": "#0d1b2a",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "icon": "media/icon.png",
+  "categories": [
+    "AI"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Navy AI Coder",
+      "properties": {
+        "navy.model": {
+          "type": "string",
+          "default": "kimi-k2.7-code:cloud",
+          "description": "The model to use for chat (e.g. llama3, gpt-4o, claude-sonnet-4-6)."
+        },
+        "navy.host": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL of the inference server (Ollama, LM Studio, or any OpenAI-compatible endpoint)."
+        },
+        "navy.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature for the model."
+        },
+        "navy.systemPrompt": {
+          "type": "string",
+          "default": "You are a concise AI coding assistant inside VS Code:. Prefer practical answers, small diffs, and clear file-specific guidance. When editing existing files, use SEARCH/REPLACE blocks in a `search-replace\\n<<<<<<< SEARCH\\nold\\n=======\\nnew\\n>>>>>>> REPLACE\\n` fence. Put the target file path after the language, like `search-replace:src/main.py. When creating new files, return the full content in a normal code fence with the path, like `python:src/main.py\\n...\\n`.",
+          "description": "System prompt sent at the start of every chat."
+        },
+        "navy.maxContextChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 0,
+          "description": "Maximum characters of the active file or selection to include as context."
+        },
+        "navy.approvalMode": {
+          "type": "string",
+          "default": "ask-always",
+          "enum": [
+            "auto-approve",
+            "ask-always"
+          ],
+          "enumDescriptions": [
+            "Apply file edits automatically without confirmation",
+            "Show every file edit in a diff view and ask for confirmation"
+          ],
+          "description": "How Navy Coder should handle file edits."
+        },
+        "navy.editFormat": {
+          "type": "string",
+          "default": "search-replace",
+          "enum": [
+            "search-replace",
+            "whole-file"
+          ],
+          "enumDescriptions": [
+            "Return SEARCH/REPLACE blocks for surgical edits",
+            "Return the complete new file content"
+          ],
+          "description": "Format the model should use when editing files."
+        },
+        "navy.maxToolIterations": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Maximum number of tool-use iterations Navy Coder can perform in one turn."
+        },
+        "navy.projectRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Active project directory for Navy Coder to use. Defaults to the first workspace folder."
+        },
+        "navy.inlineCompletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable ghost-text inline completions as you type. Uses the active provider and model. Triggers after a 350ms debounce."
+        },
+        "navy.provider": {
+          "type": "string",
+          "default": "ollama",
+          "enum": [
+            "ollama",
+            "lmstudio",
+            "anthropic",
+            "openai",
+            "deepseek",
+            "gemini",
+            "xai",
+            "zai",
+            "groq",
+            "openrouter",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "Local Ollama instance",
+            "LM Studio (local, OpenAI-compatible, http://localhost:1234)",
+            "Anthropic Claude (api.anthropic.com)",
+            "OpenAI / ChatGPT (api.openai.com)",
+            "DeepSeek (api.deepseek.com)",
+            "Google Gemini (via OpenAI-compatible endpoint)",
+            "xAI Grok (api.x.ai)",
+            "z.ai (api.z.ai)",
+            "Groq (api.groq.com)",
+            "OpenRouter — multi-provider gateway (openrouter.ai)",
+            "Custom OpenAI-compatible endpoint (set navy.apiBase)"
+          ],
+          "description": "AI provider to use."
+        },
+        "navy.apiBase": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL override for the provider API (e.g. https://api.openai.com/v1). Used when provider is 'custom' or to override a built-in provider's URL."
+        },
+        "navy.searchApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for web search. Tavily keys start with 'tvly-'; any other non-empty value is treated as a Brave Search key. Leave empty to use DuckDuckGo (no key required)."
+        },
+        "navy.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show 'Ask Navy' code lens buttons above functions in the editor."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "navy.focusChat",
+        "title": "Navy Coder: Focus Chat",
+        "icon": {
+          "light": "media/icon.svg",
+          "dark": "media/icon.svg"
+        }
+      },
+      {
+        "command": "navy.insertLastReply",
+        "title": "Navy Coder: Insert Last Reply"
+      },
+      {
+        "command": "navy.clearChat",
+        "title": "Navy Coder: Clear Chat"
+      },
+      {
+        "command": "navy.undoLastEdit",
+        "title": "Navy Coder: Undo Last Edit"
+      },
+      {
+        "command": "navy.undoLastTurn",
+        "title": "Navy Coder: Undo Last Turn (all edits)"
+      },
+      {
+        "command": "navy.inlineEdit",
+        "title": "Navy Coder: Inline Edit Selection"
+      },
+      {
+        "command": "navy.generateCommit",
+        "title": "Navy Coder: Generate Commit Message"
+      },
+      {
+        "command": "navy.generatePR",
+        "title": "Navy Coder: Generate PR Description"
+      },
+      {
+        "command": "navy.runTests",
+        "title": "Navy Coder: Run Tests"
+      },
+      {
+        "command": "navy.askAboutLine",
+        "title": "Navy Coder: Ask About This Function"
+      },
+      {
+        "command": "navy.explainTerminalError",
+        "title": "Navy Coder: Explain Terminal Error"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "navy",
+          "title": "Navy Coder",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "navy": [
+        {
+          "id": "navy.chatView",
+          "name": "Navy Coder",
+          "type": "webview",
+          "icon": "media/icon.svg",
+          "initialSize": 2
+        }
+      ]
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "navy.focusChat",
+          "group": "navigation",
+          "when": "true"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "navy.focusChat",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o"
+      },
+      {
+        "command": "navy.insertLastReply",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "navy.clearChat",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k"
+      },
+      {
+        "command": "navy.inlineEdit",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "navy.undoLastTurn",
+        "key": "ctrl+shift+z",
+        "mac": "cmd+shift+z"
+      },
+      {
+        "command": "navy.generateCommit",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g"
+      },
+      {
+        "command": "navy.runTests",
+        "key": "ctrl+shift+t",
+        "mac": "cmd+shift+t"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "check": "node --check src/extension.js",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.6.0",
+    "prettier": "^3.9.4"
+  }
+}
