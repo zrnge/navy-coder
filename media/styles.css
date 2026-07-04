@@ -1,20 +1,22 @@
 :root {
-  color-scheme: dark;
-  /* Adapt to VS Code theme when available; fall back to comfortable dark defaults */
+  /* Follow the active VS Code theme (light or dark) for form controls & scrollbars. */
+  color-scheme: light dark;
+  /* Adapt to VS Code theme when available; fall back to comfortable dark defaults.
+     Accent colors use the theme's chart palette so they stay legible on light themes. */
   --bg:           var(--vscode-sideBar-background, #13161b);
   --surface:      var(--vscode-editor-background, #1a1f27);
   --surface-hover: var(--vscode-list-hoverBackground, #1f2531);
   --border:       var(--vscode-panel-border, var(--vscode-widget-border, #2a2f3a));
-  --border-hover: #424956;
+  --border-hover: var(--vscode-focusBorder, #424956);
   --text:         var(--vscode-foreground, #d4dbe6);
   --muted:        var(--vscode-descriptionForeground, #7d8899);
   --gold:         var(--vscode-textLink-foreground, #58a6ff);
   --gold-hover:   var(--vscode-textLink-activeForeground, #79c0ff);
-  --gold-text:    #0d1117;
-  --blue:         #4d9ef7;
-  --green:        #3fb950;
-  --red:          #f47067;
-  --amber:        #d29922;
+  --gold-text:    var(--vscode-button-foreground, #0d1117);
+  --blue:         var(--vscode-charts-blue, #4d9ef7);
+  --green:        var(--vscode-charts-green, #3fb950);
+  --red:          var(--vscode-charts-red, #f47067);
+  --amber:        var(--vscode-charts-yellow, #d29922);
   --radius:       8px;
   --radius-sm:    5px;
 }
@@ -399,6 +401,10 @@ select option:hover {
 .welcome-chip:hover {
   border-color: var(--gold);
   color: var(--text);
+}
+
+.welcome-chip {
+  cursor: pointer;
 }
 
 .welcome-hint {
@@ -1898,7 +1904,8 @@ textarea:focus {
   transition: background 0.1s;
 }
 .at-dropdown-item:hover,
-.at-dropdown-item.selected {
+.at-dropdown-item.selected,
+.at-dropdown-item.active {
   background: var(--surface-hover);
 }
 .at-file-name {
@@ -1980,8 +1987,9 @@ textarea:focus {
   transition: background 0.1s;
 }
 .slash-item:hover,
-.slash-item.selected {
-  background: rgba(88, 166, 255, 0.08);
+.slash-item.selected,
+.slash-item.active {
+  background: var(--surface-hover);
 }
 .slash-icon {
   font-size: 14px;
@@ -2592,4 +2600,60 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   background: var(--bg);
   padding: 6px 8px;
   border-radius: 2px;
+}
+
+/* ── Restore note (shown at top of a restored session) ─────────────────────── */
+.restore-note {
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 6px 12px;
+  margin: 4px 0;
+  opacity: 0.8;
+}
+
+/* ── Whole-message copy button (assistant bubbles) ─────────────────────────── */
+.message.assistant {
+  position: relative;
+}
+.msg-copy-btn {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  padding: 2px 7px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.message.assistant:hover .msg-copy-btn,
+.msg-copy-btn:focus-visible {
+  opacity: 1;
+}
+.msg-copy-btn:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
+}
+
+/* ── Optional-field label hint in settings ─────────────────────────────────── */
+.setting-optional {
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ── Keyboard focus visibility ─────────────────────────────────────────────── */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+.slash-item:focus-visible,
+.at-dropdown-item:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #58a6ff);
+  outline-offset: 1px;
 }

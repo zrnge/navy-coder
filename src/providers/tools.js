@@ -206,9 +206,9 @@ const TOOLS = [
   },
   {
     name: 'get_terminal_output',
-    description: 'Get the recent output from the active VS Code terminal. Use this to see build errors, test failures, or command output without the user having to paste it.',
+    description: 'List the currently open VS Code terminals by name. NOTE: VS Code does not let extensions read terminal buffer contents. To capture command output, use run_command (foreground) or start_process + read_process_output (background) instead — do not expect this tool to return terminal text.',
     parameters: { type: 'object', properties: {
-      lines: { type: 'number', description: 'Maximum number of lines to retrieve from the terminal (default 100).' }
+      lines: { type: 'number', description: 'Unused (kept for compatibility).' }
     }}
   },
   {
@@ -287,6 +287,28 @@ const TOOLS = [
     }
   },
   {
+    name: 'find_symbol',
+    description: 'Find where a symbol (function, class, variable, interface, etc.) is defined in the workspace using the language server. Returns file path, line number, symbol kind, and a code snippet. Faster and more precise than search_codebase for looking up definitions.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Symbol name to look up (e.g. "MyClass", "parseUser", "AuthToken").' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'find_references',
+    description: 'Find all usages of a symbol across the entire workspace using the language server. Returns every file and line where the symbol is referenced. Use this before renaming, deleting, or understanding the impact of changing a symbol.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Symbol name to find references for.' }
+      },
+      required: ['name']
+    }
+  },
+  {
     name: 'web_search',
     description: 'Search the web using DuckDuckGo. Returns titles, URLs, and snippets. Use this to find documentation, packages, error solutions, or anything not in the project files.',
     parameters: {
@@ -323,7 +345,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, list_files, search_files, search_codebase, apply_edit, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, finish.
+Available tools: read_file, read_lines, write_file, list_files, search_files, search_codebase, find_symbol, find_references, apply_edit, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, finish.
 
 ## Workflow rules
 1. Review / analyse requests → call list_files on the project root first, then read_file on the files you need.
@@ -338,9 +360,12 @@ Available tools: read_file, read_lines, write_file, list_files, search_files, se
    **Changed:** comma-separated list of files modified/created (e.g. "src/utils.js, src/app.ts"), or "No files changed" for chat responses.
    **Result:** succeeded / failed / partial — one sentence on the final outcome or caveats.
    Calling finish() immediately after tool use with no preceding explanation is not allowed.
-9. Never read the same file more than once per task. Once read, use that content. If you have read 3 or more files without making any change, you have enough context — stop reading and act now.
-10. If a command fails (non-zero exit code), NEVER run the same command again immediately. Read the error output, identify the root cause, fix the code, THEN retry once. Repeating a failing command without a fix accomplishes nothing.
-11. NEVER call run_project if the project is already running — it will report "already running". Only call run_project once per session; use the existing server for all subsequent testing.`
+9. Use find_symbol to locate where a function/class/variable is defined — it is faster and more accurate than search_codebase for definitions. Use find_references before renaming or deleting anything to understand its full impact across the codebase.
+10. Never read the same file more than once per task. Once read, use that content. If you have read 3 or more files without making any change, you have enough context — stop reading and act now.
+11. If a command fails (non-zero exit code), NEVER run the same command again immediately. Read the error output, identify the root cause, fix the code, THEN retry once. Repeating a failing command without a fix accomplishes nothing.
+12. NEVER call run_project if the project is already running — it will report "already running". Only call run_project once per session; use the existing server for all subsequent testing.
+13. PLANNING: For any task that will need 3 or more tool calls, START your first response with a short numbered plan (3-6 one-line steps) under a "**Plan:**" heading, BEFORE the first tool call. Then execute the steps in order. If the plan must change mid-task, state the revised step in one line before continuing. Simple one-tool questions need no plan.
+14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors.`
 
 
 module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT };

@@ -42,7 +42,8 @@ const https = require('https');
 
     // Ollama uses a separate `images` field (base64 strings, no data-URI prefix) rather than
     // the OpenAI content-array format, so convert any vision messages here.
-    const ollamaMessages = messages.map(msg => {
+    // Also strip _rawBlocks (Anthropic-only replay state).
+    const ollamaMessages = messages.map(({ _rawBlocks, ...msg }) => {
       if (!Array.isArray(msg.content)) return msg;
       const texts = [];
       const imgs = [];
@@ -56,16 +57,25 @@ const https = require('https');
       return { role: msg.role, content: texts.join('\n'), ...(imgs.length ? { images: imgs } : {}) };
     });
 
+    const ollamaBody = {
+      model,
+      messages: ollamaMessages,
+      stream: true,
+      options,
+      tools: TOOLS_API
+    };
+    // Toggle native thinking for model families that support it. Only sent when the
+    // name matches — Ollama 400s if `think` is passed to a non-thinking model.
+    if (/(qwen3|deepseek-r1|gpt-oss|magistral|smallthinker|exaone-deep|phi4-reasoning)/i.test(model)) {
+      const level = provider.thinkingLevel || 'medium';
+      if (level === 'high') ollamaBody.think = true;
+      else if (level === 'fast') ollamaBody.think = false;
+    }
+
     const response = await fetch(host + '/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages: ollamaMessages,
-        stream: true,
-        options,
-        tools: TOOLS_API
-      }),
+      body: JSON.stringify(ollamaBody),
       signal: signal || provider.abortController.signal
     });
 
@@ -136,6 +146,11 @@ const https = require('https');
         } else {
           anthropicMessages.push({ role: 'user', content: [toolBlock] });
         }
+      } else if (msg.role === 'assistant' && Array.isArray(msg._rawBlocks) && msg._rawBlocks.length) {
+        // Replay the exact content blocks from a previous streaming turn. Required when
+        // extended thinking is enabled: Anthropic rejects tool_use turns whose thinking
+        // blocks were stripped or reconstructed.
+        anthropicMessages.push({ role: 'assistant', content: msg._rawBlocks });
       } else if (msg.role === 'assistant' && msg.tool_calls?.length) {
         // Convert OpenAI tool-call assistant turn to Anthropic tool_use blocks.
         const blocks = [];
@@ -184,10 +199,14 @@ const https = require('https');
       model,
       max_tokens: 16384,
       stream: true,
-      temperature,
       messages: anthropicMessages,
       tools: anthropicTools,
     };
+    // High thinking level → Anthropic extended thinking. Temperature must be omitted
+    // (the API requires the default of 1 when thinking is enabled).
+    const useThinking = (provider.thinkingLevel || 'medium') === 'high';
+    if (useThinking) body.thinking = { type: 'enabled', budget_tokens: 6000 };
+    else body.temperature = temperature;
     if (systemText) body.system = systemText;
 
     const anthropicEndpoint = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/messages';
@@ -215,6 +234,10 @@ const https = require('https');
     const tokenCounts = { prompt: 0, completion: 0 };
     // Track streaming tool-use blocks by index.
     const toolBlocks = {};
+    // Preserve the exact ordered content blocks (thinking/text/tool_use) so the next
+    // iteration can replay them verbatim — mandatory when extended thinking is on.
+    const rawBlocks = [];
+    const rawByIndex = {};
 
     const processLine = (line) => {
       const dataLine = line.startsWith('data: ') ? line.slice(6).trim() : null;
@@ -229,16 +252,36 @@ const https = require('https');
         tokenCounts.completion = evt.usage.output_tokens || 0;
       }
       if (evt.type === 'content_block_start') {
-        if (evt.content_block?.type === 'tool_use') {
-          toolBlocks[evt.index] = { id: evt.content_block.id, name: evt.content_block.name, argsJson: '' };
+        const cb = evt.content_block;
+        if (cb?.type === 'tool_use') {
+          toolBlocks[evt.index] = { id: cb.id, name: cb.name, argsJson: '' };
+          rawByIndex[evt.index] = { type: 'tool_use', id: cb.id, name: cb.name, input: {} };
+        } else if (cb?.type === 'thinking') {
+          rawByIndex[evt.index] = { type: 'thinking', thinking: '', signature: '' };
+          provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
+        } else if (cb?.type === 'redacted_thinking') {
+          rawByIndex[evt.index] = { type: 'redacted_thinking', data: cb.data || '' };
+        } else if (cb?.type === 'text') {
+          rawByIndex[evt.index] = { type: 'text', text: '' };
+          // Reasoning finished — reflect that the model is now writing the answer.
+          provider.view?.webview.postMessage({ type: 'statusText', text: 'Working…' });
         }
+        if (rawByIndex[evt.index]) rawBlocks.push(rawByIndex[evt.index]);
       }
       if (evt.type === 'content_block_delta') {
         const delta = evt.delta;
+        const raw = rawByIndex[evt.index];
         if (delta?.type === 'text_delta') {
           text += delta.text;
+          if (raw?.type === 'text') raw.text += delta.text;
           if (onChunk) onChunk(delta.text);
           else provider.view?.webview.postMessage({ type: 'chunk', text: delta.text });
+        }
+        if (delta?.type === 'thinking_delta' && raw?.type === 'thinking') {
+          raw.thinking += delta.thinking || '';
+        }
+        if (delta?.type === 'signature_delta' && raw?.type === 'thinking') {
+          raw.signature = delta.signature || '';
         }
         if (delta?.type === 'input_json_delta' && toolBlocks[evt.index]) {
           toolBlocks[evt.index].argsJson += delta.partial_json || '';
@@ -249,6 +292,7 @@ const https = require('https');
         let args = {};
         try { args = JSON.parse(tb.argsJson || '{}'); } catch {}
         nativeToolCalls.push({ id: tb.id, function: { name: tb.name, arguments: JSON.stringify(args) } });
+        if (rawByIndex[evt.index]?.type === 'tool_use') rawByIndex[evt.index].input = args;
         delete toolBlocks[evt.index];
       }
     };
@@ -264,7 +308,7 @@ const https = require('https');
     buffer += decoder.decode();
     if (buffer) buffer.split('\n').forEach(processLine);
 
-    return { text, nativeToolCalls, tokenCounts };
+    return { text, nativeToolCalls, tokenCounts, rawBlocks };
   }
 
   async function streamOpenAI(provider, baseUrl, model, messages, temperature, apiKey, signal = null, onChunk = null) {
@@ -273,11 +317,18 @@ const https = require('https');
 
     const body = {
       model,
-      messages,
-      temperature,
+      // _rawBlocks is Anthropic-only replay state — never send it to OpenAI-compat APIs.
+      messages: messages.map(({ _rawBlocks, ...m }) => m),
       stream: true,
       tools: TOOLS_API
     };
+    // o-series reasoning models reject `temperature` and take `reasoning_effort` instead.
+    if (/^o[0-9]/.test(model)) {
+      const level = provider.thinkingLevel || 'medium';
+      body.reasoning_effort = level === 'high' ? 'high' : level === 'fast' ? 'low' : 'medium';
+    } else {
+      body.temperature = temperature;
+    }
 
     const response = await fetch(baseUrl + '/chat/completions', {
       method: 'POST',

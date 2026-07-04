@@ -38,6 +38,7 @@ const settingProvider = document.querySelector('#settingProvider');
 const settingHost = document.querySelector('#settingHost');
 const settingApiBase = document.querySelector('#settingApiBase');
 const settingApiKey = document.querySelector('#settingApiKey');
+const settingSearchApiKey = document.querySelector('#settingSearchApiKey');
 const settingTemperature = document.querySelector('#settingTemperature');
 const settingMaxIter = document.querySelector('#settingMaxIter');
 const settingEditFormat = document.querySelector('#settingEditFormat');
@@ -106,7 +107,41 @@ promptInput.addEventListener('input', () => {
   handleSlashCommand();
 });
 
+// Returns the open autocomplete dropdown (slash or @-mention), or null.
+function getOpenDropdown() {
+  for (const id of ['slashDropdown', 'atDropdown']) {
+    const d = document.getElementById(id);
+    if (d && d.style.display !== 'none' && d.children.length) return d;
+  }
+  return null;
+}
+
+function moveDropdownSelection(dropdown, dir) {
+  const items = [...dropdown.children];
+  let idx = items.findIndex(i => i.classList.contains('active'));
+  if (idx !== -1) items[idx].classList.remove('active');
+  idx = idx === -1 ? (dir > 0 ? 0 : items.length - 1) : (idx + dir + items.length) % items.length;
+  items.forEach((it, i) => {
+    it.classList.toggle('active', i === idx);
+    it.setAttribute('aria-selected', i === idx ? 'true' : 'false');
+  });
+  items[idx].scrollIntoView({ block: 'nearest' });
+}
+
 promptInput.addEventListener('keydown', (event) => {
+  // Keyboard navigation for the slash-command / @-mention dropdowns.
+  const dropdown = getOpenDropdown();
+  if (dropdown) {
+    if (event.key === 'ArrowDown') { event.preventDefault(); moveDropdownSelection(dropdown, 1); return; }
+    if (event.key === 'ArrowUp')   { event.preventDefault(); moveDropdownSelection(dropdown, -1); return; }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault();
+      const target = dropdown.querySelector('.active') || dropdown.firstElementChild;
+      // Items act on mousedown (to beat textarea blur) — trigger the same path.
+      target?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      return;
+    }
+  }
   if (event.key === 'Escape') { hideAtDropdown(); hideSlashDropdown(); return; }
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
@@ -238,6 +273,19 @@ modelSelect.addEventListener('change', () => {
 
 approvalModeSelect?.addEventListener('change', () => {
   vscode.postMessage({ type: 'setApprovalMode', mode: approvalModeSelect.value });
+});
+
+// Welcome chips insert a starter prompt into the composer (prompts ending in a
+// space are templates for the user to complete).
+welcomeEl?.addEventListener('click', (e) => {
+  const chip = e.target.closest('.welcome-chip');
+  const p = chip?.dataset.prompt;
+  if (!p) return;
+  promptInput.value = p;
+  promptInput.focus();
+  promptInput.selectionStart = promptInput.selectionEnd = p.length;
+  autoResize();
+  updateSendButton();
 });
 
 thinkingLevelSelect?.addEventListener('change', () => {
@@ -403,19 +451,23 @@ settingProvider?.addEventListener('change', () => updateSettingsFieldVisibility(
 
 settingsForm?.addEventListener('submit', (e) => {
   e.preventDefault();
-  vscode.postMessage({
-    type: 'saveSettings',
-    settings: {
-      provider:     settingProvider?.value     || 'ollama',
-      host:         settingHost?.value         || 'http://localhost:11434',
-      apiKey:       settingApiKey?.value       || '',
-      apiBase:      settingApiBase?.value      || '',
-      temperature:  settingTemperature?.value  ?? 0.2,
-      maxIter:      settingMaxIter?.value      ?? 15,
-      editFormat:   settingEditFormat?.value   || 'search-replace',
-      systemPrompt: settingSystemPrompt?.value || '',
-    }
-  });
+  const settings = {
+    provider:     settingProvider?.value     || 'ollama',
+    host:         settingHost?.value         || 'http://localhost:11434',
+    apiBase:      settingApiBase?.value      || '',
+    temperature:  settingTemperature?.value  ?? 0.2,
+    maxIter:      settingMaxIter?.value      ?? 15,
+    editFormat:   settingEditFormat?.value   || 'search-replace',
+    systemPrompt: settingSystemPrompt?.value || '',
+  };
+  // Key fields display a masked placeholder (ab12••••cd34) after load. Only send
+  // them when the user actually typed a new value — sending the mask back would
+  // overwrite the real stored secret with garbage.
+  const apiKeyVal = settingApiKey?.value || '';
+  if (!apiKeyVal.includes('••••')) settings.apiKey = apiKeyVal;
+  const searchKeyVal = settingSearchApiKey?.value || '';
+  if (!searchKeyVal.includes('••••')) settings.searchApiKey = searchKeyVal;
+  vscode.postMessage({ type: 'saveSettings', settings });
   if (settingsPanel) settingsPanel.style.display = 'none';
 });
 
@@ -520,6 +572,7 @@ window.addEventListener('message', (event) => {
     activityLogEl = null;
     currentActivityRowEl = null;
     messagesEl.innerHTML = '';
+    messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
     welcomeEl.classList.remove('hidden');
     attachedFiles = [];
     attachedTexts = [];
@@ -630,6 +683,7 @@ window.addEventListener('message', (event) => {
     if (settingProvider)     settingProvider.value     = s.provider     || 'ollama';
     if (settingHost)         settingHost.value         = s.host         || 'http://localhost:11434';
     if (settingApiKey)       settingApiKey.value       = s.apiKey       || '';
+    if (settingSearchApiKey) settingSearchApiKey.value = s.searchApiKey || '';
     if (settingApiBase)      settingApiBase.value      = s.apiBase      || '';
     if (settingTemperature)  settingTemperature.value  = s.temperature  ?? 0.2;
     if (settingMaxIter)      settingMaxIter.value      = s.maxIter      ?? 15;
@@ -648,6 +702,10 @@ window.addEventListener('message', (event) => {
       contextLengthEl.textContent = k + 'k ctx';
       contextLengthEl.title = 'Model context window: ' + message.length.toLocaleString() + ' tokens';
     }
+  }
+
+  if (message.type === 'statusText') {
+    if (statusText) statusText.textContent = message.text || '';
   }
 
   if (message.type === 'queued') {
@@ -1058,13 +1116,14 @@ function showSlashDropdown(query) {
     dropdown = document.createElement('div');
     dropdown.id = 'slashDropdown';
     dropdown.className = 'slash-dropdown';
+    dropdown.setAttribute('role', 'listbox');
     document.querySelector('.input-area')?.appendChild(dropdown);
   }
   const q = query.slice(1).toLowerCase();
   const matches = SLASH_COMMANDS.filter(c => c.cmd.slice(1).startsWith(q));
   if (matches.length === 0) { hideSlashDropdown(); return; }
   dropdown.innerHTML = matches.map((c, i) =>
-    `<div class="slash-item" data-idx="${i}" data-cmd="${c.cmd}">
+    `<div class="slash-item" role="option" aria-selected="false" data-idx="${i}" data-cmd="${c.cmd}">
       <span class="slash-icon">${c.icon}</span>
       <span class="slash-label">${c.label}</span>
       <span class="slash-desc">${c.desc}</span>
@@ -1247,6 +1306,7 @@ function renderAtDropdown(files, state) {
     dropdown = document.createElement('div');
     dropdown.id = 'atDropdown';
     dropdown.className = 'at-dropdown';
+    dropdown.setAttribute('role', 'listbox');
     document.querySelector('.composer-wrap')?.appendChild(dropdown);
   }
 
@@ -1256,6 +1316,8 @@ function renderAtDropdown(files, state) {
     const fdir  = file.slice(0, file.length - fname.length);
     const item = document.createElement('div');
     item.className = 'at-dropdown-item';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', 'false');
     item.innerHTML = `<span class="at-file-name">${escapeHtml(fname)}</span><span class="at-file-dir">${escapeHtml(fdir)}</span>`;
     item.addEventListener('mousedown', (e) => {
       e.preventDefault(); // prevent textarea blur
@@ -1291,12 +1353,15 @@ function renderSymbolDropdown(symbols) {
     dropdown = document.createElement('div');
     dropdown.id = 'atDropdown';
     dropdown.className = 'at-dropdown';
+    dropdown.setAttribute('role', 'listbox');
     document.querySelector('.composer-wrap')?.appendChild(dropdown);
   }
   dropdown.innerHTML = '';
   for (const sym of symbols) {
     const item = document.createElement('div');
     item.className = 'at-dropdown-item';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', 'false');
     item.innerHTML = `<span class="at-symbol-kind">${sym.kind}</span><span class="at-file-name">${escapeHtml(sym.name)}</span><span class="at-file-dir">${escapeHtml(sym.file)}:${sym.line}</span>`;
     item.addEventListener('mousedown', (e) => {
       e.preventDefault();
@@ -1339,7 +1404,8 @@ function sendPrompt() {
   if (attachedTexts.length > 0) {
     const blocks = attachedTexts.map(f => {
       const ext = f.name.split('.').pop();
-      return `[Attached: ${f.name}]\n\`\`\`${ext}\n${f.content.slice(0, 12000)}\n\`\`\``;
+      const truncated = f.content.length > 12000;
+      return `[Attached: ${f.name}${truncated ? ' — TRUNCATED to first 12,000 of ' + f.content.length + ' characters' : ''}]\n\`\`\`${ext}\n${f.content.slice(0, 12000)}\n\`\`\``;
     }).join('\n\n');
     finalPrompt = blocks + '\n\n' + prompt;
   }
@@ -1406,8 +1472,14 @@ function updateWelcome() {
 
 function renderHistory(history) {
   messagesEl.innerHTML = '';
+  messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — keep it in the DOM
   if (!Array.isArray(history) || !history.length) { updateWelcome(); return; }
   welcomeEl.classList.add('hidden');
+  // Restored sessions only contain text — tool cards and diffs are not replayed.
+  const note = document.createElement('div');
+  note.className = 'restore-note';
+  note.textContent = 'Session restored — earlier tool activity and diffs are not shown.';
+  messagesEl.appendChild(note);
   for (const item of history) {
     if (!item.text?.trim()) continue; // skip empty tool-only iterations
     if (item.role === 'user')      addMessage('user',      item.text);
@@ -1630,8 +1702,25 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     pre.textContent = text;
     bubble.appendChild(pre);
   } else {
+    bubble.dataset.rawMd = text;
     bubble.innerHTML = renderMarkdown(text);
     attachCodeBlockActions(bubble);
+  }
+
+  // Hover copy button for assistant messages — copies the whole reply as markdown.
+  if (role === 'assistant') {
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'msg-copy-btn';
+    copyBtn.title = 'Copy message';
+    copyBtn.setAttribute('aria-label', 'Copy message');
+    copyBtn.textContent = '⧉';
+    copyBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'copy', text: bubble.dataset.rawMd || bubble.textContent || '' });
+      copyBtn.textContent = '✓';
+      setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
+    });
+    article.appendChild(copyBtn);
   }
 
   article.appendChild(bubble);
@@ -1679,6 +1768,7 @@ function flushAssistantText() {
 
   if (!activeAssistantBubble || !activeAssistantContent) return;
   // Single full markdown render now that streaming is complete.
+  activeAssistantBubble.dataset.rawMd = activeAssistantContent; // for the copy-message button
   const rendered = renderMarkdown(activeAssistantContent);
   if (rendered || !activeAssistantBubble.innerHTML) {
     activeAssistantBubble.innerHTML = rendered;
@@ -1781,6 +1871,9 @@ function renderMarkdown(text) {
   if (/^<think(?:ing)?>/i.test(cleaned.trim())) {
     return '<div class="think-streaming">💭 Reasoning…</div>';
   }
+  // Strip orphan think tags (closing tag with no opening, or vice versa) — some
+  // models emit malformed tags that would otherwise leak into the chat as literal text.
+  cleaned = cleaned.replace(/<\/?think(?:ing)?>/gi, '');
   cleaned = cleaned.trim();
 
   // Split on fenced code blocks first so block-markdown never touches code content.
@@ -2132,7 +2225,7 @@ function buildResultPreview(tool, result) {
     case 'write_file': case 'apply_edit': return 'saved';
     case 'delete_file': return 'deleted';
     case 'web_search': {
-      const n = (r.match(/^\d+\./gm) || []).length;
+      const n = (r.match(/^\[\d+\]/gm) || []).length;
       return n ? `${n} result${n !== 1 ? 's' : ''}` : r.slice(0, 60);
     }
     case 'git_status': {

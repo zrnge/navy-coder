@@ -18,13 +18,19 @@ function literalReplace(original, search, replace) {
   }
 
   // 2. CRLF → LF normalisation (handles Windows line-ending mismatch).
+  // Strategies 2 and 3 work on LF-normalised text, so remember the file's original
+  // line ending and restore it on output — otherwise one small edit silently
+  // rewrites every line ending in the file (a whole-file git diff).
+  const hadCRLF    = original.includes('\r\n');
+  const restoreEol = (s) => hadCRLF ? s.replace(/\r?\n/g, '\r\n') : s;
   const normOrig   = original.replace(/\r\n/g, '\n');
   const normSearch = search.replace(/\r\n/g, '\n');
+  const normReplace = replace.replace(/\r\n/g, '\n');
   const firstNorm  = normOrig.indexOf(normSearch);
   if (firstNorm !== -1) {
     if (normOrig.indexOf(normSearch, firstNorm + 1) !== -1)
       return new Error('SEARCH string matches more than one location — make it more specific so the edit is unambiguous.');
-    return normOrig.slice(0, firstNorm) + replace + normOrig.slice(firstNorm + normSearch.length);
+    return restoreEol(normOrig.slice(0, firstNorm) + normReplace + normOrig.slice(firstNorm + normSearch.length));
   }
 
   // 3. Line-level fuzzy match — tolerates leading-whitespace mismatches (indentation drift).
@@ -50,7 +56,7 @@ function literalReplace(original, search, replace) {
   if (bestScore >= 0.85 && !ambiguous && bestIdx !== -1) {
     const before = origLines.slice(0, bestIdx).join('\n');
     const after  = origLines.slice(bestIdx + sLen).join('\n');
-    return (before ? before + '\n' : '') + replace + (after ? '\n' + after : '');
+    return restoreEol((before ? before + '\n' : '') + normReplace + (after ? '\n' + after : ''));
   }
 
   return null;
@@ -70,7 +76,15 @@ class NavyCoderViewProvider {
     this.pendingCommandApprovals = new Map();
     this.checkpoints = [];
     this.activeToolCall = null;
-    this.projectRoot = '';
+    // Restore the last picked project root (persisted via navy.projectRoot) so the
+    // project choice survives window reloads. Scope matters: the workspace-level value
+    // always applies, but the global value is only trusted when NO workspace is open —
+    // otherwise a root saved in a folderless window would leak into every workspace.
+    const rootInfo = vscode.workspace.getConfiguration('navy').inspect('projectRoot');
+    const savedRoot = vscode.workspace.workspaceFolders?.length
+      ? (rootInfo?.workspaceValue || '')
+      : (rootInfo?.workspaceValue || rootInfo?.globalValue || '');
+    this.projectRoot = (savedRoot && fs.existsSync(savedRoot)) ? savedRoot : '';
     this.messageQueue = [];   // queued prompts while a turn is in progress
     this.isBusy = false;
     this.modelContextLength = null; // fetched from Ollama /api/show
@@ -154,9 +168,20 @@ class NavyCoderViewProvider {
         case 'setModel':
           await this.setModel(message.model);
           break;
-        case 'setApprovalMode':
+        case 'setApprovalMode': {
+          if (message.mode === 'auto-approve') {
+            // Auto removes every safety gate — make sure the switch is deliberate.
+            const pick = await vscode.window.showWarningMessage(
+              'Enable auto-approve? Navy will edit files, run commands, and delete files WITHOUT asking for confirmation.',
+              { modal: true },
+              'Enable'
+            );
+            if (pick !== 'Enable') { this.sendApprovalMode(); break; } // revert the dropdown
+          }
           await vscode.workspace.getConfiguration('navy').update('approvalMode', message.mode, vscode.ConfigurationTarget.Global);
+          this.sendApprovalMode();
           break;
+        }
         case 'copy':
           await vscode.env.clipboard.writeText(message.text || '');
           break;
@@ -171,6 +196,7 @@ class NavyCoderViewProvider {
           break;
         case 'setProjectRoot':
           this.projectRoot = message.root || '';
+          await this._persistProjectRoot(this.projectRoot);
           await this.sendWorkspaceFolders();
           await this.loadProjectSession();
           break;
@@ -255,10 +281,15 @@ class NavyCoderViewProvider {
           const T = vscode.ConfigurationTarget.Global;
           if (s.provider   !== undefined) await cfg.update('provider',          s.provider,          T);
           if (s.host       !== undefined) await cfg.update('host',              s.host,              T);
-          if (s.apiKey !== undefined) {
-            // cfg.update('provider') above already wrote the new provider before we reach here.
-            const currentProvider = cfg.get('provider', 'ollama');
+          // Never store a masked display value ('ab12••••cd34') back into secrets.
+          if (s.apiKey !== undefined && !String(s.apiKey).includes('••••')) {
+            // cfg is a snapshot — cfg.get('provider') would return the PRE-update value.
+            // Use the provider from this same save payload when present.
+            const currentProvider = s.provider !== undefined ? s.provider : cfg.get('provider', 'ollama');
             await this.context.secrets.store('navy.apiKey.' + currentProvider, s.apiKey);
+          }
+          if (s.searchApiKey !== undefined && !String(s.searchApiKey).includes('••••')) {
+            await this.context.secrets.store('navy.searchApiKey', s.searchApiKey);
           }
           if (s.apiBase    !== undefined) await cfg.update('apiBase',           s.apiBase,           T);
           if (s.temperature!== undefined) await cfg.update('temperature',       Number(s.temperature), T);
@@ -313,9 +344,20 @@ class NavyCoderViewProvider {
     this.view?.webview.postMessage({ type: 'commandResolved', id, approved });
   }
 
-  focus() {
-    this.view?.show?.(true);
-    this.view?.webview.postMessage({ type: 'focusInput' });
+  async focus() {
+    if (!this.view) {
+      // Sidebar has never been opened — this.view doesn't exist yet, so show() would
+      // be a silent no-op. VS Code auto-generates <viewId>.focus which opens the Navy
+      // container and resolves the view. Give it a moment so callers that immediately
+      // send a prompt (inline edit, explain error) don't race the webview handshake.
+      try {
+        await vscode.commands.executeCommand('navy.chatView.focus');
+        await new Promise(r => setTimeout(r, 400));
+      } catch {}
+      return;
+    }
+    this.view.show?.(true);
+    this.view.webview.postMessage({ type: 'focusInput' });
   }
 
   clearChat() {
@@ -359,6 +401,9 @@ class NavyCoderViewProvider {
     const apiKey = await this.context.secrets.get('navy.apiKey.' + provider)
                 || await this.context.secrets.get('navy.apiKey') || '';
     const maskedKey = apiKey ? apiKey.slice(0, 4) + '••••' + apiKey.slice(-4) : '';
+    const searchKey = c.get('searchApiKey', '')
+                   || await this.context.secrets.get('navy.searchApiKey') || '';
+    const maskedSearchKey = searchKey ? searchKey.slice(0, 4) + '••••' + searchKey.slice(-4) : '';
     this.view?.webview.postMessage({
       type: 'settings',
       settings: {
@@ -366,6 +411,7 @@ class NavyCoderViewProvider {
         host:         c.get('host',              'http://localhost:11434'),
         apiKey:       maskedKey,
         apiBase:      c.get('apiBase',           ''),
+        searchApiKey: maskedSearchKey,
         temperature:  c.get('temperature',       0.2),
         maxIter:      c.get('maxToolIterations', 50),
         editFormat:   c.get('editFormat',        'search-replace'),
@@ -399,6 +445,17 @@ class NavyCoderViewProvider {
     this.view?.webview.postMessage({ type: 'workspaceFolders', roots: displayRoots, current: this.projectRoot });
   }
 
+  // Persist the picked project root so it survives window reloads. Workspace-scoped
+  // when a workspace is open (per-project memory), global otherwise.
+  async _persistProjectRoot(root) {
+    try {
+      const target = vscode.workspace.workspaceFolders?.length
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+      await vscode.workspace.getConfiguration('navy').update('projectRoot', root || '', target);
+    } catch {}
+  }
+
   async openFolder() {
     const result = await vscode.window.showOpenDialog({
       canSelectFiles: false,
@@ -418,7 +475,9 @@ class NavyCoderViewProvider {
       await vscode.workspace.updateWorkspaceFolders(newIndex, 0, uri);
       this.projectRoot = picked;
     }
+    await this._persistProjectRoot(picked);
     await this.sendWorkspaceFolders();
+    await this.loadProjectSession();
   }
 
   async setModel(model) {
@@ -437,6 +496,10 @@ class NavyCoderViewProvider {
     const apiBase = config.get('apiBase', '');
     const apiKey = await this.context.secrets.get('navy.apiKey.' + provider)
                 || await this.context.secrets.get('navy.apiKey') || '';
+
+    // Context length is only fetchable from Ollama (/api/show) — clear it for other
+    // providers so the context gauge never shows a stale value from a previous provider.
+    if (provider !== 'ollama') this.modelContextLength = null;
 
     // Providers with static model lists
     const STATIC_MODELS = {
@@ -787,11 +850,11 @@ class NavyCoderViewProvider {
     // Always include file contents in the user message so Navy can edit without separate read_file calls
     const fileContents = [];
     if (activeFile) {
-      const activeText = await this.readFileText(activeFile);
+      const activeText = this.truncateForContext(await this.readFileText(activeFile));
       if (activeText !== null) fileContents.push('ACTIVE FILE: ' + activeFile + ' (language: ' + activeLanguage + ')\n\n' + activeText);
     }
     for (const file of extraFiles) {
-      const fileText = await this.readFileText(file);
+      const fileText = this.truncateForContext(await this.readFileText(file));
       if (fileText !== null && file !== activeFile) fileContents.push('ATTACHED FILE: ' + file + '\n\n' + fileText);
     }
 
@@ -836,9 +899,13 @@ class NavyCoderViewProvider {
       // One controller for the entire turn so Stop cancels both the current
       // stream AND any tool-loop iteration that follows it.
       this.abortController = new AbortController();
-      // Auto-abort after 3 minutes if the server hangs and never responds.
-      const watchdog = setTimeout(() => this.abortController?.abort(), 180_000);
-      this._watchdog = watchdog;
+      // Watchdog: abort if a SINGLE model call hangs for 3 minutes. Reset every
+      // iteration so long multi-step tasks that are making progress are never killed.
+      const resetWatchdog = () => {
+        clearTimeout(this._watchdog);
+        this._watchdog = setTimeout(() => this.abortController?.abort(), 180_000);
+      };
+      resetWatchdog();
 
       // Loop-detection state: prevents re-reading the same file repeatedly.
       const seenReadCalls = new Set();
@@ -849,12 +916,18 @@ class NavyCoderViewProvider {
       const taskChanges = { touched: new Map(), deleted: [], commands: [] };
       // touched: Map<inputPath, 'created'|'modified'>; commands: { cmd, exit }[]
 
+      let lastAssistantText = ''; // final assistant text, persisted to history after the loop
+
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         if (this.abortController.signal.aborted) break;
         if (iteration > 0) {
           this.view?.webview.postMessage({ type: 'stepProgress', step: iteration + 1, max: maxIterations });
         }
-        const { text: responseText, nativeToolCalls, tokenCounts } = await streamAssistant(this, host, model, messages, temperature);
+        resetWatchdog();
+        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks } = await streamAssistant(this, host, model, messages, temperature);
+        // Model call finished — stop the watchdog so it can't fire while tools run or
+        // while the user takes their time reviewing a pending edit approval.
+        clearTimeout(this._watchdog);
 
         // Send token usage and context fill level after each model call.
         const totalTokens = tokenCounts.prompt + tokenCounts.completion;
@@ -868,11 +941,18 @@ class NavyCoderViewProvider {
         // Build the assistant message. When using native tool calling, include tool_calls
         // so the model receives proper conversation history on the next iteration.
         if (nativeToolCalls.length > 0) {
-          messages.push({ role: 'assistant', content: responseText || '', tool_calls: nativeToolCalls });
+          // _rawBlocks preserves Anthropic thinking/tool_use blocks for exact replay
+          // on the next iteration (required when extended thinking is enabled).
+          messages.push({ role: 'assistant', content: responseText || '', tool_calls: nativeToolCalls,
+            ...(rawBlocks?.length ? { _rawBlocks: rawBlocks } : {}) });
         } else {
           messages.push({ role: 'assistant', content: responseText });
         }
-        if (responseText.trim()) this.messages.push({ role: 'assistant', text: responseText });
+        // Track the latest text but only persist the FINAL one to session history —
+        // persisting every intermediate tool-loop message creates runs of consecutive
+        // assistant entries that bloat context and can 400 on providers that require
+        // alternating roles (Anthropic).
+        if (responseText.trim()) lastAssistantText = responseText;
 
         // Prefer native tool calls; fall back to XML parsing for models that embed XML in text.
         const toolCalls = nativeToolCalls.length > 0
@@ -952,11 +1032,13 @@ class NavyCoderViewProvider {
         // Read-only tools are safe to run in parallel; writes must be sequential.
         const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
           'git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_symbol','find_references',
           'web_search','fetch_url','get_terminal_output','read_process_output']);
 
         // Tools whose results are stable — dedup prevents re-reading the same file in a loop.
         const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'git_status','git_diff','git_log','git_blame','get_diagnostics']);
+          'git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_symbol','find_references']);
         // Command tools where repeated failure is tracked.
         const COMMAND_TOOLS = new Set(['run_command', 'run_tests']);
         // Write tools that touch files (used for the change-report footer).
@@ -1029,10 +1111,13 @@ class NavyCoderViewProvider {
               const exitMatch = String(result).match(/^Exit code: (\d+)/);
               if (exitMatch) taskChanges.commands.push({ cmd: tool.args?.command || tool.args?.filter || '', exit: parseInt(exitMatch[1]) });
             }
-            // Record successful file writes.
+            // Record successful file writes + auto-verify with fresh diagnostics.
             if (WRITE_TOOLS.has(tool.name) && typeof result === 'string' && result.startsWith('Applied to')) {
               const p = tool.args?.path || '';
-              if (p) taskChanges.touched.set(p, _fileIsNew ? 'created' : 'modified');
+              if (p) {
+                taskChanges.touched.set(p, _fileIsNew ? 'created' : 'modified');
+                result += await this._diagnosticsAfterWrite(p);
+              }
             }
             if (tool.name === 'delete_file' && typeof result === 'string' && result.startsWith('Deleted')) {
               taskChanges.deleted.push(tool.args?.path || '');
@@ -1054,6 +1139,9 @@ class NavyCoderViewProvider {
           messages.push(tr);
         }
       }
+
+      // Persist only the final assistant message to session history (see note above).
+      if (lastAssistantText.trim()) this.messages.push({ role: 'assistant', text: lastAssistantText });
 
       // Only auto-apply code fences in pure-chat mode (no tool use), to prevent double-applies.
       if (!usedTools) {
@@ -1113,6 +1201,8 @@ class NavyCoderViewProvider {
         case 'read_process_output': return await this.toolReadProcessOutput(tool.args.id, tool.args.clear);
         case 'kill_process': return await this.toolKillProcess(tool.args.id);
         case 'git_blame': return await this.toolGitBlame(tool.args.path, tool.args.startLine, tool.args.endLine);
+        case 'find_symbol': return await this.toolFindSymbol(tool.args.name);
+        case 'find_references': return await this.toolFindReferences(tool.args.name);
         case 'web_search': return await this.toolWebSearch(tool.args.query, tool.args.maxResults);
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
@@ -1129,6 +1219,25 @@ class NavyCoderViewProvider {
     } catch (error) {
       return 'Error: ' + error.message;
     }
+  }
+
+  // After a successful write, fetch fresh LSP diagnostics for the file so the model
+  // immediately sees any errors its edit introduced — no need for it to remember to check.
+  async _diagnosticsAfterWrite(inputPath) {
+    try {
+      const filePath = this.resolveWorkspacePath(inputPath);
+      // Give the language server a moment to re-analyze the new content.
+      await new Promise(r => setTimeout(r, 900));
+      const diags = vscode.languages.getDiagnostics(vscode.Uri.file(filePath))
+        .filter(d => d.severity === 0 || d.severity === 1); // errors + warnings only
+      if (!diags.length) return '';
+      const lines = diags.slice(0, 10).map(d => {
+        const sev = d.severity === 0 ? 'Error' : 'Warning';
+        return `[${sev}] line ${d.range.start.line + 1}: ${d.message}`;
+      });
+      const more = diags.length > 10 ? `\n…and ${diags.length - 10} more` : '';
+      return `\n\n[POST-EDIT DIAGNOSTICS for ${path.basename(filePath)} — fix any Errors before finishing:]\n${lines.join('\n')}${more}`;
+    } catch { return ''; }
   }
 
   // Resolves paths to absolute and enforces workspace containment to prevent
@@ -1198,9 +1307,13 @@ class NavyCoderViewProvider {
     if (text === null) return 'Error: could not read ' + inputPath;
     const lines = text.split('\n');
     const MAX_READ_LINES = 500;
+    const MAX_READ_CHARS = 60000; // guards minified single-line files that dodge the line cap
     if (lines.length > MAX_READ_LINES) {
       const truncated = lines.slice(0, MAX_READ_LINES).join('\n');
-      return truncated + `\n\n[FILE TRUNCATED: showing ${MAX_READ_LINES} of ${lines.length} lines. Use read_lines("${inputPath}", startLine, endLine) to read other sections.]`;
+      return truncated.slice(0, MAX_READ_CHARS) + `\n\n[FILE TRUNCATED: showing ${MAX_READ_LINES} of ${lines.length} lines. Use read_lines("${inputPath}", startLine, endLine) to read other sections.]`;
+    }
+    if (text.length > MAX_READ_CHARS) {
+      return text.slice(0, MAX_READ_CHARS) + `\n\n[FILE TRUNCATED: showing ${MAX_READ_CHARS} of ${text.length} characters.]`;
     }
     return text;
   }
@@ -1294,16 +1407,19 @@ class NavyCoderViewProvider {
   async toolDeleteFile(inputPath) {
     const filePath = this.resolveWorkspacePath(inputPath);
     const basename = path.basename(filePath);
-    const choice = await vscode.window.showWarningMessage(
-      `Navy wants to delete ${basename}. This cannot be undone.`,
-      { modal: true },
-      'Delete',
-      'Cancel'
-    );
-    if (choice !== 'Delete') return `Deletion of ${basename} cancelled.`;
+    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
+    if (approvalMode !== 'auto-approve') {
+      // Modal dialogs add their own Cancel button — only pass the confirm action.
+      const choice = await vscode.window.showWarningMessage(
+        `Navy wants to delete ${basename}. It will be moved to the Recycle Bin.`,
+        { modal: true },
+        'Delete'
+      );
+      if (choice !== 'Delete') return `Deletion of ${basename} cancelled by user.`;
+    }
     try {
-      await vscode.workspace.fs.delete(vscode.Uri.file(filePath), { useTrash: true });
-      return `Deleted ${basename}`;
+      await vscode.workspace.fs.delete(vscode.Uri.file(filePath), { recursive: true, useTrash: true });
+      return `Deleted ${basename} (moved to Recycle Bin).`;
     } catch (e) {
       return `Error deleting ${basename}: ${e.message}`;
     }
@@ -1423,8 +1539,7 @@ class NavyCoderViewProvider {
     const terminals = vscode.window.terminals;
     if (terminals.length === 0) return 'No terminals open.';
     const names = terminals.map((t, i) => `${i + 1}. ${t.name}`).join('\n');
-    this.view?.webview.postMessage({ type: 'captureTerminal' });
-    return `Active terminals:\n${names}\n\nNote: Terminal content was requested. The user may need to manually share terminal output by typing "show terminal" in the chat.`;
+    return `Open terminals:\n${names}\n\nVS Code does not expose terminal buffer contents to extensions. To capture output, re-run the command yourself via run_command, or use start_process + read_process_output for long-running processes.`;
   }
 
   _shellEscapeArg(s) {
@@ -1447,7 +1562,12 @@ class NavyCoderViewProvider {
       const pkg = JSON.parse(await fs.promises.readFile(path.join(root, 'package.json'), 'utf8'));
       const scripts = pkg.scripts || {};
       if (scripts.test && scripts.test !== 'echo "Error: no test specified" && exit 1') {
-        cmd = 'npm test -- --watchAll=false' + (filter ? ' --testNamePattern=' + JSON.stringify(filter) : '');
+        // Jest-specific flags break other runners (mocha, node:test, ava) — only pass
+        // them when jest is actually in play.
+        const isJest = /\bjest\b/.test(scripts.test) || Boolean(pkg.devDependencies?.jest || pkg.dependencies?.jest);
+        cmd = isJest
+          ? 'npm test -- --watchAll=false' + (filter ? ' --testNamePattern=' + JSON.stringify(filter) : '')
+          : 'npm test';
       } else if (scripts['test:unit']) cmd = 'npm run test:unit';
       else if (scripts.vitest || pkg.devDependencies?.vitest || pkg.dependencies?.vitest) {
         cmd = 'npx vitest run' + (filter ? ' -t ' + JSON.stringify(filter) : '');
@@ -1642,18 +1762,32 @@ class NavyCoderViewProvider {
       );
     } catch {}
 
-    const choice = await vscode.window.showInformationMessage(
-      `Apply Navy's changes to ${basename}?`,
-      { modal: false },
-      'Apply',
-      'Reject'
-    );
+    // Race the in-chat diff card buttons against the native toast — first answer wins.
+    // The card is the primary control; the toast is a convenience. Dismissing the toast
+    // does NOT reject the edit — the card stays live so the agent isn't silently stalled.
+    const decision = await new Promise((resolve) => {
+      this.pendingApprovals.set(id, { resolve, filePath, kind: 'agent-edit' });
+      this.sendPendingApprovalsUpdate();
+      vscode.window.showInformationMessage(
+        `Apply Navy's changes to ${basename}?`,
+        'Apply',
+        'Reject'
+      ).then((choice) => {
+        if (!this.pendingApprovals.has(id)) return; // already decided via the card
+        if (choice === 'Apply' || choice === 'Reject') {
+          this.pendingApprovals.delete(id);
+          this.sendPendingApprovalsUpdate();
+          resolve(choice === 'Apply' ? 'approve' : 'reject');
+        }
+        // Toast dismissed without a click → card remains the sole resolver.
+      });
+    });
 
     this.context.__navyProposedProvider?.delete(id);
     // Close the diff editor and refocus the original file.
     try { await vscode.commands.executeCommand('workbench.action.closeActiveEditor'); } catch {}
 
-    if (choice === 'Apply') {
+    if (decision === 'approve') {
       try {
         this.createCheckpoint(filePath, oldText);
         await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(newText, 'utf8'));
@@ -1666,14 +1800,25 @@ class NavyCoderViewProvider {
     }
 
     this.view?.webview.postMessage({ type: 'diffResolved', id, approved: false });
-    return `Rejected — no changes made to ${basename}`;
+    return decision === 'reject'
+      ? `Rejected — no changes made to ${basename}`
+      : `Edit cancelled — no changes made to ${basename}`;
   }
 
   async resolveApproval(id, approved) {
-    // Legacy path for sidebar-card approvals (applyCode flow).
     const approval = this.pendingApprovals.get(id);
     if (!approval) return;
     this.pendingApprovals.delete(id);
+
+    // Agent-edit approvals: requestWriteApproval owns the write + diffResolved message;
+    // we just deliver the user's decision to its awaiting promise.
+    if (approval.kind === 'agent-edit') {
+      this.sendPendingApprovalsUpdate();
+      approval.resolve(approved ? 'approve' : 'reject');
+      return;
+    }
+
+    // Legacy path for sidebar-card approvals (applyCode flow).
 
     if (approved) {
       let result;
@@ -1916,7 +2061,9 @@ class NavyCoderViewProvider {
 
   async toolStartProcess(id, command) {
     if (!id || !command) return 'Error: id and command are required.';
-    if (this.bgProcesses.has(id)) return `Error: a process named "${id}" is already running.`;
+    const prior = this.bgProcesses.get(id);
+    if (prior?.proc) return `Error: a process named "${id}" is already running.`;
+    if (prior) this.bgProcesses.delete(id); // previous run exited — allow id reuse
 
     const config = vscode.workspace.getConfiguration('navy');
     if (config.get('approvalMode', 'ask-always') !== 'auto-approve') {
@@ -2093,6 +2240,84 @@ class NavyCoderViewProvider {
     });
   }
 
+  async toolFindSymbol(name) {
+    try {
+      const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', name);
+      if (!symbols || symbols.length === 0) {
+        return `No symbol named "${name}" found by the language server. Try search_codebase as a fallback.`;
+      }
+      const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const results = [];
+      for (const sym of symbols.slice(0, 10)) {
+        const filePath = sym.location.uri.fsPath;
+        const line = sym.location.range.start.line;
+        const kind = Object.keys(vscode.SymbolKind).find(k => vscode.SymbolKind[k] === sym.kind) || 'Symbol';
+        const relPath = root ? path.relative(root, filePath) : filePath;
+        let snippet = '';
+        try {
+          const content = await fs.promises.readFile(filePath, 'utf8');
+          const lines = content.split('\n');
+          const start = Math.max(0, line - 1);
+          const end = Math.min(lines.length, line + 3);
+          snippet = lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join('\n');
+        } catch {}
+        results.push(
+          `**[${kind}]** \`${sym.name}\`${sym.containerName ? ` — in \`${sym.containerName}\`` : ''}\n` +
+          `${relPath}:${line + 1}\n\`\`\`\n${snippet}\n\`\`\``
+        );
+      }
+      return `Found ${symbols.length} result${symbols.length !== 1 ? 's' : ''} for \`${name}\`:\n\n` + results.join('\n\n---\n\n');
+    } catch (e) {
+      return 'find_symbol failed: ' + e.message + '. Try search_codebase as a fallback.';
+    }
+  }
+
+  async toolFindReferences(name) {
+    try {
+      // Step 1: locate a definition position to anchor the reference query.
+      const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', name);
+      if (!symbols || symbols.length === 0) {
+        return `No symbol named "${name}" found by the language server. Try search_codebase to locate usages by text.`;
+      }
+      const sym = symbols.find(s => s.name === name) || symbols[0];
+      const uri = sym.location.uri;
+      const pos = new vscode.Position(
+        sym.location.range.start.line,
+        sym.location.range.start.character + 1
+      );
+
+      // Ensure the document is loaded so the language server can index it.
+      await vscode.workspace.openTextDocument(uri);
+
+      // Step 2: ask the language server for all references.
+      const refs = await vscode.commands.executeCommand('vscode.executeReferenceProvider', uri, pos);
+      if (!refs || refs.length === 0) {
+        return `Language server returned no references for \`${name}\`. Try opening the file in the editor first, then retry.`;
+      }
+
+      const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const lines = [];
+      for (const ref of refs.slice(0, 30)) {
+        const filePath = ref.uri.fsPath;
+        const line = ref.range.start.line;
+        const relPath = root ? path.relative(root, filePath) : filePath;
+        let snippet = '';
+        try {
+          const content = await fs.promises.readFile(filePath, 'utf8');
+          snippet = (content.split('\n')[line] || '').trim();
+        } catch {}
+        lines.push(`${relPath}:${line + 1}  ${snippet}`);
+      }
+      return (
+        `**${refs.length} reference${refs.length !== 1 ? 's' : ''} to \`${name}\`**` +
+        `${refs.length > 30 ? ' (showing first 30)' : ''}:\n\n` +
+        lines.join('\n')
+      );
+    } catch (e) {
+      return 'find_references failed: ' + e.message + '. Try search_codebase as a fallback.';
+    }
+  }
+
   async toolWebSearch(query, maxResults = 5) {
     const config = vscode.workspace.getConfiguration('navy');
     const searchKey = config.get('searchApiKey', '')
@@ -2105,13 +2330,14 @@ class NavyCoderViewProvider {
   async _searchTavily(query, maxResults, apiKey) {
     try {
       const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 10000);
+      const timer = setTimeout(() => ctrl.abort(), 10000);
       const res = await fetch('https://api.tavily.com/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ api_key: apiKey, query, max_results: Math.min(maxResults, 10) }),
         signal: ctrl.signal,
       });
+      clearTimeout(timer);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       const results = (data.results || []).slice(0, maxResults);
@@ -2128,11 +2354,12 @@ class NavyCoderViewProvider {
   async _searchBrave(query, maxResults, apiKey) {
     try {
       const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 10000);
+      const timer = setTimeout(() => ctrl.abort(), 10000);
       const res = await fetch(
         'https://api.search.brave.com/res/v1/web/search?q=' + encodeURIComponent(query) + '&count=' + Math.min(maxResults, 20),
         { headers: { 'Accept': 'application/json', 'X-Subscription-Token': apiKey }, signal: ctrl.signal }
       );
+      clearTimeout(timer);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       const results = (data.web?.results || []).slice(0, maxResults);
@@ -2149,7 +2376,7 @@ class NavyCoderViewProvider {
   async _searchDuckDuckGo(query, maxResults) {
     try {
       const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 10000);
+      const timer = setTimeout(() => ctrl.abort(), 10000);
       // DDG Lite has simpler, more stable HTML than the full search page.
       const res = await fetch('https://lite.duckduckgo.com/lite/', {
         method: 'POST',
@@ -2160,6 +2387,7 @@ class NavyCoderViewProvider {
         body: 'q=' + encodeURIComponent(query),
         signal: ctrl.signal,
       });
+      clearTimeout(timer);
       const html = await res.text();
       const links = [];
       const snips = [];
@@ -2202,7 +2430,7 @@ class NavyCoderViewProvider {
     }
 
     const prompt = `You are reviewing a pull request. For every real problem you find:\n1. Quote the relevant code snippet.\n2. Explain the bug or concern.\n3. Show the corrected version.\n\nAlso summarise overall quality at the end.\n\n\`\`\`diff\n${diff.slice(0, 80000)}\n\`\`\``;
-    this.focus();
+    await this.focus();
     this.askNavy(prompt, false, null, []);
   }
 
@@ -2289,15 +2517,23 @@ class NavyCoderViewProvider {
     }
   }
 
+  // Raw, untruncated read. Edit paths (apply_edit, edit_line, checkpoints, …) depend on
+  // getting the FULL file — truncating here would corrupt any file larger than the cap
+  // when the edited result is written back. Truncation for chat context happens only
+  // at the context-building site via truncateForContext().
   async readFileText(filePath) {
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
-      const text = Buffer.from(data).toString('utf8');
-      const max = vscode.workspace.getConfiguration('navy').get('maxContextChars', 12000);
-      return text.length > max ? text.slice(0, max) + '\n\n[Truncated to ' + max + ' characters]' : text;
+      return Buffer.from(data).toString('utf8');
     } catch (error) {
       return null;
     }
+  }
+
+  truncateForContext(text) {
+    if (text === null || text === undefined) return text;
+    const max = vscode.workspace.getConfiguration('navy').get('maxContextChars', 12000);
+    return text.length > max ? text.slice(0, max) + '\n\n[Truncated to ' + max + ' characters — use read_lines for the rest]' : text;
   }
 
   generateId() {
@@ -2478,7 +2714,7 @@ class NavyCoderViewProvider {
   }
 
   async explainTerminalError() {
-    this.focus();
+    await this.focus();
     const clipboardText = await vscode.env.clipboard.readText();
     if (!clipboardText || clipboardText.trim() === '') {
       vscode.window.showInformationMessage('Please copy the terminal error to your clipboard first.');
@@ -2498,7 +2734,7 @@ class NavyCoderViewProvider {
     });
     if (filter === undefined) return;
 
-    this.focus();
+    await this.focus();
     await this.askNavy(`Run the test suite${filter ? ` filtering for "${filter}"` : ''} and report any failures with explanations and fixes.`, false, null, []);
   }
 
@@ -2595,7 +2831,7 @@ class NavyCoderViewProvider {
             <option value="ask-always">Ask</option>
             <option value="auto-approve">Auto</option>
           </select>
-          <button id="memoryButton" type="button" class="icon-button memory-button" title="Project memory">
+          <button id="memoryButton" type="button" class="icon-button memory-button" title="Project memory" aria-label="Project memory">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
               <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
@@ -2603,37 +2839,31 @@ class NavyCoderViewProvider {
             </svg>
             <span id="memoryCount" class="memory-count" style="display:none">0</span>
           </button>
-          <button id="undoButton" type="button" class="icon-button" title="Undo last edit" disabled>
+          <button id="undoButton" type="button" class="icon-button" title="Undo last edit" aria-label="Undo last edit" disabled>
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 7v6h6"></path>
               <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
             </svg>
           </button>
-          <button id="searchButton" type="button" class="icon-button" title="Search chat (Ctrl+F)">
+          <button id="searchButton" type="button" class="icon-button" title="Search chat (Ctrl+F)" aria-label="Search chat">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
             </svg>
           </button>
-          <button id="exportButton" type="button" class="icon-button" title="Export conversation">
+          <button id="exportButton" type="button" class="icon-button" title="Export conversation" aria-label="Export conversation">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
               <polyline points="7 10 12 15 17 10"></polyline>
               <line x1="12" y1="15" x2="12" y2="3"></line>
             </svg>
           </button>
-          <button id="stopButton" type="button" class="icon-button stop-button" title="Stop generation" style="display:none">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
-              <rect x="4" y="4" width="16" height="16" rx="2"></rect>
-            </svg>
-            <span class="stop-button-label">Stop</span>
-          </button>
-          <button id="clearButton" type="button" class="icon-button new-chat-button" title="New chat">
+          <button id="clearButton" type="button" class="icon-button new-chat-button" title="New chat" aria-label="New chat">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 5v14M5 12h14"></path>
             </svg>
             <span class="new-chat-label">New chat</span>
           </button>
-          <button id="settingsButton" type="button" class="icon-button" title="Settings">
+          <button id="settingsButton" type="button" class="icon-button" title="Settings" aria-label="Settings">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="3"></circle>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -2706,7 +2936,13 @@ class NavyCoderViewProvider {
           <div class="setting-group" id="settingApiKeyGroup" style="display:none">
             <label class="setting-label">API Key</label>
             <input id="settingApiKey" type="password" class="setting-input" placeholder="sk-..." autocomplete="off" />
-            <span class="setting-hint">Your API key. Stored in VS Code global settings.</span>
+            <span class="setting-hint">Your API key for this provider. Stored in VS Code's encrypted secrets — each provider keeps its own key.</span>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Web Search API Key <span class="setting-optional">(optional)</span></label>
+            <input id="settingSearchApiKey" type="password" class="setting-input" placeholder="tvly-… (Tavily) or Brave key — empty = DuckDuckGo" autocomplete="off" />
+            <span class="setting-hint">Tavily keys (tvly-…) and Brave Search keys are auto-detected. Leave empty to use free DuckDuckGo search.</span>
           </div>
 
           <div class="setting-row">
@@ -2763,21 +2999,39 @@ class NavyCoderViewProvider {
       <div id="welcome" class="welcome">
         <div class="welcome-logo">
           <svg viewBox="0 0 24 24" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="12" cy="5" r="2.5" stroke="currentColor" stroke-width="2" fill="none"/>
-            <line x1="12" y1="7.5" x2="12" y2="20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="5" y1="14" x2="19" y2="14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <path d="M12 20L7 16.5M12 20L17 16.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.8"/>
+            <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.5"/>
+            <g stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(0 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(45 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(90 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(135 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(180 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(225 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(270 12 12)"/>
+              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(315 12 12)"/>
+            </g>
+            <g fill="currentColor">
+              <circle cx="12" cy="2" r="1.1" transform="rotate(0 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(45 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(90 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(135 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(180 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(225 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(270 12 12)"/>
+              <circle cx="12" cy="2" r="1.1" transform="rotate(315 12 12)"/>
+            </g>
           </svg>
         </div>
         <h1 class="welcome-title">Navy Coder</h1>
-        <p class="welcome-tagline">Local AI coding assistant — powered by Ollama.</p>
+        <p class="welcome-tagline">AI coding agent — local with Ollama, or OpenAI, Claude, Gemini &amp; more.</p>
         <div class="welcome-chips">
-          <span class="welcome-chip">⚓ Review code</span>
-          <span class="welcome-chip">✏️ Edit files</span>
-          <span class="welcome-chip">🔍 Search codebase</span>
-          <span class="welcome-chip">🧪 Run tests</span>
-          <span class="welcome-chip">📝 Git commit</span>
-          <span class="welcome-chip">📸 Screenshots</span>
+          <button type="button" class="welcome-chip" data-prompt="Review the active file for bugs, edge cases, and improvements.">⚓ Review code</button>
+          <button type="button" class="welcome-chip" data-prompt="Edit the active file to ">✏️ Edit files</button>
+          <button type="button" class="welcome-chip" data-prompt="Search the codebase for ">🔍 Search codebase</button>
+          <button type="button" class="welcome-chip" data-prompt="Run the test suite and fix any failures.">🧪 Run tests</button>
+          <button type="button" class="welcome-chip" data-prompt="Generate a commit message for my staged changes.">📝 Git commit</button>
+          <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">▶ Run project</button>
         </div>
         <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files</p>
       </div>
@@ -2797,13 +3051,13 @@ class NavyCoderViewProvider {
                 <input id="includeContext" type="checkbox" checked>
                 <span>Context</span>
               </label>
-              <button type="button" id="attachButton" class="attach-button" title="Attach images or files">
+              <button type="button" id="attachButton" class="attach-button" title="Attach images or files" aria-label="Attach images or files">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                 </svg>
               </button>
               <div id="approvalQueue" class="approval-queue" title="Pending approvals"></div>
-              <button id="sendButton" type="submit" class="send-button" title="Send" disabled>
+              <button id="sendButton" type="submit" class="send-button" title="Send" aria-label="Send message" disabled>
                 <svg id="sendIcon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="22" y1="2" x2="11" y2="13"></line>
                   <polygon points="22 2 15 22 11 13 2 9"></polygon>
@@ -2926,6 +3180,17 @@ function activate(context) {
   context.__navyProposedProvider = proposedProvider;
 
   const provider = new NavyCoderViewProvider(context);
+
+  // First-run welcome — point new users at the sidebar so they know where Navy lives.
+  if (!context.globalState.get('navy.welcomed')) {
+    context.globalState.update('navy.welcomed', true);
+    vscode.window.showInformationMessage(
+      'Navy AI Coder is ready — find it at the ☸ anchor icon in the activity bar (left edge).',
+      'Open Navy'
+    ).then((choice) => {
+      if (choice === 'Open Navy') vscode.commands.executeCommand('navy.chatView.focus');
+    });
+  }
 
   // ── Status bar item ─────────────────────────────────────────────────────────
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
