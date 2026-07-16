@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.1] - 2026-07-15
+
+### Added
+- Terminal IN/OUT cards: every `run_command` / `run_tests` gets its own card in the chat — command in, live output out (stderr tinted), status chip (exit 0 / failed / timeout / rejected), long output collapses behind "Click to expand"
+- Applied edits keep an expandable diff preview (changed lines in red/green) instead of collapsing to a bare "Applied" line
+- `rename_file` tool — moves/renames within the workspace with approval gating
+- Ripgrep-backed `search_codebase` / `search_files`: full-tree, `.gitignore`-aware, much faster (JS walk remains as fallback)
+- Undo survives window reloads — checkpoints persist per project
+- Mid-turn context compaction: long agent tasks prune old tool output instead of overflowing the model's context window
+- Automatic retry with backoff on rate limits (429) and transient 5xx errors for all providers
+- Restored sessions show a per-turn summary of changed files and commands
+- **Redo** — reverse an accidental undo (button next to Undo, `Ctrl+Alt+Shift+Z`); redo history is cleared when new edits land so it can never clobber newer work
+- **Transactional undo**: renames and single-file deletions are now undoable too, and undo asks before discarding edits you made by hand after Navy's write
+- **Session digest**: long conversations condense their oldest turns into a summary instead of forgetting them
+- File writes from the main chat and `/bg` background tasks are serialized — no more interleaved edits to the same file
+- Real test suite (`npm test`): 32 checks covering the edit engine, context compaction, markdown rendering, and a full simulated webview conversation
+- Version number shown on the welcome screen
+
+### Fixed
+- "Generate Commit Message" and "Generate PR Description" now work with every provider (previously Ollama-only)
+- Stop button shows a proper stop icon and turns red while Navy is working (send/stop icons were rendering stacked)
+- Smooth chat motion: entrance transitions for messages and cards, frame-synced scrolling, no more bouncing during streaming
+- Stop now also halts tools already queued in the current step (a write could previously still land after Stop)
+- Inline code like `snake_case_names` is no longer mangled by italic formatting
+- `fetch_url` re-validates every redirect hop (SSRF hardening)
+- Token counter works for OpenAI-compatible providers; mid-stream provider errors are reported instead of "No response received"
+- Diff and terminal cards no longer collapse into thin lines in long chats (flexbox was crushing overflow-hidden cards)
+- False "Navy stopped responding" during long tasks eliminated — the extension heartbeats every 30s and the UI only alarms after 4 minutes of true silence
+- Model reasoning (`<think>` blocks) is hidden behind a "💭 Reasoning…" indicator while streaming instead of flooding the chat; finished reasoning stays in a collapsed dropdown
+- Model dropdown keeps manually configured model names for cloud providers
+- `.navy/` session data is excluded from git automatically
+
 ## [0.2.0] - 2026-07-05
 
 ### Fixed — data safety

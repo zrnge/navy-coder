@@ -79,8 +79,8 @@ select {
   padding: 0 8px 3px;
 }
 
-/* Hide infrequently used topbar buttons to reduce clutter */
-#searchButton, #exportButton { display: none; }
+/* Search and Export stay visible — hiding them made both features unreachable
+   (export had no palette entry, and in-chat search is only discoverable here). */
 
 /* Brand: icon + title + spinner — fixed width */
 .topbar-brand {
@@ -1803,6 +1803,19 @@ textarea:focus {
   transform: translate(-50%, -50%);
 }
 
+/* The hidden attribute does NOT hide SVG elements by default — without this rule
+   the send and stop icons render stacked on top of each other. */
+.send-button svg[hidden] { display: none; }
+
+/* Busy state: the button reads unmistakably as Stop — solid red, not the
+   theme's salmon charts-red. */
+.send-button.stop-mode {
+  background: #d32f2f;
+  color: #fff;
+  opacity: 1;
+}
+.send-button.stop-mode:hover { background: #e53935; }
+
 /* ── Scrollbar ────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
   width: 5px;
@@ -2656,4 +2669,109 @@ textarea:focus-visible,
 .at-dropdown-item:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #58a6ff);
   outline-offset: 1px;
+}
+
+/* ── Terminal IN/OUT command card (Claude-Code-style) ─────────────────────── */
+.term-card {
+  margin: 4px 0 8px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--gold);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+}
+.term-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 10px; }
+.term-in-row { background: var(--surface); }
+.term-out-row { border-top: 1px solid var(--border); }
+.term-label {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.08em;
+  color: var(--muted); width: 26px; flex-shrink: 0; padding-top: 3px;
+  -webkit-user-select: none; user-select: none;
+}
+.term-in, .term-out {
+  margin: 0; flex: 1; min-width: 0;
+  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
+  font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+  background: none; color: var(--text);
+}
+.term-out { max-height: 240px; overflow-y: auto; }
+.term-out.collapsed { max-height: 110px; overflow: hidden; }
+.term-stderr { color: var(--red); }
+.term-status { margin-left: auto; font-size: 10px; font-weight: 600; flex-shrink: 0; padding-top: 2px; }
+.term-status.running { color: var(--gold); }
+.term-status.ok   { color: var(--green); }
+.term-status.fail { color: var(--red); }
+
+/* ── "Click to expand" toggle (terminal + diff cards) ─────────────────────── */
+.expand-btn {
+  display: block; width: 100%;
+  padding: 3px 8px;
+  font-size: 10.5px;
+  color: var(--muted);
+  background: transparent;
+  border: none; border-top: 1px dashed var(--border);
+  cursor: pointer; text-align: center;
+}
+.expand-btn:hover { color: var(--text); background: var(--surface); }
+.expand-btn:focus-visible { outline: 1px solid var(--gold); outline-offset: -1px; }
+
+/* ── Resolved diff cards keep a compact changed-lines preview ─────────────── */
+.diff-body.preview { max-height: 160px; overflow: hidden; }
+.diff-body.preview .diff-unchanged,
+.diff-body.preview .diff-skip { display: none; }
+
+/* Approved cards that still show a diff preview need their frame back — the
+   base .is-approved style collapses body-less cards to a single line. */
+.diff-card.is-approved:has(.diff-body) {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--green);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin: 4px 0 8px;
+}
+
+/* ── Smooth motion ─────────────────────────────────────────────────────────── */
+/* Chromium's automatic scroll anchoring fights our manual bottom-pinning during
+   streaming and causes visible bouncing — we own the scroll position. */
+.messages { overflow-anchor: none; }
+
+/* CRITICAL: .messages is a column flexbox. Once content overflows, flex shrinks
+   items to fit — and any card with overflow:hidden (diff cards, terminal cards)
+   has NO automatic minimum size, so it gets crushed to a 2px sliver ("the line").
+   Children must never shrink; the ::before spacer (untouched by >*) still can. */
+.messages > * { flex-shrink: 0; }
+
+/* Gentle entrance for everything that appears in the chat stream. */
+@keyframes navy-appear {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.message,
+.diff-card,
+.command-card,
+.term-card,
+.run-project-card,
+.system-notice,
+.restore-note,
+.activity-log,
+.continue-btn {
+  animation: navy-appear 0.18s ease-out;
+}
+.activity-row { animation: navy-appear 0.14s ease-out; }
+
+/* State changes glide instead of snapping. */
+.activity-row,
+.term-status,
+.diff-card,
+.send-button {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message, .diff-card, .command-card, .term-card, .run-project-card,
+  .system-notice, .restore-note, .activity-log, .activity-row, .continue-btn {
+    animation: none;
+  }
+  .spin-wheel { animation: none; }
 }

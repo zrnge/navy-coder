@@ -13,6 +13,7 @@ const modelSelect = document.querySelector('#modelSelect');
 const clearButton = document.querySelector('#clearButton');
 const stopButton  = document.querySelector('#stopButton');
 const undoButton = document.querySelector('#undoButton');
+const redoButton = document.querySelector('#redoButton');
 const projectSelect = document.querySelector('#projectSelect');
 const approvalQueue = document.querySelector('#approvalQueue');
 const approvalModeSelect = document.querySelector('#approvalModeSelect');
@@ -259,6 +260,10 @@ undoButton?.addEventListener('click', () => {
   vscode.postMessage({ type: 'undoLast' });
 });
 
+redoButton?.addEventListener('click', () => {
+  vscode.postMessage({ type: 'redoLast' });
+});
+
 addContextButton.addEventListener('click', () => {
   if (activeFilePath && !attachedFiles.includes(activeFilePath)) {
     attachedFiles.push(activeFilePath);
@@ -303,10 +308,10 @@ closeMemoryButton?.addEventListener('click', () => {
   memoryPanel.style.display = 'none';
 });
 
+// Note: window.confirm() is blocked inside VS Code webviews — the extension shows
+// a native confirmation modal instead.
 clearMemoryButton?.addEventListener('click', () => {
-  if (confirm('Clear all project memories? This cannot be undone.')) {
-    vscode.postMessage({ type: 'clearMemory' });
-  }
+  vscode.postMessage({ type: 'clearMemory' });
 });
 
 // ── Search ───────────────────────────────────────────────────────────────────
@@ -354,10 +359,21 @@ document.addEventListener('keydown', ev => {
 exportButton?.addEventListener('click', () => {
   const lines = ['# Navy Chat Export', `> ${new Date().toLocaleString()}`, ''];
   document.querySelectorAll('.message').forEach(el => {
-    const isUser = el.classList.contains('message-user');
-    const isAssistant = el.classList.contains('message-assistant');
+    const isUser = el.classList.contains('user');
+    const isAssistant = el.classList.contains('assistant');
     const bubble = el.querySelector('.message-bubble');
-    const text = bubble ? bubble.innerText.trim() : '';
+    if (!bubble) return;
+    let text = '';
+    if (bubble.dataset.rawMd) {
+      // Assistant messages keep their original markdown — cleanest export.
+      text = bubble.dataset.rawMd.trim();
+    } else {
+      // Strip UI chrome (Copy/Insert/Apply buttons, expand toggles) and keep line breaks.
+      const clone = bubble.cloneNode(true);
+      clone.querySelectorAll('button, .msg-attachments').forEach(n => n.remove());
+      clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+      text = clone.textContent.trim();
+    }
     if (text) {
       lines.push(isUser ? '**You:** ' + text : isAssistant ? '**Navy:** ' + text : text);
       lines.push('');
@@ -480,6 +496,11 @@ window.addEventListener('message', (event) => {
   try {
   const message = event.data;
 
+  // Any message from the extension proves it's alive — push the dead-backend
+  // watchdog out. Includes the 30s 'heartbeat' sent during long turns.
+  if (isBusy) armBusyWatchdog();
+  if (message.type === 'heartbeat') return;
+
   if (message.type === 'start') {
     flushAssistantText();
     setBusy(true);
@@ -488,7 +509,9 @@ window.addEventListener('message', (event) => {
     activeAssistantContent = '';
     activeFilePath = message.activeFile || '';
     updateWelcome();
-    // Clear shell output from previous turn.
+    // Clear shell output from previous turn; orphan a stale terminal card so a
+    // new turn's chunks can't stream into last turn's card.
+    activeTermCard = null;
     if (shellOutput) shellOutput.textContent = '';
     if (shellPanel) shellPanel.style.display = 'none';
     // Show an initial "Thinking" row — replaced by real tool rows as they arrive.
@@ -511,6 +534,8 @@ window.addEventListener('message', (event) => {
   if (message.type === 'done' || message.type === 'aborted') {
     flushAssistantText();
     setBusy(false);
+    // A command still streaming when the turn ends (Stop pressed) — close its card.
+    if (activeTermCard) finalizeTermCard('__stopped__');
     if (activeAssistantContent.trim() === '' && activeAssistantMessage) {
       // No text was generated — remove the empty bubble entirely so the UI doesn't
       // show a blank assistant turn. Tool-call cards are appended to messagesEl directly
@@ -546,6 +571,7 @@ window.addEventListener('message', (event) => {
   if (message.type === 'error') {
     flushAssistantText();
     setBusy(false);
+    if (activeTermCard) finalizeTermCard('__stopped__');
     activeAssistantMessage = null;
     activeAssistantBubble = null;
     activeAssistantContent = '';
@@ -571,6 +597,7 @@ window.addEventListener('message', (event) => {
     activeAssistantContent = '';
     activityLogEl = null;
     currentActivityRowEl = null;
+    activeTermCard = null;
     messagesEl.innerHTML = '';
     messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
     welcomeEl.classList.remove('hidden');
@@ -617,13 +644,24 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'toolCall') {
-    addToolCallCard(message.tool, message.args);
+    // Shell commands get a dedicated IN/OUT terminal card instead of an activity row.
+    if (message.tool === 'run_command' || message.tool === 'run_tests') {
+      const cmdText = message.args?.command
+        || ('run_tests' + (message.args?.filter ? ' — ' + message.args.filter : ' (auto-detected)'));
+      createTermCard(message.tool, cmdText);
+    } else {
+      addToolCallCard(message.tool, message.args);
+    }
     const verb = TOOL_VERB[message.tool] || message.tool;
     if (statusText) statusText.textContent = `${verb}…`;
   }
 
   if (message.type === 'toolResult') {
-    addToolResultCard(message.tool, message.result);
+    if ((message.tool === 'run_command' || message.tool === 'run_tests') && activeTermCard) {
+      finalizeTermCard(message.result);
+    } else {
+      addToolResultCard(message.tool, message.result);
+    }
     if (statusText) statusText.textContent = 'Working…';
   }
 
@@ -632,6 +670,11 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'pendingCommand') {
+    // Ask mode: the command hasn't started yet — don't let the card claim it's running.
+    if (activeTermCard) {
+      activeTermCard.statusEl.textContent = 'awaiting approval';
+      activeTermCard.statusEl.className = 'term-status running';
+    }
     addPendingCommandCard(message.id, message.command);
   }
 
@@ -643,23 +686,49 @@ window.addEventListener('message', (event) => {
       const status = card.querySelector('.command-status');
       if (status) status.textContent = message.approved ? 'Approved — running' : 'Rejected by you';
     }
+    if (activeTermCard && message.approved) {
+      activeTermCard.statusEl.textContent = 'running…';
+      activeTermCard.statusEl.className = 'term-status running';
+    }
   }
 
   if (message.type === 'diffResolved') {
     const card = document.querySelector(`.diff-card[data-diff-id="${message.id}"]`);
     if (card) {
-      // Remove the action buttons and the full diff body — no longer needed.
       card.querySelector('.diff-actions')?.remove();
-      card.querySelector('.diff-body')?.remove();
       card.querySelector('.diff-summary')?.remove();
       const status = card.querySelector('.diff-status');
       if (status) status.textContent = message.approved ? '✓ Applied' : '✕ Rejected';
       card.classList.add(message.approved ? 'is-approved' : 'is-rejected');
+      const body = card.querySelector('.diff-body');
+      if (body) {
+        const changedRows = body.querySelectorAll('.diff-added, .diff-removed').length;
+        if (message.approved && changedRows > 0) {
+          // Keep a compact preview of the change (added/removed lines only) with a
+          // toggle to reveal the full diff — instead of discarding it entirely.
+          body.classList.add('preview');
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'expand-btn diff-expand-btn';
+          btn.textContent = 'Click to expand';
+          btn.addEventListener('click', () => {
+            const collapsed = body.classList.toggle('preview');
+            btn.textContent = collapsed ? 'Click to expand' : 'Collapse';
+          });
+          card.appendChild(btn);
+        } else {
+          body.remove(); // rejected (or empty diff): collapse to the one-line summary
+        }
+      }
     }
   }
 
   if (message.type === 'checkpoints') {
     if (undoButton) undoButton.disabled = !(message.count > 0);
+  }
+
+  if (message.type === 'redoState') {
+    if (redoButton) redoButton.disabled = !(message.count > 0);
   }
 
   if (message.type === 'workspaceFolders') {
@@ -790,13 +859,42 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'shellChunk') {
+    // Route into the active IN/OUT terminal card when one exists; the top shell
+    // panel remains as a fallback for commands run outside the tool loop (PR review).
+    if (appendTermOutput(message.chunk, message.isStderr)) return;
     const panel = document.getElementById('shellPanel');
     const output = document.getElementById('shellOutput');
     if (panel && output) {
       panel.style.display = '';
-      output.textContent += message.chunk;
+      // Append as a text node (O(1)) instead of textContent += (re-serializes all),
+      // and keep only the last ~30k chars so chatty commands can't freeze the panel.
+      output.appendChild(document.createTextNode(message.chunk));
+      if (output.textContent.length > 30000) {
+        output.textContent = output.textContent.slice(-30000);
+      }
       output.scrollTop = output.scrollHeight;
     }
+  }
+
+  if (message.type === 'debugDump') {
+    // Serialize the real rendered chat DOM — tag, classes, actual layout box,
+    // computed visibility — so rendering issues can be diagnosed from a file.
+    const out = ['NAVY DOM DUMP — build 0.2.1-cards — ' + new Date().toISOString()];
+    const walk = (el, d) => {
+      if (d > 4) return;
+      let line = '  '.repeat(d);
+      try {
+        const r = el.getBoundingClientRect();
+        const cs = window.getComputedStyle(el);
+        const cls = typeof el.className === 'string' && el.className ? '.' + el.className.trim().replace(/\s+/g, '.') : '';
+        const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+        line += `<${el.tagName.toLowerCase()}${cls}> ${Math.round(r.width)}x${Math.round(r.height)} display=${cs.display} opacity=${cs.opacity} visibility=${cs.visibility} border=${cs.borderTopWidth}/${cs.borderLeftWidth} color=${cs.color} bg=${cs.backgroundColor} | "${text}"`;
+      } catch (e) { line += '(error: ' + e.message + ')'; }
+      out.push(line);
+      for (const c of el.children) walk(c, d + 1);
+    };
+    try { for (const c of messagesEl.children) walk(c, 0); } catch (e) { out.push('WALK ERROR: ' + e.message); }
+    vscode.postMessage({ type: 'debugDumpResult', dump: out.join('\n') });
   }
 
   if (message.type === 'requestExport') {
@@ -1431,13 +1529,45 @@ function sendPrompt() {
   renderAttachedTextChips();
 }
 
+// Recovery path when the extension host truly went silent (crash / kill).
+function busyRecovery() {
+  busyWatchdog = null;
+  flushAssistantText();
+  activeAssistantMessage = null;
+  activeAssistantBubble = null;
+  activeAssistantContent = '';
+  setBusy(false);
+  collapseToolProgress();
+  addMessage('error', 'Navy stopped responding. If this keeps happening try Ctrl+Shift+P → "Developer: Reload Window".');
+}
+
+// (Re)arm the dead-backend watchdog. Called on EVERY message from the extension
+// while busy — the extension heartbeats every 30s during a turn, so this only
+// fires after 4 minutes of true silence, never during long-running work or
+// while an approval sits waiting for the user. Rearming is throttled to once
+// per 5s: streaming delivers dozens of chunks a second and per-chunk timer
+// churn is pure waste against a 4-minute deadline.
+let _watchdogArmedAt = 0;
+function armBusyWatchdog(force) {
+  const now = Date.now();
+  if (!force && busyWatchdog && now - _watchdogArmedAt < 5000) return;
+  _watchdogArmedAt = now;
+  if (busyWatchdog) { clearTimeout(busyWatchdog); busyWatchdog = null; }
+  if (isBusy) busyWatchdog = setTimeout(busyRecovery, 4 * 60 * 1000);
+}
+
 function setBusy(busy) {
   if (busyWatchdog) { clearTimeout(busyWatchdog); busyWatchdog = null; }
   isBusy = busy;
   const sendIcon = document.querySelector('#sendIcon');
   const stopIcon = document.querySelector('#stopIcon');
-  if (sendIcon) sendIcon.hidden = busy;
-  if (stopIcon) stopIcon.hidden = !busy;
+  // SVGElement has NO `hidden` property — assigning it creates a dead expando.
+  // Toggle the ATTRIBUTE itself: it's what the svg[hidden]{display:none} CSS
+  // matches, including the initial hidden attr baked into the HTML.
+  if (sendIcon) { if (busy) sendIcon.setAttribute('hidden', ''); else sendIcon.removeAttribute('hidden'); }
+  if (stopIcon) { if (busy) stopIcon.removeAttribute('hidden'); else stopIcon.setAttribute('hidden', ''); }
+  sendButton.classList.toggle('stop-mode', busy);
+  sendButton.setAttribute('aria-label', busy ? 'Stop' : 'Send message');
   sendButton.title = busy ? 'Stop' : 'Send';
   if (stopButton) stopButton.style.display = busy ? '' : 'none';
   if (clearButton) clearButton.style.display = busy ? 'none' : '';
@@ -1447,18 +1577,7 @@ function setBusy(busy) {
   updateSendButton();
   if (statusText) statusText.textContent = busy ? 'Working…' : '';
   if (busy) {
-    // Auto-unlock if the backend crashes and never sends 'done' (4 min > backend's 3-min watchdog)
-    busyWatchdog = setTimeout(() => {
-      busyWatchdog = null;
-      // Clear stale assistant state before unlocking so the next turn starts clean.
-      flushAssistantText();
-      activeAssistantMessage = null;
-      activeAssistantBubble = null;
-      activeAssistantContent = '';
-      setBusy(false);
-      collapseToolProgress();
-      addMessage('error', 'Navy stopped responding. If this keeps happening try Ctrl+Shift+P → "Developer: Reload Window".');
-    }, 4 * 60 * 1000);
+    armBusyWatchdog(true); // fresh turn — always start a clean 4-minute window
   } else {
     if (queuedBadge) { queuedBadge.style.display = 'none'; queuedBadge.textContent = ''; }
     promptInput.focus();
@@ -1466,7 +1585,9 @@ function setBusy(busy) {
 }
 
 function updateWelcome() {
-  const hasMessages = messagesEl.querySelectorAll('.message').length > 0;
+  // Count cards too — a tools-only turn has no .message article, and the welcome
+  // screen must not reappear in the middle of an active conversation.
+  const hasMessages = messagesEl.querySelectorAll('.message, .diff-card, .command-card, .term-card, .run-project-card, .activity-log').length > 0;
   welcomeEl.classList.toggle('hidden', hasMessages);
 }
 
@@ -1482,8 +1603,19 @@ function renderHistory(history) {
   messagesEl.appendChild(note);
   for (const item of history) {
     if (!item.text?.trim()) continue; // skip empty tool-only iterations
-    if (item.role === 'user')      addMessage('user',      item.text);
-    else if (item.role === 'assistant') addMessage('assistant', item.text);
+    if (item.role === 'user') {
+      addMessage('user', item.text);
+    } else if (item.role === 'assistant') {
+      addMessage('assistant', item.text);
+      // Restore the change summary for this turn (live footer isn't persisted).
+      if (item.meta) {
+        const bits = [];
+        if (item.meta.files?.length)   bits.push('changed ' + item.meta.files.join(', '));
+        if (item.meta.deleted?.length) bits.push('deleted ' + item.meta.deleted.join(', '));
+        if (item.meta.commands)        bits.push(item.meta.commands + ' command' + (item.meta.commands > 1 ? 's' : '') + ' run');
+        if (bits.length) addSystemMessage('This turn: ' + bits.join(' · '));
+      }
+    }
   }
 }
 
@@ -1731,7 +1863,6 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
 
 // Streaming render state
 let _streamPre = null;    // <pre> shown live during streaming (raw text, O(1) append)
-let _streamTimer = null;  // throttle timer for scroll-to-bottom during streaming
 
 function appendAssistantText(text) {
   if (!activeAssistantMessage) {
@@ -1742,6 +1873,26 @@ function appendAssistantText(text) {
 
   activeAssistantContent += text;
 
+  // NEVER show raw <think> reasoning while streaming: drop closed blocks and,
+  // if a block is still open, hide its contents behind a live indicator.
+  // The final render collapses finished reasoning into the 💭 dropdown.
+  let display = activeAssistantContent.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+  let thinkingLive = false;
+  const openIdx = display.search(/<think(?:ing)?>/i);
+  if (openIdx !== -1) {
+    display = display.slice(0, openIdx);
+    thinkingLive = true;
+    if (statusText) statusText.textContent = 'Reasoning…';
+  } else if (statusText && statusText.textContent === 'Reasoning…') {
+    // Thinking closed and the answer is streaming — don't leave the stale label up.
+    statusText.textContent = 'Working…';
+  }
+  display = display.trim();
+
+  // Models emit stray newline-only chunks between tool calls — don't render a pre
+  // for pure whitespace or it grows into a tall blank block in the chat.
+  if (!display && !thinkingLive) return;
+
   // During streaming: show raw text via textContent — O(1), no innerHTML churn,
   // no layout reflow, no markdown parsing. Final render happens in flushAssistantText.
   if (!_streamPre) {
@@ -1750,30 +1901,23 @@ function appendAssistantText(text) {
     activeAssistantBubble.innerHTML = '';
     activeAssistantBubble.appendChild(_streamPre);
   }
-  _streamPre.textContent = activeAssistantContent;
+  _streamPre.textContent = display + (thinkingLive ? (display ? '\n\n' : '') + '💭 Reasoning…' : '');
 
-  // Throttle scroll-to-bottom so it doesn't trigger layout on every chunk.
-  if (!_streamTimer) {
-    _streamTimer = setTimeout(() => {
-      _streamTimer = null;
-      scrollToBottom();
-    }, 80);
-  }
+  // rAF-batched — at most one scroll write per painted frame.
+  scrollToBottom();
 }
 
 function flushAssistantText() {
-  // Cancel pending scroll timer.
-  if (_streamTimer) { clearTimeout(_streamTimer); _streamTimer = null; }
   _streamPre = null;
 
   if (!activeAssistantBubble || !activeAssistantContent) return;
-  // Single full markdown render now that streaming is complete.
+  // Single full markdown render now that streaming is complete. Always assign —
+  // even when the result is empty — so a stale streaming <pre> (e.g. whitespace-only
+  // or tool-XML-only content) never lingers as a tall blank block in the chat.
   activeAssistantBubble.dataset.rawMd = activeAssistantContent; // for the copy-message button
   const rendered = renderMarkdown(activeAssistantContent);
-  if (rendered || !activeAssistantBubble.innerHTML) {
-    activeAssistantBubble.innerHTML = rendered;
-    attachCodeBlockActions(activeAssistantBubble);
-  }
+  activeAssistantBubble.innerHTML = rendered;
+  if (rendered) attachCodeBlockActions(activeAssistantBubble);
   scrollToBottom();
 }
 
@@ -1811,10 +1955,16 @@ function updateMemoryPanel(mem) {
   memoryContent.innerHTML = renderBlockMarkdown(mem);
 }
 
+// rAF-batched scroll pinning: at most one scroll write per frame, synced to paint,
+// so streaming chunks and card insertions never cause competing scroll jumps.
+let _scrollPending = false;
 function scrollToBottom() {
-  if (!userScrolledUp) {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
+  if (userScrolledUp || _scrollPending) return;
+  _scrollPending = true;
+  requestAnimationFrame(() => {
+    _scrollPending = false;
+    if (!userScrolledUp) messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
 }
 
 function attachCodeBlockActions(container) {
@@ -2036,13 +2186,21 @@ function renderList(lines, startI, baseIndent) {
 // Render inline markdown (bold, italic, code, links, strikethrough).
 function renderInline(text) {
   let h = escapeHtml(text);
+  // Pull code spans out FIRST — otherwise `snake_case_names` and `*args` inside
+  // backticks get mangled by the italic/bold regexes below.
+  const NUL = String.fromCharCode(0); // delimiter that can never appear in HTML-escaped text
+  const codeSpans = [];
+  h = h.replace(/`([^`]+)`/g, (_, c) => {
+    codeSpans.push(c);
+    return NUL + 'C' + (codeSpans.length - 1) + NUL;
+  });
   h = h.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
   h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   h = h.replace(/__(.+?)__/g, '<strong>$1</strong>');
   h = h.replace(/\*(.+?)\*/g, '<em>$1</em>');
   h = h.replace(/_([^_]+)_/g, '<em>$1</em>');
   h = h.replace(/~~(.+?)~~/g, '<del>$1</del>');
-  h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+  h = h.replace(new RegExp(NUL + 'C(\\d+)' + NUL, 'g'), (_, i) => '<code>' + codeSpans[Number(i)] + '</code>');
   h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
     // url is HTML-escaped at this point — unescape & before using in href.
     const rawUrl = url.replace(/&amp;/g, '&');
@@ -2102,7 +2260,7 @@ const TOOL_ICON_SVG = {
 
 const TOOL_VERB = {
   read_file: 'Reading', read_lines: 'Reading', write_file: 'Writing',
-  delete_file: 'Deleting', apply_edit: 'Editing', edit_line: 'Editing',
+  delete_file: 'Deleting', rename_file: 'Renaming', apply_edit: 'Editing', edit_line: 'Editing',
   delete_line: 'Deleting', insert_after_line: 'Inserting',
   list_files: 'Listing', search_files: 'Searching', search_codebase: 'Searching',
   fetch_url: 'Fetching', web_search: 'Web searching',
@@ -2224,6 +2382,7 @@ function buildResultPreview(tool, result) {
     }
     case 'write_file': case 'apply_edit': return 'saved';
     case 'delete_file': return 'deleted';
+    case 'rename_file': return 'renamed';
     case 'web_search': {
       const n = (r.match(/^\[\d+\]/gm) || []).length;
       return n ? `${n} result${n !== 1 ? 's' : ''}` : r.slice(0, 60);
@@ -2271,8 +2430,11 @@ function addToolCallCard(tool, args) {
   }
 
   const verb   = TOOL_VERB[tool] || tool;
-  const target = args.path || args.directory || args.query || args.command || args.id || args.url || args.fact || args.name || '';
-  const fname  = target ? target.replace(/^.*[\\/]/, '') : '';
+  const base   = (p) => String(p).replace(/^.*[\\/]/, '');
+  const target = (args.from && args.to ? args.from + ' → ' + args.to : '')
+    || args.path || args.directory || args.query || args.command || args.id || args.url || args.fact || args.name || '';
+  const fname  = args.from && args.to ? base(args.from) + ' → ' + base(args.to)
+    : target ? base(target) : '';
 
   let rangeStr = '';
   if (args.start != null && args.end != null) rangeStr = ` ${args.start}–${args.end}`;
@@ -2310,6 +2472,102 @@ function addToolResultCard(tool, result) {
   if (preview) {
     const resultEl = row.querySelector('.act-result');
     if (resultEl) resultEl.textContent = preview;
+  }
+  scrollToBottom();
+}
+
+// ── Terminal IN/OUT card (Claude-Code-style) ─────────────────────────────────
+// One card per run_command / run_tests call: IN = the command, OUT = live output.
+// Long output collapses behind a "Click to expand" toggle when the command ends.
+
+let activeTermCard = null;
+
+function createTermCard(tool, commandText) {
+  // Terminal cards bypass addToolCallCard, which normally clears the "Thinking"
+  // placeholder — clear it here too or it spins forever above the card.
+  if (activityLogEl) {
+    activityLogEl.querySelector('.thinking-row')?.remove();
+    if (!activityLogEl.children.length) { activityLogEl.remove(); activityLogEl = null; }
+  }
+  const card = document.createElement('div');
+  card.className = 'term-card';
+  card.innerHTML = `
+    <div class="term-row term-in-row">
+      <span class="term-label">IN</span>
+      <pre class="term-in"></pre>
+      <span class="term-status running">running…</span>
+    </div>
+    <div class="term-row term-out-row" style="display:none">
+      <span class="term-label">OUT</span>
+      <pre class="term-out"></pre>
+    </div>`;
+  card.querySelector('.term-in').textContent = commandText;
+  messagesEl.appendChild(card);
+  activeTermCard = {
+    el: card,
+    outEl: card.querySelector('.term-out'),
+    outRow: card.querySelector('.term-out-row'),
+    statusEl: card.querySelector('.term-status'),
+    tool,
+  };
+  updateWelcome();
+  scrollToBottom();
+}
+
+function appendTermOutput(chunk, isStderr) {
+  const t = activeTermCard;
+  if (!t) return false;
+  t.outRow.style.display = '';
+  if (isStderr) {
+    const span = document.createElement('span');
+    span.className = 'term-stderr';
+    span.textContent = chunk;
+    t.outEl.appendChild(span);
+  } else {
+    t.outEl.appendChild(document.createTextNode(chunk));
+  }
+  if (t.outEl.textContent.length > 30000) {
+    t.outEl.textContent = t.outEl.textContent.slice(-30000);
+  }
+  t.outEl.scrollTop = t.outEl.scrollHeight;
+  return true;
+}
+
+function finalizeTermCard(result) {
+  const t = activeTermCard;
+  if (!t) return;
+  activeTermCard = null;
+  const r = String(result || '');
+  let label = 'done', cls = 'ok';
+  const exitM = r.match(/^Exit code: (\d+)/);
+  if (exitM)                                { label = 'exit ' + exitM[1]; cls = exitM[1] === '0' ? 'ok' : 'fail'; }
+  else if (r.startsWith('Command timed out')) { label = 'timeout';  cls = 'fail'; }
+  else if (r.startsWith('Command rejected'))  { label = 'rejected'; cls = 'fail'; }
+  else if (r.startsWith('[Blocked'))          { label = 'blocked';  cls = 'fail'; }
+  else if (r.startsWith('Command error'))     { label = 'error';    cls = 'fail'; }
+  else if (r === '__stopped__')               { label = 'stopped';  cls = 'fail'; }
+  t.statusEl.textContent = label;
+  t.statusEl.className = 'term-status ' + cls;
+
+  // Nothing streamed (short command, or output only in the result) — show the result body.
+  if (!t.outEl.textContent.trim() && r && r !== '__stopped__') {
+    const body = r.replace(/^Exit code: \d+\n?/, '').replace(/^stdout:\n?/m, '').replace(/\n?stderr:\n?$/, '').trim();
+    if (body) { t.outRow.style.display = ''; t.outEl.textContent = body.slice(0, 4000); }
+  }
+
+  // Collapse long output behind an expand toggle.
+  const txt = t.outEl.textContent;
+  if (txt.length > 600 || txt.split('\n').length > 8) {
+    t.outEl.classList.add('collapsed');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'expand-btn';
+    btn.textContent = 'Click to expand';
+    btn.addEventListener('click', () => {
+      const collapsed = t.outEl.classList.toggle('collapsed');
+      btn.textContent = collapsed ? 'Click to expand' : 'Collapse';
+    });
+    t.el.appendChild(btn);
   }
   scrollToBottom();
 }
@@ -2376,8 +2634,10 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   card.appendChild(body);
 
   messagesEl.appendChild(card);
-  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  // No smooth scrollIntoView here — it fights the instant streaming scroll and
+  // causes visible rubber-banding. One rAF-pinned scroll keeps motion consistent.
   userScrolledUp = false;
+  scrollToBottom();
 }
 
 function addPendingCommandCard(id, command) {
@@ -2421,8 +2681,8 @@ function addPendingCommandCard(id, command) {
   card.appendChild(body);
 
   messagesEl.appendChild(card);
-  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   userScrolledUp = false;
+  scrollToBottom();
 }
 
 // ── LCS-based unified diff ────────────────────────────────────────────────────
@@ -2457,21 +2717,26 @@ function computeLCS(a, b) {
 
 function renderDiff(oldText, newText) {
   const CONTEXT = 3;
+  const MAX_ROWS = 400; // cap DOM rows so huge files can't freeze the sidebar
   const oldLines = oldText.split('\n');
   const newLines = newText.split('\n');
   const ops = computeLCS(oldLines, newLines);
 
   // Fall back to simple sequential diff for very large files.
   if (!ops) {
-    let html = '', added = 0, removed = 0;
+    let html = '', added = 0, removed = 0, rows = 0;
     const max = Math.max(oldLines.length, newLines.length);
     for (let k = 0; k < max; k++) {
-      if (k < oldLines.length && k < newLines.length && oldLines[k] === newLines[k]) {
-        html += diffRow(' ', 'diff-unchanged', null, null, oldLines[k]);
-      } else {
-        if (k < oldLines.length) { html += diffRow('-', 'diff-removed', k+1, null, oldLines[k]); removed++; }
-        if (k < newLines.length) { html += diffRow('+', 'diff-added',   null, k+1, newLines[k]); added++; }
+      const changedHere = !(k < oldLines.length && k < newLines.length && oldLines[k] === newLines[k]);
+      if (!changedHere) {
+        if (rows < MAX_ROWS) { html += diffRow(' ', 'diff-unchanged', null, null, oldLines[k]); rows++; }
+        continue;
       }
+      if (k < oldLines.length) { removed++; if (rows < MAX_ROWS) { html += diffRow('-', 'diff-removed', k+1, null, oldLines[k]); rows++; } }
+      if (k < newLines.length) { added++;   if (rows < MAX_ROWS) { html += diffRow('+', 'diff-added',   null, k+1, newLines[k]); rows++; } }
+    }
+    if (rows >= MAX_ROWS) {
+      html += `<div class="diff-skip">↕ diff truncated — use the editor diff view for the full change</div>`;
     }
     return { html, added, removed };
   }
@@ -2488,7 +2753,8 @@ function renderDiff(oldText, newText) {
   }
 
   let html = '';
-  let added = 0, removed = 0;
+  let added = 0, removed = 0, rows = 0;
+  let truncated = false;
   let k = 0;
   while (k < ops.length) {
     if (!visible[k]) {
@@ -2499,14 +2765,23 @@ function renderDiff(oldText, newText) {
       continue;
     }
     const op = ops[k];
+    // Keep counting +/- for the badge, but stop emitting DOM rows past the cap.
     if (op.t === '=') {
-      html += diffRow(' ', 'diff-unchanged', op.ol, op.nl, op.line);
+      if (rows < MAX_ROWS) { html += diffRow(' ', 'diff-unchanged', op.ol, op.nl, op.line); rows++; }
+      else truncated = true;
     } else if (op.t === '+') {
-      html += diffRow('+', 'diff-added',   null, op.nl, op.line); added++;
+      added++;
+      if (rows < MAX_ROWS) { html += diffRow('+', 'diff-added', null, op.nl, op.line); rows++; }
+      else truncated = true;
     } else {
-      html += diffRow('-', 'diff-removed', op.ol, null, op.line); removed++;
+      removed++;
+      if (rows < MAX_ROWS) { html += diffRow('-', 'diff-removed', op.ol, null, op.line); rows++; }
+      else truncated = true;
     }
     k++;
+  }
+  if (truncated) {
+    html += `<div class="diff-skip">↕ diff truncated — use the editor diff view for the full change</div>`;
   }
 
   return { html: html || diffRow(' ', 'diff-unchanged', null, null, 'No changes'), added, removed };

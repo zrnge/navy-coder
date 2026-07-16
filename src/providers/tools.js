@@ -82,13 +82,25 @@ const TOOLS = [
   },
   {
     name: 'delete_file',
-    description: 'Permanently delete a file. Use with caution — this cannot be undone through Navy.',
+    description: 'Delete a file or directory (moved to the OS Recycle Bin / Trash, recoverable there). The user is asked to confirm unless auto-approve is on. Use with caution.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to delete.' }
       },
       required: ['path']
+    }
+  },
+  {
+    name: 'rename_file',
+    description: 'Rename or move a file/directory within the workspace. Creates missing target directories. Fails if the destination already exists. Much safer than read + write + delete for moves.',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Current file path.' },
+        to:   { type: 'string', description: 'New file path (may be in a different directory).' }
+      },
+      required: ['from', 'to']
     }
   },
   {
@@ -310,7 +322,7 @@ const TOOLS = [
   },
   {
     name: 'web_search',
-    description: 'Search the web using DuckDuckGo. Returns titles, URLs, and snippets. Use this to find documentation, packages, error solutions, or anything not in the project files.',
+    description: 'Search the web (Tavily or Brave when a key is configured, DuckDuckGo otherwise). Returns titles, URLs, and snippets. Use this to find documentation, packages, error solutions, or anything not in the project files.',
     parameters: {
       type: 'object',
       properties: {
@@ -345,7 +357,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, list_files, search_files, search_codebase, find_symbol, find_references, apply_edit, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, find_symbol, find_references, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → call list_files on the project root first, then read_file on the files you need.

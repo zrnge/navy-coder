@@ -1,6 +1,50 @@
 const { TOOLS_API, TOOLS } = require('./tools.js');
+const { openAiCompatBase } = require('./endpoints.js');
 const vscode = require('vscode');
 const https = require('https');
+
+// Abortable sleep for retry backoff. The abort listener is removed on normal
+// completion — otherwise every retry leaks a listener on the turn's signal.
+function backoffSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// fetch with automatic retry on transient failures (429 rate limit, 5xx, network
+// error). Safe here because retries only happen BEFORE any stream chunk is consumed.
+// Honors Retry-After when present; backs off 1s → 2s → gives up (3 attempts total).
+async function fetchWithRetry(url, init) {
+  const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, init);
+    } catch (e) {
+      if (e.name === 'AbortError' || attempt === 2) throw e;
+      lastError = e;
+      await backoffSleep(1000 * 2 ** attempt, init.signal);
+      continue;
+    }
+    if (RETRYABLE.has(res.status) && attempt < 2) {
+      const retryAfter = Number(res.headers.get('retry-after')) || 0;
+      const delay = Math.min(Math.max(retryAfter * 1000, 1000 * 2 ** attempt), 15000);
+      await backoffSleep(delay, init.signal);
+      continue;
+    }
+    return res;
+  }
+  throw lastError || new Error('fetch failed after retries');
+}
 
 
 
@@ -15,26 +59,13 @@ const https = require('https');
                 || await provider.context.secrets.get('navy.apiKey') || '';
     const apiBase = config.get('apiBase', '');
 
-    // Provider → OpenAI-compatible base URL map
-    const OPENAI_COMPAT_BASE = {
-      openai:     'https://api.openai.com/v1',
-      lmstudio:   apiBase || 'http://localhost:1234/v1',
-      deepseek:   'https://api.deepseek.com/v1',
-      gemini:     'https://generativelanguage.googleapis.com/v1beta/openai',
-      xai:        'https://api.x.ai/v1',
-      zai:        apiBase || 'https://api.z.ai/v1',
-      groq:       'https://api.groq.com/openai/v1',
-      openrouter: 'https://openrouter.ai/api/v1',
-      custom:     apiBase || host,
-    };
-
     if (aiProvider === 'anthropic') {
       return await streamAnthropic(provider, model, messages, temperature, apiKey, apiBase, signal, onChunk);
     }
 
-    if (OPENAI_COMPAT_BASE[aiProvider]) {
-      const base = apiBase || OPENAI_COMPAT_BASE[aiProvider];
-      return await streamOpenAI(provider, base, model, messages, temperature, apiKey, signal, onChunk);
+    const compatBase = openAiCompatBase(aiProvider, apiBase, host);
+    if (compatBase) {
+      return await streamOpenAI(provider, compatBase, model, messages, temperature, apiKey, signal, onChunk);
     }
 
     const options = { temperature };
@@ -72,7 +103,7 @@ const https = require('https');
       else if (level === 'fast') ollamaBody.think = false;
     }
 
-    const response = await fetch(host + '/api/chat', {
+    const response = await fetchWithRetry(host + '/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(ollamaBody),
@@ -95,6 +126,14 @@ const https = require('https');
       if (!line.trim()) return;
       const events = extractJsonObjects(line);
       for (const event of events) {
+        // Ollama reports mid-stream failures (model crash, OOM) as {"error": "..."} —
+        // surface them instead of silently ending with an empty response.
+        if (event.error) throw new Error('Ollama error: ' + event.error);
+        // Native think mode streams reasoning in a separate field (never rendered) —
+        // update the status line so the UI doesn't look frozen while it thinks.
+        if (event.message?.thinking && !event.message?.content) {
+          provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
+        }
         const content = event.message?.content || '';
         if (content) {
           text += content;
@@ -188,6 +227,19 @@ const https = require('https');
       }
     }
 
+    // Merge consecutive same-role messages — Anthropic 400s when roles don't alternate.
+    // (Happens after an aborted turn: two user entries land back to back in history.)
+    const mergedMessages = [];
+    for (const m of anthropicMessages) {
+      const prev = mergedMessages[mergedMessages.length - 1];
+      if (prev && prev.role === m.role) {
+        const toBlocks = (c) => Array.isArray(c) ? c : [{ type: 'text', text: String(c) }];
+        prev.content = [...toBlocks(prev.content), ...toBlocks(m.content)];
+      } else {
+        mergedMessages.push(m);
+      }
+    }
+
     // Convert TOOLS_API (OpenAI format) to Anthropic tool format.
     const anthropicTools = TOOLS_API.map(t => ({
       name: t.function.name,
@@ -195,22 +247,28 @@ const https = require('https');
       input_schema: t.function.parameters || { type: 'object', properties: {} },
     }));
 
+    // Older model generations cap max_tokens lower — exceeding the cap is a 400 error.
+    const maxTokens = /claude-3-(opus|sonnet|haiku)-/.test(model) ? 4096
+                    : /claude-3-5-/.test(model) ? 8192
+                    : 16384;
     const body = {
       model,
-      max_tokens: 16384,
+      max_tokens: maxTokens,
       stream: true,
-      messages: anthropicMessages,
+      messages: mergedMessages,
       tools: anthropicTools,
     };
     // High thinking level → Anthropic extended thinking. Temperature must be omitted
-    // (the API requires the default of 1 when thinking is enabled).
-    const useThinking = (provider.thinkingLevel || 'medium') === 'high';
+    // (the API requires the default of 1 when thinking is enabled). Claude 3.x
+    // generations don't support the thinking parameter — fall back to temperature.
+    const supportsThinking = !/claude-3-(opus|sonnet|haiku|5)/.test(model);
+    const useThinking = supportsThinking && (provider.thinkingLevel || 'medium') === 'high';
     if (useThinking) body.thinking = { type: 'enabled', budget_tokens: 6000 };
     else body.temperature = temperature;
     if (systemText) body.system = systemText;
 
     const anthropicEndpoint = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/messages';
-    const response = await fetch(anthropicEndpoint, {
+    const response = await fetchWithRetry(anthropicEndpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -245,6 +303,11 @@ const https = require('https');
       let evt;
       try { evt = JSON.parse(dataLine); } catch { return; }
 
+      // Mid-stream API errors (overloaded, rate limit) arrive as an error event —
+      // throw so the user sees the real reason instead of "No response received".
+      if (evt.type === 'error') {
+        throw new Error('Anthropic stream error: ' + (evt.error?.message || JSON.stringify(evt.error || {})));
+      }
       if (evt.type === 'message_start' && evt.message?.usage) {
         tokenCounts.prompt = evt.message.usage.input_tokens || 0;
       }
@@ -322,6 +385,11 @@ const https = require('https');
       stream: true,
       tools: TOOLS_API
     };
+    // Without this, OpenAI-compatible streams never include usage and the token
+    // counter / context gauge stay at 0. Gemini's compat layer rejects the field.
+    if (!baseUrl.includes('generativelanguage')) {
+      body.stream_options = { include_usage: true };
+    }
     // o-series reasoning models reject `temperature` and take `reasoning_effort` instead.
     if (/^o[0-9]/.test(model)) {
       const level = provider.thinkingLevel || 'medium';
@@ -330,7 +398,7 @@ const https = require('https');
       body.temperature = temperature;
     }
 
-    const response = await fetch(baseUrl + '/chat/completions', {
+    const response = await fetchWithRetry(baseUrl + '/chat/completions', {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -392,7 +460,9 @@ const https = require('https');
     buffer += decoder.decode();
     if (buffer.trim()) processSSE(buffer);
 
-    return { text, nativeToolCalls, tokenCounts };
+    // Sparse indexes (a provider skipping tc.index values) leave holes that would
+    // crash the caller's .map(tc => tc.function.name) — compact them out.
+    return { text, nativeToolCalls: nativeToolCalls.filter(Boolean), tokenCounts };
   }
 
   function extractJsonObjects(text) {
