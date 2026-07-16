@@ -1,4 +1,5 @@
 const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./providers/llm.js');
+const { openAiCompatBase } = require('./providers/endpoints.js');
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
@@ -75,6 +76,7 @@ class NavyCoderViewProvider {
     this.pendingApprovals = new Map();
     this.pendingCommandApprovals = new Map();
     this.checkpoints = [];
+    this.redoStack = []; // entries: { files: [{ filePath, text }] } — text as it was before the undo
     this.activeToolCall = null;
     // Restore the last picked project root (persisted via navy.projectRoot) so the
     // project choice survives window reloads. Scope matters: the workspace-level value
@@ -88,10 +90,12 @@ class NavyCoderViewProvider {
     this.messageQueue = [];   // queued prompts while a turn is in progress
     this.isBusy = false;
     this.modelContextLength = null; // fetched from Ollama /api/show
-    this.thinkingLevel = 'medium'; // fast | medium | high
+    // Restore the persisted thinking level so the choice survives window reloads.
+    this.thinkingLevel = vscode.workspace.getConfiguration('navy').get('thinkingLevel', 'medium');
     this.currentTurnId = null;     // groups checkpoints for per-turn undo
     this.statusBarItem = null; // set by activate() after construction
     this.bgProcesses = new Map(); // id → { proc, stdout, stderr, exitCode }
+    this._writeLock = Promise.resolve(); // serializes file writes across main turn + background tasks
     this.bgWorkers   = new Map(); // taskId → { ctrl: AbortController }
     this.bgWorkerId  = 0;
     this.editedRanges = new Map(); // filePath -> [{start,end}] for gutter decorations
@@ -132,6 +136,10 @@ class NavyCoderViewProvider {
           await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || []);
           break;
         case 'stop':
+          // Stop means stop everything — including prompts waiting in the queue,
+          // otherwise the next queued message fires the instant the abort lands.
+          this.messageQueue = [];
+          this.view?.webview.postMessage({ type: 'queueDrained', remaining: 0 });
           this.abortController?.abort();
           this.cancelPendingApprovals();
           break;
@@ -158,6 +166,9 @@ class NavyCoderViewProvider {
           break;
         case 'undoLast':
           await this.undoLastCheckpoint();
+          break;
+        case 'redoLast':
+          await this.redoLast();
           break;
         case 'clear':
           this.clearChat();
@@ -186,7 +197,11 @@ class NavyCoderViewProvider {
           await vscode.env.clipboard.writeText(message.text || '');
           break;
         case 'runCommand':
-          if (message.command) vscode.commands.executeCommand(message.command);
+          // Defense in depth: the webview renders model output, so never let it invoke
+          // arbitrary VS Code commands (e.g. terminal.sendSequence → shell execution).
+          if (message.command && /^navy\.[a-zA-Z]+$/.test(message.command)) {
+            vscode.commands.executeCommand(message.command);
+          }
           break;
         case 'openFolder':
           await this.openFolder();
@@ -195,6 +210,13 @@ class NavyCoderViewProvider {
           await this.sendWorkspaceFolders();
           break;
         case 'setProjectRoot':
+          // Never switch roots while a turn is running — executing tools resolve
+          // paths against this.projectRoot live, so edits would land in the wrong project.
+          if (this.isBusy) {
+            vscode.window.showWarningMessage('Navy is working — stop the current task before switching projects.');
+            await this.sendWorkspaceFolders(); // re-send current root so the dropdown reverts
+            break;
+          }
           this.projectRoot = message.root || '';
           await this._persistProjectRoot(this.projectRoot);
           await this.sendWorkspaceFolders();
@@ -203,9 +225,15 @@ class NavyCoderViewProvider {
         case 'setThinkingLevel':
           this.setThinkingLevel(message.level);
           break;
-        case 'clearMemory':
-          await this.toolForget('');
+        case 'clearMemory': {
+          const pick = await vscode.window.showWarningMessage(
+            'Clear all project memories? This cannot be undone.',
+            { modal: true },
+            'Clear All'
+          );
+          if (pick === 'Clear All') await this.toolForget('');
           break;
+        }
         case 'getMemory': {
           const mem = await this.loadProjectMemory();
           this.view?.webview.postMessage({ type: 'memoryUpdated', memory: mem });
@@ -238,6 +266,18 @@ class NavyCoderViewProvider {
         case 'exportConversation':
           await this.exportConversation(message.text || '');
           break;
+        case 'debugDumpResult': {
+          // Written to a FIXED location so it's findable regardless of project.
+          try {
+            const target = path.join(require('os').tmpdir(), 'navy-debug-dom.txt');
+            await fs.promises.writeFile(target, message.dump || '(empty dump)', 'utf8');
+            const doc = await vscode.workspace.openTextDocument(target);
+            await vscode.window.showTextDocument(doc, { preview: false });
+          } catch (e) {
+            vscode.window.showErrorMessage('Navy: debug dump failed — ' + e.message);
+          }
+          break;
+        }
         case 'reviewPR':
           await this.generatePRReview();
           break;
@@ -361,9 +401,18 @@ class NavyCoderViewProvider {
   }
 
   clearChat() {
+    // Clearing mid-turn: abort the running turn and drop queued prompts first, so a
+    // ghost turn can't keep streaming into (and re-saving over) the cleared chat.
+    this.messageQueue = [];
+    this.abortController?.abort();
+    this.cancelPendingApprovals();
     this.messages = [];
     this.lastReply = '';
+    this.sessionDigest = '';
     this.checkpoints = [];
+    this.redoStack = [];
+    this.view?.webview.postMessage({ type: 'redoState', count: 0 });
+    this._persistCheckpoints();
     this.editedRanges.clear();
     this.view?.webview.postMessage({ type: 'cleared' });
     this.saveProjectSession();
@@ -381,9 +430,14 @@ class NavyCoderViewProvider {
     // Auto-derive project root from the workspace folder that contains the active file,
     // or (if no workspace is open) from the active file's directory.
     if (!this.projectRoot && filePath && !filePath.startsWith('Untitled')) {
-      const wsFolder = vscode.workspace.workspaceFolders?.find(
-        (f) => filePath.startsWith(f.uri.fsPath)
-      );
+      // Containment check must be separator-aware (E:\Proj2 is NOT inside E:\Proj)
+      // and case-folded on Windows where paths are case-insensitive.
+      const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
+      const fp = fold(filePath);
+      const wsFolder = vscode.workspace.workspaceFolders?.find((f) => {
+        const base = fold(f.uri.fsPath);
+        return fp === base || fp.startsWith(base + path.sep);
+      });
       this.projectRoot = wsFolder ? wsFolder.uri.fsPath : path.dirname(filePath);
       this.sendWorkspaceFolders();
     }
@@ -465,16 +519,29 @@ class NavyCoderViewProvider {
     });
     if (!result || result.length === 0) return;
     const picked = result[0].fsPath;
+    const uri = vscode.Uri.file(picked);
     const folders = vscode.workspace.workspaceFolders || [];
     const exists = folders.some((f) => f.uri.fsPath === picked);
-    if (exists) {
+
+    if (!exists && folders.length === 0) {
+      // No workspace open — actually open the folder (Explorer, language servers,
+      // file watching), exactly like File → Open Folder. Persist the root first:
+      // opening a folder reloads the window, and the fresh session derives its
+      // root from the newly opened workspace folder.
       this.projectRoot = picked;
-    } else {
-      const uri = vscode.Uri.file(picked);
-      const newIndex = folders.length;
-      await vscode.workspace.updateWorkspaceFolders(newIndex, 0, uri);
-      this.projectRoot = picked;
+      await this._persistProjectRoot(picked);
+      await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: false });
+      return; // window reloads — nothing more to do in this session
     }
+
+    if (!exists) {
+      // Workspace already open — add the project as an additional workspace folder
+      // so the current one stays available, and reveal it so it's visibly loaded.
+      await vscode.workspace.updateWorkspaceFolders(folders.length, 0, uri);
+      try { await vscode.commands.executeCommand('revealInExplorer', uri); } catch {}
+    }
+
+    this.projectRoot = picked;
     await this._persistProjectRoot(picked);
     await this.sendWorkspaceFolders();
     await this.loadProjectSession();
@@ -513,8 +580,11 @@ class NavyCoderViewProvider {
     };
 
     if (STATIC_MODELS[provider]) {
-      const models = STATIC_MODELS[provider];
+      let models = STATIC_MODELS[provider];
       const activeModel = config.get('model', models[0]);
+      // A manually configured model (newer release, fine-tune) must stay selectable —
+      // otherwise the dropdown silently shows the wrong model.
+      if (activeModel && !models.includes(activeModel)) models = [activeModel, ...models];
       this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
       return;
     }
@@ -618,6 +688,8 @@ class NavyCoderViewProvider {
   setThinkingLevel(level) {
     if (['fast', 'medium', 'high'].includes(level)) {
       this.thinkingLevel = level;
+      // Persist so the choice survives window reloads (fire-and-forget is fine here).
+      vscode.workspace.getConfiguration('navy').update('thinkingLevel', level, vscode.ConfigurationTarget.Global);
       this.view?.webview.postMessage({ type: 'thinkingLevel', level });
     }
   }
@@ -632,16 +704,28 @@ class NavyCoderViewProvider {
     const dir = this.getNavyDir();
     if (!dir) return null;
     try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir)); } catch {}
+    // Self-ignoring directory: session.json contains the full conversation text,
+    // which must never end up committed to the user's repo.
+    const gi = vscode.Uri.file(path.join(dir, '.gitignore'));
+    try { await vscode.workspace.fs.stat(gi); }
+    catch { try { await vscode.workspace.fs.writeFile(gi, Buffer.from('*\n', 'utf8')); } catch {} }
     return dir;
   }
 
   async loadProjectSession() {
+    // Undo/redo history is per-project: checkpoints are reloaded below, and the
+    // redo stack must not survive a switch (it holds the OTHER project's files).
+    if (this.redoStack.length) {
+      this.redoStack = [];
+      this.view?.webview.postMessage({ type: 'redoState', count: 0 });
+    }
     const dir = this.getNavyDir();
     if (!dir) return;
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'session.json')));
       const session = JSON.parse(Buffer.from(data).toString('utf8'));
       this.messages = Array.isArray(session.messages) ? session.messages : [];
+      this.sessionDigest = typeof session.digest === 'string' ? session.digest : '';
       this.restoreMessages();
       const memory = await this.loadProjectMemory();
       this.view?.webview.postMessage({
@@ -652,17 +736,19 @@ class NavyCoderViewProvider {
       });
     } catch {
       this.messages = [];
+      this.sessionDigest = '';
       this.view?.webview.postMessage({ type: 'sessionLoaded', count: 0, memory: '', projectRoot: this.projectRoot });
     }
     const rules = await this.loadProjectRules();
     this.view?.webview.postMessage({ type: 'rulesStatus', active: Boolean(rules) });
+    await this._loadCheckpoints();
   }
 
   async saveProjectSession() {
     const dir = await this.ensureNavyDir();
     if (!dir) return;
     try {
-      const session = { updated: new Date().toISOString(), projectRoot: this.projectRoot, messages: this.messages };
+      const session = { updated: new Date().toISOString(), projectRoot: this.projectRoot, messages: this.messages, digest: this.sessionDigest || '' };
       await vscode.workspace.fs.writeFile(
         vscode.Uri.file(path.join(dir, 'session.json')),
         Buffer.from(JSON.stringify(session, null, 2), 'utf8')
@@ -761,6 +847,13 @@ class NavyCoderViewProvider {
     this.isBusy = true;
     if (this.statusBarItem) this.statusBarItem.text = '$(sync~spin) Navy';
     this.currentTurnId = this.generateId();
+    // Liveness beacon: the webview only declares Navy dead after 4 minutes of
+    // silence, so beat every 30s for the whole turn (model calls, tools, and
+    // approval waits included). Cleared in finally.
+    clearInterval(this._heartbeat);
+    this._heartbeat = setInterval(() => {
+      this.view?.webview.postMessage({ type: 'heartbeat' });
+    }, 30000);
 
     const config = vscode.workspace.getConfiguration('navy');
     const configuredModel = config.get('model', 'kimi-k2.7-code:cloud');
@@ -842,6 +935,9 @@ class NavyCoderViewProvider {
     if (projectMemory) {
       systemContent += '\n\n## Project Memory (facts you learned in previous sessions — treat as ground truth unless you discover otherwise):\n' + projectMemory;
     }
+    if (this.sessionDigest) {
+      systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + this.sessionDigest;
+    }
     if (diagnosticsContext) systemContent += diagnosticsContext;
     systemContent += '\n\nRepository map:\n' + repoMap;
 
@@ -866,8 +962,22 @@ class NavyCoderViewProvider {
     if (fileContents.length > 0) userParts.push(fileContents.join('\n\n---\n\n'));
     userParts.push('USER REQUEST:\n' + prompt);
 
+    // Long sessions: condense the oldest turns into a digest instead of silently
+    // forgetting them — Navy keeps knowing what was discussed and changed early on.
     if (this.messages.length > 80) {
+      const dropped = this.messages.slice(0, this.messages.length - 60);
       this.messages = this.messages.slice(-60);
+      const lines = dropped.map(m => {
+        const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
+        if (!head) return '';
+        if (m.role === 'user') return '- User: ' + head;
+        const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
+        return '- Navy: ' + head + files;
+      }).filter(Boolean);
+      this.sessionDigest = ((this.sessionDigest || '') + '\n' + lines.join('\n')).trim();
+      if (this.sessionDigest.length > 6000) {
+        this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
+      }
     }
 
     for (const item of this.messages) {
@@ -917,6 +1027,7 @@ class NavyCoderViewProvider {
       // touched: Map<inputPath, 'created'|'modified'>; commands: { cmd, exit }[]
 
       let lastAssistantText = ''; // final assistant text, persisted to history after the loop
+      const messagesRef = this.messages; // identity guard: clearChat/project-switch replace this array
 
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         if (this.abortController.signal.aborted) break;
@@ -924,6 +1035,8 @@ class NavyCoderViewProvider {
           this.view?.webview.postMessage({ type: 'stepProgress', step: iteration + 1, max: maxIterations });
         }
         resetWatchdog();
+        // Keep the request within the context window on long multi-step tasks.
+        if (iteration > 0) this._compactMessages(messages);
         const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks } = await streamAssistant(this, host, model, messages, temperature);
         // Model call finished — stop the watchdog so it can't fire while tools run or
         // while the user takes their time reviewing a pending edit approval.
@@ -984,7 +1097,7 @@ class NavyCoderViewProvider {
             const parts = [];
             if (changedFiles.length) {
               const fileList = changedFiles.map(([p, type]) =>
-                '`' + path.basename(p) + '`' + (type === 'created' ? ' *(new)*' : '')
+                '`' + path.basename(p) + '`' + (type === 'created' ? ' *(new)*' : type === 'renamed' ? ' *(renamed)*' : '')
               ).join(', ');
               parts.push(`**${changedFiles.length} file${changedFiles.length !== 1 ? 's' : ''} changed:** ${fileList}`);
             }
@@ -1086,6 +1199,9 @@ class NavyCoderViewProvider {
           toolResults.push(...parallel);
         } else {
           for (const tool of toolsToRun) {
+            // Stop pressed mid-iteration — don't execute the remaining tools (a write
+            // tool would still hit disk after the user asked everything to halt).
+            if (this.abortController.signal.aborted) break;
             this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args });
 
             // Pre-call: check whether the file exists so we can label it 'created' vs 'modified'.
@@ -1122,6 +1238,9 @@ class NavyCoderViewProvider {
             if (tool.name === 'delete_file' && typeof result === 'string' && result.startsWith('Deleted')) {
               taskChanges.deleted.push(tool.args?.path || '');
             }
+            if (tool.name === 'rename_file' && typeof result === 'string' && result.startsWith('Renamed')) {
+              if (tool.args?.to) taskChanges.touched.set(tool.args.to, 'renamed');
+            }
 
             this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result });
             toolResults.push(makeToolResult(tool, result));
@@ -1141,7 +1260,17 @@ class NavyCoderViewProvider {
       }
 
       // Persist only the final assistant message to session history (see note above).
-      if (lastAssistantText.trim()) this.messages.push({ role: 'assistant', text: lastAssistantText });
+      // Skip if the chat was cleared or the project switched mid-turn — this.messages
+      // is a different array by then and pushing would create an orphan entry.
+      if (lastAssistantText.trim() && this.messages === messagesRef) {
+        // Attach what the turn changed so a restored session can still show it —
+        // the live change-report footer is webview-only and lost on reload.
+        const meta = {};
+        if (taskChanges.touched.size)   meta.files   = [...taskChanges.touched.keys()].map(p => path.basename(p));
+        if (taskChanges.deleted.length) meta.deleted = taskChanges.deleted.filter(Boolean).map(p => path.basename(p));
+        if (taskChanges.commands.length) meta.commands = taskChanges.commands.length;
+        this.messages.push({ role: 'assistant', text: lastAssistantText, ...(Object.keys(meta).length ? { meta } : {}) });
+      }
 
       // Only auto-apply code fences in pure-chat mode (no tool use), to prevent double-applies.
       if (!usedTools) {
@@ -1160,6 +1289,8 @@ class NavyCoderViewProvider {
         this.view?.webview.postMessage({ type: 'error', message: `${providerLabel} error${hint} — ${error.message}` });
       }
     } finally {
+      clearInterval(this._heartbeat);
+      this._heartbeat = undefined;
       clearTimeout(this._watchdog);
       this._watchdog = undefined;
       this.abortController = undefined;
@@ -1180,7 +1311,69 @@ class NavyCoderViewProvider {
     }
   }
 
+  // Mid-turn context compaction: when the accumulated conversation gets too large,
+  // replace the OLDEST tool results with a stub so long agent tasks don't blow the
+  // model's context window. Messages are edited in place (never removed) so
+  // tool_use/tool_result pairing stays intact for providers that require it.
+  _compactMessages(messages) {
+    const MAX_CHARS = 240000;   // ≈60k tokens — conservative floor across providers
+    const KEEP_RECENT = 6;      // never touch the N most recent tool results
+    const sizeOf = (m) => typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
+    let total = 0;
+    for (const m of messages) total += sizeOf(m);
+    if (total <= MAX_CHARS) return;
+
+    // Pasted images dominate the budget (megabytes of base64) — once we're over,
+    // strip image blocks from all but the LAST vision message, keeping its text.
+    const visionIdxs = messages
+      .map((m, i) => Array.isArray(m.content) ? i : -1)
+      .filter(i => i !== -1);
+    for (const idx of visionIdxs.slice(0, -1)) {
+      const m = messages[idx];
+      const before = sizeOf(m);
+      const texts = m.content.filter(p => p.type === 'text').map(p => p.text);
+      m.content = texts.join('\n') + '\n[Image(s) removed from context to stay within the window.]';
+      total -= before - sizeOf(m);
+    }
+    if (total <= MAX_CHARS) return;
+
+    const toolIdxs = [];
+    messages.forEach((m, i) => {
+      if (m.role === 'tool') toolIdxs.push(i);
+      else if (m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('<tool_result')) toolIdxs.push(i);
+    });
+
+    const prunable = toolIdxs.slice(0, Math.max(0, toolIdxs.length - KEEP_RECENT));
+    for (const idx of prunable) {
+      if (total <= MAX_CHARS) break;
+      const m = messages[idx];
+      const before = sizeOf(m);
+      if (before < 300) continue; // already small — pruning gains nothing
+      const note = '[Old tool output pruned to keep the conversation within the context window. Re-run the tool if you need this data again.]';
+      m.content = m.role === 'tool' ? note : `<tool_result name="pruned">\n${note}\n</tool_result>`;
+      total -= before - sizeOf(m);
+    }
+  }
+
+  // Promise-chain mutex: file-mutating tools from the main turn and background
+  // tasks (/bg) run concurrently — without this they could interleave writes to
+  // the same file. Read tools stay unserialized.
+  _withWriteLock(fn) {
+    const run = this._writeLock.then(fn, fn);
+    this._writeLock = run.catch(() => {});
+    return run;
+  }
+
   async executeTool(tool) {
+    const MUTATING = new Set(['write_file', 'apply_edit', 'edit_line', 'delete_line',
+      'insert_after_line', 'delete_file', 'rename_file']);
+    if (MUTATING.has(tool.name)) {
+      return await this._withWriteLock(() => this._executeToolInner(tool));
+    }
+    return await this._executeToolInner(tool);
+  }
+
+  async _executeToolInner(tool) {
     try {
       switch (tool.name) {
         case 'read_file': return await this.toolReadFile(tool.args.path);
@@ -1189,6 +1382,7 @@ class NavyCoderViewProvider {
         case 'read_lines': return await this.toolReadLines(tool.args.path, tool.args.start, tool.args.end);
         case 'write_file': return await this.toolWriteFile(tool.args.path, tool.args.content);
         case 'delete_file': return await this.toolDeleteFile(tool.args.path);
+        case 'rename_file': return await this.toolRenameFile(tool.args.from, tool.args.to);
         case 'list_files': return await this.toolListFiles(tool.args.path, tool.args.maxDepth);
         case 'search_files': return await this.toolSearchFiles(tool.args.query);
         case 'apply_edit': return await this.toolApplyEdit(tool.args.path, tool.args.search, tool.args.replace);
@@ -1247,16 +1441,19 @@ class NavyCoderViewProvider {
     if (!root) throw new Error('No project root — open a folder before using file tools');
 
     const candidate = path.isAbsolute(inputPath) ? inputPath : path.join(root, inputPath);
-    const normalRoot = path.normalize(root);
-    const normalCandidate = path.normalize(candidate);
+    // Windows paths are case-insensitive — compare case-folded there so "e:\code ex\…"
+    // isn't falsely rejected against a root of "E:\Code Ex". Containment is unaffected.
+    const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
+    const normalRoot = fold(path.normalize(root));
+    const normalCandidate = fold(path.normalize(candidate));
     if (normalCandidate !== normalRoot && !normalCandidate.startsWith(normalRoot + path.sep)) {
       throw new Error('Path is outside the workspace root: ' + inputPath);
     }
 
     // Resolve symlinks to prevent traversal through symlinks inside the workspace
     try {
-      const real = fs.realpathSync(candidate);
-      const realRoot = fs.realpathSync(root);
+      const real = fold(fs.realpathSync(candidate));
+      const realRoot = fold(fs.realpathSync(root));
       if (real !== realRoot && !real.startsWith(realRoot + path.sep)) {
         throw new Error('Path resolves outside workspace root via symlink: ' + inputPath);
       }
@@ -1323,6 +1520,10 @@ class NavyCoderViewProvider {
     try {
       const lines = [];
       await this._listDir(dirPath, '', maxDepth, 0, lines);
+      if (lines.length > 400) {
+        return lines.slice(0, 400).join('\n')
+          + `\n… (${lines.length - 400} more entries — list a subdirectory or lower maxDepth)`;
+      }
       return lines.join('\n') || '(empty directory)';
     } catch (error) {
       return 'Error: ' + error.message;
@@ -1330,9 +1531,13 @@ class NavyCoderViewProvider {
   }
 
   async _listDir(dirPath, prefix, maxDepth, depth, lines) {
+    // Hard stop above the 400-entry display cap — a huge directory (generated data,
+    // vendored assets) must not build a million-entry array before we slice it.
+    if (lines.length > 1200) return;
     const SKIP = new Set(['node_modules', '.git', 'dist', 'out', '.next', '__pycache__', '.venv']);
     const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
     for (const entry of entries) {
+      if (lines.length > 1200) return;
       if (entry.isDirectory()) {
         lines.push(prefix + entry.name + '/');
         if (depth < maxDepth - 1 && !SKIP.has(entry.name)) {
@@ -1344,10 +1549,55 @@ class NavyCoderViewProvider {
     }
   }
 
+  // Locate VS Code's bundled ripgrep so searches are fast and respect .gitignore.
+  // Returns the binary path or null (then callers fall back to the JS walk).
+  _findRipgrep() {
+    if (this._rgPath !== undefined) return this._rgPath;
+    const exe = process.platform === 'win32' ? 'rg.exe' : 'rg';
+    const arch = `${process.platform}-${process.arch}`;
+    const candidates = [
+      path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', exe),
+      path.join(vscode.env.appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep', 'bin', exe),
+      path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep-universal', 'bin', arch, exe),
+      path.join(vscode.env.appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep-universal', 'bin', arch, exe),
+    ];
+    this._rgPath = candidates.find(c => { try { return fs.existsSync(c); } catch { return false; } }) || null;
+    return this._rgPath;
+  }
+
+  // Run ripgrep with an output cap. Resolves { code, out } — never rejects.
+  _rgRun(rgPath, args, cwd, maxOut = 60000) {
+    return new Promise((resolve) => {
+      const proc = spawn(rgPath, args, { cwd });
+      let out = '';
+      proc.stdout.on('data', d => {
+        out += d.toString();
+        if (out.length > maxOut) { out = out.slice(0, maxOut); this._killProcessTree(proc); }
+      });
+      proc.stderr.on('data', () => {});
+      proc.on('close', code => resolve({ code: code ?? 0, out }));
+      proc.on('error', () => resolve({ code: -1, out: '' }));
+    });
+  }
+
   async toolSearchFiles(query) {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'No workspace open';
     try {
+      // Fast path: bundled ripgrep — respects .gitignore, searches the whole tree.
+      const rg = this._findRipgrep();
+      if (rg) {
+        const { code, out } = await this._rgRun(rg,
+          ['--line-number', '--max-count', '1', '--fixed-strings', '--max-filesize', '512K',
+           '--no-heading', '--with-filename', '--', query, '.'], root);
+        if (code === 0) {
+          const lines = out.split('\n').filter(Boolean).slice(0, 20)
+            .map(l => l.replace(/^\.[\\/]/, '').replace(/:(\d+):/, ':$1 '));
+          if (lines.length) return lines.join('\n');
+        }
+        if (code === 1) return 'No matches';
+        // code 2 / -1 → rg failed, fall through to the JS walk
+      }
       const results = [];
       await this.searchDirectory(root, query, results, 0, root);
       return results.slice(0, 20).join('\n') || 'No matches';
@@ -1358,9 +1608,11 @@ class NavyCoderViewProvider {
 
   async searchDirectory(dir, query, results, depth, root) {
     if (depth > 2) return;
+    if (results.length >= 20) return; // caller shows 20 — stop reading files past that
     const SKIP = new Set(['node_modules', '.git', 'dist', 'out', '__pycache__', '.venv']);
     const entries = await fs.promises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (results.length >= 20) return;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (!SKIP.has(entry.name)) {
@@ -1418,10 +1670,46 @@ class NavyCoderViewProvider {
       if (choice !== 'Delete') return `Deletion of ${basename} cancelled by user.`;
     }
     try {
+      // Snapshot single files (≤5 MB) before deleting so Undo can restore them.
+      // Directories aren't snapshotted — the Recycle Bin covers those.
+      let snapshot = null;
+      try {
+        const st = await vscode.workspace.fs.stat(vscode.Uri.file(filePath));
+        if (st.type === vscode.FileType.File && st.size <= 5_000_000) {
+          snapshot = await this.readFileText(filePath);
+        }
+      } catch {}
       await vscode.workspace.fs.delete(vscode.Uri.file(filePath), { recursive: true, useTrash: true });
-      return `Deleted ${basename} (moved to Recycle Bin).`;
+      if (snapshot !== null) this._pushCheckpoint({ kind: 'delete', filePath, originalText: snapshot });
+      return `Deleted ${basename} (moved to Recycle Bin${snapshot !== null ? '; Undo can restore it' : ''}).`;
     } catch (e) {
       return `Error deleting ${basename}: ${e.message}`;
+    }
+  }
+
+  async toolRenameFile(fromPath, toPath) {
+    if (!fromPath || !toPath) return 'Error: both from and to paths are required.';
+    // Both ends must stay inside the workspace — a rename is a read at `from`
+    // plus a write at `to`, so it gets the same containment rules as each.
+    const src = this.resolveWorkspacePath(fromPath);
+    const dst = this.resolveWorkspacePath(toPath);
+    const fromName = path.basename(src);
+    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
+    if (approvalMode !== 'auto-approve') {
+      const choice = await vscode.window.showWarningMessage(
+        `Navy wants to rename ${fromName} → ${toPath}`,
+        { modal: true },
+        'Rename'
+      );
+      if (choice !== 'Rename') return `Rename of ${fromName} cancelled by user.`;
+    }
+    try {
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(dst)));
+      await vscode.workspace.fs.rename(vscode.Uri.file(src), vscode.Uri.file(dst), { overwrite: false });
+      this._pushCheckpoint({ kind: 'rename', from: src, to: dst });
+      return `Renamed ${fromPath} → ${toPath}`;
+    } catch (e) {
+      return `Error renaming ${fromName}: ${e.message}`;
     }
   }
 
@@ -1437,7 +1725,7 @@ class NavyCoderViewProvider {
     lines[idx] = content;
     const newText = lines.join('\n');
     const result = await this.requestWriteApproval(inputPath, filePath, existing, newText);
-    this.highlightChangedLines(filePath, [idx], []);
+    if (result.startsWith('Applied')) this.highlightChangedLines(filePath, [idx], []);
     return result;
   }
 
@@ -1503,33 +1791,52 @@ class NavyCoderViewProvider {
     }).join('\n');
   }
 
+  // Block private/local addresses: loopback, RFC-1918, link-local, IPv6 loopback,
+  // decimal-encoded IPs (e.g. 2130706433 = 127.0.0.1), cloud metadata endpoints.
+  _isBlockedHost(h) {
+    return /^(localhost|127\.|0\.0\.0\.0|::1|::ffff:|0:0:0:0:0:0:0:1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(h)
+      || /^[0-9]+$/.test(h)   // decimal IP like 2130706433
+      || h === 'metadata.google.internal'
+      || h.endsWith('.internal')
+      || h.endsWith('.local');
+  }
+
   async toolFetchUrl(url) {
     try {
-      let parsed;
-      try { parsed = new URL(url); } catch { return 'Fetch error: invalid URL'; }
-      if (!/^https?:$/i.test(parsed.protocol)) return 'Fetch error: only http/https URLs are allowed';
-      const h = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-      // Block private/local addresses: loopback, RFC-1918, link-local, IPv6 loopback,
-      // decimal-encoded IPs (e.g. 2130706433 = 127.0.0.1), cloud metadata endpoints.
-      if (/^(localhost|127\.|0\.0\.0\.0|::1|::ffff:|0:0:0:0:0:0:0:1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(h)
-        || /^[0-9]+$/.test(h)   // decimal IP like 2130706433
-        || h === 'metadata.google.internal'
-        || h.endsWith('.internal')
-        || h.endsWith('.local'))
-        return 'Fetch error: fetching private or local addresses is not allowed';
-      const res = await fetch(url, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'NavyCoder/1.0' } });
-      if (!res.ok) return `HTTP ${res.status}: ${res.statusText}`;
-      const ct = res.headers.get('content-type') || '';
-      let text = await res.text();
-      if (ct.includes('html')) {
-        text = text
-          .replace(/<script[\s\S]*?<\/script>/gi, '')
-          .replace(/<style[\s\S]*?<\/style>/gi, '')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s{2,}/g, ' ')
-          .trim();
+      // Follow redirects MANUALLY so every hop is re-validated — otherwise a public
+      // URL that 302s to 127.0.0.1 or a metadata endpoint bypasses the SSRF block.
+      let current = url;
+      for (let hop = 0; hop < 5; hop++) {
+        let parsed;
+        try { parsed = new URL(current); } catch { return 'Fetch error: invalid URL'; }
+        if (!/^https?:$/i.test(parsed.protocol)) return 'Fetch error: only http/https URLs are allowed';
+        const h = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        if (this._isBlockedHost(h)) return 'Fetch error: fetching private or local addresses is not allowed';
+        const res = await fetch(current, {
+          signal: AbortSignal.timeout(15000),
+          headers: { 'User-Agent': 'NavyCoder/1.0' },
+          redirect: 'manual',
+        });
+        if (res.status >= 300 && res.status < 400) {
+          const loc = res.headers.get('location');
+          if (!loc) return `HTTP ${res.status}: redirect with no Location header`;
+          current = new URL(loc, current).href; // re-validated at top of loop
+          continue;
+        }
+        if (!res.ok) return `HTTP ${res.status}: ${res.statusText}`;
+        const ct = res.headers.get('content-type') || '';
+        let text = await res.text();
+        if (ct.includes('html')) {
+          text = text
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+        }
+        return text.slice(0, 12000);
       }
-      return text.slice(0, 12000);
+      return 'Fetch error: too many redirects (max 5)';
     } catch (e) {
       return 'Fetch error: ' + e.message;
     }
@@ -1597,6 +1904,23 @@ class NavyCoderViewProvider {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'No workspace open.';
 
+    // Fast path: bundled ripgrep — .gitignore-aware, full-tree, regex-capable.
+    const rg = this._findRipgrep();
+    if (rg) {
+      const args = ['--line-number', '--context', String(Math.min(contextLines, 6)), '--max-count', '3',
+        '--max-filesize', '300K', '--max-columns', '300', '--smart-case', '--heading'];
+      if (filePattern) args.push('--glob', filePattern);
+      args.push('-e', query, '.');
+      const { code, out } = await this._rgRun(rg, args, root);
+      if (code === 0 && out.trim()) {
+        const text = out.replace(/^\.[\\/]/gm, '');
+        const note = text.length > 16000 ? '\n\n[Results truncated — narrow the query or add a filePattern.]' : '';
+        return text.slice(0, 16000).trim() + note;
+      }
+      if (code === 1) return `No matches for "${query}"`;
+      // code 2 (bad regex/glob) or spawn failure → fall through to the JS walk below
+    }
+
     const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '__pycache__', '.venv', 'venv', 'coverage', '.cache']);
     const results = [];
     let fileRegex = null;
@@ -1657,7 +1981,7 @@ class NavyCoderViewProvider {
     const newText = lines.join('\n');
     const insertedIndices = Array.from({ length: insertLines.length }, (_, i) => idx + i);
     const result = await this.requestWriteApproval(inputPath, filePath, existing, newText);
-    this.highlightChangedLines(filePath, insertedIndices, []);
+    if (result.startsWith('Applied')) this.highlightChangedLines(filePath, insertedIndices, []);
     return result;
   }
 
@@ -1739,7 +2063,7 @@ class NavyCoderViewProvider {
 
     if (approvalMode === 'auto-approve') {
       try {
-        this.createCheckpoint(filePath, oldText);
+        this.createCheckpoint(filePath, oldText, newText);
         await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(newText, 'utf8'));
         this.view?.webview.postMessage({ type: 'diffResolved', id, approved: true });
         this.highlightWriteChanges(filePath, oldText, newText);
@@ -1789,7 +2113,7 @@ class NavyCoderViewProvider {
 
     if (decision === 'approve') {
       try {
-        this.createCheckpoint(filePath, oldText);
+        this.createCheckpoint(filePath, oldText, newText);
         await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(newText, 'utf8'));
         this.view?.webview.postMessage({ type: 'diffResolved', id, approved: true });
         this.highlightWriteChanges(filePath, oldText, newText);
@@ -1824,7 +2148,7 @@ class NavyCoderViewProvider {
       let result;
       try {
         const original = await this.readFileText(approval.filePath) || '';
-        this.createCheckpoint(approval.filePath, original);
+        this.createCheckpoint(approval.filePath, original, approval.newText);
         await vscode.workspace.fs.writeFile(
           vscode.Uri.file(approval.filePath),
           Buffer.from(approval.newText, 'utf8')
@@ -1849,7 +2173,7 @@ class NavyCoderViewProvider {
       if (newText instanceof Error) return 'Error: ' + newText.message;
       if (newText === null) return 'Error: search text not found in ' + path.basename(filePath);
 
-      this.createCheckpoint(filePath, original);
+      this.createCheckpoint(filePath, original, newText);
       await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(newText, 'utf8'));
       return 'Applied edit to ' + path.basename(filePath);
     } catch (error) {
@@ -1857,25 +2181,132 @@ class NavyCoderViewProvider {
     }
   }
 
-  createCheckpoint(filePath, originalText) {
-    this.checkpoints.push({ filePath, originalText, time: Date.now(), turnId: this.currentTurnId });
+  // Central checkpoint push: clears redo (a fresh operation invalidates redo
+  // history — standard editor semantics), caps entries and bytes, persists.
+  _pushCheckpoint(entry) {
+    if (this.redoStack.length) {
+      this.redoStack = [];
+      this.view?.webview.postMessage({ type: 'redoState', count: 0 });
+    }
+    this.checkpoints.push({ time: Date.now(), turnId: this.currentTurnId, ...entry });
     if (this.checkpoints.length > 200) this.checkpoints.splice(0, this.checkpoints.length - 200);
+    // Entry cap alone isn't enough — 200 snapshots of multi-MB files would pin
+    // hundreds of MB. Cap total retained bytes too, evicting oldest first.
+    let bytes = 0;
+    for (let i = this.checkpoints.length - 1; i >= 0; i--) {
+      bytes += (this.checkpoints[i].originalText || '').length;
+      if (bytes > 30_000_000 && i > 0) { this.checkpoints.splice(0, i); break; }
+    }
     this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+    this._persistCheckpoints();
+  }
+
+  createCheckpoint(filePath, originalText, newText) {
+    // newHash lets undo detect "the user hand-edited this file AFTER Navy's
+    // write" and ask before discarding those edits.
+    const newHash = typeof newText === 'string'
+      ? crypto.createHash('md5').update(newText, 'utf8').digest('hex')
+      : undefined;
+    this._pushCheckpoint({ kind: 'edit', filePath, originalText, ...(newHash ? { newHash } : {}) });
+  }
+
+  // Persist checkpoints to .navy/checkpoints.json (debounced) so Undo survives a
+  // window reload. Only the newest ~8 MB is written — undo history, not a backup.
+  _persistCheckpoints() {
+    clearTimeout(this._cpSaveTimer);
+    this._cpSaveTimer = setTimeout(async () => {
+      const dir = await this.ensureNavyDir();
+      if (!dir) return;
+      try {
+        let bytes = 0;
+        const keep = [];
+        for (let i = this.checkpoints.length - 1; i >= 0; i--) {
+          bytes += (this.checkpoints[i].originalText || '').length;
+          if (bytes > 8_000_000) break;
+          keep.unshift(this.checkpoints[i]);
+        }
+        await vscode.workspace.fs.writeFile(
+          vscode.Uri.file(path.join(dir, 'checkpoints.json')),
+          Buffer.from(JSON.stringify({ checkpoints: keep }), 'utf8')
+        );
+      } catch {}
+    }, 500);
+  }
+
+  async _loadCheckpoints() {
+    const dir = this.getNavyDir();
+    if (!dir) return;
+    try {
+      const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'checkpoints.json')));
+      const parsed = JSON.parse(Buffer.from(data).toString('utf8'));
+      if (Array.isArray(parsed.checkpoints)) {
+        this.checkpoints = parsed.checkpoints.filter(c => c && (
+          (c.kind === 'rename' && c.from && c.to) ||
+          (c.filePath && typeof c.originalText === 'string')
+        ));
+        this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+      }
+    } catch { /* no saved checkpoints — fine */ }
+  }
+
+  // Undo a single checkpoint entry (kind-aware). Returns the redo operation.
+  async _undoOne(cp) {
+    if (cp.kind === 'rename') {
+      await vscode.workspace.fs.rename(vscode.Uri.file(cp.to), vscode.Uri.file(cp.from), { overwrite: false });
+      return { kind: 'rename', from: cp.from, to: cp.to };
+    }
+    // 'edit' and 'delete' both restore content ('delete' recreates the file).
+    const current = await this.readFileText(cp.filePath); // null → file doesn't exist (deleted)
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(cp.filePath)));
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(cp.filePath), Buffer.from(cp.originalText, 'utf8'));
+    return { kind: 'edit', filePath: cp.filePath, text: current };
+  }
+
+  // If the user hand-edited any of these files AFTER Navy's write, undo would
+  // silently discard their work — ask first.
+  async _confirmUndoSafe(cps) {
+    const touched = [];
+    for (const cp of cps) {
+      if (cp.kind !== 'edit' || !cp.newHash) continue;
+      const current = await this.readFileText(cp.filePath);
+      if (current === null) continue;
+      const hash = crypto.createHash('md5').update(current, 'utf8').digest('hex');
+      if (hash !== cp.newHash) touched.push(path.basename(cp.filePath));
+    }
+    if (!touched.length) return true;
+    const pick = await vscode.window.showWarningMessage(
+      `${touched.join(', ')} ${touched.length === 1 ? 'was' : 'were'} modified after Navy's edit — undoing will discard those changes.`,
+      { modal: true },
+      'Undo Anyway'
+    );
+    return pick === 'Undo Anyway';
+  }
+
+  _afterUndoRedo() {
+    if (this.redoStack.length > 50) this.redoStack.splice(0, this.redoStack.length - 50);
+    this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+    this.view?.webview.postMessage({ type: 'redoState', count: this.redoStack.length });
+    this._persistCheckpoints();
   }
 
   async undoLastCheckpoint() {
-    const last = this.checkpoints.pop();
+    const last = this.checkpoints[this.checkpoints.length - 1];
     if (!last) {
       vscode.window.showInformationMessage('No Navy Coder edits to undo');
       return;
     }
+    if (!(await this._confirmUndoSafe([last]))) return;
+    this.checkpoints.pop();
     try {
-      await vscode.workspace.fs.writeFile(vscode.Uri.file(last.filePath), Buffer.from(last.originalText, 'utf8'));
-      vscode.window.showInformationMessage('Undid last Navy Coder edit');
-      this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+      const redoOp = await this._undoOne(last);
+      this.redoStack.push({ ops: [redoOp] });
+      const what = last.kind === 'rename' ? 'rename' : last.kind === 'delete' ? 'deletion' : 'edit';
+      vscode.window.showInformationMessage(`Undid last Navy Coder ${what} (Redo is available)`);
     } catch (error) {
+      this.checkpoints.push(last); // restore the checkpoint — the undo didn't happen
       vscode.window.showErrorMessage('Undo failed: ' + error.message);
     }
+    this._afterUndoRedo();
   }
 
   async undoLastTurn() {
@@ -1885,21 +2316,72 @@ class NavyCoderViewProvider {
     }
     const lastTurnId = this.checkpoints[this.checkpoints.length - 1].turnId;
     const toUndo = this.checkpoints.filter(c => c.turnId === lastTurnId).reverse();
+    if (!(await this._confirmUndoSafe(toUndo))) return;
     this.checkpoints = this.checkpoints.filter(c => c.turnId !== lastTurnId);
+
+    const redoOps = [];
     const errors = [];
+    const undoneFiles = new Set();
     for (const cp of toUndo) {
+      // Multiple edits to one file in a turn: the LAST checkpoint (first in this
+      // reversed list) holds the turn-start content — undo once per file.
+      const key = cp.kind === 'rename' ? 'r:' + cp.from + '→' + cp.to : cp.filePath;
+      if (undoneFiles.has(key)) continue;
+      undoneFiles.add(key);
       try {
-        await vscode.workspace.fs.writeFile(vscode.Uri.file(cp.filePath), Buffer.from(cp.originalText, 'utf8'));
+        redoOps.push(await this._undoOne(cp));
       } catch (e) {
-        errors.push(path.basename(cp.filePath) + ': ' + e.message);
+        errors.push(path.basename(cp.filePath || cp.from || '?') + ': ' + e.message);
       }
     }
+    if (redoOps.length) this.redoStack.push({ ops: redoOps });
     if (errors.length > 0) {
       vscode.window.showErrorMessage('Some undos failed: ' + errors.join(', '));
     } else {
-      vscode.window.showInformationMessage(`Undid ${toUndo.length} edit${toUndo.length !== 1 ? 's' : ''} from last turn`);
+      vscode.window.showInformationMessage(`Undid ${redoOps.length} operation${redoOps.length !== 1 ? 's' : ''} from last turn (Redo is available)`);
     }
-    this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+    this._afterUndoRedo();
+  }
+
+  // Redo: reverse the most recent undo. Re-checkpoints the pre-redo state so
+  // undo→redo→undo round-trips cleanly. Pushes checkpoints directly (NOT via
+  // _pushCheckpoint) — a redo must not wipe the remaining redo history.
+  async redoLast() {
+    const entry = this.redoStack.pop();
+    if (!entry) {
+      vscode.window.showInformationMessage('Nothing to redo.');
+      return;
+    }
+    const turnId = this.generateId();
+    const errors = [];
+    let done = 0;
+    for (const op of entry.ops) {
+      try {
+        if (op.kind === 'rename') {
+          await vscode.workspace.fs.rename(vscode.Uri.file(op.from), vscode.Uri.file(op.to), { overwrite: false });
+          this.checkpoints.push({ kind: 'rename', from: op.from, to: op.to, time: Date.now(), turnId });
+        } else if (op.text === null) {
+          // The undo recreated a deleted file — redo deletes it again.
+          const current = await this.readFileText(op.filePath) ?? '';
+          await vscode.workspace.fs.delete(vscode.Uri.file(op.filePath), { recursive: false, useTrash: true });
+          this.checkpoints.push({ kind: 'delete', filePath: op.filePath, originalText: current, time: Date.now(), turnId });
+        } else {
+          const current = await this.readFileText(op.filePath) ?? '';
+          const newHash = crypto.createHash('md5').update(op.text, 'utf8').digest('hex');
+          this.checkpoints.push({ kind: 'edit', filePath: op.filePath, originalText: current, newHash, time: Date.now(), turnId });
+          await vscode.workspace.fs.writeFile(vscode.Uri.file(op.filePath), Buffer.from(op.text, 'utf8'));
+        }
+        done++;
+      } catch (e) {
+        errors.push(path.basename(op.filePath || op.to || '?') + ': ' + e.message);
+      }
+    }
+    if (errors.length > 0) {
+      vscode.window.showErrorMessage('Redo failed for: ' + errors.join(', '));
+    } else {
+      vscode.window.showInformationMessage(`Redid ${done} operation${done !== 1 ? 's' : ''}.`);
+    }
+    this._afterUndoRedo();
   }
 
   async toolRunCommand(command, timeout = 30000) {
@@ -1925,25 +2407,36 @@ class NavyCoderViewProvider {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
+      const MAX_BUF = 200000; // cap accumulation — a chatty command must not eat memory
       const child = spawn(shellBin, shellArgs, { cwd: root, detached: !isWin });
       const timer = setTimeout(() => {
         this._killProcessTree(child);
-        resolve('Command timed out after ' + timeout + 'ms\nstdout: ' + stdout + '\nstderr: ' + stderr);
+        resolve('Command timed out after ' + timeout + 'ms\nstdout: ' + stdout.slice(-8000) + '\nstderr: ' + stderr.slice(-8000));
       }, timeout);
 
       child.stdout.on('data', (data) => {
         const chunk = data.toString();
         stdout += chunk;
+        if (stdout.length > MAX_BUF) stdout = stdout.slice(-MAX_BUF);
         this.view?.webview.postMessage({ type: 'shellChunk', chunk });
       });
       child.stderr.on('data', (data) => {
         const chunk = data.toString();
         stderr += chunk;
+        if (stderr.length > MAX_BUF) stderr = stderr.slice(-MAX_BUF);
         this.view?.webview.postMessage({ type: 'shellChunk', chunk, isStderr: true });
       });
       child.on('close', (code) => {
         clearTimeout(timer);
-        resolve('Exit code: ' + code + '\nstdout:\n' + stdout + '\nstderr:\n' + stderr);
+        let out = 'Exit code: ' + code + '\nstdout:\n' + stdout + '\nstderr:\n' + stderr;
+        // Cap what goes back to the model: keep the head (exit code + first lines,
+        // which the failure tracker parses) and the tail (where errors usually are).
+        if (out.length > 16000) {
+          out = out.slice(0, 2000)
+              + `\n\n[... output truncated — ${out.length.toLocaleString()} chars total, showing head and tail ...]\n\n`
+              + out.slice(-13000);
+        }
+        resolve(out);
       });
       child.on('error', (error) => {
         clearTimeout(timer);
@@ -2145,6 +2638,8 @@ class NavyCoderViewProvider {
   }
 
   dispose() {
+    clearInterval(this._heartbeat);
+    clearTimeout(this._cpSaveTimer);
     // Kill all background processes when the extension is deactivated or reloaded.
     for (const [, entry] of this.bgProcesses) {
       if (entry?.proc) { try { this._killProcessTree(entry.proc); } catch {} }
@@ -2199,6 +2694,7 @@ class NavyCoderViewProvider {
         usedTools = true;
         const toolResults = [];
         for (const tool of toolCalls) {
+          if (ctrl.signal.aborted) break;
           if (tool.name === 'finish') continue;
           post('tool', { tool: tool.name, args: tool.args });
           const result = await this.executeTool(tool);
@@ -2235,7 +2731,8 @@ class NavyCoderViewProvider {
       let err = '';
       proc.stdout.on('data', d => { out += d; });
       proc.stderr.on('data', d => { err += d; });
-      proc.on('close', () => resolve(out.trim() || ('git blame failed: ' + err.trim())));
+      // Cap like git_diff — blaming a whole large file would flood the model context.
+      proc.on('close', () => resolve((out.trim() || ('git blame failed: ' + err.trim())).slice(0, 8000)));
       proc.on('error', e => resolve('git error: ' + e.message));
     });
   }
@@ -2392,9 +2889,14 @@ class NavyCoderViewProvider {
       const links = [];
       const snips = [];
       let m;
-      const linkRe = /<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
-      while ((m = linkRe.exec(html)) !== null) links.push({ url: m[1], title: m[2].replace(/<[^>]*>/g, '').trim() });
-      const snipRe = /<td[^>]+class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+      // Tolerate attribute order and quote-style changes: match whole anchors that
+      // carry the result-link class, then pull href out separately.
+      const anchorRe = /<a\b[^>]*class=["']?[^"'>]*result-link[^"'>]*["']?[^>]*>([\s\S]*?)<\/a>/gi;
+      while ((m = anchorRe.exec(html)) !== null) {
+        const href = m[0].match(/href=["']([^"']+)["']/i);
+        if (href) links.push({ url: href[1], title: m[1].replace(/<[^>]*>/g, '').trim() });
+      }
+      const snipRe = /<td\b[^>]*class=["']?[^"'>]*result-snippet[^"'>]*["']?[^>]*>([\s\S]*?)<\/td>/gi;
       while ((m = snipRe.exec(html)) !== null) snips.push(m[1].replace(/<[^>]*>/g, '').trim());
       const results = [];
       for (let i = 0; i < Math.min(links.length, maxResults); i++) {
@@ -2409,6 +2911,9 @@ class NavyCoderViewProvider {
   }
 
   async generatePRReview() {
+    // Open the sidebar FIRST — the command-approval card (ask-always mode) renders in
+    // the webview, and if the view was never resolved the await below would hang forever.
+    await this.focus();
     const input = await vscode.window.showInputBox({
       prompt: 'PR number or leave blank to diff current branch vs main',
       placeHolder: 'e.g. 42',
@@ -2471,6 +2976,12 @@ class NavyCoderViewProvider {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'PROJECT ROOT UNKNOWN — do NOT invent file names or project names. Tell the user to open a folder in VS Code first.';
 
+    // The map is rebuilt on every message but the tree rarely changes that fast —
+    // cache per root for 30 s to keep prompt latency off the filesystem.
+    if (this._repoMapCache?.root === root && Date.now() - this._repoMapCache.time < 30_000) {
+      return this._repoMapCache.map;
+    }
+
     const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt', '__pycache__', '.venv', 'venv', 'coverage', '.cache']);
     const lines = [];
 
@@ -2511,7 +3022,9 @@ class NavyCoderViewProvider {
       }
       if (projectMeta) lines.unshift('Project: ' + projectMeta);
 
-      return lines.join('\n') || 'Empty project directory';
+      const map = lines.join('\n') || 'Empty project directory';
+      this._repoMapCache = { root, time: Date.now(), map };
+      return map;
     } catch (error) {
       return 'Could not build repo map: ' + error.message;
     }
@@ -2593,7 +3106,7 @@ class NavyCoderViewProvider {
   async writeWholeFile(filePath, text) {
     try {
       const original = await this.readFileText(filePath) || '';
-      this.createCheckpoint(filePath, original);
+      this.createCheckpoint(filePath, original, text);
       await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(text, 'utf8'));
       const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
       await vscode.window.showTextDocument(doc, { preview: false });
@@ -2615,6 +3128,20 @@ class NavyCoderViewProvider {
 
   restoreMessages() {
     this.view?.webview.postMessage({ type: 'restore', messages: this.messages });
+  }
+
+  // One-shot, non-streaming completion through the ACTIVE provider (not just Ollama).
+  // Chunks are swallowed via a no-op onChunk so nothing leaks into the chat webview.
+  async _completeOnce(host, model, messages) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000);
+    try {
+      const { text } = await streamAssistant(this, host, model, messages, 0.2, ctrl.signal, () => {});
+      // Reasoning models may wrap deliberation in <think> tags — strip them.
+      return (text || '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async generateCommit() {
@@ -2639,20 +3166,10 @@ class NavyCoderViewProvider {
 
     vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Navy: Generating commit message…', cancellable: false }, async () => {
       try {
-        const res = await fetch(host + '/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: 'You write concise, conventional-commits-style git commit messages. Output ONLY the commit message — no explanation, no quotes, no markdown.' },
-              { role: 'user', content: `Write a git commit message for this diff:\n\n${diffToUse.slice(0, 6000)}` }
-            ],
-            stream: false
-          })
-        });
-        const data = await res.json();
-        const message = (data.message?.content || '').trim();
+        const message = await this._completeOnce(host, model, [
+          { role: 'system', content: 'You write concise, conventional-commits-style git commit messages. Output ONLY the commit message — no explanation, no quotes, no markdown.' },
+          { role: 'user', content: `Write a git commit message for this diff:\n\n${diffToUse.slice(0, 6000)}` }
+        ]);
         if (!message) { vscode.window.showErrorMessage('Navy: Failed to generate commit message.'); return; }
 
         const confirmed = await vscode.window.showInputBox({
@@ -2689,20 +3206,10 @@ class NavyCoderViewProvider {
 
     vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Navy: Generating PR description…', cancellable: false }, async () => {
       try {
-        const res = await fetch(host + '/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: 'system', content: 'You write clear GitHub pull request descriptions in markdown. Include: a short title line, a ## Summary section with bullet points, and a ## Changes section. Be concise and factual.' },
-              { role: 'user', content: `Generate a PR description for these changes:\n\nCommits:\n${log}\n\nDiff (truncated):\n${diff.slice(0, 5000)}` }
-            ],
-            stream: false
-          })
-        });
-        const data = await res.json();
-        const prText = (data.message?.content || '').trim();
+        const prText = await this._completeOnce(host, model, [
+          { role: 'system', content: 'You write clear GitHub pull request descriptions in markdown. Include: a short title line, a ## Summary section with bullet points, and a ## Changes section. Be concise and factual.' },
+          { role: 'user', content: `Generate a PR description for these changes:\n\nCommits:\n${log}\n\nDiff (truncated):\n${diff.slice(0, 5000)}` }
+        ]);
         if (!prText) { vscode.window.showErrorMessage('Navy: Failed to generate PR description.'); return; }
 
         const doc = await vscode.workspace.openTextDocument({ content: prText, language: 'markdown' });
@@ -2743,6 +3250,8 @@ class NavyCoderViewProvider {
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'styles.css'));
     const host = vscode.workspace.getConfiguration('navy').get('host', 'http://localhost:11434').replace(/\/$/, '');
     const nonce = getNonce();
+    // Shown on the welcome screen so it's always obvious which build is running.
+    const version = this.context.extension?.packageJSON?.version || '';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -2843,6 +3352,12 @@ class NavyCoderViewProvider {
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 7v6h6"></path>
               <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
+            </svg>
+          </button>
+          <button id="redoButton" type="button" class="icon-button" title="Redo (reverse last undo)" aria-label="Redo last undone edit" disabled>
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 7v6h-6"></path>
+              <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"></path>
             </svg>
           </button>
           <button id="searchButton" type="button" class="icon-button" title="Search chat (Ctrl+F)" aria-label="Search chat">
@@ -2952,7 +3467,7 @@ class NavyCoderViewProvider {
             </div>
             <div class="setting-group setting-half">
               <label class="setting-label">Max Tool Iterations</label>
-              <input id="settingMaxIter" type="number" class="setting-input" min="1" max="100" step="1" placeholder="15" />
+              <input id="settingMaxIter" type="number" class="setting-input" min="1" max="200" step="1" placeholder="50" />
             </div>
           </div>
 
@@ -3033,7 +3548,7 @@ class NavyCoderViewProvider {
           <button type="button" class="welcome-chip" data-prompt="Generate a commit message for my staged changes.">📝 Git commit</button>
           <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">▶ Run project</button>
         </div>
-        <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files</p>
+        <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files${version ? ' · <span class="welcome-version">v' + version + '</span>' : ''}</p>
       </div>
     </section>
 
@@ -3185,7 +3700,7 @@ function activate(context) {
   if (!context.globalState.get('navy.welcomed')) {
     context.globalState.update('navy.welcomed', true);
     vscode.window.showInformationMessage(
-      'Navy AI Coder is ready — find it at the ☸ anchor icon in the activity bar (left edge).',
+      'Navy AI Coder is ready — find it at the ☸ wheel icon in the activity bar (left edge).',
       'Open Navy'
     ).then((choice) => {
       if (choice === 'Open Navy') vscode.commands.executeCommand('navy.chatView.focus');
@@ -3225,14 +3740,6 @@ function activate(context) {
       const apiKey     = await provider.context.secrets.get('navy.apiKey.' + aiProvider)
                        || await provider.context.secrets.get('navy.apiKey') || '';
 
-      const OPENAI_COMPAT_BASE = {
-        openai: 'https://api.openai.com/v1', lmstudio: apiBase || 'http://localhost:1234/v1',
-        deepseek: 'https://api.deepseek.com/v1', gemini: 'https://generativelanguage.googleapis.com/v1beta/openai',
-        xai: 'https://api.x.ai/v1', zai: apiBase || 'https://api.z.ai/v1',
-        groq: 'https://api.groq.com/openai/v1', openrouter: 'https://openrouter.ai/api/v1',
-        custom: apiBase || host,
-      };
-
       const ctrl = new AbortController();
       token.onCancellationRequested(() => ctrl.abort());
 
@@ -3267,7 +3774,7 @@ function activate(context) {
           completion = (data.content?.[0]?.text || '').trimEnd();
 
         } else {
-          const base = OPENAI_COMPAT_BASE[aiProvider] || host;
+          const base = openAiCompatBase(aiProvider, apiBase, host) || host;
           const headers = { 'Content-Type': 'application/json' };
           if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
           const res = await fetch(base + '/chat/completions', {
@@ -3300,6 +3807,7 @@ function activate(context) {
     vscode.commands.registerCommand('navy.clearChat', () => provider.clearChat()),
     vscode.commands.registerCommand('navy.undoLastEdit', () => provider.undoLastCheckpoint()),
     vscode.commands.registerCommand('navy.undoLastTurn', () => provider.undoLastTurn()),
+    vscode.commands.registerCommand('navy.redoLastUndo', () => provider.redoLast()),
     vscode.commands.registerCommand('navy.inlineEdit', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
@@ -3318,14 +3826,14 @@ function activate(context) {
       const filePath = editor.document.fileName;
       const lang = editor.document.languageId;
       const prompt = `You are editing a ${lang} file. Edit ONLY the following code snippet as instructed. Return ONLY the edited code with no explanation, no markdown fences, no extra text.\n\nInstruction: ${instruction}\n\nCode to edit:\n${selectedText}`;
-      provider.focus();
+      await provider.focus();
       await provider.askNavy(prompt, false, null, [filePath]);
     }),
     vscode.commands.registerCommand('navy.generateCommit', () => provider.generateCommit()),
     vscode.commands.registerCommand('navy.generatePR', () => provider.generatePRDescription()),
     vscode.commands.registerCommand('navy.runTests', () => provider.runTestsCommand()),
-    vscode.commands.registerCommand('navy.askAboutLine', (uri, line) => {
-      provider.focus();
+    vscode.commands.registerCommand('navy.askAboutLine', async (uri, line) => {
+      await provider.focus();
       const relativePath = vscode.workspace.asRelativePath(uri);
       provider.askNavy(`Explain the function at line ${line} of ${relativePath}. What does it do, are there any issues, and how could it be improved?`, false, null, [uri.fsPath]);
     }),
@@ -3334,15 +3842,16 @@ function activate(context) {
     vscode.languages.registerCodeActionsProvider({ pattern: '**' }, new NavyFixCodeActionProvider(provider), {
       providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
     }),
-    vscode.commands.registerCommand('navy.fixDiagnostic', (uri, diag) => {
+    vscode.commands.registerCommand('navy.fixDiagnostic', async (uri, diag) => {
       const rel = vscode.workspace.asRelativePath(uri);
       const line = diag.range.start.line + 1;
       const sev = diag.severity === 0 ? 'error' : 'warning';
       const prompt = `Fix the ${sev} on line ${line} of ${rel}:\n\n"${diag.message}"\n\nRead the file, understand the root cause, then apply the minimal correct fix.`;
-      provider.focus();
+      await provider.focus();
       provider.askNavy(prompt, false, null, [uri.fsPath]);
     }),
     vscode.commands.registerCommand('navy.exportConversation', () => provider.view?.webview.postMessage({ type: 'requestExport' })),
+    vscode.commands.registerCommand('navy.debugDumpDom', () => provider.view?.webview.postMessage({ type: 'debugDump' })),
     vscode.commands.registerCommand('navy.reviewPR', () => provider.generatePRReview()),
     vscode.window.onDidChangeActiveTextEditor(editor => {
       if (editor) provider.applyGutterDecorations(editor);

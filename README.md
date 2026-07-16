@@ -13,10 +13,12 @@
 - **11 AI providers** — Ollama, LM Studio, OpenAI, Anthropic Claude, DeepSeek, Google Gemini, xAI Grok, z.ai, Groq, OpenRouter, and any custom OpenAI-compatible endpoint
 - **Per-provider API keys** — switch providers without losing other keys
 - **Web search** — built-in search via DuckDuckGo (no key needed), Brave Search, or Tavily
+- **Terminal cards** — every command shows an IN/OUT card in the chat with live output, exit status, and expandable logs
 - **Dev server management** — start, monitor, and stop your dev server from the chat
 - **Git integration** — status, diff, log, and blame tools available to the agent
+- **Fast search** — ripgrep-backed, `.gitignore`-aware codebase search
 - **Inline completions** — ghost-text suggestions as you type (opt-in, uses the active provider)
-- **Undo** — revert the last edit or the entire last turn with one click
+- **Undo & Redo** — revert any edit, rename, or file deletion (survives window reloads), and redo an accidental undo
 - **Code Lens** — "Ask Navy" buttons above functions in the editor
 
 ---
@@ -118,13 +120,13 @@ API keys are **not** stored in settings — they are stored in VS Code's encrypt
 
 | Command | Shortcut (Win/Linux) | Shortcut (Mac) |
 |---|---|---|
-| Focus Chat | `Ctrl+Shift+O` | `Cmd+Shift+O` |
-| Inline Edit Selection | `Ctrl+Shift+E` | `Cmd+Shift+E` |
-| Undo Last Turn | `Ctrl+Shift+Z` | `Cmd+Shift+Z` |
-| Generate Commit Message | `Ctrl+Shift+G` | `Cmd+Shift+G` |
-| Run Tests | `Ctrl+Shift+T` | `Cmd+Shift+T` |
-| Clear Chat | `Ctrl+Shift+K` | `Cmd+Shift+K` |
-| Insert Last Reply | `Ctrl+Shift+I` | `Cmd+Shift+I` |
+| Focus Chat | `Ctrl+Alt+N` | `Cmd+Alt+N` |
+| Inline Edit Selection | `Ctrl+Alt+E` | `Cmd+Alt+E` |
+| Undo Last Turn | `Ctrl+Alt+Z` | `Cmd+Alt+Z` |
+| Generate Commit Message | `Ctrl+Alt+G` | `Cmd+Alt+G` |
+| Run Tests | `Ctrl+Alt+T` | `Cmd+Alt+T` |
+| Clear Chat (Navy focused) | `Ctrl+Alt+K` | `Cmd+Alt+K` |
+| Insert Last Reply | `Ctrl+Alt+I` | `Cmd+Alt+I` |
 
 All commands are also accessible via the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) — search **Navy**.
 

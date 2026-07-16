@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -15,8 +15,18 @@
   "license": "MIT",
   "preview": true,
   "keywords": [
-    "ai", "copilot", "agent", "ollama", "openai", "anthropic", "claude",
-    "code assistant", "inline completion", "chat", "deepseek", "gemini"
+    "ai",
+    "copilot",
+    "agent",
+    "ollama",
+    "openai",
+    "anthropic",
+    "claude",
+    "code assistant",
+    "inline completion",
+    "chat",
+    "deepseek",
+    "gemini"
   ],
   "galleryBanner": {
     "color": "#0d1b2a",
@@ -29,7 +39,9 @@
   "categories": [
     "AI"
   ],
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
@@ -142,6 +154,21 @@
           "default": "",
           "description": "Base URL override for the provider API (e.g. https://api.openai.com/v1). Used when provider is 'custom' or to override a built-in provider's URL."
         },
+        "navy.thinkingLevel": {
+          "type": "string",
+          "default": "medium",
+          "enum": [
+            "fast",
+            "medium",
+            "high"
+          ],
+          "enumDescriptions": [
+            "Lowest latency — minimal reasoning (temperature 0, no extended thinking)",
+            "Balanced (default)",
+            "Deepest reasoning — extended thinking on Claude, high reasoning effort on o-series, think mode on Ollama reasoning models"
+          ],
+          "description": "How much reasoning effort the model should spend per request."
+        },
         "navy.searchApiKey": {
           "type": "string",
           "default": "",
@@ -180,6 +207,10 @@
         "title": "Navy Coder: Undo Last Turn (all edits)"
       },
       {
+        "command": "navy.redoLastUndo",
+        "title": "Navy Coder: Redo (reverse last undo)"
+      },
+      {
         "command": "navy.inlineEdit",
         "title": "Navy Coder: Inline Edit Selection"
       },
@@ -202,6 +233,18 @@
       {
         "command": "navy.explainTerminalError",
         "title": "Navy Coder: Explain Terminal Error"
+      },
+      {
+        "command": "navy.exportConversation",
+        "title": "Navy Coder: Export Conversation"
+      },
+      {
+        "command": "navy.reviewPR",
+        "title": "Navy Coder: Review Pull Request"
+      },
+      {
+        "command": "navy.debugDumpDom",
+        "title": "Navy Coder: Debug — Dump Chat DOM"
       }
     ],
     "viewsContainers": {
@@ -236,53 +279,62 @@
     "keybindings": [
       {
         "command": "navy.focusChat",
-        "key": "ctrl+shift+o",
-        "mac": "cmd+shift+o"
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
       },
       {
         "command": "navy.insertLastReply",
-        "key": "ctrl+shift+i",
-        "mac": "cmd+shift+i"
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i"
       },
       {
         "command": "navy.clearChat",
-        "key": "ctrl+shift+k",
-        "mac": "cmd+shift+k"
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "focusedView == navy.chatView"
       },
       {
         "command": "navy.inlineEdit",
-        "key": "ctrl+shift+e",
-        "mac": "cmd+shift+e",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
         "when": "editorTextFocus"
       },
       {
         "command": "navy.undoLastTurn",
-        "key": "ctrl+shift+z",
-        "mac": "cmd+shift+z"
+        "key": "ctrl+alt+z",
+        "mac": "cmd+alt+z"
+      },
+      {
+        "command": "navy.redoLastUndo",
+        "key": "ctrl+alt+shift+z",
+        "mac": "cmd+alt+shift+z"
       },
       {
         "command": "navy.generateCommit",
-        "key": "ctrl+shift+g",
-        "mac": "cmd+shift+g"
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g"
       },
       {
         "command": "navy.runTests",
-        "key": "ctrl+shift+t",
-        "mac": "cmd+shift+t"
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
       }
     ]
   },
   "scripts": {
-    "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "check": "node --check src/extension.js",
     "vscode:prepublish": "npm run build",
-    "package": "vsce package"
+    "package": "vsce package",
+    "test": "node test/run.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.6.0",
+    "jsdom": "^29.1.1",
     "prettier": "^3.9.4"
   }
 }
