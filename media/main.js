@@ -80,7 +80,6 @@ function setStatus(text) {
   if (statusText) {
     statusText.textContent = text;
   }
-  console.log('[Navy Coder]', text);
 }
 
 function updateSendButton() {
@@ -536,10 +535,11 @@ window.addEventListener('message', (event) => {
     setBusy(false);
     // A command still streaming when the turn ends (Stop pressed) — close its card.
     if (activeTermCard) finalizeTermCard('__stopped__');
-    if (activeAssistantContent.trim() === '' && activeAssistantMessage) {
-      // No text was generated — remove the empty bubble entirely so the UI doesn't
-      // show a blank assistant turn. Tool-call cards are appended to messagesEl directly
-      // and remain visible regardless.
+    // Remove the bubble when nothing VISIBLE was produced — either no content at
+    // all, or content that renders empty (e.g. a reply that was purely tool-call
+    // JSON from a small model). The tool cards remain regardless.
+    const renderedEmpty = activeAssistantBubble && !activeAssistantBubble.innerHTML.trim();
+    if ((activeAssistantContent.trim() === '' || renderedEmpty) && activeAssistantMessage) {
       activeAssistantMessage.remove();
       activeAssistantMessage = null;
     } else {
@@ -876,26 +876,6 @@ window.addEventListener('message', (event) => {
     }
   }
 
-  if (message.type === 'debugDump') {
-    // Serialize the real rendered chat DOM — tag, classes, actual layout box,
-    // computed visibility — so rendering issues can be diagnosed from a file.
-    const out = ['NAVY DOM DUMP — build 0.2.1-cards — ' + new Date().toISOString()];
-    const walk = (el, d) => {
-      if (d > 4) return;
-      let line = '  '.repeat(d);
-      try {
-        const r = el.getBoundingClientRect();
-        const cs = window.getComputedStyle(el);
-        const cls = typeof el.className === 'string' && el.className ? '.' + el.className.trim().replace(/\s+/g, '.') : '';
-        const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
-        line += `<${el.tagName.toLowerCase()}${cls}> ${Math.round(r.width)}x${Math.round(r.height)} display=${cs.display} opacity=${cs.opacity} visibility=${cs.visibility} border=${cs.borderTopWidth}/${cs.borderLeftWidth} color=${cs.color} bg=${cs.backgroundColor} | "${text}"`;
-      } catch (e) { line += '(error: ' + e.message + ')'; }
-      out.push(line);
-      for (const c of el.children) walk(c, d + 1);
-    };
-    try { for (const c of messagesEl.children) walk(c, 0); } catch (e) { out.push('WALK ERROR: ' + e.message); }
-    vscode.postMessage({ type: 'debugDumpResult', dump: out.join('\n') });
-  }
 
   if (message.type === 'requestExport') {
     const lines = ['# Navy Chat Export', `> ${new Date().toLocaleString()}`, ''];
@@ -1889,6 +1869,14 @@ function appendAssistantText(text) {
   }
   display = display.trim();
 
+  // A response that's a raw tool-call JSON (small models that print the call as
+  // text) is executed by the agent, not shown — suppress it while streaming too so
+  // it doesn't flash as a JSON block before the tool card replaces it.
+  if (/^\{\s*"(?:name|tool|function)"\s*:/.test(display)) {
+    if (statusText) statusText.textContent = 'Working…';
+    return;
+  }
+
   // Models emit stray newline-only chunks between tool calls — don't render a pre
   // for pure whitespace or it grows into a tall blank block in the chat.
   if (!display && !thinkingLive) return;
@@ -2002,6 +1990,50 @@ function attachCodeBlockActions(container) {
 
 // ─── Markdown renderer ────────────────────────────────────────────────────────
 
+// True when a string is a tool call the model printed as raw JSON instead of
+// using the tool API (common with small local models). Such text is executed by
+// the agent, never meant for the user — so it must not render as a chat bubble.
+function isToolCallJson(s) {
+  const t = (s || '').trim();
+  if (t[0] !== '{' || t[t.length - 1] !== '}') return false;
+  try {
+    const o = JSON.parse(t);
+    const name = o.name || o.tool || o.function;
+    const args = o.arguments ?? o.parameters ?? o.args ?? o.input;
+    return typeof name === 'string' && args !== undefined && typeof args === 'object';
+  } catch { return false; }
+}
+
+// Remove every top-level tool-call JSON object from text, including several
+// concatenated back-to-back ({...}{...}{...}) — small models emit tool calls
+// this way and they must never render (the agent executes them). Brace-matched
+// so strings containing braces don't confuse it.
+function stripToolCallJson(text) {
+  let out = '', i = 0;
+  const n = text.length;
+  while (i < n) {
+    if (text[i] === '{') {
+      let depth = 0, inStr = false, esc = false, end = -1;
+      for (let j = i; j < n; j++) {
+        const c = text[j];
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) { end = j + 1; break; } }
+      }
+      if (end !== -1) {
+        const obj = text.slice(i, end);
+        if (isToolCallJson(obj)) { i = end; continue; } // drop this tool call
+        out += obj; i = end; continue;
+      }
+    }
+    out += text[i++];
+  }
+  return out;
+}
+
 function renderMarkdown(text) {
   // Normalize line endings first — models on some backends emit \r\n.
   let cleaned = text
@@ -2009,6 +2041,14 @@ function renderMarkdown(text) {
     .replace(/<tool\s+name="[^"]*"[^>]*>[\s\S]*?(?:<\/tool\s*>|<\|tool_call_end\|>)/g, '')
     .replace(/<\|tool_calls_section_(?:start|end)\|>/g, '')
     .trim();
+
+  // Strip tool-call JSON small models print as text — one object, or several
+  // concatenated ({...}{...}{...}). If nothing but tool calls remains, render
+  // nothing (the tool activity card is the real feedback).
+  cleaned = stripToolCallJson(cleaned).trim();
+  if (!cleaned) return '';
+  // Fenced tool-call JSON inside other text → drop just that block.
+  cleaned = cleaned.replace(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/g, (m, body) => isToolCallJson(body) ? '' : m).trim();
 
   // Extract <think>…</think> blocks (DeepSeek-R1, Qwen3, etc.) and render as collapsible.
   let thinkingHtml = '';

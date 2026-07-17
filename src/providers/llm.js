@@ -533,6 +533,24 @@ async function fetchWithRetry(url, init) {
       } catch {}
     }
 
+    // Bare JSON tool calls — small local models (qwen-coder, llama, etc.) often
+    // can't use native tool calling or the XML format and just print the call as
+    // raw JSON text. Fallback only: fire when nothing else matched AND the object
+    // clearly names a KNOWN tool with an arguments object, so we never mistake
+    // JSON the user is merely discussing for a tool call.
+    if (calls.length === 0) {
+      for (const obj of extractJsonObjects(text)) {
+        if (!obj || typeof obj !== 'object') continue;
+        const name = obj.name || obj.tool || obj.function;
+        const rawArgs = obj.arguments ?? obj.parameters ?? obj.args ?? obj.input;
+        if (typeof name !== 'string' || rawArgs === undefined) continue;
+        if (!TOOLS.some(t => t.name === name)) continue;
+        let args = rawArgs;
+        if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+        calls.push({ name, args: args && typeof args === 'object' ? args : {} });
+      }
+    }
+
     return calls;
   }
 

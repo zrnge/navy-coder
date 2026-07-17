@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -241,10 +241,6 @@
       {
         "command": "navy.reviewPR",
         "title": "Navy Coder: Review Pull Request"
-      },
-      {
-        "command": "navy.debugDumpDom",
-        "title": "Navy Coder: Debug — Dump Chat DOM"
       }
     ],
     "viewsContainers": {

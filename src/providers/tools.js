@@ -299,6 +299,18 @@ const TOOLS = [
     }
   },
   {
+    name: 'find_relevant_files',
+    description: 'Find the files most relevant to a task or question, ranked. Give it the user\'s request or a set of keywords/symbol names; it scores every source file by symbol definitions, filename matches, and term frequency and returns the top candidates with a reason. Use this FIRST on an unfamiliar or large codebase to decide which files to read — it is far more targeted than list_files or a raw search.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'The task description, question, or space-separated keywords / symbol names to rank files against.' },
+        maxResults: { type: 'number', description: 'How many ranked files to return (default 8).' }
+      },
+      required: ['query']
+    }
+  },
+  {
     name: 'find_symbol',
     description: 'Find where a symbol (function, class, variable, interface, etc.) is defined in the workspace using the language server. Returns file path, line number, symbol kind, and a code snippet. Faster and more precise than search_codebase for looking up definitions.',
     parameters: {
@@ -307,6 +319,20 @@ const TOOLS = [
         name: { type: 'string', description: 'Symbol name to look up (e.g. "MyClass", "parseUser", "AuthToken").' }
       },
       required: ['name']
+    }
+  },
+  {
+    name: 'rename_symbol',
+    description: 'Rename a symbol (variable, function, class, method, etc.) across the ENTIRE workspace using the language server — a true structural rename that updates every reference and leaves unrelated text that merely matches the name untouched. Give the file, the 1-indexed line where the symbol appears, its exact current name, and the new name. Strongly prefer this over apply_edit for renames.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'A file where the symbol appears (usually its definition).' },
+        line: { type: 'number', description: '1-indexed line number on which the symbol name appears in that file.' },
+        name: { type: 'string', description: 'The exact current symbol name.' },
+        newName: { type: 'string', description: 'The new name.' }
+      },
+      required: ['path', 'line', 'name', 'newName']
     }
   },
   {
@@ -350,17 +376,17 @@ const TOOL_PROMPT = `You are Navy Coder, an expert AI coding assistant embedded 
 
 NEVER say "please provide the code", "paste the file", or "I don't have access" — you DO have access, use your tools.
 NEVER refuse a coding task because you "don't see the code" — call list_files then read_file.
-NEVER invent a task the user did not request. If the message is a greeting, question, or is ambiguous, reply conversationally and ask what they need.
+NEVER invent a task the user did not request. If the message is a greeting, small talk, or is ambiguous, reply in ONE short plain-text sentence and DO NOT call any tool (no web_search, no reading files) — just answer.
 When the user DOES ask to review, fix, explain, or improve code, START by reading the relevant files immediately — do not ask them to paste anything.
 
 ## Tool usage
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, find_symbol, find_references, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
 
 ## Workflow rules
-1. Review / analyse requests → call list_files on the project root first, then read_file on the files you need.
+1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
 2. Edit requests → read_file first, then apply_edit (search string must match the file exactly).
 3. New file requests → use write_file with the full content.
 4. Never use run_command to write files.

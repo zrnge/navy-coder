@@ -16,7 +16,8 @@
 - **Terminal cards** — every command shows an IN/OUT card in the chat with live output, exit status, and expandable logs
 - **Dev server management** — start, monitor, and stop your dev server from the chat
 - **Git integration** — status, diff, log, and blame tools available to the agent
-- **Fast search** — ripgrep-backed, `.gitignore`-aware codebase search
+- **Fast search & retrieval** — ripgrep-backed `.gitignore`-aware search, plus a ranked "find relevant files" retriever that points the agent at the right code on large repos
+- **Rename & delete are undoable** — transactional undo/redo across edits, renames, and file deletions
 - **Inline completions** — ghost-text suggestions as you type (opt-in, uses the active provider)
 - **Undo & Redo** — revert any edit, rename, or file deletion (survives window reloads), and redo an accidental undo
 - **Code Lens** — "Ask Navy" buttons above functions in the editor

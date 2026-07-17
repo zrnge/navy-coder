@@ -1,8 +1,17 @@
 # Changelog
 
-## [0.2.1] - 2026-07-15
+## [0.2.2] - 2026-07-17
 
 ### Added
+- **Codebase retrieval** — a new `find_relevant_files` tool ranks source files by symbol definitions, filename matches, and term frequency (BM25-style saturation) so the agent targets the right files instead of blindly guessing on large repos. On a code-oriented request Navy also auto-injects a ranked shortlist of likely-relevant files up front. Works fully offline, no embeddings.
+- **`rename_symbol`** — structural, workspace-wide rename via the language server (updates every reference, leaves matching-but-unrelated text alone), fully undoable. Prefer it over text-replace for renames.
+- **Smarter failed-edit recovery** — when an `apply_edit` search string isn't found, Navy now shows the closest-matching region of the real file so the model (especially weaker/local ones) can correct in one round-trip instead of guessing.
+
+### Fixed
+- **Small-model support** — models that can't use the native tool-calling API (e.g. qwen-coder-7b) emit tool calls as raw JSON text; Navy now parses those bare-JSON calls so tools actually run, and never renders tool-call JSON as a chat message. Greeting/small-talk prompting tightened so small models stop firing spurious searches.
+
+### Changed
+- Webview HTML shell extracted from `extension.js` into its own module; test suite now 81 checks (added retrieval, rename_symbol, edit-recovery, and end-to-end undo coverage through a mock-vscode + real temp filesystem).
 - Terminal IN/OUT cards: every `run_command` / `run_tests` gets its own card in the chat — command in, live output out (stderr tinted), status chip (exit 0 / failed / timeout / rejected), long output collapses behind "Click to expand"
 - Applied edits keep an expandable diff preview (changed lines in red/green) instead of collapsing to a bare "Applied" line
 - `rename_file` tool — moves/renames within the workspace with approval gating
@@ -15,7 +24,8 @@
 - **Transactional undo**: renames and single-file deletions are now undoable too, and undo asks before discarding edits you made by hand after Navy's write
 - **Session digest**: long conversations condense their oldest turns into a summary instead of forgetting them
 - File writes from the main chat and `/bg` background tasks are serialized — no more interleaved edits to the same file
-- Real test suite (`npm test`): 32 checks covering the edit engine, context compaction, markdown rendering, and a full simulated webview conversation
+- Real test suite (`npm test`): 51 checks covering the edit engine, context compaction, markdown rendering, a full simulated webview conversation, and end-to-end undo/redo (rename, delete, multi-edit turns, hand-edit detection) driven through the real provider against a mock-vscode + temp filesystem
+- Undo fixes: "Undo Last Turn" now returns files edited multiple times in a turn to their true turn-start content (previously only the last edit was reverted); no more spurious "file was modified" warning on multi-edit undos; undo/redo now go through the write mutex; background-task edits form their own undo group; system-prompt sections are capped so a huge repo/memory can't overflow the context window
 - Version number shown on the welcome screen
 
 ### Fixed

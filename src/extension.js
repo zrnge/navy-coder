@@ -1,5 +1,6 @@
 const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./providers/llm.js');
 const { openAiCompatBase } = require('./providers/endpoints.js');
+const { getWebviewHtml } = require('./webview-html.js');
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
@@ -266,18 +267,6 @@ class NavyCoderViewProvider {
         case 'exportConversation':
           await this.exportConversation(message.text || '');
           break;
-        case 'debugDumpResult': {
-          // Written to a FIXED location so it's findable regardless of project.
-          try {
-            const target = path.join(require('os').tmpdir(), 'navy-debug-dom.txt');
-            await fs.promises.writeFile(target, message.dump || '(empty dump)', 'utf8');
-            const doc = await vscode.workspace.openTextDocument(target);
-            await vscode.window.showTextDocument(doc, { preview: false });
-          } catch (e) {
-            vscode.window.showErrorMessage('Navy: debug dump failed — ' + e.message);
-          }
-          break;
-        }
         case 'reviewPR':
           await this.generatePRReview();
           break;
@@ -881,6 +870,26 @@ class NavyCoderViewProvider {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'none';
     const repoMap = await this.buildRepoMap();
 
+    // Auto-retrieval: on a code-oriented request, hand the model a ranked shortlist
+    // of likely-relevant files up front so it doesn't have to guess-and-read. Only
+    // paths (not contents) — the model reads the ones it wants. Gated to code tasks
+    // and bounded, so simple chat and huge repos stay fast; failures are non-fatal.
+    let relevantBlock = '';
+    try {
+      const isCodeTask = /\b(fix|bug|edit|update|change|modify|refactor|implement|add|remove|rename|review|debug|explain|where|find|which|how|trace|test|error|function|class|method|component|endpoint|route|handler|module|import|feature)\b/i.test(prompt);
+      if (root !== 'none' && isCodeTask) {
+        const terms = this._tokenizeQuery(prompt);
+        if (terms.length) {
+          const hits = await this._collectRelevance(root, terms, { maxFiles: 800 });
+          const ranked = this._rankRelevance(hits, terms).slice(0, 6);
+          if (ranked.length) {
+            relevantBlock = '\n\n## Likely relevant files (ranked for this request — read the ones you need, this is a hint not a limit):\n'
+              + ranked.map(h => `- ${h.rel}${h.defs ? ' (defines a queried symbol)' : ''}`).join('\n');
+          }
+        }
+      }
+    } catch { /* retrieval is best-effort */ }
+
     let diagnosticsContext = '';
     if (activeFile) {
       try {
@@ -929,17 +938,22 @@ class NavyCoderViewProvider {
         + `- Date/time: ${nowStr}\n`
         + `If asked about the project name, directory, or OS, answer using ONLY the values above.`;
     }
+    // Cap each variable section so the system prompt can't itself overflow the
+    // context window on a huge repo / big memory / long rules file — _compactMessages
+    // only prunes tool results and images, never the system message.
+    const cap = (s, n) => s.length > n ? s.slice(0, n) + `\n…[truncated ${s.length - n} chars]` : s;
     if (projectRules) {
-      systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults):\n' + projectRules;
+      systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults):\n' + cap(projectRules, 8000);
     }
     if (projectMemory) {
-      systemContent += '\n\n## Project Memory (facts you learned in previous sessions — treat as ground truth unless you discover otherwise):\n' + projectMemory;
+      systemContent += '\n\n## Project Memory (facts you learned in previous sessions — treat as ground truth unless you discover otherwise):\n' + cap(projectMemory, 6000);
     }
     if (this.sessionDigest) {
-      systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + this.sessionDigest;
+      systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + cap(this.sessionDigest, 6000);
     }
     if (diagnosticsContext) systemContent += diagnosticsContext;
-    systemContent += '\n\nRepository map:\n' + repoMap;
+    systemContent += '\n\nRepository map:\n' + cap(repoMap, 12000);
+    if (relevantBlock) systemContent += cap(relevantBlock, 2000);
 
     const messages = [{ role: 'system', content: systemContent }];
 
@@ -1144,14 +1158,15 @@ class NavyCoderViewProvider {
 
         // Read-only tools are safe to run in parallel; writes must be sequential.
         const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_relevant_files','git_status','git_diff','git_log','git_blame','get_diagnostics',
           'find_symbol','find_references',
           'web_search','fetch_url','get_terminal_output','read_process_output']);
 
         // Tools whose results are stable — dedup prevents re-reading the same file in a loop.
+        // web_search included so a weak model can't spin on the same query repeatedly.
         const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'git_status','git_diff','git_log','git_blame','get_diagnostics',
-          'find_symbol','find_references']);
+          'find_relevant_files','git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_symbol','find_references','web_search']);
         // Command tools where repeated failure is tracked.
         const COMMAND_TOOLS = new Set(['run_command', 'run_tests']);
         // Write tools that touch files (used for the change-report footer).
@@ -1240,6 +1255,9 @@ class NavyCoderViewProvider {
             }
             if (tool.name === 'rename_file' && typeof result === 'string' && result.startsWith('Renamed')) {
               if (tool.args?.to) taskChanges.touched.set(tool.args.to, 'renamed');
+            }
+            if (tool.name === 'rename_symbol' && typeof result === 'string' && result.startsWith('Renamed')) {
+              taskChanges.touched.set(tool.args?.name || 'symbol', 'renamed');
             }
 
             this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result });
@@ -1364,11 +1382,19 @@ class NavyCoderViewProvider {
     return run;
   }
 
-  async executeTool(tool) {
+  async executeTool(tool, turnIdOverride) {
     const MUTATING = new Set(['write_file', 'apply_edit', 'edit_line', 'delete_line',
-      'insert_after_line', 'delete_file', 'rename_file']);
+      'insert_after_line', 'delete_file', 'rename_file', 'rename_symbol']);
     if (MUTATING.has(tool.name)) {
-      return await this._withWriteLock(() => this._executeToolInner(tool));
+      // Inside the mutex only one mutating tool runs at a time, so this field is
+      // safe to set/restore around it — lets background-task edits carry their own
+      // turnId instead of folding into the main turn's Undo Last Turn grouping.
+      return await this._withWriteLock(async () => {
+        const prev = this._checkpointTurnId;
+        this._checkpointTurnId = turnIdOverride || this.currentTurnId;
+        try { return await this._executeToolInner(tool); }
+        finally { this._checkpointTurnId = prev; }
+      });
     }
     return await this._executeToolInner(tool);
   }
@@ -1383,6 +1409,7 @@ class NavyCoderViewProvider {
         case 'write_file': return await this.toolWriteFile(tool.args.path, tool.args.content);
         case 'delete_file': return await this.toolDeleteFile(tool.args.path);
         case 'rename_file': return await this.toolRenameFile(tool.args.from, tool.args.to);
+        case 'rename_symbol': return await this.toolRenameSymbol(tool.args.path, tool.args.line, tool.args.name, tool.args.newName);
         case 'list_files': return await this.toolListFiles(tool.args.path, tool.args.maxDepth);
         case 'search_files': return await this.toolSearchFiles(tool.args.query);
         case 'apply_edit': return await this.toolApplyEdit(tool.args.path, tool.args.search, tool.args.replace);
@@ -1406,6 +1433,7 @@ class NavyCoderViewProvider {
         case 'get_terminal_output': return await this.toolGetTerminalOutput(tool.args.lines);
         case 'run_tests': return await this.toolRunTests(tool.args.filter);
         case 'search_codebase': return await this.toolSearchCodebase(tool.args.query, tool.args.filePattern, tool.args.contextLines);
+        case 'find_relevant_files': return await this.toolFindRelevantFiles(tool.args.query, tool.args.maxResults);
         case '__parse_error__':
           return 'Tool call JSON was invalid and could not be parsed. Tool attempted: ' + tool.args.tool + '. Error: ' + tool.args.error + '. Please re-emit the tool block with valid JSON.';
         default: return 'Unknown tool: ' + tool.name;
@@ -1710,6 +1738,77 @@ class NavyCoderViewProvider {
       return `Renamed ${fromPath} → ${toPath}`;
     } catch (e) {
       return `Error renaming ${fromName}: ${e.message}`;
+    }
+  }
+
+  // Structural, workspace-wide rename via the language server. Updates every
+  // reference correctly (unlike text replace) and records an undo checkpoint per
+  // affected file so the whole rename is reversible as one turn.
+  async toolRenameSymbol(inputPath, line, name, newName) {
+    if (!inputPath || !line || !name || !newName) {
+      return 'Error: path, line, name, and newName are all required.';
+    }
+    const filePath = this.resolveWorkspacePath(inputPath);
+    const text = await this.readFileText(filePath);
+    if (text === null) return 'Error: could not read ' + inputPath;
+    const lines = text.split('\n');
+    const idx = line - 1;
+    if (idx < 0 || idx >= lines.length) return `Error: line ${line} is out of range (file has ${lines.length} lines).`;
+    const col = lines[idx].indexOf(name);
+    if (col === -1) return `Error: "${name}" not found on line ${line} of ${path.basename(filePath)}. Read the file to confirm the exact line and spelling.`;
+
+    const uri = vscode.Uri.file(filePath);
+    try {
+      await vscode.workspace.openTextDocument(uri); // ensure the LS has indexed it
+      const position = new vscode.Position(idx, col + 1);
+      const edit = await vscode.commands.executeCommand(
+        'vscode.executeDocumentRenameProvider', uri, position, newName
+      );
+      const entries = edit && typeof edit.entries === 'function' ? edit.entries() : [];
+      if (!entries.length) {
+        return `The language server could not rename "${name}" (no rename provider for this file type, or the symbol isn't renameable). Fall back to apply_edit / search_codebase.`;
+      }
+
+      // Containment: every other write tool refuses to touch files outside the
+      // workspace, but these edit targets come straight from the language server
+      // (could include SDK stubs / linked files). If ANY is outside the root,
+      // refuse the whole rename — never partially apply or edit outside the project.
+      const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (root) {
+        const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
+        const nRoot = fold(path.normalize(root));
+        const outside = entries
+          .map(([u]) => u.fsPath)
+          .filter(fp => { const n = fold(path.normalize(fp)); return n !== nRoot && !n.startsWith(nRoot + path.sep); });
+        if (outside.length) {
+          return `Refused: renaming "${name}" would also modify ${outside.length} file(s) OUTSIDE the workspace (e.g. ${path.basename(outside[0])}). Navy only edits files inside the project. Use apply_edit for an in-project-only change if that's what you intended.`;
+        }
+      }
+
+      const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
+      if (approvalMode !== 'auto-approve') {
+        const choice = await vscode.window.showWarningMessage(
+          `Navy wants to rename "${name}" → "${newName}" across ${entries.length} file${entries.length !== 1 ? 's' : ''} (structural, all references).`,
+          { modal: true }, 'Rename'
+        );
+        if (choice !== 'Rename') return `Rename of "${name}" cancelled by user.`;
+      }
+
+      // Snapshot every affected file BEFORE applying so undo can restore them all.
+      const affected = [];
+      for (const [fileUri] of entries) {
+        const original = await this.readFileText(fileUri.fsPath);
+        if (original !== null) {
+          this._pushCheckpoint({ kind: 'edit', filePath: fileUri.fsPath, originalText: original });
+          affected.push(fileUri.fsPath);
+        }
+      }
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (!ok) return `Error: the workspace edit for renaming "${name}" was rejected.`;
+      const names = affected.map(f => path.basename(f));
+      return `Renamed "${name}" → "${newName}" across ${affected.length} file${affected.length !== 1 ? 's' : ''}: ${names.join(', ')}`;
+    } catch (e) {
+      return `rename_symbol failed: ${e.message}. Fall back to apply_edit.`;
     }
   }
 
@@ -2035,7 +2134,18 @@ class NavyCoderViewProvider {
     if (newText instanceof Error) return 'Error: ' + newText.message;
 
     if (newText === null) {
-      // Auto-retry hint: show first 300 chars so the model can correct without a round-trip.
+      // "Did you mean" recovery: show the model the CLOSEST-matching region of the
+      // real file so it can correct in one round-trip instead of flailing — a big
+      // help for weaker models that don't reproduce whitespace/text exactly.
+      const region = this._closestRegion(existingText, search);
+      if (region) {
+        return (
+          `Error: SEARCH text not found verbatim in ${path.basename(filePath)}.\n` +
+          `Closest matching region (~${region.score}% similar, around line ${region.startLine}) — copy your SEARCH block from here EXACTLY, including whitespace:\n` +
+          '```\n' + region.text + '\n```\n' +
+          'Re-emit apply_edit with the search copied character-for-character from the lines above. If you meant to replace most of the file, use write_file.'
+        );
+      }
       const preview = existingText.slice(0, 300).replace(/\n/g, '\\n');
       return (
         `Error: The search text was not found verbatim in ${path.basename(filePath)}.\n` +
@@ -2046,6 +2156,37 @@ class NavyCoderViewProvider {
     }
 
     return await this.requestWriteApproval(inputPath, filePath, existingText, newText);
+  }
+
+  // Find the file region most similar to a failed SEARCH block, for the
+  // "did you mean" recovery hint. Pure. Returns { startLine, score, text } or null.
+  _closestRegion(fileText, search) {
+    const orig = fileText.split('\n');
+    const sTrim = search.split('\n').map(l => l.trim());
+    const sLen = sTrim.length;
+    if (!sLen || orig.length === 0 || sLen > orig.length) return null;
+    const sim = (a, b) => {
+      a = a.trim(); b = b.trim();
+      if (a === b) return a === '' ? 0.5 : 1;
+      if (!a || !b) return 0;
+      const ta = new Set(a.split(/\W+/).filter(Boolean));
+      const tb = new Set(b.split(/\W+/).filter(Boolean));
+      if (!ta.size || !tb.size) return 0;
+      let inter = 0;
+      for (const t of ta) if (tb.has(t)) inter++;
+      return inter / Math.max(ta.size, tb.size);
+    };
+    let best = { score: -1, idx: 0 };
+    for (let i = 0; i <= orig.length - sLen; i++) {
+      let sc = 0;
+      for (let j = 0; j < sLen; j++) sc += sim(orig[i + j], sTrim[j]);
+      sc /= sLen;
+      if (sc > best.score) best = { score: sc, idx: i };
+    }
+    if (best.score <= 0.1) return null; // nothing meaningfully close — preview fallback
+    const start = best.idx;
+    const text = orig.slice(start, start + sLen).map((l, k) => `${start + k + 1}: ${l}`).join('\n');
+    return { startLine: start + 1, score: Math.round(best.score * 100), text };
   }
 
   // Central write-approval path used by both toolApplyEdit and toolWriteFile.
@@ -2188,7 +2329,7 @@ class NavyCoderViewProvider {
       this.redoStack = [];
       this.view?.webview.postMessage({ type: 'redoState', count: 0 });
     }
-    this.checkpoints.push({ time: Date.now(), turnId: this.currentTurnId, ...entry });
+    this.checkpoints.push({ time: Date.now(), turnId: this._checkpointTurnId || this.currentTurnId, ...entry });
     if (this.checkpoints.length > 200) this.checkpoints.splice(0, this.checkpoints.length - 200);
     // Entry cap alone isn't enough — 200 snapshots of multi-MB files would pin
     // hundreds of MB. Cap total retained bytes too, evicting oldest first.
@@ -2264,10 +2405,16 @@ class NavyCoderViewProvider {
 
   // If the user hand-edited any of these files AFTER Navy's write, undo would
   // silently discard their work — ask first.
+  // cps must be newest-first: only the NEWEST checkpoint per file carries the hash
+  // of Navy's last write, i.e. what the disk should still equal. Older checkpoints
+  // for the same file hash intermediate states and would false-positive.
   async _confirmUndoSafe(cps) {
     const touched = [];
+    const seen = new Set();
     for (const cp of cps) {
       if (cp.kind !== 'edit' || !cp.newHash) continue;
+      if (seen.has(cp.filePath)) continue;
+      seen.add(cp.filePath);
       const current = await this.readFileText(cp.filePath);
       if (current === null) continue;
       const hash = crypto.createHash('md5').update(current, 'utf8').digest('hex');
@@ -2297,15 +2444,19 @@ class NavyCoderViewProvider {
     }
     if (!(await this._confirmUndoSafe([last]))) return;
     this.checkpoints.pop();
-    try {
-      const redoOp = await this._undoOne(last);
-      this.redoStack.push({ ops: [redoOp] });
-      const what = last.kind === 'rename' ? 'rename' : last.kind === 'delete' ? 'deletion' : 'edit';
-      vscode.window.showInformationMessage(`Undid last Navy Coder ${what} (Redo is available)`);
-    } catch (error) {
-      this.checkpoints.push(last); // restore the checkpoint — the undo didn't happen
-      vscode.window.showErrorMessage('Undo failed: ' + error.message);
-    }
+    // Through the write mutex so an in-flight background-task write to the same
+    // file can't interleave with the restore.
+    await this._withWriteLock(async () => {
+      try {
+        const redoOp = await this._undoOne(last);
+        this.redoStack.push({ ops: [redoOp] });
+        const what = last.kind === 'rename' ? 'rename' : last.kind === 'delete' ? 'deletion' : 'edit';
+        vscode.window.showInformationMessage(`Undid last Navy Coder ${what} (Redo is available)`);
+      } catch (error) {
+        this.checkpoints.push(last); // restore the checkpoint — the undo didn't happen
+        vscode.window.showErrorMessage('Undo failed: ' + error.message);
+      }
+    });
     this._afterUndoRedo();
   }
 
@@ -2315,30 +2466,34 @@ class NavyCoderViewProvider {
       return;
     }
     const lastTurnId = this.checkpoints[this.checkpoints.length - 1].turnId;
-    const toUndo = this.checkpoints.filter(c => c.turnId === lastTurnId).reverse();
+    const toUndo = this.checkpoints.filter(c => c.turnId === lastTurnId).reverse(); // newest → oldest
     if (!(await this._confirmUndoSafe(toUndo))) return;
     this.checkpoints = this.checkpoints.filter(c => c.turnId !== lastTurnId);
 
+    // Restore must apply EVERY checkpoint in reverse order — a file edited N times
+    // in the turn has N checkpoints, and only replaying them all (newest→oldest)
+    // lands it on the turn-start content. (Deduping to the newest only reverts the
+    // last edit.) Redo, by contrast, needs one op per target: the FIRST _undoOne
+    // for a file reads the turn-END state off disk, which is the correct redo goal.
     const redoOps = [];
+    const redoSeen = new Set();
     const errors = [];
-    const undoneFiles = new Set();
-    for (const cp of toUndo) {
-      // Multiple edits to one file in a turn: the LAST checkpoint (first in this
-      // reversed list) holds the turn-start content — undo once per file.
-      const key = cp.kind === 'rename' ? 'r:' + cp.from + '→' + cp.to : cp.filePath;
-      if (undoneFiles.has(key)) continue;
-      undoneFiles.add(key);
-      try {
-        redoOps.push(await this._undoOne(cp));
-      } catch (e) {
-        errors.push(path.basename(cp.filePath || cp.from || '?') + ': ' + e.message);
+    await this._withWriteLock(async () => {
+      for (const cp of toUndo) {
+        const key = cp.kind === 'rename' ? 'r:' + cp.from + '→' + cp.to : 'f:' + cp.filePath;
+        try {
+          const redoOp = await this._undoOne(cp);
+          if (!redoSeen.has(key)) { redoSeen.add(key); redoOps.push(redoOp); }
+        } catch (e) {
+          errors.push(path.basename(cp.filePath || cp.from || '?') + ': ' + e.message);
+        }
       }
-    }
+    });
     if (redoOps.length) this.redoStack.push({ ops: redoOps });
     if (errors.length > 0) {
       vscode.window.showErrorMessage('Some undos failed: ' + errors.join(', '));
     } else {
-      vscode.window.showInformationMessage(`Undid ${redoOps.length} operation${redoOps.length !== 1 ? 's' : ''} from last turn (Redo is available)`);
+      vscode.window.showInformationMessage(`Undid ${redoOps.length} file${redoOps.length !== 1 ? 's' : ''} from last turn (Redo is available)`);
     }
     this._afterUndoRedo();
   }
@@ -2355,27 +2510,30 @@ class NavyCoderViewProvider {
     const turnId = this.generateId();
     const errors = [];
     let done = 0;
-    for (const op of entry.ops) {
-      try {
-        if (op.kind === 'rename') {
-          await vscode.workspace.fs.rename(vscode.Uri.file(op.from), vscode.Uri.file(op.to), { overwrite: false });
-          this.checkpoints.push({ kind: 'rename', from: op.from, to: op.to, time: Date.now(), turnId });
-        } else if (op.text === null) {
-          // The undo recreated a deleted file — redo deletes it again.
-          const current = await this.readFileText(op.filePath) ?? '';
-          await vscode.workspace.fs.delete(vscode.Uri.file(op.filePath), { recursive: false, useTrash: true });
-          this.checkpoints.push({ kind: 'delete', filePath: op.filePath, originalText: current, time: Date.now(), turnId });
-        } else {
-          const current = await this.readFileText(op.filePath) ?? '';
-          const newHash = crypto.createHash('md5').update(op.text, 'utf8').digest('hex');
-          this.checkpoints.push({ kind: 'edit', filePath: op.filePath, originalText: current, newHash, time: Date.now(), turnId });
-          await vscode.workspace.fs.writeFile(vscode.Uri.file(op.filePath), Buffer.from(op.text, 'utf8'));
+    // Through the write mutex — same reason as undo.
+    await this._withWriteLock(async () => {
+      for (const op of entry.ops) {
+        try {
+          if (op.kind === 'rename') {
+            await vscode.workspace.fs.rename(vscode.Uri.file(op.from), vscode.Uri.file(op.to), { overwrite: false });
+            this.checkpoints.push({ kind: 'rename', from: op.from, to: op.to, time: Date.now(), turnId });
+          } else if (op.text === null) {
+            // The undo recreated a deleted file — redo deletes it again.
+            const current = await this.readFileText(op.filePath) ?? '';
+            await vscode.workspace.fs.delete(vscode.Uri.file(op.filePath), { recursive: false, useTrash: true });
+            this.checkpoints.push({ kind: 'delete', filePath: op.filePath, originalText: current, time: Date.now(), turnId });
+          } else {
+            const current = await this.readFileText(op.filePath) ?? '';
+            const newHash = crypto.createHash('md5').update(op.text, 'utf8').digest('hex');
+            this.checkpoints.push({ kind: 'edit', filePath: op.filePath, originalText: current, newHash, time: Date.now(), turnId });
+            await vscode.workspace.fs.writeFile(vscode.Uri.file(op.filePath), Buffer.from(op.text, 'utf8'));
+          }
+          done++;
+        } catch (e) {
+          errors.push(path.basename(op.filePath || op.to || '?') + ': ' + e.message);
         }
-        done++;
-      } catch (e) {
-        errors.push(path.basename(op.filePath || op.to || '?') + ': ' + e.message);
       }
-    }
+    });
     if (errors.length > 0) {
       vscode.window.showErrorMessage('Redo failed for: ' + errors.join(', '));
     } else {
@@ -2650,6 +2808,9 @@ class NavyCoderViewProvider {
   async runBackgroundTask(taskId, prompt) {
     const ctrl = new AbortController();
     this.bgWorkers.set(taskId, { ctrl });
+    // Distinct turnId so this task's file edits form their own Undo Last Turn group,
+    // never merging into whatever main-chat turn happens to be active.
+    const bgTurnId = 'bg-' + this.generateId();
 
     const post = (status, extra = {}) =>
       this.view?.webview.postMessage({ type: 'bgTaskUpdate', taskId, status, ...extra });
@@ -2697,7 +2858,7 @@ class NavyCoderViewProvider {
           if (ctrl.signal.aborted) break;
           if (tool.name === 'finish') continue;
           post('tool', { tool: tool.name, args: tool.args });
-          const result = await this.executeTool(tool);
+          const result = await this.executeTool(tool, bgTurnId);
           post('toolResult', { tool: tool.name, result: String(result).slice(0, 800) });
           if (nativeToolCalls.length > 0) {
             toolResults.push({ role: 'tool', tool_call_id: tool.id || '', content: String(result) });
@@ -2970,6 +3131,120 @@ class NavyCoderViewProvider {
       new vscode.Range(r.start, 0, r.end, 0)
     );
     editor.setDecorations(this.gutterDecorationType, decorations);
+  }
+
+  // ── Lexical retrieval ────────────────────────────────────────────────────
+  // Navy has no embeddings; this gives the agent a purpose-built ranked file
+  // finder so it stops blindly guessing which files to read on a large repo.
+
+  // Extract salient search terms from a prompt: identifiers/words ≥3 chars, minus
+  // common English + coding filler. Also splits camelCase / snake_case so
+  // "parseUserToken" contributes parse/user/token as well as the whole word. Pure.
+  _tokenizeQuery(q) {
+    const STOP = new Set(['the','and','for','with','this','that','from','into','have','has','are','was','were','file','files','code','line','lines','function','please','make','fix','fixes','fixed','add','added','update','updated','change','changes','create','created','remove','removed','delete','implement','refactor','review','explain','check','using','use','used','need','needs','want','should','would','could','how','what','why','where','when','which','all','any','get','set','new','old','error','errors','bug','bugs','issue','issues','test','tests','navy','let','you','your','can','not','the','then','than','also','here','there','they','them','its','our']);
+    const words = (q || '').match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+    const terms = new Map(); // term → weight (whole identifiers weigh more than split parts)
+    const add = (t, w) => { const k = t.toLowerCase(); if (k.length >= 3 && !STOP.has(k)) terms.set(k, Math.max(terms.get(k) || 0, w)); };
+    for (const w of words) {
+      add(w, 2);
+      // split identifier into parts
+      for (const part of w.replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[_\s]+/)) add(part, 1);
+    }
+    return [...terms.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([t, w]) => ({ term: t, weight: w }));
+  }
+
+  // Pure ranker: hits = [{ rel, count, matched:[terms], inName:bool, defs:bool }].
+  _rankRelevance(hits, terms) {
+    const distinct = terms.length || 1;
+    return hits
+      .map(h => {
+        // Sublinear frequency (TF saturation, à la BM25): the 40th mention of a term
+        // barely helps, so a file that merely name-drops a term can't outrank the one
+        // that DEFINES it or is named after it.
+        let score = Math.min(Math.log2(1 + h.count) * 4, 20);
+        score += (h.matched.length / distinct) * 25;  // coverage of distinct query terms matters most
+        if (h.inName) score += 12;                    // a query term in the filename is a strong signal
+        if (h.defs)   score += 10;                    // the file DEFINES a query term
+        return { ...h, score: Math.round(score) };
+      })
+      .sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+  }
+
+  // Walk the repo, read each source file once, score against terms. Bounded so a
+  // huge tree can't hang: skip dirs, size cap, file-count cap. Results are cached
+  // per (root, maxFiles, terms) for 30s so repeated identical prompts (e.g. the
+  // same request re-sent) don't re-read the whole tree each time.
+  async _collectRelevance(root, terms, { maxFiles = 1500, maxBytes = 300 * 1024 } = {}) {
+    const cacheKey = root + ' ' + maxFiles + ' ' + terms.map(t => t.term).sort().join(',');
+    if (this._relCache && this._relCache.key === cacheKey && Date.now() - this._relCache.time < 30_000) {
+      return this._relCache.hits;
+    }
+    const SKIP = new Set(['node_modules','.git','dist','build','out','.next','.nuxt','__pycache__','.venv','venv','coverage','.cache','.navy','vendor','target']);
+    const CODE = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.go','.rs','.java','.rb','.php','.c','.h','.cpp','.hpp','.cc','.cs','.swift','.kt','.scala','.vue','.svelte','.sql','.sh','.md','.json','.yml','.yaml','.toml']);
+    const DEF_KW = 'function|class|def|const|let|var|interface|type|struct|enum|fn|func|trait|impl|module|component';
+    // Compile the term + definition regexes ONCE (not per file) — a repo scan is
+    // up to maxFiles × terms iterations, so per-file compilation is pure waste.
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = terms.map(t => ({
+      term: t.term,
+      re: new RegExp('\\b' + esc(t.term) + '\\b', 'gi'),
+      defRe: new RegExp('\\b(?:' + DEF_KW + ')\\b[^\\n]*\\b' + esc(t.term) + '\\b', 'i'),
+    }));
+    const hits = [];
+    let scanned = 0;
+    const walk = async (dir) => {
+      if (scanned >= maxFiles) return;
+      let entries;
+      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (scanned >= maxFiles) return;
+        if (e.isDirectory()) {
+          if (!SKIP.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name));
+          continue;
+        }
+        const ext = path.extname(e.name).toLowerCase();
+        if (!CODE.has(ext)) continue;
+        const full = path.join(dir, e.name);
+        let text;
+        try {
+          const st = await fs.promises.stat(full);
+          if (st.size > maxBytes) continue;
+          text = await fs.promises.readFile(full, 'utf8');
+        } catch { continue; }
+        scanned++;
+        const rel = path.relative(root, full).replace(/\\/g, '/');
+        // Word-boundary name match (a query term as its own path segment / camel part),
+        // so "app" no longer credits "mapper.js".
+        const nameTokens = new Set(rel.toLowerCase().replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[^a-z0-9]+/i).filter(Boolean));
+        let count = 0, inName = false, defs = false;
+        const matched = [];
+        for (const p of patterns) {
+          const m = text.match(p.re);
+          const n = m ? m.length : 0;
+          if (n > 0) { count += n; matched.push(p.term); }
+          if (nameTokens.has(p.term)) inName = true;
+          if (!defs && p.defRe.test(text)) defs = true;
+        }
+        if (count > 0 || inName) hits.push({ rel, count, matched, inName, defs });
+      }
+    };
+    await walk(root);
+    this._relCache = { key: cacheKey, time: Date.now(), hits };
+    return hits;
+  }
+
+  async toolFindRelevantFiles(query, maxResults = 8) {
+    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return 'No workspace open.';
+    const terms = this._tokenizeQuery(query);
+    if (!terms.length) return 'Give a more specific query — identifiers, symbol names, or distinctive keywords.';
+    const hits = await this._collectRelevance(root, terms);
+    const ranked = this._rankRelevance(hits, terms).slice(0, Math.max(1, Math.min(maxResults || 8, 25)));
+    if (!ranked.length) return `No files matched: ${terms.map(t => t.term).join(', ')}`;
+    const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}\n`;
+    return header + ranked.map(h =>
+      `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}; matched: ${h.matched.join(', ') || '—'}]`
+    ).join('\n');
   }
 
   async buildRepoMap() {
@@ -3248,354 +3523,8 @@ class NavyCoderViewProvider {
   getHtml(webview) {
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.js'));
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'styles.css'));
-    const host = vscode.workspace.getConfiguration('navy').get('host', 'http://localhost:11434').replace(/\/$/, '');
-    const nonce = getNonce();
-    // Shown on the welcome screen so it's always obvious which build is running.
     const version = this.context.extension?.packageJSON?.version || '';
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data: blob:; connect-src 'none';">
-  <link href="${styleUri}" rel="stylesheet">
-  <title>Navy Coder</title>
-</head>
-<body>
-  <main class="app">
-    <header class="topbar">
-      <!-- Row 1: brand · live status · mode controls · actions -->
-      <div class="topbar-row topbar-row1">
-        <div class="topbar-brand">
-          <svg class="brand-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.8"/>
-            <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.5"/>
-            <g stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(0 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(45 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(90 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(135 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(180 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(225 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(270 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(315 12 12)"/>
-            </g>
-            <g fill="currentColor">
-              <circle cx="12" cy="2" r="1.1" transform="rotate(0 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(45 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(90 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(135 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(180 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(225 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(270 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(315 12 12)"/>
-            </g>
-          </svg>
-          <span class="brand-title">Navy</span>
-          <svg class="brand-thinking" viewBox="0 0 24 24" width="13" height="13" fill="none" aria-label="Thinking" title="Navy is thinking…">
-            <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.8"/>
-            <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.5"/>
-            <g stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(0 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(45 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(90 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(135 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(180 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(225 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(270 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(315 12 12)"/>
-            </g>
-            <g fill="currentColor">
-              <circle cx="12" cy="2" r="1" transform="rotate(0 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(45 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(90 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(135 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(180 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(225 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(270 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(315 12 12)"/>
-            </g>
-          </svg>
-        </div>
-        <!-- Live status (elastic, mostly hidden) -->
-        <div class="topbar-info">
-          <span id="diagBadge" class="diag-badge" style="display:none"></span>
-          <span id="stepBadge" class="step-badge"></span>
-          <span id="queuedBadge" class="queued-badge" style="display:none"></span>
-          <span id="statusText" class="status-text"></span>
-          <span id="rulesBadge" class="rules-badge" title="Project rules active">RULES</span>
-          <span id="contextLength" class="context-length-badge" title="Context window"></span>
-          <span id="tokenCounter" class="token-counter" title="Tokens used"></span>
-          <span id="inlineEditBadge" class="inline-edit-badge"></span>
-        </div>
-        <!-- Mode selects + icon buttons -->
-        <div class="topbar-actions">
-          <select id="thinkingLevelSelect" title="Thinking depth" class="select-compact">
-            <option value="fast">Fast</option>
-            <option value="medium" selected>Med</option>
-            <option value="high">High</option>
-          </select>
-          <select id="approvalModeSelect" title="Edit approval mode" class="select-compact">
-            <option value="ask-always">Ask</option>
-            <option value="auto-approve">Auto</option>
-          </select>
-          <button id="memoryButton" type="button" class="icon-button memory-button" title="Project memory" aria-label="Project memory">
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
-              <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
-              <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
-            </svg>
-            <span id="memoryCount" class="memory-count" style="display:none">0</span>
-          </button>
-          <button id="undoButton" type="button" class="icon-button" title="Undo last edit" aria-label="Undo last edit" disabled>
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 7v6h6"></path>
-              <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
-            </svg>
-          </button>
-          <button id="redoButton" type="button" class="icon-button" title="Redo (reverse last undo)" aria-label="Redo last undone edit" disabled>
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 7v6h-6"></path>
-              <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"></path>
-            </svg>
-          </button>
-          <button id="searchButton" type="button" class="icon-button" title="Search chat (Ctrl+F)" aria-label="Search chat">
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-            </svg>
-          </button>
-          <button id="exportButton" type="button" class="icon-button" title="Export conversation" aria-label="Export conversation">
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="7 10 12 15 17 10"></polyline>
-              <line x1="12" y1="15" x2="12" y2="3"></line>
-            </svg>
-          </button>
-          <button id="clearButton" type="button" class="icon-button new-chat-button" title="New chat" aria-label="New chat">
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 5v14M5 12h14"></path>
-            </svg>
-            <span class="new-chat-label">New chat</span>
-          </button>
-          <button id="settingsButton" type="button" class="icon-button" title="Settings" aria-label="Settings">
-            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="3"></circle>
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-            </svg>
-          </button>
-        </div>
-      </div>
-      <!-- Row 2: context selectors (project · model) -->
-      <div class="topbar-row topbar-row2">
-        <select id="projectSelect" title="Project directory" class="select-project"></select>
-        <select id="modelSelect" title="Model" class="select-model"></select>
-      </div>
-    </header>
-    <div class="context-bar"><div id="contextBarFill" class="context-bar-fill ok"></div></div>
-
-    <div id="debugPanel" class="debug-panel" style="display:none"></div>
-
-    <!-- Project memory panel (shown when memoryButton is clicked) -->
-    <div id="memoryPanel" class="memory-panel" style="display:none">
-      <div class="memory-panel-header">
-        <span class="memory-panel-title">Project Memory</span>
-        <div class="memory-panel-actions">
-          <button id="clearMemoryButton" type="button" class="memory-action-btn" title="Clear all memories">Clear all</button>
-          <button id="closeMemoryButton" type="button" class="memory-action-btn" title="Close">✕</button>
-        </div>
-      </div>
-      <div id="memoryContent" class="memory-content">
-        <span class="memory-empty">No memories yet. Navy will remember facts about this project as you work.</span>
-      </div>
-    </div>
-
-    <!-- Settings panel -->
-    <div id="settingsPanel" class="settings-panel" style="display:none">
-      <div class="settings-header">
-        <span class="settings-title">⚙ Settings</span>
-        <button id="closeSettingsButton" type="button" class="memory-action-btn" title="Close">✕</button>
-      </div>
-      <div class="settings-body">
-        <form id="settingsForm">
-
-          <div class="setting-group">
-            <label class="setting-label">Provider</label>
-            <select id="settingProvider" class="setting-select">
-              <option value="ollama">Ollama (local)</option>
-              <option value="lmstudio">LM Studio (local)</option>
-              <option value="anthropic">Anthropic Claude</option>
-              <option value="openai">OpenAI / ChatGPT</option>
-              <option value="deepseek">DeepSeek</option>
-              <option value="gemini">Google Gemini</option>
-              <option value="xai">xAI / Grok</option>
-              <option value="zai">z.ai</option>
-              <option value="groq">Groq</option>
-              <option value="openrouter">OpenRouter</option>
-              <option value="custom">Custom Endpoint</option>
-            </select>
-          </div>
-
-          <div class="setting-group" id="settingHostGroup">
-            <label class="setting-label">Ollama Host</label>
-            <input id="settingHost" type="text" class="setting-input" placeholder="http://localhost:11434" />
-            <span class="setting-hint">URL where Ollama is running. Change this to connect to a remote server or different port (e.g. http://192.168.1.10:11434).</span>
-          </div>
-
-          <div class="setting-group" id="settingApiBaseGroup" style="display:none">
-            <label class="setting-label">API Base URL</label>
-            <input id="settingApiBase" type="text" class="setting-input" placeholder="" />
-            <span class="setting-hint" id="settingApiBaseHint">Base URL for the API endpoint.</span>
-          </div>
-
-          <div class="setting-group" id="settingApiKeyGroup" style="display:none">
-            <label class="setting-label">API Key</label>
-            <input id="settingApiKey" type="password" class="setting-input" placeholder="sk-..." autocomplete="off" />
-            <span class="setting-hint">Your API key for this provider. Stored in VS Code's encrypted secrets — each provider keeps its own key.</span>
-          </div>
-
-          <div class="setting-group">
-            <label class="setting-label">Web Search API Key <span class="setting-optional">(optional)</span></label>
-            <input id="settingSearchApiKey" type="password" class="setting-input" placeholder="tvly-… (Tavily) or Brave key — empty = DuckDuckGo" autocomplete="off" />
-            <span class="setting-hint">Tavily keys (tvly-…) and Brave Search keys are auto-detected. Leave empty to use free DuckDuckGo search.</span>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-group setting-half">
-              <label class="setting-label">Temperature</label>
-              <input id="settingTemperature" type="number" class="setting-input" min="0" max="2" step="0.05" placeholder="0.2" />
-            </div>
-            <div class="setting-group setting-half">
-              <label class="setting-label">Max Tool Iterations</label>
-              <input id="settingMaxIter" type="number" class="setting-input" min="1" max="200" step="1" placeholder="50" />
-            </div>
-          </div>
-
-          <div class="setting-group">
-            <label class="setting-label">Edit Format</label>
-            <select id="settingEditFormat" class="setting-select">
-              <option value="search-replace">Search / Replace (surgical edits)</option>
-              <option value="whole-file">Whole file (full rewrite)</option>
-            </select>
-          </div>
-
-          <div class="setting-group">
-            <label class="setting-label">System Prompt</label>
-            <textarea id="settingSystemPrompt" class="setting-textarea" rows="5" placeholder="You are a concise AI coding assistant..."></textarea>
-          </div>
-
-          <div class="settings-footer">
-            <button type="submit" class="settings-save-btn">Save Settings</button>
-          </div>
-        </form>
-      </div>
-    </div>
-
-    <!-- Search bar (hidden by default, toggled by search button) -->
-    <div id="searchBar" class="search-bar" style="display:none">
-      <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" class="search-bar-icon">
-        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-      </svg>
-      <input id="searchInput" type="text" class="search-input" placeholder="Search messages…" autocomplete="off">
-      <span id="searchCount" class="search-count"></span>
-      <button id="searchClose" class="search-close" title="Close search">✕</button>
-    </div>
-
-    <!-- Live shell output panel (shown while run_command is streaming) -->
-    <div id="shellPanel" class="shell-panel" style="display:none">
-      <div class="shell-panel-header">
-        <span class="shell-panel-title">Terminal output</span>
-        <button id="shellPanelClose" class="shell-panel-close" title="Dismiss">✕</button>
-      </div>
-      <pre id="shellOutput" class="shell-output"></pre>
-    </div>
-
-    <section id="messages" class="messages" aria-live="polite">
-      <div id="welcome" class="welcome">
-        <div class="welcome-logo">
-          <svg viewBox="0 0 24 24" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.8"/>
-            <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.5"/>
-            <g stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(0 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(45 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(90 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(135 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(180 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(225 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(270 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(315 12 12)"/>
-            </g>
-            <g fill="currentColor">
-              <circle cx="12" cy="2" r="1.1" transform="rotate(0 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(45 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(90 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(135 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(180 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(225 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(270 12 12)"/>
-              <circle cx="12" cy="2" r="1.1" transform="rotate(315 12 12)"/>
-            </g>
-          </svg>
-        </div>
-        <h1 class="welcome-title">Navy Coder</h1>
-        <p class="welcome-tagline">AI coding agent — local with Ollama, or OpenAI, Claude, Gemini &amp; more.</p>
-        <div class="welcome-chips">
-          <button type="button" class="welcome-chip" data-prompt="Review the active file for bugs, edge cases, and improvements.">⚓ Review code</button>
-          <button type="button" class="welcome-chip" data-prompt="Edit the active file to ">✏️ Edit files</button>
-          <button type="button" class="welcome-chip" data-prompt="Search the codebase for ">🔍 Search codebase</button>
-          <button type="button" class="welcome-chip" data-prompt="Run the test suite and fix any failures.">🧪 Run tests</button>
-          <button type="button" class="welcome-chip" data-prompt="Generate a commit message for my staged changes.">📝 Git commit</button>
-          <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">▶ Run project</button>
-        </div>
-        <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files${version ? ' · <span class="welcome-version">v' + version + '</span>' : ''}</p>
-      </div>
-    </section>
-
-    <div class="composer-wrap">
-      <form id="chatForm" class="composer">
-        <input type="file" id="fileAttachInput" multiple hidden>
-        <div class="input-area">
-          <textarea id="prompt" rows="1" placeholder="Ask Navy to code, edit, or run commands..."></textarea>
-          <div class="input-meta">
-            <div class="file-chips" id="fileChips">
-              <button type="button" id="addContextButton" class="chip chip-add" title="Add current file to context">+ Add file</button>
-            </div>
-            <div class="composer-actions">
-              <label class="context-toggle" title="Include current editor context">
-                <input id="includeContext" type="checkbox" checked>
-                <span>Context</span>
-              </label>
-              <button type="button" id="attachButton" class="attach-button" title="Attach images or files" aria-label="Attach images or files">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                </svg>
-              </button>
-              <div id="approvalQueue" class="approval-queue" title="Pending approvals"></div>
-              <button id="sendButton" type="submit" class="send-button" title="Send" aria-label="Send message" disabled>
-                <svg id="sendIcon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <line x1="22" y1="2" x2="11" y2="13"></line>
-                  <polygon points="22 2 15 22 11 13 2 9"></polygon>
-                </svg>
-                <svg id="stopIcon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" hidden>
-                  <rect x="6" y="6" width="12" height="12" rx="2"></rect>
-                </svg>
-              </button>
-            </div>
-          </div>
-        </div>
-      </form>
-    </div>
-    <!-- Full-size image lightbox -->
-    <div id="imageLightbox" class="lightbox hidden" role="dialog" aria-modal="true">
-      <div id="lightboxBackdrop" class="lightbox-backdrop"></div>
-      <img id="lightboxImg" class="lightbox-img" src="" alt="Full size preview">
-      <button id="lightboxClose" class="lightbox-close" title="Close (Esc)">✕</button>
-    </div>
-  </main>
-  <script nonce="${nonce}" src="${scriptUri}"></script>
-</body>
-</html>`;
+    return getWebviewHtml({ scriptUri, styleUri, cspSource: webview.cspSource, nonce: getNonce(), version });
   }
 }
 
@@ -3851,7 +3780,6 @@ function activate(context) {
       provider.askNavy(prompt, false, null, [uri.fsPath]);
     }),
     vscode.commands.registerCommand('navy.exportConversation', () => provider.view?.webview.postMessage({ type: 'requestExport' })),
-    vscode.commands.registerCommand('navy.debugDumpDom', () => provider.view?.webview.postMessage({ type: 'debugDump' })),
     vscode.commands.registerCommand('navy.reviewPR', () => provider.generatePRReview()),
     vscode.window.onDidChangeActiveTextEditor(editor => {
       if (editor) provider.applyGutterDecorations(editor);
@@ -3863,4 +3791,6 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+// NavyCoderViewProvider is exported for the test suite (test/run.js drives its
+// undo/redo/checkpoint logic against a mock vscode + real temp filesystem).
+module.exports = { activate, deactivate, NavyCoderViewProvider };
