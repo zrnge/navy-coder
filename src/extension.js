@@ -1,5 +1,7 @@
 const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./providers/llm.js');
-const { openAiCompatBase } = require('./providers/endpoints.js');
+const { openAiCompatBase, providerDisplayName } = require('./providers/endpoints.js');
+const { McpManager } = require('./providers/mcp.js');
+const { formatProviderError } = require('./providers/errors.js');
 const { getWebviewHtml } = require('./webview-html.js');
 const vscode = require('vscode');
 const path = require('path');
@@ -97,6 +99,8 @@ class NavyCoderViewProvider {
     this.statusBarItem = null; // set by activate() after construction
     this.bgProcesses = new Map(); // id → { proc, stdout, stderr, exitCode }
     this._writeLock = Promise.resolve(); // serializes file writes across main turn + background tasks
+    this.log = null; // set by activate() → Navy Coder output channel; safe to call before
+    this.mcp = new McpManager((line) => this.log?.(line)); // external MCP tool servers
     this.bgWorkers   = new Map(); // taskId → { ctrl: AbortController }
     this.bgWorkerId  = 0;
     this.editedRanges = new Map(); // filePath -> [{start,end}] for gutter decorations
@@ -175,7 +179,7 @@ class NavyCoderViewProvider {
           this.clearChat();
           break;
         case 'getModels':
-          await this.loadModels();
+          await this.loadModels(true); // explicit refresh — bypass the cache
           break;
         case 'setModel':
           await this.setModel(message.model);
@@ -325,8 +329,8 @@ class NavyCoderViewProvider {
           if (s.maxIter    !== undefined) await cfg.update('maxToolIterations', Number(s.maxIter),   T);
           if (s.editFormat !== undefined) await cfg.update('editFormat',        s.editFormat,        T);
           if (s.systemPrompt!==undefined) await cfg.update('systemPrompt',      s.systemPrompt,      T);
-          // Reload models in case provider/host changed.
-          await this.loadModels();
+          // Reload models in case provider/host/key changed — force a fresh fetch.
+          await this.loadModels(true);
           await this.sendSettings();
           vscode.window.showInformationMessage('Navy: Settings saved.');
           break;
@@ -543,114 +547,142 @@ class NavyCoderViewProvider {
     await this.loadModels();
   }
 
-  async loadModels() {
+  // Curated fallbacks — shown ONLY when the live /models fetch fails (no API key,
+  // offline, endpoint down) so the dropdown is never empty. The live list is
+  // always preferred, so a provider adding/removing a model is reflected
+  // automatically without a Navy update.
+  static MODEL_FALLBACKS = {
+    openai:     ['gpt-4o', 'gpt-4o-mini', 'o3', 'o3-mini', 'o1', 'gpt-4-turbo'],
+    anthropic:  ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-3-5-sonnet-20241022'],
+    deepseek:   ['deepseek-chat', 'deepseek-reasoner'],
+    gemini:     ['gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+    xai:        ['grok-3', 'grok-3-mini', 'grok-2'],
+    groq:       ['moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
+    openrouter: ['openai/gpt-4o', 'anthropic/claude-opus-4', 'google/gemini-2.0-flash', 'deepseek/deepseek-r1'],
+  };
+
+  // GET a provider's /models list. Returns an array of model ids, or null on any
+  // failure (caller falls back). Handles OpenAI ({data:[{id}]}) and bare-array
+  // shapes, and follows Anthropic-style has_more/last_id pagination (≤3 pages).
+  async _fetchModelList(url, headers) {
+    try {
+      const all = [];
+      let pageUrl = url;
+      for (let page = 0; page < 3 && pageUrl; page++) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const res = await fetch(pageUrl, { headers, signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!res.ok) return all.length ? all : null;
+        const data = await res.json();
+        const raw = data.data || data.models || (Array.isArray(data) ? data : []);
+        all.push(...raw.map(m => (typeof m === 'string' ? m : (m && (m.id || m.name)))).filter(Boolean));
+        pageUrl = (data.has_more && data.last_id)
+          ? url + (url.includes('?') ? '&' : '?') + 'after_id=' + encodeURIComponent(data.last_id)
+          : null;
+      }
+      return all.length ? all : null;
+    } catch { return null; }
+  }
+
+  // Pure: provider-specific cleanup of a live /models list.
+  //  • gemini returns ids as "models/gemini-…" — strip the prefix (their chat
+  //    endpoint accepts the bare id, and the prefixed form is ugly in the UI).
+  //  • openai lists EVERY model (whisper, tts, dall-e, embeddings…) — keep only
+  //    chat-capable families, but never filter down to empty (future-proofing).
+  _sanitizeModelList(provider, list) {
+    if (!list) return list;
+    let out = list;
+    if (provider === 'gemini') out = out.map(id => id.replace(/^models\//, ''));
+    if (provider === 'openai') {
+      const chat = out.filter(id =>
+        /^(gpt-|o[0-9]|chatgpt)/.test(id) &&
+        !/(embedding|whisper|tts|audio|realtime|dall-e|image|moderation|transcribe|davinci|babbage|search)/.test(id));
+      if (chat.length) out = chat;
+    }
+    return out;
+  }
+
+  // Pure: decide the final dropdown list. Prefer the live list; fall back to the
+  // curated list; always keep the user's active model selectable even if the
+  // provider dropped it from the live list. Returns { models, error }.
+  _mergeModelList(fetched, fallback, activeModel) {
+    const live = fetched && fetched.length;
+    let models = (live ? fetched : (fallback || [])).slice();
+    const error = (!live && !(fallback && fallback.length))
+      ? "Couldn't fetch models — check your API key or base URL." : undefined;
+    models.sort((a, b) => a.localeCompare(b));
+    if (activeModel && models.length && !models.includes(activeModel)) models = [activeModel, ...models];
+    return { models, error };
+  }
+
+  async loadModels(force = false) {
     const config = vscode.workspace.getConfiguration('navy');
     const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
-    const currentModel = config.get('model', 'kimi-k2.7-code:cloud');
-
     const provider = config.get('provider', 'ollama');
     const apiBase = config.get('apiBase', '');
     const apiKey = await this.context.secrets.get('navy.apiKey.' + provider)
                 || await this.context.secrets.get('navy.apiKey') || '';
+    const currentModel = config.get('model', '');
 
     // Context length is only fetchable from Ollama (/api/show) — clear it for other
     // providers so the context gauge never shows a stale value from a previous provider.
     if (provider !== 'ollama') this.modelContextLength = null;
 
-    // Providers with static model lists
-    const STATIC_MODELS = {
-      openai:     ['gpt-4o', 'gpt-4o-mini', 'o1', 'o1-mini', 'o3', 'o3-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'],
-      anthropic:  ['claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001', 'claude-3-5-sonnet-20241022', 'claude-3-opus-20240229'],
-      deepseek:   ['deepseek-chat', 'deepseek-reasoner'],
-      gemini:     ['gemini-2.5-pro-preview-06-05', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
-      xai:        ['grok-3', 'grok-3-mini', 'grok-2', 'grok-beta'],
-      groq:       ['moonshotai/kimi-k2-instruct', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it'],
-      openrouter: ['openai/gpt-4o', 'anthropic/claude-opus-4', 'google/gemini-2.0-flash', 'deepseek/deepseek-r1', 'meta-llama/llama-3.3-70b-instruct', 'x-ai/grok-3'],
-    };
-
-    if (STATIC_MODELS[provider]) {
-      let models = STATIC_MODELS[provider];
-      const activeModel = config.get('model', models[0]);
-      // A manually configured model (newer release, fine-tune) must stay selectable —
-      // otherwise the dropdown silently shows the wrong model.
-      if (activeModel && !models.includes(activeModel)) models = [activeModel, ...models];
-      this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
-      return;
-    }
-
-    // LM Studio — fetch from local OpenAI-compatible endpoint
-    if (provider === 'lmstudio') {
-      const base = (apiBase || 'http://localhost:1234/v1').replace(/\/$/, '');
+    // Ollama — native tags endpoint (+ context length).
+    if (provider === 'ollama') {
       try {
-        const res = await fetch(base + '/models');
-        if (res.ok) {
-          const data = await res.json();
-          const models = (data.data || data.models || []).map(m => m.id || m.name).filter(Boolean);
-          if (models.length > 0) {
-            const activeModel = config.get('model', models[0]);
-            this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
-            return;
-          }
-        }
-      } catch {}
-      this.view?.webview.postMessage({ type: 'models', models: [], currentModel, error: 'LM Studio not reachable at ' + base });
-      return;
-    }
-
-    // z.ai — fetch from their OpenAI-compatible endpoint
-    if (provider === 'zai') {
-      const base = (apiBase || 'https://api.z.ai/v1').replace(/\/$/, '');
-      try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-        const res = await fetch(base + '/models', { headers });
-        if (res.ok) {
-          const data = await res.json();
-          const models = (data.data || data.models || []).map(m => m.id || m.name).filter(Boolean);
-          if (models.length > 0) {
-            const activeModel = config.get('model', models[0]);
-            this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
-            return;
-          }
-        }
-      } catch {}
-      this.view?.webview.postMessage({ type: 'models', models: [], currentModel, error: 'z.ai not reachable or no models returned' });
-      return;
-    }
-
-    // Custom — fetch from user-specified base URL
-    if (provider === 'custom' && apiBase) {
-      try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-        const res = await fetch(apiBase.replace(/\/$/, '') + '/models', { headers });
-        if (res.ok) {
-          const data = await res.json();
-          const models = (data.data || data.models || []).map(m => m.id || m.name).filter(Boolean);
-          if (models.length > 0) {
-            const activeModel = config.get('model', models[0]);
-            this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
-            return;
-          }
-        }
-      } catch {}
-    }
-
-    // Ollama (default)
-    try {
-      const response = await fetch(host + '/api/tags');
-      if (!response.ok) throw new Error('Ollama returned ' + response.status);
-      const data = await response.json();
-      const models = (data.models || []).map((m) => m.name || m.model).filter(Boolean).sort();
-      if (models.length > 0 && !models.includes(currentModel)) {
-        await config.update('model', models[0], true);
+        const response = await fetch(host + '/api/tags');
+        if (!response.ok) throw new Error('Ollama returned ' + response.status);
+        const data = await response.json();
+        const models = (data.models || []).map((m) => m.name || m.model).filter(Boolean).sort();
+        if (models.length > 0 && !models.includes(currentModel)) await config.update('model', models[0], true);
+        const activeModel = config.get('model', models[0] || currentModel);
+        this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
+        this.fetchModelContext(host, activeModel);
+      } catch (error) {
+        this.view?.webview.postMessage({ type: 'models', models: [], currentModel, error: error.message });
       }
-      const activeModel = config.get('model', models[0] || currentModel);
-      this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel });
-      this.fetchModelContext(host, activeModel);
-    } catch (error) {
-      this.view?.webview.postMessage({ type: 'models', models: [], currentModel, error: error.message });
+      return;
     }
+
+    // Everyone else exposes a /models list. Anthropic needs its own auth header;
+    // the rest (openai, deepseek, gemini, xai, zai, groq, openrouter, lmstudio,
+    // custom) are OpenAI-compatible and share the same Bearer + /models shape.
+    let url, headers = { 'Content-Type': 'application/json' };
+    if (provider === 'anthropic') {
+      url = (apiBase || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/models?limit=100';
+      if (apiKey) { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01'; }
+    } else {
+      const base = openAiCompatBase(provider, apiBase, host) || host;
+      url = base.replace(/\/$/, '') + '/models';
+      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+    }
+
+    // Cache successful fetches for 5 min so opening settings / switching the model
+    // dropdown doesn't hit the network every time. Cache key includes the URL and
+    // whether a key is present, so a provider/base/key change re-fetches.
+    const cacheKey = provider + '|' + url + '|' + (apiKey ? 'k' : '');
+    let fetched;
+    if (!force && this._modelListCache?.key === cacheKey && Date.now() - this._modelListCache.time < 300_000) {
+      fetched = this._modelListCache.models;
+    } else {
+      fetched = this._sanitizeModelList(provider, await this._fetchModelList(url, headers));
+      if (fetched && fetched.length) this._modelListCache = { key: cacheKey, time: Date.now(), models: fetched };
+    }
+
+    let activeModel = config.get('model', currentModel);
+    // If we have an authoritative LIVE list and the configured model isn't in it,
+    // it's stale for this provider (typically right after switching providers, when
+    // navy.model still holds the old provider's model). Default to the first real
+    // model and persist it, so the next chat doesn't 400 on an invalid model.
+    // Only when live — a failed fetch (fallback) must not clobber the user's choice.
+    if (fetched && fetched.length && !fetched.includes(activeModel)) {
+      activeModel = fetched[0];
+      await config.update('model', activeModel, true);
+    }
+    const { models, error } = this._mergeModelList(fetched, NavyCoderViewProvider.MODEL_FALLBACKS[provider], activeModel);
+    this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel, ...(error ? { error } : {}) });
   }
 
   async fetchModelContext(host, model) {
@@ -845,9 +877,10 @@ class NavyCoderViewProvider {
     }, 30000);
 
     const config = vscode.workspace.getConfiguration('navy');
-    const configuredModel = config.get('model', 'kimi-k2.7-code:cloud');
+    const configuredModel = config.get('model', '');
     const model = selectedModel || configuredModel;
     const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const aiProviderForTag = config.get('provider', 'ollama'); // tags _rawBlocks with its origin provider
 
     // Map thinking level to temperature.
     const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7 };
@@ -888,7 +921,7 @@ class NavyCoderViewProvider {
           }
         }
       }
-    } catch { /* retrieval is best-effort */ }
+    } catch (e) { this.log?.('auto-retrieval failed: ' + e.message); }
 
     let diagnosticsContext = '';
     if (activeFile) {
@@ -942,6 +975,16 @@ class NavyCoderViewProvider {
     // context window on a huge repo / big memory / long rules file — _compactMessages
     // only prunes tool results and images, never the system message.
     const cap = (s, n) => s.length > n ? s.slice(0, n) + `\n…[truncated ${s.length - n} chars]` : s;
+    // navy.systemPrompt: user-supplied preferences, appended AFTER the mandatory
+    // tool-use rules so it can't accidentally override them. Guarded against the
+    // legacy pre-agentic-loop default text (SEARCH/REPLACE fence instructions) —
+    // that default used to be silently persisted by clicking Save, and injecting
+    // it now would tell the model to paste code instead of calling tools, which
+    // is precisely the hallucination bug this rule set exists to prevent.
+    const customSystemPrompt = vscode.workspace.getConfiguration('navy').get('systemPrompt', '');
+    if (customSystemPrompt.trim() && !customSystemPrompt.includes('SEARCH/REPLACE blocks')) {
+      systemContent += '\n\n## User preferences (does not override the tool-use rules above):\n' + cap(customSystemPrompt.trim(), 2000);
+    }
     if (projectRules) {
       systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults):\n' + cap(projectRules, 8000);
     }
@@ -952,8 +995,22 @@ class NavyCoderViewProvider {
       systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + cap(this.sessionDigest, 6000);
     }
     if (diagnosticsContext) systemContent += diagnosticsContext;
+    if (this.mcp?.toolCount) {
+      const names = this.mcp.getToolsApi().map(t => t.function.name).join(', ');
+      systemContent += '\n\n## External MCP tools available (call them exactly like built-in tools):\n' + cap(names, 2000);
+    }
     systemContent += '\n\nRepository map:\n' + cap(repoMap, 12000);
     if (relevantBlock) systemContent += cap(relevantBlock, 2000);
+    // Appended LAST (highest recency salience) and only for models whose name
+    // suggests they're small — a blunt, maximally-explicit restatement of the
+    // anti-hallucination rule for the models most likely to need it.
+    if (this._isLikelySmallModel(model)) {
+      systemContent += '\n\n## IMPORTANT — READ THIS LAST INSTRUCTION CAREFULLY\n'
+        + 'You are running as a smaller model that sometimes forgets to use tools. Before you write ANY sentence containing '
+        + 'the words "created", "saved", "written", "done", or "fixed" about a file, STOP and check: did you actually call '
+        + 'write_file or apply_edit and see a success result in THIS conversation? If not, call the tool NOW instead of '
+        + 'describing the change in text. Text alone changes nothing on disk.';
+    }
 
     const messages = [{ role: 'system', content: systemContent }];
 
@@ -981,6 +1038,7 @@ class NavyCoderViewProvider {
     if (this.messages.length > 80) {
       const dropped = this.messages.slice(0, this.messages.length - 60);
       this.messages = this.messages.slice(-60);
+      // Mechanical digest — always available, zero latency, used as the fallback.
       const lines = dropped.map(m => {
         const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
         if (!head) return '';
@@ -988,7 +1046,23 @@ class NavyCoderViewProvider {
         const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
         return '- Navy: ' + head + files;
       }).filter(Boolean);
-      this.sessionDigest = ((this.sessionDigest || '') + '\n' + lines.join('\n')).trim();
+      let digestAddition = lines.join('\n');
+      // Preferred: let the model write a REAL summary of what's being forgotten
+      // (decisions, files changed, unresolved threads) — the way Claude Code
+      // compacts. Rare (once per ~20 turns), so the extra call is acceptable;
+      // any failure falls back to the mechanical digest above.
+      try {
+        this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
+        const excerpt = dropped
+          .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
+          .join('\n').slice(0, 12000);
+        const summary = await this._completeOnce(host, model, [
+          { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
+          { role: 'user', content: excerpt },
+        ]);
+        if (summary && summary.trim().length > 40) digestAddition = summary.trim();
+      } catch (e) { this.log?.('history summarization failed (using mechanical digest): ' + e.message); }
+      this.sessionDigest = ((this.sessionDigest || '') + '\n' + digestAddition).trim();
       if (this.sessionDigest.length > 6000) {
         this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
       }
@@ -1017,8 +1091,8 @@ class NavyCoderViewProvider {
     this.view?.webview.postMessage({ type: 'start', model, activeFile, activeLanguage });
 
     let hitCap = false;   // declared outside try so finally{} can read it
+    let usedTools = false; // outside try — the catch offers "Continue" only for turns with progress
     try {
-      let usedTools = false;
 
       // One controller for the entire turn so Stop cancels both the current
       // stream AND any tool-loop iteration that follows it.
@@ -1035,12 +1109,22 @@ class NavyCoderViewProvider {
       const seenReadCalls = new Set();
       let consecutiveReadOnlyIters = 0;
       const failedCommands = new Map(); // key → consecutive fail count for run_command/run_tests
+      const fileEditCounts = new Map(); // path → successful-write count this turn (loop-of-edits guard)
+      const FILE_EDIT_SOFT_CAP = 5;  // stop feeding fresh diagnostics + nudge to wrap up
+      const FILE_EDIT_HARD_CAP = 10; // refuse further writes to this file for the rest of the turn
 
       // Change tracker: accumulates what the model touched so we can append a report footer.
       const taskChanges = { touched: new Map(), deleted: [], commands: [] };
       // touched: Map<inputPath, 'created'|'modified'>; commands: { cmd, exit }[]
 
       let lastAssistantText = ''; // final assistant text, persisted to history after the loop
+      let hallucinationNudged = false; // false-completion-claim correction sent once
+      let hallucinationWarned = false; // still claimed success after the nudge — tell the user
+      // Only worth running the hallucination guard at all if the user's request
+      // could plausibly have wanted a file created/changed — avoids false
+      // positives on purely informational turns (computed once; the prompt text
+      // doesn't change mid-turn).
+      const promptRequestsFileAction = this._promptRequestsFileAction(prompt);
       const messagesRef = this.messages; // identity guard: clearChat/project-switch replace this array
 
       for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -1065,13 +1149,23 @@ class NavyCoderViewProvider {
           }
         }
 
+        // Normalize tool-call ids BEFORE they're used in the assistant message or
+        // the tool results, so both sides pair correctly even on providers that
+        // return empty/duplicate ids (Cohere/others via OpenRouter).
+        this._normalizeToolCallIds(nativeToolCalls);
+
         // Build the assistant message. When using native tool calling, include tool_calls
         // so the model receives proper conversation history on the next iteration.
         if (nativeToolCalls.length > 0) {
-          // _rawBlocks preserves Anthropic thinking/tool_use blocks for exact replay
-          // on the next iteration (required when extended thinking is enabled).
+          // _rawBlocks preserves Anthropic thinking/tool_use blocks OR Gemini
+          // thought/functionCall parts for exact replay on the next iteration
+          // (required for thinking + tool use on either provider). Tagged with
+          // the producing provider — the two shapes are NOT interchangeable, so
+          // if the user switches provider mid-conversation, each native path
+          // only trusts rawBlocks it recognizes as its own and safely falls back
+          // to reconstructing from the generic tool_calls array otherwise.
           messages.push({ role: 'assistant', content: responseText || '', tool_calls: nativeToolCalls,
-            ...(rawBlocks?.length ? { _rawBlocks: rawBlocks } : {}) });
+            ...(rawBlocks?.length ? { _rawBlocks: rawBlocks, _rawBlocksProvider: aiProviderForTag } : {}) });
         } else {
           messages.push({ role: 'assistant', content: responseText });
         }
@@ -1099,6 +1193,23 @@ class NavyCoderViewProvider {
         const isDone = toolCalls.length === 0 ||
           toolCalls.every((t) => t.name === 'finish');
 
+        // Hallucination guard: the model claims a file action succeeded but never
+        // called a tool this whole turn. Give it exactly ONE correction chance
+        // (weak models that truly can't emit tool calls would otherwise loop
+        // forever); if it still can't act, let it finish but warn the user plainly
+        // instead of silently trusting the claim.
+        if (isDone && !usedTools && promptRequestsFileAction && this._looksLikeFalseCompletionClaim(responseText)) {
+          if (!hallucinationNudged) {
+            hallucinationNudged = true;
+            messages.push({
+              role: 'user',
+              content: '[SYSTEM: You just described a file action (created/saved/written/updated) but did NOT call any tool — nothing was actually changed. If you want to create or edit a file, call the write_file or apply_edit tool NOW. Do not just repeat the code as text.]',
+            });
+            continue;
+          }
+          hallucinationWarned = true;
+        }
+
         if (isDone) {
           this.lastReply = responseText;
 
@@ -1122,6 +1233,10 @@ class NavyCoderViewProvider {
               parts.push('**Commands:** ' + ranCmds.map(c => '`' + c.cmd + '`' + (c.exit === 0 ? ' ✓' : ' ✗')).join(', '));
             }
             footer = '\n\n---\n' + parts.join('  \n');
+          }
+          if (hallucinationWarned) {
+            footer += (footer ? '\n' : '\n\n---\n')
+              + '⚠️ **No files were actually changed.** The model described a file action above but never called a tool — nothing was saved. Ask it to actually write/apply the change, or apply the code yourself.';
           }
 
           if (!responseText.trim()) {
@@ -1158,14 +1273,14 @@ class NavyCoderViewProvider {
 
         // Read-only tools are safe to run in parallel; writes must be sequential.
         const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'find_relevant_files','git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
           'find_symbol','find_references',
           'web_search','fetch_url','get_terminal_output','read_process_output']);
 
         // Tools whose results are stable — dedup prevents re-reading the same file in a loop.
         // web_search included so a weak model can't spin on the same query repeatedly.
         const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'find_relevant_files','git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
           'find_symbol','find_references','web_search']);
         // Command tools where repeated failure is tracked.
         const COMMAND_TOOLS = new Set(['run_command', 'run_tests']);
@@ -1196,6 +1311,19 @@ class NavyCoderViewProvider {
             const n = failedCommands.get(cmdKey) || 0;
             if (n >= 2) {
               const r = `[Blocked: this command has already failed ${n} time(s) in a row. Do NOT retry — diagnose the error output above, fix the code, then run again.]`;
+              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r });
+              toolResults.push(makeToolResult(tool, r));
+              continue;
+            }
+          }
+          // Hard stop on a loop-of-edits: the same file has already been written
+          // this many times in one turn (this is what the screenshot of 16+
+          // consecutive "index.html ✓ Applied" cards was — usually a fix that
+          // never actually resolves the diagnostic it's chasing).
+          if (WRITE_TOOLS.has(tool.name) && tool.args?.path) {
+            const editCount = fileEditCounts.get(tool.args.path) || 0;
+            if (editCount >= FILE_EDIT_HARD_CAP) {
+              const r = `[Blocked: ${tool.args.path} has already been edited ${editCount} times this turn with no finish(). This file will not accept further edits this turn. Call get_diagnostics on it and either explain to the user what's still wrong (and why you can't fix it automatically) or call finish() now.]`;
               this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r });
               toolResults.push(makeToolResult(tool, r));
               continue;
@@ -1247,7 +1375,19 @@ class NavyCoderViewProvider {
               const p = tool.args?.path || '';
               if (p) {
                 taskChanges.touched.set(p, _fileIsNew ? 'created' : 'modified');
-                result += await this._diagnosticsAfterWrite(p);
+                const editCount = (fileEditCounts.get(p) || 0) + 1;
+                fileEditCounts.set(p, editCount);
+                if (editCount < FILE_EDIT_SOFT_CAP) {
+                  // Normal case: fresh diagnostics help the model verify its own edit.
+                  result += await this._diagnosticsAfterWrite(p);
+                } else if (editCount === FILE_EDIT_SOFT_CAP) {
+                  // Stop feeding diagnostics from here — if the model has edited this
+                  // file 5 times already, more of the same feedback is very likely
+                  // what's DRIVING the loop rather than helping end it.
+                  result += `\n\n[SYSTEM: You have edited ${p} ${editCount} times this turn. STOP iterating on small fixes here. Re-read the file if needed, make ONE decisive final edit, then call finish() and clearly state in your report if anything remains unresolved. Diagnostics will not be shown for further edits to this file this turn.]`;
+                }
+                // editCount > SOFT_CAP: no diagnostics, no repeated nudge — silence
+                // itself discourages continuing, and the hard cap above is the backstop.
               }
             }
             if (tool.name === 'delete_file' && typeof result === 'string' && result.startsWith('Deleted')) {
@@ -1302,9 +1442,12 @@ class NavyCoderViewProvider {
         this.view?.webview.postMessage({ type: 'aborted' });
       } else {
         const p = vscode.workspace.getConfiguration('navy').get('provider', 'ollama');
-        const providerLabel = { ollama: 'Ollama', lmstudio: 'LM Studio', anthropic: 'Anthropic', openai: 'OpenAI', deepseek: 'DeepSeek', gemini: 'Gemini', xai: 'xAI', zai: 'z.ai', groq: 'Groq', openrouter: 'OpenRouter', custom: 'Custom endpoint' }[p] || p;
-        const hint = p === 'ollama' ? ' (run "ollama serve" if not running)' : '';
-        this.view?.webview.postMessage({ type: 'error', message: `${providerLabel} error${hint} — ${error.message}` });
+        const providerLabel = providerDisplayName(p);
+        // Classified + redacted: plain-language cause, concrete next steps, no account ids.
+        this.log?.('provider error: ' + error.message);
+        this.view?.webview.postMessage({ type: 'error', message: formatProviderError(providerLabel, error.message) });
+        // The turn made real progress before failing — offer a one-click resume.
+        if (usedTools) this.view?.webview.postMessage({ type: 'errorContinue' });
       }
     } finally {
       clearInterval(this._heartbeat);
@@ -1318,7 +1461,7 @@ class NavyCoderViewProvider {
       if (hitCap) this.view?.webview.postMessage({ type: 'capReached', steps: maxIterations });
       // Persist the session after every turn — wrapped so a write failure never
       // prevents 'done' from being sent or the queue from draining.
-      try { await this.saveProjectSession(); } catch (e) { console.error('[Navy] saveProjectSession failed:', e); }
+      try { await this.saveProjectSession(); } catch (e) { this.log?.('session save failed: ' + e.message); }
 
       // Drain the message queue — process the next queued message if any.
       if (this.messageQueue.length > 0) {
@@ -1382,6 +1525,71 @@ class NavyCoderViewProvider {
     return run;
   }
 
+  // Detects a model claiming it completed a file action (created/saved/written/
+  // updated/fixed a file, script, function...) in plain text with NO tool call
+  // having been made. Weak/local models that can't reliably emit tool calls fall
+  // back to normal chat behavior — print code, narrate success — and Navy would
+  // otherwise trust that narration verbatim. Pure, so it's directly testable.
+  // Deliberately requires a creation/change VERB near a file-ish NOUN (not just
+  // the word "done") to avoid false positives on ordinary explanations.
+  _looksLikeFalseCompletionClaim(text) {
+    if (!text || !text.trim()) return false;
+    const verb = 'creat(?:ed|e)|written|wrote|writing|sav(?:ed|e)|add(?:ed)?|updat(?:ed|e)|modif(?:ied|y)|fix(?:ed)?|implement(?:ed)?|generat(?:ed|e)|appl(?:ied|y)';
+    // Generic nouns PLUS an actual filename pattern (hello.py, config.json, …) —
+    // real replies almost always name the file, not the word "file" itself.
+    const filename = '\\w[\\w-]*\\.[a-zA-Z0-9]{1,5}';
+    const noun = '(?:file|script|function|class|module|component|program|' + filename + ')';
+    // The gap allows periods (filenames contain them) but is capped short and
+    // newline-free so it can't bridge two unrelated sentences.
+    const gap = '[^\\n]{0,40}';
+    const re1 = new RegExp('\\b(?:' + verb + ')\\b' + gap + noun, 'i');
+    const re2 = new RegExp(noun + gap + '\\b(?:has been|is now|was)?\\s*(?:' + verb + ')\\b', 'i');
+    return re1.test(text) || re2.test(text);
+  }
+
+  // Gate for the hallucination guard: only worth checking a response for a false
+  // completion claim if the user's ORIGINAL request actually asked for a file to
+  // be created/changed. Without this gate, a purely informational reply that
+  // happens to mention "the file was updated" (e.g. describing git history, or
+  // answering "did this file change recently") could misfire. Pure + testable.
+  // Heuristic: does this model NAME suggest it's a small/weak model that's more
+  // likely to hallucinate tool use? No provider exposes real capability info, so
+  // this is name-pattern matching only — false positives just mean a capable
+  // model gets a harmless extra reminder; false negatives mean a weak model
+  // doesn't get the reinforcement (the base guard in askNavy still catches it).
+  _isLikelySmallModel(model) {
+    const m = String(model || '').toLowerCase();
+    if (/\b(mini|tiny|nano|micro)\b/.test(m)) return true;
+    const paramMatch = m.match(/[:\-_](\d+(?:\.\d+)?)b\b/);
+    return Boolean(paramMatch && parseFloat(paramMatch[1]) <= 9);
+  }
+
+  _promptRequestsFileAction(prompt) {
+    if (!prompt) return false;
+    return /\b(write|create|generate|make|add|implement|build)\b[^.\n]{0,60}\b(file|script|function|class|module|component|program|test)\b/i.test(prompt)
+        || /\b(fix|edit|update|modify|refactor|rewrite|change|save|apply)\b[^.\n]{0,60}\b(file|script|function|class|module|component|program|code|bug)\b/i.test(prompt)
+        || /\b(write|create|generate|make|save)\s+(a|an|the|this|me)?\s*\w[\w-]*\.[a-zA-Z0-9]{1,5}\b/i.test(prompt);
+  }
+
+  // Normalize native tool calls to the exact OpenAI shape before they go into the
+  // assistant message / tool results:
+  //  • unique non-empty id — Cohere/others via OpenRouter return empty or duplicate
+  //    ids, which breaks tool_call↔tool_result pairing ("id ... not found").
+  //  • type: "function" — required by strict deserializers (DeepSeek 400s with
+  //    "missing field `type`"); OpenAI/Groq/Ollama tolerate its absence.
+  // Mutates in place so the assistant message and derived tool results stay in sync.
+  _normalizeToolCallIds(nativeToolCalls) {
+    const seen = new Set();
+    for (const tc of nativeToolCalls || []) {
+      if (!tc.id || seen.has(tc.id)) {
+        tc.id = ((tc.function && tc.function.name) || 'tool') + '_' + this.generateId();
+      }
+      seen.add(tc.id);
+      if (!tc.type) tc.type = 'function';
+    }
+    return nativeToolCalls;
+  }
+
   async executeTool(tool, turnIdOverride) {
     const MUTATING = new Set(['write_file', 'apply_edit', 'edit_line', 'delete_line',
       'insert_after_line', 'delete_file', 'rename_file', 'rename_symbol']);
@@ -1399,8 +1607,77 @@ class NavyCoderViewProvider {
     return await this._executeToolInner(tool);
   }
 
+  // (Re)connect MCP servers from navy.mcpServers. Non-fatal: a bad server is
+  // reported in the status bar tooltip-ish message, never breaks Navy.
+  async reloadMcpServers() {
+    try {
+      const config = vscode.workspace.getConfiguration('navy').get('mcpServers', {});
+      if (!config || !Object.keys(config).length) { this.mcp.stop(); return; }
+      const results = await this.mcp.start(config);
+      const ok = results.filter(r => !r.error);
+      const bad = results.filter(r => r.error);
+      if (ok.length) {
+        vscode.window.setStatusBarMessage(`Navy: ${this.mcp.toolCount} MCP tool${this.mcp.toolCount !== 1 ? 's' : ''} from ${ok.map(r => r.name).join(', ')}`, 8000);
+      }
+      for (const b of bad) {
+        vscode.window.showWarningMessage(`Navy: MCP server "${b.name}" failed to start — ${b.error}`);
+      }
+    } catch (e) {
+      this.log?.('MCP reload failed: ' + e.message);
+    }
+  }
+
+  // Validate/coerce args against the tool's own schema (from tools.js) so a
+  // model passing garbage gets a clear, actionable message instead of a Node
+  // internals error like `The "path" argument must be of type string`.
+  _validateToolArgs(tool) {
+    const def = TOOLS.find(t => t.name === tool.name);
+    if (!def) return null;
+    const props = def.parameters?.properties || {};
+    const required = def.parameters?.required || [];
+    const args = tool.args || {};
+    for (const r of required) {
+      if (args[r] === undefined || args[r] === null) {
+        return `Error: required parameter "${r}" is missing for ${tool.name}. Re-emit the call with all required parameters: ${required.join(', ')}.`;
+      }
+    }
+    for (const [k, v] of Object.entries(args)) {
+      const p = props[k];
+      if (!p || v === undefined || v === null) continue;
+      if (p.type === 'string' && typeof v !== 'string') {
+        if (typeof v === 'number' || typeof v === 'boolean') args[k] = String(v);
+        else return `Error: parameter "${k}" of ${tool.name} must be a string, got ${Array.isArray(v) ? 'array' : typeof v}.`;
+      } else if (p.type === 'number' && typeof v !== 'number') {
+        const n = Number(v);
+        if (Number.isFinite(n)) args[k] = n;
+        else return `Error: parameter "${k}" of ${tool.name} must be a number, got "${String(v).slice(0, 40)}".`;
+      }
+    }
+    return null;
+  }
+
   async _executeToolInner(tool) {
     try {
+      const invalid = this._validateToolArgs(tool);
+      if (invalid) return invalid;
+      // External MCP tools: approval-gated in ask mode (their side effects are
+      // unknown to Navy), then routed to the owning server.
+      if (this.mcp?.isMcpTool(tool.name)) {
+        const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
+        if (approvalMode !== 'auto-approve') {
+          const id = this.generateId();
+          const label = tool.name.replace(/^mcp__/, '').replace(/__/, ' → ');
+          this.view?.webview.postMessage({
+            type: 'pendingCommand', id,
+            command: `MCP: ${label}(${JSON.stringify(tool.args || {}).slice(0, 300)})`,
+          });
+          const approved = await new Promise((resolve) => {
+            this.pendingCommandApprovals.set(id, { resolve });
+          });
+          if (!approved) return 'MCP call rejected by user.';
+        }
+        return await this.mcp.call(tool.name, tool.args);
+      }
       switch (tool.name) {
         case 'read_file': return await this.toolReadFile(tool.args.path);
         case 'remember': return await this.toolRemember(tool.args.fact);
@@ -1433,6 +1710,7 @@ class NavyCoderViewProvider {
         case 'get_terminal_output': return await this.toolGetTerminalOutput(tool.args.lines);
         case 'run_tests': return await this.toolRunTests(tool.args.filter);
         case 'search_codebase': return await this.toolSearchCodebase(tool.args.query, tool.args.filePattern, tool.args.contextLines);
+        case 'search_docs': return await this.toolSearchDocs(tool.args.query, tool.args.maxResults);
         case 'find_relevant_files': return await this.toolFindRelevantFiles(tool.args.query, tool.args.maxResults);
         case '__parse_error__':
           return 'Tool call JSON was invalid and could not be parsed. Tool attempted: ' + tool.args.tool + '. Error: ' + tool.args.error + '. Please re-emit the tool block with valid JSON.';
@@ -1794,17 +2072,20 @@ class NavyCoderViewProvider {
         if (choice !== 'Rename') return `Rename of "${name}" cancelled by user.`;
       }
 
-      // Snapshot every affected file BEFORE applying so undo can restore them all.
-      const affected = [];
+      // Snapshot every affected file BEFORE applying, but only record checkpoints
+      // AFTER the edit succeeds — a rejected edit must not pollute undo history
+      // with entries for files that never changed.
+      const snapshots = [];
       for (const [fileUri] of entries) {
         const original = await this.readFileText(fileUri.fsPath);
-        if (original !== null) {
-          this._pushCheckpoint({ kind: 'edit', filePath: fileUri.fsPath, originalText: original });
-          affected.push(fileUri.fsPath);
-        }
+        if (original !== null) snapshots.push({ filePath: fileUri.fsPath, original });
       }
       const ok = await vscode.workspace.applyEdit(edit);
       if (!ok) return `Error: the workspace edit for renaming "${name}" was rejected.`;
+      for (const s of snapshots) {
+        this._pushCheckpoint({ kind: 'edit', filePath: s.filePath, originalText: s.original });
+      }
+      const affected = snapshots.map(s => s.filePath);
       const names = affected.map(f => path.basename(f));
       return `Renamed "${name}" → "${newName}" across ${affected.length} file${affected.length !== 1 ? 's' : ''}: ${names.join(', ')}`;
     } catch (e) {
@@ -1997,6 +2278,70 @@ class NavyCoderViewProvider {
 
     const result = await this.toolRunCommand(cmd, 60000);
     return result.slice(0, 8000);
+  }
+
+  // Search only the project's OWN documentation (README/CHANGELOG/CONTRIBUTING/
+  // docs//*.md etc.) — lets the agent check "did the project already answer
+  // this" before guessing at conventions or setup steps. Shares the same
+  // ripgrep/JS-walk infrastructure as search_codebase, scoped by file type/name.
+  async toolSearchDocs(query, maxResults = 8) {
+    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return 'No workspace open.';
+    const cap = Math.max(1, Math.min(maxResults || 8, 25));
+
+    const rg = this._findRipgrep();
+    if (rg) {
+      const args = ['--line-number', '--context', '2', '--max-count', '3',
+        '--max-filesize', '300K', '--max-columns', '300', '--smart-case', '--heading',
+        '--glob', '*.{md,mdx,txt,rst}',
+        '--glob', 'README*', '--glob', 'CHANGELOG*', '--glob', 'CONTRIBUTING*', '--glob', 'AGENTS*',
+        '--glob', 'docs/**', '--glob', 'doc/**',
+        '-e', query, '.'];
+      const { code, out } = await this._rgRun(rg, args, root);
+      if (code === 0 && out.trim()) {
+        const text = out.replace(/^\.[\\/]/gm, '');
+        const note = text.length > 12000 ? '\n\n[Results truncated — narrow the query.]' : '';
+        return text.slice(0, 12000).trim() + note;
+      }
+      if (code === 1) return `No documentation matches for "${query}". Try search_codebase for source code instead.`;
+      // code 2 / spawn failure → fall through to the JS walk below
+    }
+
+    const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '__pycache__', '.venv', 'venv', 'coverage', '.cache']);
+    const DOC_EXT = new Set(['.md', '.mdx', '.txt', '.rst']);
+    const DOC_NAME_RE = /^(README|CHANGELOG|CONTRIBUTING|LICENSE|AGENTS)(\.|$)/i;
+    const results = [];
+    const walk = async (dir, depth) => {
+      if (results.length >= cap || depth > 4) return;
+      let entries;
+      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (results.length >= cap) return;
+        if (e.isDirectory()) {
+          if (!SKIP.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name), depth + 1);
+          continue;
+        }
+        const ext = path.extname(e.name).toLowerCase();
+        if (!DOC_EXT.has(ext) && !DOC_NAME_RE.test(e.name)) continue;
+        const full = path.join(dir, e.name);
+        try {
+          const stat = await fs.promises.stat(full);
+          if (stat.size > 300 * 1024) continue;
+          const text = await fs.promises.readFile(full, 'utf8');
+          const lines = text.split('\n');
+          const idx = lines.findIndex(l => l.toLowerCase().includes(query.toLowerCase()));
+          if (idx !== -1) {
+            const rel = path.relative(root, full).replace(/\\/g, '/');
+            const start = Math.max(0, idx - 2), end = Math.min(lines.length, idx + 3);
+            const snippet = lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join('\n');
+            results.push(`${rel}:${idx + 1}\n${snippet}`);
+          }
+        } catch {}
+      }
+    };
+    await walk(root, 0);
+    if (!results.length) return `No documentation matches for "${query}". Try search_codebase for source code instead.`;
+    return results.join('\n\n---\n\n');
   }
 
   async toolSearchCodebase(query, filePattern, contextLines = 2) {
@@ -2370,7 +2715,7 @@ class NavyCoderViewProvider {
           vscode.Uri.file(path.join(dir, 'checkpoints.json')),
           Buffer.from(JSON.stringify({ checkpoints: keep }), 'utf8')
         );
-      } catch {}
+      } catch (e) { this.log?.('checkpoint persist failed: ' + e.message); }
     }, 500);
   }
 
@@ -2796,6 +3141,7 @@ class NavyCoderViewProvider {
   }
 
   dispose() {
+    this.mcp?.stop();
     clearInterval(this._heartbeat);
     clearTimeout(this._cpSaveTimer);
     // Kill all background processes when the extension is deactivated or reloaded.
@@ -2830,12 +3176,15 @@ class NavyCoderViewProvider {
       let usedTools = false;
 
       for (let iter = 0; iter < maxIter; iter++) {
-        const { text, nativeToolCalls } = await streamAssistant(this, 
+        const { text, nativeToolCalls } = await streamAssistant(this,
           host, model, bgMessages, temperature,
           ctrl.signal,
           (chunk) => post('chunk', { text: chunk })
         );
 
+        // Same normalization as the main loop — strict providers (DeepSeek's
+        // `type` field, Cohere's empty ids) reject unnormalized replays here too.
+        this._normalizeToolCallIds(nativeToolCalls);
         bgMessages.push({
           role: 'assistant',
           content: text || '',
@@ -2872,7 +3221,10 @@ class NavyCoderViewProvider {
       post('done');
     } catch (e) {
       if (e.name === 'AbortError') post('aborted');
-      else post('error', { message: e.message });
+      else {
+        const p = vscode.workspace.getConfiguration('navy').get('provider', 'ollama');
+        post('error', { message: formatProviderError(providerDisplayName(p), e.message) });
+      }
     } finally {
       this.bgWorkers.delete(taskId);
     }
@@ -3141,7 +3493,7 @@ class NavyCoderViewProvider {
   // common English + coding filler. Also splits camelCase / snake_case so
   // "parseUserToken" contributes parse/user/token as well as the whole word. Pure.
   _tokenizeQuery(q) {
-    const STOP = new Set(['the','and','for','with','this','that','from','into','have','has','are','was','were','file','files','code','line','lines','function','please','make','fix','fixes','fixed','add','added','update','updated','change','changes','create','created','remove','removed','delete','implement','refactor','review','explain','check','using','use','used','need','needs','want','should','would','could','how','what','why','where','when','which','all','any','get','set','new','old','error','errors','bug','bugs','issue','issues','test','tests','navy','let','you','your','can','not','the','then','than','also','here','there','they','them','its','our']);
+    const STOP = new Set(['the','and','for','with','this','that','from','into','have','has','are','was','were','file','files','code','line','lines','function','please','make','fix','fixes','fixed','add','added','update','updated','change','changes','create','created','remove','removed','delete','implement','refactor','review','explain','check','using','use','used','need','needs','want','should','would','could','how','what','why','where','when','which','all','any','get','set','new','old','error','errors','bug','bugs','issue','issues','test','tests','navy','let','you','your','can','not','then','than','also','here','there','they','them','its','our']);
     const words = (q || '').match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
     const terms = new Map(); // term → weight (whole identifiers weigh more than split parts)
     const add = (t, w) => { const k = t.toLowerCase(); if (k.length >= 3 && !STOP.has(k)) terms.set(k, Math.max(terms.get(k) || 0, w)); };
@@ -3175,7 +3527,7 @@ class NavyCoderViewProvider {
   // per (root, maxFiles, terms) for 30s so repeated identical prompts (e.g. the
   // same request re-sent) don't re-read the whole tree each time.
   async _collectRelevance(root, terms, { maxFiles = 1500, maxBytes = 300 * 1024 } = {}) {
-    const cacheKey = root + ' ' + maxFiles + ' ' + terms.map(t => t.term).sort().join(',');
+    const cacheKey = root + '|' + maxFiles + '|' + terms.map(t => t.term).sort().join(',');
     if (this._relCache && this._relCache.key === cacheKey && Date.now() - this._relCache.time < 30_000) {
       return this._relCache.hits;
     }
@@ -3625,6 +3977,12 @@ function activate(context) {
 
   const provider = new NavyCoderViewProvider(context);
 
+  // Output channel: the home for best-effort failures (checkpoint persistence,
+  // MCP server chatter, provider errors) — View → Output → "Navy Coder".
+  const outputChannel = vscode.window.createOutputChannel('Navy Coder');
+  context.subscriptions.push(outputChannel);
+  provider.log = (line) => outputChannel.appendLine(new Date().toISOString().slice(11, 19) + '  ' + line);
+
   // First-run welcome — point new users at the sidebar so they know where Navy lives.
   if (!context.globalState.get('navy.welcomed')) {
     context.globalState.update('navy.welcomed', true);
@@ -3785,8 +4143,14 @@ function activate(context) {
       if (editor) provider.applyGutterDecorations(editor);
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.sendWorkspaceFolders()),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('navy.mcpServers')) provider.reloadMcpServers();
+    }),
     { dispose: () => provider.dispose() }
   );
+
+  // Connect configured MCP servers in the background — never blocks activation.
+  provider.reloadMcpServers();
 }
 
 function deactivate() {}

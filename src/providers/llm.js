@@ -59,13 +59,27 @@ async function fetchWithRetry(url, init) {
                 || await provider.context.secrets.get('navy.apiKey') || '';
     const apiBase = config.get('apiBase', '');
 
+    // Built-in tools plus any live MCP server tools (dynamic per request, so
+    // connecting/disconnecting a server needs no reload).
+    const toolsApi = TOOLS_API.concat(provider.mcp?.getToolsApi?.() || []);
+
     if (aiProvider === 'anthropic') {
-      return await streamAnthropic(provider, model, messages, temperature, apiKey, apiBase, signal, onChunk);
+      return await streamAnthropic(provider, model, messages, temperature, apiKey, apiBase, signal, onChunk, toolsApi);
+    }
+
+    // Gemini 2.5+/3.x always attach a thoughtSignature to functionCall parts when
+    // tools are involved, and Google REQUIRES it to be echoed back on the next
+    // request — a field the OpenAI-compatibility shim has no way to carry. Route
+    // those specific models through Gemini's native API, which can round-trip it.
+    // Older/non-thinking Gemini models (1.5, 2.0-flash) are unaffected by this and
+    // keep using the proven OpenAI-compat path — this is additive, not a replacement.
+    if (aiProvider === 'gemini' && isGeminiThinkingModel(model)) {
+      return await streamGeminiNative(provider, model, messages, temperature, apiKey, apiBase, signal, onChunk, toolsApi);
     }
 
     const compatBase = openAiCompatBase(aiProvider, apiBase, host);
     if (compatBase) {
-      return await streamOpenAI(provider, compatBase, model, messages, temperature, apiKey, signal, onChunk);
+      return await streamOpenAI(provider, compatBase, model, messages, temperature, apiKey, signal, onChunk, toolsApi);
     }
 
     const options = { temperature };
@@ -73,8 +87,8 @@ async function fetchWithRetry(url, init) {
 
     // Ollama uses a separate `images` field (base64 strings, no data-URI prefix) rather than
     // the OpenAI content-array format, so convert any vision messages here.
-    // Also strip _rawBlocks (Anthropic-only replay state).
-    const ollamaMessages = messages.map(({ _rawBlocks, ...msg }) => {
+    // Also strip _rawBlocks/_rawBlocksProvider (Anthropic/Gemini-only replay state).
+    const ollamaMessages = messages.map(({ _rawBlocks, _rawBlocksProvider, ...msg }) => {
       if (!Array.isArray(msg.content)) return msg;
       const texts = [];
       const imgs = [];
@@ -93,7 +107,7 @@ async function fetchWithRetry(url, init) {
       messages: ollamaMessages,
       stream: true,
       options,
-      tools: TOOLS_API
+      tools: toolsApi
     };
     // Toggle native thinking for model families that support it. Only sent when the
     // name matches — Ollama 400s if `think` is passed to a non-thinking model.
@@ -169,7 +183,33 @@ async function fetchWithRetry(url, init) {
     return { text, nativeToolCalls, tokenCounts };
   }
 
-  async function streamAnthropic(provider, model, messages, temperature, apiKey, baseUrl = '', signal = null, onChunk = null) {
+  // Anthropic prompt caching: mark the static prefix (system + tools) and the
+  // newest message block as ephemeral cache breakpoints. On a multi-step agent
+  // turn the ~10k-token prefix is then billed at ~10% and served far faster from
+  // the second call on. Pure — clones instead of mutating, so breakpoints never
+  // accumulate across iterations (Anthropic allows at most 4 per request).
+  function applyAnthropicCacheControl(systemText, tools, messages) {
+    const cc = { cache_control: { type: 'ephemeral' } };
+    const system = systemText ? [{ type: 'text', text: systemText, ...cc }] : undefined;
+    const outTools = tools.length
+      ? tools.map((t, i) => i === tools.length - 1 ? { ...t, ...cc } : t)
+      : tools;
+    const outMsgs = messages.slice();
+    if (outMsgs.length) {
+      const last = { ...outMsgs[outMsgs.length - 1] };
+      if (typeof last.content === 'string' && last.content) {
+        last.content = [{ type: 'text', text: last.content, ...cc }];
+      } else if (Array.isArray(last.content) && last.content.length) {
+        const blocks = last.content.slice();
+        blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], ...cc };
+        last.content = blocks;
+      }
+      outMsgs[outMsgs.length - 1] = last;
+    }
+    return { system, tools: outTools, messages: outMsgs };
+  }
+
+  async function streamAnthropic(provider, model, messages, temperature, apiKey, baseUrl = '', signal = null, onChunk = null, toolsApi = TOOLS_API) {
     // Convert OpenAI-format messages to Anthropic Messages API format.
     let systemText = '';
     const anthropicMessages = [];
@@ -185,10 +225,13 @@ async function fetchWithRetry(url, init) {
         } else {
           anthropicMessages.push({ role: 'user', content: [toolBlock] });
         }
-      } else if (msg.role === 'assistant' && Array.isArray(msg._rawBlocks) && msg._rawBlocks.length) {
+      } else if (msg.role === 'assistant' && msg._rawBlocksProvider === 'anthropic' && Array.isArray(msg._rawBlocks) && msg._rawBlocks.length) {
         // Replay the exact content blocks from a previous streaming turn. Required when
         // extended thinking is enabled: Anthropic rejects tool_use turns whose thinking
-        // blocks were stripped or reconstructed.
+        // blocks were stripped or reconstructed. Provider-tag-gated: if the user
+        // switched provider mid-conversation, rawBlocks from a DIFFERENT provider
+        // (e.g. Gemini's parts shape) must never be replayed here — fall through
+        // to the generic tool_calls reconstruction branch below instead.
         anthropicMessages.push({ role: 'assistant', content: msg._rawBlocks });
       } else if (msg.role === 'assistant' && msg.tool_calls?.length) {
         // Convert OpenAI tool-call assistant turn to Anthropic tool_use blocks.
@@ -240,8 +283,8 @@ async function fetchWithRetry(url, init) {
       }
     }
 
-    // Convert TOOLS_API (OpenAI format) to Anthropic tool format.
-    const anthropicTools = TOOLS_API.map(t => ({
+    // Convert the OpenAI-format tool list (built-ins + MCP) to Anthropic format.
+    const anthropicTools = toolsApi.map(t => ({
       name: t.function.name,
       description: t.function.description || '',
       input_schema: t.function.parameters || { type: 'object', properties: {} },
@@ -251,37 +294,82 @@ async function fetchWithRetry(url, init) {
     const maxTokens = /claude-3-(opus|sonnet|haiku)-/.test(model) ? 4096
                     : /claude-3-5-/.test(model) ? 8192
                     : 16384;
-    const body = {
-      model,
-      max_tokens: maxTokens,
-      stream: true,
-      messages: mergedMessages,
-      tools: anthropicTools,
-    };
     // High thinking level → Anthropic extended thinking. Temperature must be omitted
     // (the API requires the default of 1 when thinking is enabled). Claude 3.x
     // generations don't support the thinking parameter — fall back to temperature.
     const supportsThinking = !/claude-3-(opus|sonnet|haiku|5)/.test(model);
-    const useThinking = supportsThinking && (provider.thinkingLevel || 'medium') === 'high';
-    if (useThinking) body.thinking = { type: 'enabled', budget_tokens: 6000 };
-    else body.temperature = temperature;
-    if (systemText) body.system = systemText;
+    const thinkingLevel = provider.thinkingLevel || 'medium';
+    const useThinking = supportsThinking && thinkingLevel === 'high';
+    const effortMap = { fast: 'low', medium: 'medium', high: 'high' };
+
+    // Prompt caching: system + tools + newest message become cache breakpoints.
+    const cached = applyAnthropicCacheControl(systemText, anthropicTools, mergedMessages);
+
+    // Newer model generations reject the legacy thinking shape ({type:'enabled',
+    // budget_tokens}) and reject `temperature` outright, wanting
+    // {type:'adaptive'} + output_config.effort instead. We can't know which
+    // generation a given model name belongs to ahead of time without going stale
+    // the moment a new one ships, so build both shapes and fall back at runtime
+    // on the API's own error text — same pattern as the cache_control fallback.
+    const buildBody = (useAdaptive, withCaching) => {
+      const b = {
+        model,
+        max_tokens: maxTokens,
+        stream: true,
+        messages: withCaching ? cached.messages : mergedMessages,
+        tools: withCaching ? cached.tools : anthropicTools,
+      };
+      if (useAdaptive) {
+        b.thinking = { type: 'adaptive' };
+        b.output_config = { effort: effortMap[thinkingLevel] || 'medium' };
+      } else if (useThinking) {
+        b.thinking = { type: 'enabled', budget_tokens: 6000 };
+      } else {
+        b.temperature = temperature;
+      }
+      const sys = withCaching ? cached.system : systemText;
+      if (sys) b.system = sys;
+      return b;
+    };
 
     const anthropicEndpoint = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/messages';
-    const response = await fetchWithRetry(anthropicEndpoint, {
+    const anthropicHeaders = {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    };
+    const postAnthropic = (b) => fetchWithRetry(anthropicEndpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
+      headers: anthropicHeaders,
+      body: JSON.stringify(b),
       signal: signal || provider.abortController.signal,
     });
 
+    const looksLikeCachingIssue = (txt) => /cache_control|cache/i.test(txt);
+    const needsAdaptiveRetry = (txt) => /thinking\.type\.enabled|thinking\.type\.adaptive|output_config\.effort|`?temperature`?\s+is deprecated/i.test(txt);
+
+    let withCaching = true;
+    let useAdaptive = false;
+    let response = await postAnthropic(buildBody(useAdaptive, withCaching));
+    let txt = null;
     if (!response.ok || !response.body) {
-      const txt = await response.text();
-      throw new Error('Anthropic API error ' + response.status + ': ' + txt);
+      txt = await response.text();
+
+      if (response.status === 400 && looksLikeCachingIssue(txt) && !needsAdaptiveRetry(txt)) {
+        withCaching = false;
+        response = await postAnthropic(buildBody(useAdaptive, withCaching));
+        txt = (response.ok && response.body) ? null : await response.text();
+      }
+
+      if (txt !== null && response.status === 400 && needsAdaptiveRetry(txt)) {
+        useAdaptive = true;
+        response = await postAnthropic(buildBody(useAdaptive, withCaching));
+        txt = (response.ok && response.body) ? null : await response.text();
+      }
+
+      if (txt !== null) {
+        throw new Error('Anthropic API error ' + response.status + ': ' + txt);
+      }
     }
 
     const reader = response.body.getReader();
@@ -374,16 +462,17 @@ async function fetchWithRetry(url, init) {
     return { text, nativeToolCalls, tokenCounts, rawBlocks };
   }
 
-  async function streamOpenAI(provider, baseUrl, model, messages, temperature, apiKey, signal = null, onChunk = null) {
+  async function streamOpenAI(provider, baseUrl, model, messages, temperature, apiKey, signal = null, onChunk = null, toolsApi = TOOLS_API) {
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
     const body = {
       model,
-      // _rawBlocks is Anthropic-only replay state — never send it to OpenAI-compat APIs.
-      messages: messages.map(({ _rawBlocks, ...m }) => m),
+      // _rawBlocks/_rawBlocksProvider are Anthropic/Gemini-only replay state — never
+      // send them to OpenAI-compat APIs.
+      messages: messages.map(({ _rawBlocks, _rawBlocksProvider, ...m }) => m),
       stream: true,
-      tools: TOOLS_API
+      tools: toolsApi
     };
     // Without this, OpenAI-compatible streams never include usage and the token
     // counter / context gauge stay at 0. Gemini's compat layer rejects the field.
@@ -465,6 +554,169 @@ async function fetchWithRetry(url, init) {
     return { text, nativeToolCalls: nativeToolCalls.filter(Boolean), tokenCounts };
   }
 
+  // Gemini 2.5+ and 3.x always think, and Google requires the resulting
+  // thoughtSignature to be echoed back on functionCall parts on the next request
+  // or tool use breaks outright ("Function call is missing a thought_signature").
+  // The OpenAI-compat shim (used for older Gemini models) has no field for it.
+  function isGeminiThinkingModel(model) {
+    return /gemini-(2\.5|3(?:\.\d+)?)/i.test(String(model || ''));
+  }
+
+  // Native Gemini streaming (generateContent SSE), used only for isGeminiThinkingModel().
+  // Mirrors the Anthropic native path's approach: preserve the exact "parts" the
+  // model returned (including thought/thoughtSignature) in rawBlocks, and replay
+  // them verbatim as the next request's "model" turn — Gemini's analogue of
+  // Anthropic's _rawBlocks requirement for thinking + tool use.
+  async function streamGeminiNative(provider, model, messages, temperature, apiKey, baseUrl = '', signal = null, onChunk = null, toolsApi = TOOLS_API) {
+    // Convert the OpenAI-shaped internal message list to Gemini's `contents`.
+    // Track tool_call_id → name so 'tool' role results (which only carry the id)
+    // can be turned into Gemini's name-keyed functionResponse parts.
+    let systemText = '';
+    const contents = [];
+    const idToName = {};
+
+    const toGeminiParts = (content) => {
+      if (typeof content === 'string') return content ? [{ text: content }] : [];
+      if (!Array.isArray(content)) return [];
+      const parts = [];
+      for (const part of content) {
+        if (part.type === 'text' && part.text) parts.push({ text: part.text });
+        else if (part.type === 'image_url') {
+          const url = part.image_url?.url || '';
+          if (url.startsWith('data:')) {
+            const [meta, data] = url.split(',');
+            const mimeType = meta.slice(5).split(';')[0];
+            parts.push({ inlineData: { mimeType, data } });
+          }
+        }
+      }
+      return parts;
+    };
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        systemText += (systemText ? '\n' : '') + (typeof msg.content === 'string' ? msg.content : '');
+      } else if (msg.role === 'assistant' && msg._rawBlocksProvider === 'gemini' && Array.isArray(msg._rawBlocks) && msg._rawBlocks.length) {
+        // Exact replay — required to keep thoughtSignature intact. Gated on the
+        // provider tag for the same cross-provider-switch reason as Anthropic's
+        // replay branch above.
+        contents.push({ role: 'model', parts: msg._rawBlocks });
+        for (const tc of (msg.tool_calls || [])) if (tc.id) idToName[tc.id] = tc.function?.name || '';
+      } else if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        // No native rawBlocks available (e.g. history from a different provider) —
+        // reconstruct a best-effort functionCall-only turn.
+        const parts = [];
+        if (msg.content) parts.push({ text: String(msg.content) });
+        for (const tc of msg.tool_calls) {
+          let args = {};
+          try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+          parts.push({ functionCall: { name: tc.function?.name || '', args } });
+          if (tc.id) idToName[tc.id] = tc.function?.name || '';
+        }
+        contents.push({ role: 'model', parts });
+      } else if (msg.role === 'tool') {
+        const name = idToName[msg.tool_call_id] || 'unknown_function';
+        const responsePart = { functionResponse: { name, response: { result: String(msg.content) } } };
+        const last = contents[contents.length - 1];
+        if (last?.role === 'user' && last.parts.every(p => p.functionResponse)) last.parts.push(responsePart);
+        else contents.push({ role: 'user', parts: [responsePart] });
+      } else if (Array.isArray(msg.content)) {
+        const parts = toGeminiParts(msg.content);
+        if (parts.length) contents.push({ role: msg.role === 'assistant' ? 'model' : 'user', parts });
+      } else {
+        const text = typeof msg.content === 'string' ? msg.content : '';
+        if (text || msg.role === 'user') contents.push({ role: msg.role === 'assistant' ? 'model' : 'user', parts: text ? [{ text }] : [{ text: '' }] });
+      }
+    }
+
+    const geminiTools = toolsApi.length
+      ? [{ functionDeclarations: toolsApi.map(t => ({
+          name: t.function.name,
+          description: t.function.description || '',
+          parameters: t.function.parameters || { type: 'object', properties: {} },
+        })) }]
+      : undefined;
+
+    const useThinking = (provider.thinkingLevel || 'medium') === 'high';
+    const body = {
+      contents,
+      ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
+      ...(geminiTools ? { tools: geminiTools } : {}),
+      generationConfig: {
+        temperature,
+        maxOutputTokens: 8192,
+        ...(useThinking ? { thinkingConfig: { includeThoughts: true, thinkingBudget: 8000 } } : {}),
+      },
+    };
+
+    const base = (baseUrl || 'https://generativelanguage.googleapis.com').replace(/\/$/, '');
+    const url = base + '/v1beta/models/' + encodeURIComponent(model) + ':streamGenerateContent?alt=sse';
+    const response = await fetchWithRetry(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify(body),
+      signal: signal || provider.abortController.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      const txt = await response.text();
+      throw new Error('Gemini API error ' + response.status + ': ' + txt);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    const nativeToolCalls = [];
+    const tokenCounts = { prompt: 0, completion: 0 };
+    const rawBlocks = []; // exact parts, replayed verbatim next turn
+    let thinkingStarted = false;
+
+    const processLine = (line) => {
+      const dataLine = line.startsWith('data: ') ? line.slice(6).trim() : null;
+      if (!dataLine || dataLine === '[DONE]') return;
+      let evt;
+      try { evt = JSON.parse(dataLine); } catch { return; }
+      if (evt.usageMetadata) {
+        tokenCounts.prompt = evt.usageMetadata.promptTokenCount || tokenCounts.prompt;
+        tokenCounts.completion = evt.usageMetadata.candidatesTokenCount || tokenCounts.completion;
+      }
+      const parts = evt.candidates?.[0]?.content?.parts || [];
+      for (const part of parts) {
+        if (part.functionCall) {
+          const id = part.functionCall.id || (part.functionCall.name + '_' + Math.random().toString(16).slice(2, 10));
+          nativeToolCalls.push({ id, function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) } });
+          rawBlocks.push(part); // preserves thoughtSignature on this part, if present
+        } else if (part.thought) {
+          if (!thinkingStarted) {
+            thinkingStarted = true;
+            provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
+          }
+          rawBlocks.push(part);
+        } else if (typeof part.text === 'string') {
+          text += part.text;
+          rawBlocks.push(part);
+          if (thinkingStarted) provider.view?.webview.postMessage({ type: 'statusText', text: 'Working…' });
+          if (onChunk) onChunk(part.text);
+          else provider.view?.webview.postMessage({ type: 'chunk', text: part.text });
+        }
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) processLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) buffer.split('\n').forEach(processLine);
+
+    return { text, nativeToolCalls, tokenCounts, rawBlocks };
+  }
+
   function extractJsonObjects(text) {
     const events = [];
     let pos = 0;
@@ -527,7 +779,11 @@ async function fetchWithRetry(url, init) {
         const obj = JSON.parse(match[1]);
         const toolName = obj.tool || obj.function || obj.name;
         const toolArgs = obj.arguments || obj.parameters || obj.args || {};
-        if (toolName && TOOLS.some(t => t.name === toolName)) {
+        // mcp__<server>__<tool> is Navy's own reserved namespace for connected MCP
+        // servers — allow it through even though it's not in the static TOOLS list
+        // (that list only knows the built-ins). A name that doesn't correspond to
+        // an actually-connected server is handled gracefully by McpManager.call().
+        if (toolName && (TOOLS.some(t => t.name === toolName) || /^mcp__/.test(toolName))) {
           calls.push({ name: toolName, args: toolArgs });
         }
       } catch {}
@@ -544,7 +800,7 @@ async function fetchWithRetry(url, init) {
         const name = obj.name || obj.tool || obj.function;
         const rawArgs = obj.arguments ?? obj.parameters ?? obj.args ?? obj.input;
         if (typeof name !== 'string' || rawArgs === undefined) continue;
-        if (!TOOLS.some(t => t.name === name)) continue;
+        if (!TOOLS.some(t => t.name === name) && !/^mcp__/.test(name)) continue;
         let args = rawArgs;
         if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
         calls.push({ name, args: args && typeof args === 'object' ? args : {} });
@@ -569,4 +825,4 @@ async function fetchWithRetry(url, init) {
   }
 
   
-module.exports = { streamAssistant, parseToolCalls, extractCodeEdits };
+module.exports = { streamAssistant, parseToolCalls, extractCodeEdits, applyAnthropicCacheControl, isGeminiThinkingModel };

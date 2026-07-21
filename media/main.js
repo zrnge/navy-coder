@@ -421,18 +421,22 @@ function handleDroppedFiles(files) {
 
 // ── Settings panel ──────────────────────────────────────────────────────────
 
+// Each provider's real default API base URL — auto-filled into the URL box so the
+// user never has to type it (they can still edit it for a proxy / self-hosted
+// gateway). These are stable infrastructure endpoints, mirrored from
+// src/providers/endpoints.js (the extension's source of truth for requests).
 const PROVIDER_DEFAULTS = {
-  ollama:     { base: '',                                                  needsKey: false, basePlaceholder: '',                                              baseHint: '' },
-  lmstudio:   { base: 'http://localhost:1234/v1',                         needsKey: false, basePlaceholder: 'http://localhost:1234/v1',                      baseHint: 'LM Studio local server URL. Change port if needed.' },
-  anthropic:  { base: '',                                                  needsKey: true,  basePlaceholder: 'https://api.anthropic.com (optional)',          baseHint: 'Leave blank to use the default Anthropic endpoint.' },
-  openai:     { base: '',                                                  needsKey: true,  basePlaceholder: 'https://api.openai.com/v1 (optional)',          baseHint: 'Leave blank to use the default OpenAI endpoint.' },
-  deepseek:   { base: '',                                                  needsKey: true,  basePlaceholder: 'https://api.deepseek.com/v1 (optional)',        baseHint: 'Leave blank to use the default DeepSeek endpoint.' },
-  gemini:     { base: '',                                                  needsKey: true,  basePlaceholder: 'https://generativelanguage.googleapis.com/... (optional)', baseHint: "Leave blank to use Google's OpenAI-compatible endpoint." },
-  xai:        { base: '',                                                  needsKey: true,  basePlaceholder: 'https://api.x.ai/v1 (optional)',               baseHint: 'Leave blank to use the default xAI Grok endpoint.' },
-  zai:        { base: 'https://api.z.ai/v1',                             needsKey: true,  basePlaceholder: 'https://api.z.ai/v1',                           baseHint: 'z.ai API base URL.' },
-  groq:       { base: '',                                                  needsKey: true,  basePlaceholder: 'https://api.groq.com/openai/v1 (optional)',     baseHint: 'Leave blank to use the default Groq endpoint.' },
-  openrouter: { base: '',                                                  needsKey: true,  basePlaceholder: 'https://openrouter.ai/api/v1 (optional)',       baseHint: 'Leave blank to use the default OpenRouter endpoint.' },
-  custom:     { base: '',                                                  needsKey: false, basePlaceholder: 'https://your-server.example.com/v1',            baseHint: 'Full base URL of your OpenAI-compatible API endpoint.' },
+  ollama:     { base: '',                                              needsKey: false, baseHint: '' },
+  lmstudio:   { base: 'http://localhost:1234/v1',                      needsKey: false, baseHint: 'LM Studio local server URL. Change the port if yours differs.' },
+  anthropic:  { base: 'https://api.anthropic.com',                     needsKey: true,  baseHint: 'Anthropic endpoint. Edit only for a proxy/gateway.' },
+  openai:     { base: 'https://api.openai.com/v1',                     needsKey: true,  baseHint: 'OpenAI endpoint. Edit only for a proxy/gateway.' },
+  deepseek:   { base: 'https://api.deepseek.com/v1',                   needsKey: true,  baseHint: 'DeepSeek endpoint. Edit only for a proxy/gateway.' },
+  gemini:     { base: 'https://generativelanguage.googleapis.com/v1beta/openai', needsKey: true, baseHint: "Google's OpenAI-compatible endpoint. Edit only for a proxy/gateway." },
+  xai:        { base: 'https://api.x.ai/v1',                           needsKey: true,  baseHint: 'xAI Grok endpoint. Edit only for a proxy/gateway.' },
+  zai:        { base: 'https://api.z.ai/v1',                           needsKey: true,  baseHint: 'z.ai endpoint. Edit only for a proxy/gateway.' },
+  groq:       { base: 'https://api.groq.com/openai/v1',                needsKey: true,  baseHint: 'Groq endpoint. Edit only for a proxy/gateway.' },
+  openrouter: { base: 'https://openrouter.ai/api/v1',                  needsKey: true,  baseHint: 'OpenRouter endpoint. Edit only for a proxy/gateway.' },
+  custom:     { base: '',                                              needsKey: false, baseHint: 'Full base URL of your OpenAI-compatible API endpoint.' },
 };
 
 function updateSettingsFieldVisibility(isProviderChange) {
@@ -443,11 +447,14 @@ function updateSettingsFieldVisibility(isProviderChange) {
   if (settingApiBaseGroup) settingApiBaseGroup.style.display = p !== 'ollama' ? '' : 'none';
   if (settingApiKeyGroup)  settingApiKeyGroup.style.display  = info.needsKey  ? '' : 'none';
 
-  if (settingApiBase) settingApiBase.placeholder = info.basePlaceholder;
+  if (settingApiBase) settingApiBase.placeholder = info.base || 'https://your-server.example.com/v1';
   const hintEl = document.querySelector('#settingApiBaseHint');
   if (hintEl) hintEl.textContent = info.baseHint;
 
-  if (isProviderChange && settingApiBase && info.base) {
+  // Auto-fill the URL box with the provider's endpoint:
+  //  • on a provider change → always overwrite with the new provider's default
+  //  • on load → only when the box is empty (never clobber a saved override)
+  if (settingApiBase && info.base && (isProviderChange || !settingApiBase.value)) {
     settingApiBase.value = info.base;
   }
 }
@@ -466,10 +473,16 @@ settingProvider?.addEventListener('change', () => updateSettingsFieldVisibility(
 
 settingsForm?.addEventListener('submit', (e) => {
   e.preventDefault();
+  // If the URL box still holds the provider's own default, save '' — an explicit
+  // override would pin users to today's endpoint even if a future Navy update
+  // changes the default. Only genuinely custom URLs are stored.
+  const provVal = settingProvider?.value || 'ollama';
+  const rawBase = settingApiBase?.value || '';
+  const provDefault = (PROVIDER_DEFAULTS[provVal] || {}).base || '';
   const settings = {
-    provider:     settingProvider?.value     || 'ollama',
+    provider:     provVal,
     host:         settingHost?.value         || 'http://localhost:11434',
-    apiBase:      settingApiBase?.value      || '',
+    apiBase:      rawBase === provDefault ? '' : rawBase,
     temperature:  settingTemperature?.value  ?? 0.2,
     maxIter:      settingMaxIter?.value      ?? 15,
     editFormat:   settingEditFormat?.value   || 'search-replace',
@@ -503,6 +516,7 @@ window.addEventListener('message', (event) => {
   if (message.type === 'start') {
     flushAssistantText();
     setBusy(true);
+    resetPlanCard();
     activeAssistantMessage = addMessage('assistant', '');
     activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
     activeAssistantContent = '';
@@ -533,6 +547,9 @@ window.addEventListener('message', (event) => {
   if (message.type === 'done' || message.type === 'aborted') {
     flushAssistantText();
     setBusy(false);
+    // Only a genuinely successful finish claims every plan step is done — an
+    // aborted turn may have only completed some of them.
+    if (message.type === 'done') updatePlanProgress(0, true);
     // A command still streaming when the turn ends (Stop pressed) — close its card.
     if (activeTermCard) finalizeTermCard('__stopped__');
     // Remove the bubble when nothing VISIBLE was produced — either no content at
@@ -551,6 +568,22 @@ window.addEventListener('message', (event) => {
     if (stepBadgeEl) { stepBadgeEl.textContent = ''; stepBadgeEl.classList.remove('visible'); }
     collapseToolProgress();
     updateWelcome();
+  }
+
+  if (message.type === 'errorContinue') {
+    // The turn errored after real progress — one click resumes where it stopped.
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'continue-btn';
+    btn.textContent = 'Continue where it stopped';
+    btn.addEventListener('click', () => {
+      btn.remove();
+      const p = 'Continue the task — the previous turn was interrupted by a provider error. Pick up exactly where you left off; files already changed are done, do not redo them.';
+      addMessage('user', p);
+      vscode.postMessage({ type: 'ask', prompt: p });
+    });
+    messagesEl.appendChild(btn);
+    scrollToBottom();
   }
 
   if (message.type === 'capReached') {
@@ -575,6 +608,7 @@ window.addEventListener('message', (event) => {
     activeAssistantMessage = null;
     activeAssistantBubble = null;
     activeAssistantContent = '';
+    resetPlanCard();
     collapseToolProgress();
     addMessage('error', message.message);
     updateWelcome();
@@ -598,6 +632,7 @@ window.addEventListener('message', (event) => {
     activityLogEl = null;
     currentActivityRowEl = null;
     activeTermCard = null;
+    resetPlanCard();
     messagesEl.innerHTML = '';
     messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
     welcomeEl.classList.remove('hidden');
@@ -830,6 +865,12 @@ window.addEventListener('message', (event) => {
     if (stepBadgeEl) {
       stepBadgeEl.textContent = `step ${message.step}`;
       stepBadgeEl.classList.add('visible');
+    }
+    // Best-effort mapping of tool-loop iteration → plan step (message.step starts
+    // at 2 on the loop's second iteration; see extension.js).
+    if (planCardEl && planStepCount > 0) {
+      const activeIdx = Math.min(Math.max(message.step - 2, 0), planStepCount - 1);
+      updatePlanProgress(activeIdx, false);
     }
   }
 
@@ -1655,11 +1696,56 @@ function renderApprovalQueue(approvals) {
   approvalQueue.appendChild(list);
 }
 
+// True when a model list is dominated by "vendor/model" naming (OpenRouter's
+// convention) — worth grouping into <optgroup>s by vendor. A minority of
+// slash-containing names (e.g. one oddly-named model on Groq) isn't enough to
+// group everything else, so this requires most of the list to match.
+function shouldGroupByVendor(models) {
+  if (models.length < 8) return false;
+  const withSlash = models.filter(m => /^[\w.-]+\//.test(m)).length;
+  return withSlash / models.length >= 0.7;
+}
+
+// Renders `models` into `select`, grouped into <optgroup>s by vendor prefix when
+// the list looks like OpenRouter's "vendor/model" convention, flat otherwise.
+// Shared by the initial populate and the filter-box's live re-render so grouping
+// behavior never diverges between the two.
+function renderModelOptions(select, models, selectedValue) {
+  select.innerHTML = '';
+  if (shouldGroupByVendor(models)) {
+    const groups = new Map(); // vendor → [names]
+    for (const name of models) {
+      const m = name.match(/^([\w.-]+)\//);
+      const vendor = m ? m[1] : '(other)';
+      if (!groups.has(vendor)) groups.set(vendor, []);
+      groups.get(vendor).push(name);
+    }
+    for (const [vendor, names] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const grp = document.createElement('optgroup');
+      grp.label = vendor;
+      for (const name of names) {
+        const o = document.createElement('option');
+        o.value = name; o.textContent = name;
+        if (name === selectedValue) o.selected = true;
+        grp.appendChild(o);
+      }
+      select.appendChild(grp);
+    }
+  } else {
+    for (const name of models) {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      if (name === selectedValue) o.selected = true;
+      select.appendChild(o);
+    }
+  }
+}
+
 function populateModels(models, current, error) {
   const previous = modelSelect.value || current;
-  modelSelect.innerHTML = '';
 
   if (error || models.length === 0) {
+    modelSelect.innerHTML = '';
     const option = document.createElement('option');
     option.value = current || '';
     option.textContent = current || 'No models';
@@ -1674,15 +1760,38 @@ function populateModels(models, current, error) {
   }
 
   setStatus(models.length + ' models');
-  for (const name of models) {
-    const option = document.createElement('option');
-    option.value = name;
-    option.textContent = name;
-    if (name === current || name === previous) {
-      option.selected = true;
-    }
-    modelSelect.appendChild(option);
+  // Prefer `current` if it's actually in the list; otherwise fall back to
+  // whatever the select previously held (`previous`) — matches the original
+  // "select current OR previous" intent with a single target value.
+  const selectedValue = models.includes(current) ? current : (models.includes(previous) ? previous : current);
+  renderModelOptions(modelSelect, models, selectedValue);
+
+  updateModelFilter(models, current || previous);
+}
+
+// Big providers (OpenRouter lists 300+ models) make a bare <select> unusable —
+// show a small type-to-filter box next to it once the list crosses a threshold.
+let _allModels = [];
+function updateModelFilter(models, current) {
+  _allModels = models.slice();
+  let input = document.getElementById('modelFilter');
+  if (models.length <= 30) { if (input) input.style.display = 'none'; return; }
+  if (!input) {
+    input = document.createElement('input');
+    input.id = 'modelFilter';
+    input.type = 'text';
+    input.className = 'model-filter';
+    input.placeholder = 'filter…';
+    input.setAttribute('aria-label', 'Filter models');
+    modelSelect?.parentNode?.insertBefore(input, modelSelect);
+    input.addEventListener('input', () => {
+      const q = input.value.toLowerCase().trim();
+      const filtered = q ? _allModels.filter(m => m.toLowerCase().includes(q)) : _allModels;
+      const selected = modelSelect.value;
+      renderModelOptions(modelSelect, filtered.length ? filtered : _allModels, selected);
+    });
   }
+  input.style.display = '';
 }
 
 function renderFileChips() {
@@ -1841,6 +1950,79 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
   return article;
 }
 
+// ── Plan checklist card ────────────────────────────────────────────────────
+// Parses a "**Plan:**" section (rule 13 in TOOL_PROMPT asks the model for one
+// on any 3+ tool-call task) into an array of step strings. Pure/testable.
+// Stops at the first blank line after the list, or at end of text.
+function parsePlanSteps(text) {
+  const m = text.match(/\*\*Plan:\*\*[ \t]*\n([\s\S]*)/i) || text.match(/(?:^|\n)Plan:[ \t]*\n([\s\S]*)/i);
+  if (!m) return [];
+  const steps = [];
+  for (const line of m[1].split('\n')) {
+    const sm = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (sm) steps.push(sm[1].trim());
+    else if (steps.length && line.trim() === '') break;
+    else if (steps.length && !sm) break; // non-numbered line after the list ends it
+  }
+  return steps;
+}
+
+let planCardEl = null;
+let planStepCount = 0;
+
+// Builds the checklist once per turn, as soon as a parseable plan appears in the
+// streamed text. Best-effort/visual only — a wrong step count or a model that
+// never states a plan just means no card appears; nothing else depends on it.
+function maybeBuildPlanCard() {
+  if (planCardEl || !activeAssistantContent) return;
+  const steps = parsePlanSteps(activeAssistantContent);
+  if (!steps.length) return;
+  planStepCount = steps.length;
+  const card = document.createElement('div');
+  card.className = 'plan-card';
+  const header = document.createElement('div');
+  header.className = 'plan-card-header';
+  header.textContent = `Plan — ${steps.length} step${steps.length !== 1 ? 's' : ''}`;
+  card.appendChild(header);
+  const list = document.createElement('ol');
+  list.className = 'plan-card-list';
+  for (const s of steps) {
+    const li = document.createElement('li');
+    li.className = 'plan-step pending';
+    const icon = document.createElement('span');
+    icon.className = 'plan-step-icon';
+    const label = document.createElement('span');
+    label.className = 'plan-step-text';
+    label.textContent = s;
+    li.appendChild(icon);
+    li.appendChild(label);
+    list.appendChild(li);
+  }
+  card.appendChild(list);
+  (activeAssistantMessage || messagesEl).appendChild(card);
+  planCardEl = card;
+  scrollToBottom();
+}
+
+// activeIdx: 0-based step currently "in progress" (best-effort — Navy's tool
+// iterations don't map 1:1 to plan steps, so this is an approximate indicator,
+// not a guarantee). allDone forces every step to the done state.
+function updatePlanProgress(activeIdx, allDone) {
+  if (!planCardEl) return;
+  const items = planCardEl.querySelectorAll('.plan-step');
+  items.forEach((li, i) => {
+    li.classList.remove('pending', 'active', 'done');
+    if (allDone || i < activeIdx) li.classList.add('done');
+    else if (i === activeIdx) li.classList.add('active');
+    else li.classList.add('pending');
+  });
+}
+
+function resetPlanCard() {
+  planCardEl = null;
+  planStepCount = 0;
+}
+
 // Streaming render state
 let _streamPre = null;    // <pre> shown live during streaming (raw text, O(1) append)
 
@@ -1852,6 +2034,7 @@ function appendAssistantText(text) {
   }
 
   activeAssistantContent += text;
+  maybeBuildPlanCard();
 
   // NEVER show raw <think> reasoning while streaming: drop closed blocks and,
   // if a block is still open, hide its contents behind a live indicator.
@@ -2878,6 +3061,24 @@ function errorIcon() {
     <line x1="12" y1="8" x2="12" y2="13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
     <circle cx="12" cy="16" r="1" fill="currentColor"/>
   </svg>`;
+}
+
+// Panel resizes reflow the whole chat: keep the view pinned to the bottom
+// (unless the user deliberately scrolled up) and re-fit the composer textarea
+// to its new width. rAF-batched — one adjustment per painted frame while the
+// user drags the splitter. Guarded for environments without ResizeObserver.
+if (typeof ResizeObserver === 'function') {
+  let _resizePending = false;
+  const _panelObserver = new ResizeObserver(() => {
+    if (_resizePending) return;
+    _resizePending = true;
+    requestAnimationFrame(() => {
+      _resizePending = false;
+      autoResize();
+      if (!userScrolledUp) messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  });
+  _panelObserver.observe(document.body);
 }
 
 // Initialize — signal readiness so the extension sends all startup state.

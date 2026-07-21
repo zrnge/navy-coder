@@ -30,7 +30,8 @@ function createVscodeMock() {
     nextWarning: undefined,           // value the next showWarningMessage resolves to
     nextRename: null,                 // [{ fsPath, newText }] the fake rename provider returns
     shown: { warning: [], info: [], error: [] },
-    reset() { this.nextWarning = undefined; this.nextRename = null; this.shown = { warning: [], info: [], error: [] }; },
+    applyEditFails: false,
+    reset() { this.nextWarning = undefined; this.nextRename = null; this.applyEditFails = false; this.shown = { warning: [], info: [], error: [] }; },
   };
 
   const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
@@ -63,12 +64,16 @@ function createVscodeMock() {
 
   const configApi = {
     get: (k, d) => (k in ctrl.config ? ctrl.config[k] : d),
-    update: async () => {},
+    update: async (k, v) => { ctrl.config[k] = v; }, // write-through so tests can observe
     inspect: () => ({ workspaceValue: undefined, globalValue: undefined }),
   };
 
   const vscode = {
     FileType,
+    // No real rg.exe under a tmpdir → _findRipgrep() correctly returns null,
+    // so ripgrep-backed tools deterministically exercise their JS-walk fallback
+    // in tests rather than depending on the test machine's real VS Code install.
+    env: { appRoot: require('os').tmpdir() },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
     Uri: { file: uri, parse: (s) => uri(s) },
@@ -84,7 +89,9 @@ function createVscodeMock() {
       asRelativePath: (p) => (p && p.fsPath) || p,
       openTextDocument: async () => ({ getText: () => '' }),
       // Applies a fake structural-rename WorkspaceEdit to the temp filesystem.
+      // Set ctrl.applyEditFails = true to simulate the editor rejecting the edit.
       applyEdit: async (edit) => {
+        if (ctrl.applyEditFails) return false;
         if (edit && edit.__rename) { for (const r of edit.__rename) fs.writeFileSync(r.fsPath, r.newText); return true; }
         return false;
       },

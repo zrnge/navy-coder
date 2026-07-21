@@ -21,4 +21,17 @@ function openAiCompatBase(provider, apiBase, host) {
   return apiBase || DEFAULTS[provider];
 }
 
-module.exports = { openAiCompatBase };
+// Human-readable name for a provider id — single source of truth so error
+// messages read the same everywhere ("OpenAI", not the raw setting value
+// "openai"). Falls back to the id itself for anything unrecognized (a custom
+// or future provider), so this never needs updating just to avoid a blank.
+const PROVIDER_NAMES = {
+  ollama: 'Ollama', lmstudio: 'LM Studio', anthropic: 'Anthropic', openai: 'OpenAI',
+  deepseek: 'DeepSeek', gemini: 'Gemini', xai: 'xAI', zai: 'z.ai', groq: 'Groq',
+  openrouter: 'OpenRouter', custom: 'Custom endpoint',
+};
+function providerDisplayName(id) {
+  return PROVIDER_NAMES[id] || id;
+}
+
+module.exports = { openAiCompatBase, providerDisplayName };

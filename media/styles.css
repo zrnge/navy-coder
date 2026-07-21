@@ -2775,3 +2775,111 @@ textarea:focus-visible,
   }
   .spin-wheel { animation: none; }
 }
+
+/* ── Resize robustness ─────────────────────────────────────────────────────── */
+/* Row 1 holds ~9 fixed controls; on a narrow sidebar they must WRAP to a second
+   line, never clip off the edge where they become unreachable. */
+.topbar-row1 {
+  flex-wrap: wrap;
+  height: auto;
+  min-height: 36px;
+}
+.topbar-actions { flex-wrap: wrap; }
+
+@media (max-width: 380px) {
+  .brand-title    { display: none; }  /* the wheel icon carries the brand */
+  .new-chat-label { display: none; }  /* + icon remains */
+  .topbar-row     { padding: 0 5px; }
+  .topbar-actions { gap: 2px; }
+}
+
+/* Extreme narrow: drop the two buttons that have keyboard/palette equivalents
+   (search = Ctrl+F, export = Command Palette "Navy Coder: Export Conversation").
+   Unlike the old unconditional hiding this only applies below 300px, where an
+   unclipped, usable topbar matters more. */
+@media (max-width: 300px) {
+  #searchButton, #exportButton { display: none; }
+  .select-compact { padding: 0 4px; }
+}
+
+/* Type-to-filter box for huge model lists (appears when >30 models) */
+.model-filter {
+  flex: 0 0 84px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 7px;
+  font-size: 11px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.model-filter:focus { outline: none; border-color: var(--gold); }
+
+/* ── Plan checklist card ───────────────────────────────────────────────────── */
+.plan-card {
+  margin: 6px 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--gold);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.plan-card-header {
+  padding: 7px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+}
+.plan-card-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+}
+.plan-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.plan-step-icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-hover);
+  box-sizing: border-box;
+  position: relative;
+}
+.plan-step.pending .plan-step-text { color: var(--muted); }
+.plan-step.active .plan-step-icon {
+  border-color: var(--gold);
+  animation: spin-wheel 1.2s linear infinite;
+  border-top-color: transparent;
+}
+.plan-step.active .plan-step-text { color: var(--text); font-weight: 600; }
+.plan-step.done .plan-step-icon {
+  border-color: var(--green);
+  background: var(--green);
+}
+.plan-step.done .plan-step-icon::after {
+  content: '';
+  position: absolute;
+  left: 3px; top: 0.5px;
+  width: 4px; height: 8px;
+  border: solid var(--gold-text, #0d1117);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.plan-step.done .plan-step-text { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--border-hover); }
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-step.active .plan-step-icon { animation: none; border-top-color: var(--gold); }
+}

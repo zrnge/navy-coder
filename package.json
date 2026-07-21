@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -49,8 +49,8 @@
       "properties": {
         "navy.model": {
           "type": "string",
-          "default": "kimi-k2.7-code:cloud",
-          "description": "The model to use for chat (e.g. llama3, gpt-4o, claude-sonnet-4-6)."
+          "default": "",
+          "description": "The model to use for chat. Leave empty to auto-select the first available model for the chosen provider (e.g. llama3, gpt-4o, claude-sonnet-4-6)."
         },
         "navy.host": {
           "type": "string",
@@ -66,8 +66,8 @@
         },
         "navy.systemPrompt": {
           "type": "string",
-          "default": "You are a concise AI coding assistant inside VS Code:. Prefer practical answers, small diffs, and clear file-specific guidance. When editing existing files, use SEARCH/REPLACE blocks in a `search-replace\\n<<<<<<< SEARCH\\nold\\n=======\\nnew\\n>>>>>>> REPLACE\\n` fence. Put the target file path after the language, like `search-replace:src/main.py. When creating new files, return the full content in a normal code fence with the path, like `python:src/main.py\\n...\\n`.",
-          "description": "System prompt sent at the start of every chat."
+          "default": "",
+          "description": "Optional custom instructions appended to every conversation (e.g. coding style preferences). Does not replace or override Navy's built-in tool-use rules."
         },
         "navy.maxContextChars": {
           "type": "number",
@@ -178,6 +178,21 @@
           "type": "boolean",
           "default": true,
           "description": "Show 'Ask Navy' code lens buttons above functions in the editor."
+        },
+        "navy.mcpServers": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "MCP (Model Context Protocol) tool servers Navy can use, same format as Claude Desktop. Local (stdio) example: `{ \"windbg\": { \"command\": \"pwsh.exe\", \"args\": [\"-File\", \"C:/path/server.ps1\"] } }`. Remote (streamable HTTP) example: `{ \"myserver\": { \"url\": \"https://example.com/mcp\" } }`. Tools appear to the agent as `mcp__<server>__<tool>`.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string", "description": "Executable to launch a local (stdio) MCP server." },
+              "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for a local server." },
+              "env": { "type": "object", "description": "Extra environment variables for a local server." },
+              "url": { "type": "string", "description": "Endpoint URL for a remote (streamable HTTP) MCP server. Use this instead of command/args/env." },
+              "headers": { "type": "object", "description": "Extra HTTP headers for a remote server (e.g. Authorization)." }
+            }
+          }
         }
       }
     },

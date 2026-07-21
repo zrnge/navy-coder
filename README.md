@@ -12,6 +12,8 @@
 - **Diff approval gate** — every file change is shown as a side-by-side diff; you approve or reject before it's written
 - **11 AI providers** — Ollama, LM Studio, OpenAI, Anthropic Claude, DeepSeek, Google Gemini, xAI Grok, z.ai, Groq, OpenRouter, and any custom OpenAI-compatible endpoint
 - **Per-provider API keys** — switch providers without losing other keys
+- **MCP tool servers** — plug in any Model Context Protocol server (`navy.mcpServers`, Claude Desktop config format) and the agent can use its tools
+- **Prompt caching on Claude** — repeated agent steps reuse the cached prefix: several times cheaper and faster
 - **Web search** — built-in search via DuckDuckGo (no key needed), Brave Search, or Tavily
 - **Terminal cards** — every command shows an IN/OUT card in the chat with live output, exit status, and expandable logs
 - **Dev server management** — start, monitor, and stop your dev server from the chat

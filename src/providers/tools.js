@@ -299,6 +299,18 @@ const TOOLS = [
     }
   },
   {
+    name: 'search_docs',
+    description: 'Search the project\'s OWN documentation (README, CHANGELOG, CONTRIBUTING, docs/**, *.md) for a term. Use this BEFORE guessing at project conventions, setup steps, architecture decisions, or "how do I run this" — the project may have already documented the answer. Different from search_codebase, which searches source code, not docs.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Term or phrase to search for in the project documentation.' },
+        maxResults: { type: 'number', description: 'Maximum matches to return (default 8).' }
+      },
+      required: ['query']
+    }
+  },
+  {
     name: 'find_relevant_files',
     description: 'Find the files most relevant to a task or question, ranked. Give it the user\'s request or a set of keywords/symbol names; it scores every source file by symbol definitions, filename matches, and term frequency and returns the top candidates with a reason. Use this FIRST on an unfamiliar or large codebase to decide which files to read — it is far more targeted than list_files or a raw search.',
     parameters: {
@@ -383,7 +395,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
@@ -403,7 +415,9 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 11. If a command fails (non-zero exit code), NEVER run the same command again immediately. Read the error output, identify the root cause, fix the code, THEN retry once. Repeating a failing command without a fix accomplishes nothing.
 12. NEVER call run_project if the project is already running — it will report "already running". Only call run_project once per session; use the existing server for all subsequent testing.
 13. PLANNING: For any task that will need 3 or more tool calls, START your first response with a short numbered plan (3-6 one-line steps) under a "**Plan:**" heading, BEFORE the first tool call. Then execute the steps in order. If the plan must change mid-task, state the revised step in one line before continuing. Simple one-tool questions need no plan.
-14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors.`
+14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors.
+15. CRITICAL — DO NOT HALLUCINATE FILE ACTIONS: Writing code in your reply text does NOT save it anywhere — it only appears in the chat. If the user asked you to create, write, save, or edit a file, you MUST call the write_file or apply_edit tool and see its result before saying it succeeded. NEVER say "created", "saved", "written", "done", or similar unless you actually called that tool THIS turn and it returned success. If you are only showing an example or discussing code without being asked to save it, say so explicitly instead of claiming completion.
+16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.`
 
 
 module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT };
