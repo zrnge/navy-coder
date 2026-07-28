@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.5] - 2026-07-24
+## [0.2.5] - 2026-07-28
 
 ### Added
 - **Semantic codebase search** — `find_relevant_files` was pure keyword/ripgrep matching, so a query sharing no literal words with the target file (e.g. "how do we track a logged-in user" for a file called `session-store.js` that never says "logged in") could only be found by luck. Opt in with `navy.embeddingModel` (empty by default — zero behavior change unless set): Navy builds a per-file embedding index, persisted and updated incrementally in `.navy/embeddings.json` (only new/changed files are re-embedded, not the whole repo each time), and blends cosine-similarity results into the existing keyword ranking — a file matching on both gets a bonus, a semantic-only match is added as a new candidate above a similarity floor, keyword-only search is completely unaffected when unset. Works with any embeddings-capable model for the active provider (Ollama's native `/api/embed`, or the OpenAI-compatible `/embeddings` endpoint for OpenAI/Gemini/others) — a provider that doesn't actually support it just fails the request and semantic search silently disables itself for the session.
