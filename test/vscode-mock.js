@@ -28,10 +28,19 @@ function createVscodeMock() {
       inlineCompletions: false,
     },
     nextWarning: undefined,           // value the next showWarningMessage resolves to
+    nextInfo: undefined,              // value the next showInformationMessage resolves to (modal choices)
     nextRename: null,                 // [{ fsPath, newText }] the fake rename provider returns
+    nextOpenDialog: null,             // [fsPath] the next showOpenDialog returns, or null for cancel
+    executedCommands: [],             // [{ command, args }] — lets tests assert vscode.openFolder etc.
     shown: { warning: [], info: [], error: [] },
     applyEditFails: false,
-    reset() { this.nextWarning = undefined; this.nextRename = null; this.applyEditFails = false; this.shown = { warning: [], info: [], error: [] }; },
+    reset() {
+      this.nextWarning = undefined; this.nextInfo = undefined; this.nextRename = null;
+      this.nextOpenDialog = null; this.applyEditFails = false;
+      this.executedCommands = [];
+      this.scoped = {};
+      this.shown = { warning: [], info: [], error: [] };
+    },
   };
 
   const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
@@ -62,10 +71,22 @@ function createVscodeMock() {
     },
   };
 
+  // Scoped values, so tests can exercise the workspace-vs-global precedence the
+  // real settings system has (a root saved in one project must not leak into
+  // another). ctrl.scoped[key] = { workspaceValue, globalValue }.
+  ctrl.scoped = {};
   const configApi = {
     get: (k, d) => (k in ctrl.config ? ctrl.config[k] : d),
-    update: async (k, v) => { ctrl.config[k] = v; }, // write-through so tests can observe
-    inspect: () => ({ workspaceValue: undefined, globalValue: undefined }),
+    update: async (k, v, target) => {
+      ctrl.config[k] = v;
+      const slot = (ctrl.scoped[k] = ctrl.scoped[k] || {});
+      // ConfigurationTarget.Global === 1; anything else is workspace-ish.
+      if (target === 1) slot.globalValue = v; else slot.workspaceValue = v;
+    },
+    inspect: (k) => ({
+      workspaceValue: ctrl.scoped[k]?.workspaceValue,
+      globalValue: ctrl.scoped[k]?.globalValue,
+    }),
   };
 
   const vscode = {
@@ -85,6 +106,18 @@ function createVscodeMock() {
       workspaceFolders: undefined,
       getConfiguration: () => configApi,
       fs: wfs,
+      // Mirrors the REAL API contract: entries must be { uri } objects, not bare
+      // Uris. A bare Uri leaves `.uri` undefined and VS Code rejects the call —
+      // reproducing that here is the whole point, otherwise a test can't tell a
+      // correct call from the malformed one that silently added nothing.
+      updateWorkspaceFolders: (start, deleteCount, ...toAdd) => {
+        if (toAdd.some(f => !f || !f.uri || !f.uri.fsPath)) return false;
+        const current = vscode.workspace.workspaceFolders || [];
+        const next = current.slice();
+        next.splice(start, deleteCount || 0, ...toAdd.map(f => ({ uri: f.uri, name: f.name })));
+        vscode.workspace.workspaceFolders = next;
+        return true;
+      },
       onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
       asRelativePath: (p) => (p && p.fsPath) || p,
       openTextDocument: async () => ({ getText: () => '' }),
@@ -101,13 +134,15 @@ function createVscodeMock() {
       activeTextEditor: undefined,
       createTextEditorDecorationType: () => ({ dispose() {} }),
       showWarningMessage: async (msg) => { ctrl.shown.warning.push(msg); return ctrl.nextWarning; },
-      showInformationMessage: async (msg) => { ctrl.shown.info.push(msg); return undefined; },
+      showInformationMessage: async (msg) => { ctrl.shown.info.push(msg); return ctrl.nextInfo; },
+      showOpenDialog: async () => (ctrl.nextOpenDialog ? ctrl.nextOpenDialog.map(uri) : undefined),
       showErrorMessage: async (msg) => { ctrl.shown.error.push(msg); return undefined; },
       createStatusBarItem: () => ({ show() {}, dispose() {}, text: '', tooltip: '', command: '', name: '' }),
     },
     languages: { getDiagnostics: () => [] },
     commands: {
-      executeCommand: async (cmd) => {
+      executeCommand: async (cmd, ...args) => {
+        ctrl.executedCommands.push({ command: cmd, args });
         if (cmd === 'vscode.executeDocumentRenameProvider') {
           if (!ctrl.nextRename) return undefined; // no rename provider / not renameable
           const files = ctrl.nextRename;

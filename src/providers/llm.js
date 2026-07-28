@@ -812,7 +812,10 @@ async function fetchWithRetry(url, init) {
 
   function extractCodeEdits(text) {
     const edits = [];
-    const regex = /(^|\n)(`{3,})(\w+)?(?::([^\s\n]+))?\n([\s\S]*?)\n\2($|\n)/g;
+    // Fence length bounded — `{3,}` plus the \2 backreference backtracks
+    // quadratically on a long backtick run, and this parses raw model output.
+    // Real fences are 3-4 backticks; 8 covers every legitimate case.
+    const regex = /(^|\n)(`{3,8})(\w+)?(?::([^\s\n]+))?\n([\s\S]*?)\n\2($|\n)/g;
     let match;
     while ((match = regex.exec(text)) !== null) {
       const language = match[3] || '';

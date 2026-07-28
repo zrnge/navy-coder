@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -42,6 +42,16 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In a workspace you have not trusted, Navy still opens and can read files and answer questions, but it will not run shell commands, start language toolchains, launch MCP servers, or send file contents to an embeddings provider."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Navy's file, search, and terminal tools need a real filesystem on disk."
+    }
+  },
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
@@ -116,7 +126,17 @@
         "navy.inlineCompletions": {
           "type": "boolean",
           "default": false,
-          "description": "Enable ghost-text inline completions as you type. Uses the active provider and model. Triggers after a 350ms debounce."
+          "description": "Enable ghost-text inline completions as you type. Uses the active provider and model (or navy.completionModel if set). Triggers after a 350ms debounce."
+        },
+        "navy.completionModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Separate, faster model to use for inline ghost-text completions only — leave empty to reuse `navy.model`. Inline completions need low latency, so pointing this at a small/fast model (e.g. a local Ollama model like `qwen2.5-coder:1.5b`, or a fast hosted model) keeps typing responsive without changing which model handles chat."
+        },
+        "navy.embeddingModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Embedding model for semantic codebase search (used by `find_relevant_files` in addition to keyword search). Leave empty to disable — keyword-only search is the default.\n\n**⚠️ Privacy:** enabling this sends the first ~1500 characters of each source file in your project to the embedding provider you have configured. If `navy.provider` is a hosted service (OpenAI, Gemini, …), your code leaves your machine. Files whose names look credential-bearing (`.env*`, `*secret*`, `*credentials*`, `*.pem`, `serviceAccount*`, `docker-compose*`, …) and anything your repo gitignores are excluded, but review the setting before enabling it on a private codebase. Use a local Ollama embedding model (e.g. `nomic-embed-text`) to keep everything on-device.\n\nMust be an embeddings-capable model for the active `navy.provider` (e.g. `nomic-embed-text` or `mxbai-embed-large` for Ollama, `text-embedding-3-small` for OpenAI, `text-embedding-004` for Gemini). The index is built incrementally and cached in `.navy/embeddings.json`, which is gitignored automatically."
         },
         "navy.provider": {
           "type": "string",
@@ -338,7 +358,9 @@
     "check": "node --check src/extension.js",
     "vscode:prepublish": "npm run build",
     "package": "vsce package",
-    "test": "node test/run.js"
+    "test": "node test/run.js",
+    "eval": "node eval/run.js",
+    "eval:selftest": "node eval/selftest.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.90.0",

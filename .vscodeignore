@@ -8,6 +8,12 @@ scratchpad/**
 *.sh
 src/**
 test/**
+eval/**
+# Navy's own session state from developing/testing Navy on this repo. Git
+# ignores it via .navy/.gitignore, but vsce doesn't read nested .gitignores —
+# so without this it was packaged into the VSIX, shipping local chat history
+# and absolute developer paths to every user who installed the extension.
+.navy/**
 *.vsix
 .gitignore
 **/*.map

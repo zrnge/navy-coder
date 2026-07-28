@@ -52,6 +52,60 @@ console.log('\nliteralReplace:');
     literalReplace('  a();\r\n  b();', 'a();\nb();', 'c();') === 'c();');
 }
 
+// ── 1a2. Fenced-code regexes must not backtrack catastrophically ─────────────
+// Both the webview renderer and the provider-side edit extractor match fences
+// with a backreference. Left unbounded (`{3,}`), a long run of backticks in
+// model output backtracks quadratically — measured at 14.5s of frozen renderer
+// for a 160k run, on a regex that runs for every render of every reply.
+console.log('\nfenced-code regex safety:');
+{
+  const sources = [
+    ['media/main.js', fs.readFileSync(path.join(ROOT, 'media', 'main.js'), 'utf8')],
+    ['src/providers/llm.js', fs.readFileSync(path.join(ROOT, 'src', 'providers', 'llm.js'), 'utf8')],
+  ];
+  for (const [name, src] of sources) {
+    // Match the capturing-group form actually used in the regex, so the
+    // explanatory comments (which quote the old unbounded pattern) don't
+    // trip this.
+    check(`${name}: fence capture group is bounded`, !/\(`\{3,\}\)/.test(src));
+  }
+
+  // Behavioural proof, not just a source-text assertion.
+  const codeRe = /(?:^|\n)(`{3,8})([\w.+\-]*)(?::([^\s\n]+))?[^\n]*\n([\s\S]*?)\n\1[ \t]*(?=$|\n)/g;
+  const t0 = Date.now();
+  codeRe.lastIndex = 0;
+  codeRe.test('`'.repeat(120000));
+  const ms = Date.now() - t0;
+  check('pathological backtick run stays fast (was seconds)', ms < 250, ms + 'ms');
+
+  // Every legitimate fence form must still parse exactly as before.
+  const forms = [
+    ['plain', '\n```\nplain body\n```', 'plain body'],
+    ['language', '\n```js\nconst a = 1;\n```', 'const a = 1;'],
+    ['lang+path', '\n```python:app.py\nx = 1\n```', 'x = 1'],
+    ['4-backtick wrapping 3', '\n````js\nhas ``` inside\n````', 'has ``` inside'],
+  ];
+  for (const [label, input, expected] of forms) {
+    codeRe.lastIndex = 0;
+    const m = codeRe.exec(input);
+    check(`fence still parses: ${label}`, Boolean(m) && m[4] === expected, m ? m[4] : 'no match');
+  }
+}
+
+// ── 1b. stripSuffixOverlap (inline FIM completion dedup) ─────────────────────
+console.log('\nstripSuffixOverlap:');
+{
+  const stripSuffixOverlap = eval('(' + extractFunction(extSrc, 'function stripSuffixOverlap') + ')');
+  check('trims a completion that echoes the start of the suffix',
+    stripSuffixOverlap('return x;\n}', '\n}\n\nfunction next(){}') === 'return x;');
+  check('leaves a completion with no overlap untouched',
+    stripSuffixOverlap('const y = 2;', '\nfunction next(){}') === 'const y = 2;');
+  check('exact full-string overlap trims to empty',
+    stripSuffixOverlap('abc', 'abcdef') === '');
+  check('empty completion passed through unchanged', stripSuffixOverlap('', 'abc') === '');
+  check('empty suffix passed through unchanged', stripSuffixOverlap('abc', '') === 'abc');
+}
+
 // ── 2. _compactMessages ──────────────────────────────────────────────────────
 console.log('\ncompactMessages:');
 {
@@ -151,6 +205,41 @@ console.log('\nwebview DOM:');
   check('diff card has expand button', card && Boolean(card.querySelector('.diff-expand-btn')));
   check('changed line visible in preview', card && card.textContent.includes('TWO'));
 
+  // Regression: a LARGE file (over computeLCS's ~633-line bail-out) whose change
+  // lands past the renderer's 400-row budget used to produce a diff body with no
+  // changed rows in it — and diffResolved then deleted the body entirely, so an
+  // edit that really happened showed a card with no diff.
+  {
+    const big = Array.from({ length: 900 }, (_, i) => 'line ' + i);
+    const bigNew = big.slice();
+    bigNew[700] = 'CHANGED_DEEP_LINE';
+    send({ type: 'pendingDiff', id: 'big1', path: 'big.js', oldText: big.join('\n'), newText: bigNew.join('\n') });
+    const bigCard = $('.diff-card[data-diff-id="big1"]');
+    check('large-file diff: card created', Boolean(bigCard));
+    check('large-file diff: the deep change is actually rendered',
+      bigCard && bigCard.textContent.includes('CHANGED_DEEP_LINE'));
+    check('large-file diff: has changed rows in the DOM',
+      bigCard && bigCard.querySelectorAll('.diff-added, .diff-removed').length > 0);
+    check('large-file diff: records a non-zero change count',
+      bigCard && parseInt(bigCard.dataset.changeCount, 10) > 0);
+    send({ type: 'diffResolved', id: 'big1', approved: true });
+    check('large-file diff: body survives resolution instead of being deleted',
+      bigCard && Boolean(bigCard.querySelector('.diff-body')));
+    check('large-file diff: change still visible after resolution',
+      bigCard && bigCard.textContent.includes('CHANGED_DEEP_LINE'));
+  }
+
+  // A genuinely empty diff (no changes at all) should still collapse its body —
+  // the fix above must not keep an empty diff around forever.
+  {
+    const same = 'a\nb\nc';
+    send({ type: 'pendingDiff', id: 'nochange', path: 'same.js', oldText: same, newText: same });
+    const noCard = $('.diff-card[data-diff-id="nochange"]');
+    check('empty diff: change count is zero', noCard && noCard.dataset.changeCount === '0');
+    send({ type: 'diffResolved', id: 'nochange', approved: true });
+    check('empty diff: body collapsed as before', noCard && !noCard.querySelector('.diff-body'));
+  }
+
   const bubble = $('.message.assistant .message-bubble');
   const thinkBlock = bubble && bubble.querySelector('.think-block');
   check('reasoning tucked into a collapsed block', Boolean(thinkBlock) && !thinkBlock.hasAttribute('open'));
@@ -193,6 +282,74 @@ console.log('\nwebview DOM:');
   send({ type: 'chunk', text: 'Just a normal answer, no plan here.' });
   send({ type: 'done' });
   check('no new plan card for a plan-less turn', window.document.querySelectorAll('.plan-card').length === planCardCountBefore);
+
+  // Regression: a turn's closing summary used to land in the SAME bubble as its
+  // opening line, which sits above the activity log — so after a long tool run
+  // the report rendered before the work it describes, and nothing followed the
+  // tool cards at all. Read top-to-bottom the summary looked missing.
+  {
+    send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '' });
+    send({ type: 'chunk', text: 'I will start by reading the full file.' });
+    send({ type: 'toolCall', tool: 'read_lines', args: { path: 'big.js', start: 1, end: 800 }, callId: 'ord1' });
+    send({ type: 'toolResult', tool: 'read_lines', result: 'ok', callId: 'ord1' });
+    send({ type: 'chunk', text: '\n\n**Done:** fixed 2 bugs.' });
+    send({ type: 'done' });
+
+    const msg = [...window.document.querySelectorAll('.message.assistant')].pop();
+    const kids = [...msg.children];
+    const logIdx = kids.findIndex(c => /activity-log/.test(c.className));
+    const summaryIdx = kids.findIndex(c => /Done:/.test(c.textContent || ''));
+    const introIdx = kids.findIndex(c => /reading the full file/.test(c.textContent || ''));
+    check('report order: tool activity is present', logIdx !== -1);
+    check('report order: opening text stays ABOVE the tool activity', introIdx !== -1 && introIdx < logIdx);
+    check('report order: closing summary lands BELOW the tool activity', summaryIdx > logIdx);
+    check('report order: summary is its own bubble, not merged into the intro', summaryIdx !== introIdx);
+    check('report order: copy still yields the whole reply',
+      /reading the full file[\s\S]*Done:/.test(msg.dataset.rawMd || ''));
+  }
+
+  // A turn that produces tool activity but no text at all must keep the tool
+  // cards — the old emptiness check deleted the entire message, cards included.
+  {
+    send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '' });
+    send({ type: 'toolCall', tool: 'read_lines', args: { path: 'q.js', start: 1, end: 10 }, callId: 'ord2' });
+    send({ type: 'toolResult', tool: 'read_lines', result: 'ok', callId: 'ord2' });
+    send({ type: 'done' });
+    const msg = [...window.document.querySelectorAll('.message.assistant')].pop();
+    check('textless turn: tool activity survives instead of the message vanishing',
+      Boolean(msg && msg.querySelector('.activity-log, .activity-log-collapsed')));
+  }
+
+  // Regression: toolResult must route to the row matching its own callId, not
+  // "whichever row is current" — parallel reads can finish out of order, and
+  // dedup/blocked-retry short-circuits now always send a paired toolCall.
+  send({ type: 'toolCall', tool: 'search_docs', args: { query: 'ZZZ_QUERY_C1' }, callId: 'call-c1' });
+  send({ type: 'toolCall', tool: 'search_docs', args: { query: 'ZZZ_QUERY_C2' }, callId: 'call-c2' });
+  send({ type: 'toolResult', tool: 'search_docs', result: 'RESULT_FOR_C2', callId: 'call-c2' }); // c2 finishes first
+  send({ type: 'toolResult', tool: 'search_docs', result: 'RESULT_FOR_C1', callId: 'call-c1' });
+  const rowForQuery = (q) => [...window.document.querySelectorAll('.activity-row')]
+    .find(r => r.querySelector('.act-target')?.textContent.includes(q));
+  check('toolResult by callId: out-of-order result lands on its own row (c1)',
+    rowForQuery('ZZZ_QUERY_C1')?.querySelector('.act-result')?.textContent === 'RESULT_FOR_C1');
+  check('toolResult by callId: out-of-order result lands on its own row (c2)',
+    rowForQuery('ZZZ_QUERY_C2')?.querySelector('.act-result')?.textContent === 'RESULT_FOR_C2');
+  send({ type: 'done' });
+
+  // Regression: 'applied' must only flip the Apply button that's actually mid-apply
+  // and matches the reported path — not every Apply button in the message (live bug:
+  // a reply with two files, approving one marked BOTH as applied).
+  send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '' });
+  send({ type: 'chunk', text: '```js:src/a.js\nconsole.log("a");\n```\n```js:src/b.js\nconsole.log("b");\n```' });
+  send({ type: 'done' });
+  const applyButtons = [...window.document.querySelectorAll('.apply-button')];
+  check('applied regression: two code blocks produced two apply buttons', applyButtons.length === 2);
+  if (applyButtons.length === 2) {
+    applyButtons[0].click(); // simulate clicking Apply on the FIRST block only
+    check('applied regression: clicked button enters pending state', applyButtons[0].textContent === '...');
+    send({ type: 'applied', path: 'src/a.js' });
+    check('applied regression: clicked button marked Applied', applyButtons[0].textContent === 'Applied' && applyButtons[0].disabled === true);
+    check('applied regression: OTHER block\'s button untouched', applyButtons[1].textContent === 'Apply' && applyButtons[1].disabled === false);
+  }
 
   // Small-model tool-call JSON leak (qwen-coder): a turn whose whole reply is
   // several concatenated tool-call JSON objects must render NO assistant bubble.
@@ -274,6 +431,11 @@ console.log('\nwebview DOM:');
   check('model filter narrows options', $('#modelSelect').options.length === 1 && $('#modelSelect').value === 'openai/gpt-4o');
   window.populateModels(['a', 'b'], 'a');
   check('model filter hides for small lists', filterInp.style.display === 'none');
+
+  // The webview runs a permanent stall-detector interval (correct there — it
+  // lives as long as the panel). Under jsdom that timer keeps node's event loop
+  // alive forever, so tear the window down or `npm test` never exits.
+  dom.window.close();
 }
 
 // ── 5. Undo/Redo & checkpoints (real provider, mock vscode, real temp fs) ────
@@ -387,6 +549,30 @@ async function retrievalSuite() {
     ], [{ term: 'auth', weight: 2 }]);
     check('ranker: definer+name-match beats raw frequency', ranked[0].rel === 'auth.js');
 
+    // Pure: semantic blend — a file present in both keyword and semantic
+    // results gets a bonus (not a replacement); a semantic-ONLY file (no
+    // keyword overlap at all — the entire point of semantic search) is added
+    // as a new entry; a weak semantic match below the threshold is dropped.
+    const keywordOnly = [{ rel: 'a.js', count: 5, matched: ['x'], inName: false, defs: false, score: 10 }];
+    const blended = provider._blendSemanticRanking(keywordOnly, [
+      { rel: 'a.js', similarity: 0.9 },     // overlaps a keyword hit → bonus, not duplicate
+      { rel: 'session-store.js', similarity: 0.8 }, // semantic-only, above threshold → new entry
+      { rel: 'unrelated.js', similarity: 0.1 },     // below threshold → dropped
+    ]);
+    check('semantic blend: overlapping file gets a score bonus, not a duplicate row',
+      blended.filter(h => h.rel === 'a.js').length === 1 && blended.find(h => h.rel === 'a.js').score > 10);
+    check('semantic blend: semantic-only match (no keyword overlap) is included',
+      blended.some(h => h.rel === 'session-store.js' && h.semantic));
+    check('semantic blend: weak match below threshold is excluded',
+      !blended.some(h => h.rel === 'unrelated.js'));
+
+    // Pure: cosine similarity (embeddings.js).
+    const { cosineSimilarity } = require('../src/providers/embeddings.js');
+    check('cosineSimilarity: identical vectors → 1', Math.abs(cosineSimilarity([1, 0, 1], [1, 0, 1]) - 1) < 1e-9);
+    check('cosineSimilarity: orthogonal vectors → 0', Math.abs(cosineSimilarity([1, 0], [0, 1])) < 1e-9);
+    check('cosineSimilarity: opposite vectors → -1', Math.abs(cosineSimilarity([1, 0], [-1, 0]) + 1) < 1e-9);
+    check('cosineSimilarity: zero vector handled without NaN/throw', cosineSimilarity([0, 0], [1, 1]) === 0);
+
     // Integration: real files, real walk, real scoring through the tool.
     fs.writeFileSync(path.join(tmp, 'auth.js'), 'function parseUserToken(t){ return verify(t); }\nclass AuthService {}');
     fs.writeFileSync(path.join(tmp, 'ui.js'), 'export function renderButton(){ return "<button>"; }');
@@ -400,6 +586,462 @@ async function retrievalSuite() {
     check('retrieval handles no-match gracefully', /No files matched|more specific/.test(empty));
   } catch (e) {
     check('retrieval suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6b. Semantic search (navy.embeddingModel) — provider routing + incremental index ──
+async function semanticSearchSuite() {
+  console.log('\nsemantic search (embeddings):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+
+  // Provider routing: Ollama gets its native /api/embed; everything else
+  // (including Gemini, which exposes an OpenAI-compat facade) goes through
+  // the shared OpenAI-compatible /embeddings endpoint.
+  {
+    const { getEmbeddings } = require('../src/providers/embeddings.js');
+    const realFetch = global.fetch;
+    try {
+      let capturedUrl = '', capturedBody = null;
+      global.fetch = async (url, init) => {
+        capturedUrl = url; capturedBody = JSON.parse(init.body);
+        return { ok: true, status: 200, json: async () => ({ embeddings: [[1, 0], [0, 1]] }) };
+      };
+      const ollamaVecs = await getEmbeddings('ollama', 'nomic-embed-text', ['a', 'b'], { host: 'http://localhost:11434' });
+      check('embeddings: ollama routes to /api/embed', capturedUrl === 'http://localhost:11434/api/embed');
+      check('embeddings: ollama sends batched input array', Array.isArray(capturedBody.input) && capturedBody.input.length === 2);
+      check('embeddings: ollama returns vectors in order', ollamaVecs.length === 2 && ollamaVecs[0][0] === 1);
+
+      global.fetch = async (url, init) => {
+        capturedUrl = url; capturedBody = JSON.parse(init.body);
+        // Deliberately out of index order — caller must sort by `index`, not trust array order.
+        return { ok: true, status: 200, json: async () => ({ data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] }) };
+      };
+      const openaiVecs = await getEmbeddings('openai', 'text-embedding-3-small', ['a', 'b'], { apiKey: 'sk-x' });
+      check('embeddings: openai routes to /embeddings', capturedUrl === 'https://api.openai.com/v1/embeddings');
+      check('embeddings: openai response re-sorted by index, not array order', openaiVecs[0][0] === 1 && openaiVecs[1][1] === 1);
+
+      const geminiVecs = await getEmbeddings('gemini', 'text-embedding-004', ['a', 'b'], { apiKey: 'k' });
+      check('embeddings: gemini routes through the OpenAI-compat facade too', capturedUrl.includes('generativelanguage.googleapis.com') && capturedUrl.endsWith('/embeddings'));
+
+      global.fetch = async () => ({ ok: false, status: 404, text: async () => 'no such route' });
+      let threw = false;
+      try { await getEmbeddings('groq', 'whatever', ['a']); } catch { threw = true; }
+      check('embeddings: unsupported provider failure throws (caller falls back), never returns wrong data', threw);
+    } catch (e) {
+      check('embeddings provider-routing suite ran', false, e.stack || e.message);
+    } finally {
+      global.fetch = realFetch;
+    }
+  }
+
+  // Incremental index + hybrid ranking, through the real provider + real temp files.
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-semantic-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    await vscode.workspace.getConfiguration().update('embeddingModel', 'fake-embed');
+    await vscode.workspace.getConfiguration().update('provider', 'ollama');
+
+    // "session-store.js" deliberately shares NO keyword with the query — only
+    // a real semantic search (not the keyword ranker) can surface it.
+    fs.writeFileSync(path.join(tmp, 'auth.js'), 'function login(u,p){ return checkCreds(u,p); }');
+    fs.writeFileSync(path.join(tmp, 'session-store.js'), 'function persistUserSession(id){ cache.set(id, Date.now()); }');
+    fs.writeFileSync(path.join(tmp, 'unrelated.js'), 'function renderChart(data){ return draw(data); }');
+
+    // Deterministic fake embedder: each file/query gets a fixed vector based on
+    // content, so we can assert exact similarity relationships without needing
+    // a real model. session-store.js is engineered to be closest to the query.
+    const VECS = {
+      'auth.js\n\nfunction login(u,p){ return checkCreds(u,p); }': [1, 0, 0],
+      'session-store.js\n\nfunction persistUserSession(id){ cache.set(id, Date.now()); }': [0.9, 0.1, 0],
+      'unrelated.js\n\nfunction renderChart(data){ return draw(data); }': [0, 0, 1],
+      'how do we keep track of a logged-in user between requests': [0.85, 0.15, 0],
+    };
+    let embedCallCount = 0;
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      embedCallCount++;
+      const vectors = body.input.map(t => VECS[t] || [0, 0, 0]);
+      return { ok: true, status: 200, json: async () => ({ embeddings: vectors }) };
+    };
+
+    const out1 = await provider.toolFindRelevantFiles('how do we keep track of a logged-in user between requests', 5);
+    check('semantic: header notes hybrid keyword+semantic ranking was used', out1.includes('keyword + semantic'));
+    check('semantic: semantic-only file (no shared keywords) surfaces via meaning', out1.includes('session-store.js'));
+    check('semantic: semantic-match annotation shown', /session-store\.js.*semantic-match/.test(out1));
+    const firstCallCount = embedCallCount;
+    await new Promise(r => setTimeout(r, 600)); // index persistence is debounced 500ms
+    check('semantic: index actually persisted to .navy/embeddings.json', fs.existsSync(path.join(tmp, '.navy', 'embeddings.json')));
+
+    // Second call, nothing changed on disk — must NOT re-embed anything (only
+    // the query itself needs a fresh embedding call).
+    await provider.toolFindRelevantFiles('how do we keep track of a logged-in user between requests', 5);
+    check('semantic: unchanged files are not re-embedded on a second call', embedCallCount === firstCallCount + 1);
+
+    // Modify one file — only THAT file's batch call should contain 1 input,
+    // not all 3 (fetch-CALL count alone can't tell this apart from a full
+    // re-embed, since 3 files still fit in one batch — inspect the actual
+    // batch payload sizes instead).
+    await new Promise(r => setTimeout(r, 10)); // ensure a distinct mtime
+    fs.writeFileSync(path.join(tmp, 'unrelated.js'), 'function renderChart(data){ return draw(data); } // changed');
+    VECS['unrelated.js\n\nfunction renderChart(data){ return draw(data); } // changed'] = [0, 0, 1];
+    const batchSizes = [];
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      embedCallCount++;
+      batchSizes.push(body.input.length);
+      const vectors = body.input.map(t => VECS[t] || [0, 0, 0]);
+      return { ok: true, status: 200, json: async () => ({ embeddings: vectors }) };
+    };
+    await provider.toolFindRelevantFiles('how do we keep track of a logged-in user between requests', 5);
+    // Two fetch calls: the index-update batch (1 changed file) and the query
+    // embedding (1 query string) — neither batch is the full 3-file repo.
+    check('semantic: only the changed file is re-embedded, not the whole repo',
+      batchSizes.length === 2 && batchSizes.includes(1) && !batchSizes.includes(3));
+
+    // navy.embeddingModel unset (default) → zero behavior change, zero embedding calls.
+    await vscode.workspace.getConfiguration().update('embeddingModel', '');
+    embedCallCount = 0;
+    const outDisabled = await provider.toolFindRelevantFiles('how do we keep track of a logged-in user', 5);
+    check('semantic: disabled by default — no embedding calls attempted', embedCallCount === 0);
+    check('semantic: disabled — header has no "semantic" mention', !outDisabled.includes('semantic'));
+  } catch (e) {
+    check('semantic search integration suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    await vscode.workspace.getConfiguration().update('embeddingModel', '');
+    await vscode.workspace.getConfiguration().update('provider', 'ollama');
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6c. check_syntax — real parsers, independent of any language extension ───
+async function syntaxCheckSuite() {
+  console.log('\ncheck_syntax (independent verification):');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-syntax-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const W = (n, c) => { fs.writeFileSync(path.join(tmp, n), c); return n; };
+
+    // JSON — parsed in-process, no toolchain needed.
+    W('good.json', '{"a": 1, "b": [2, 3]}');
+    const goodJson = await provider.toolCheckSyntax('good.json');
+    check('syntax: valid JSON reported VALID', goodJson.startsWith('VALID'));
+
+    W('bad.json', '{\n  "a": 1,\n  "b": [2, 3,\n}');
+    const badJson = await provider.toolCheckSyntax('bad.json');
+    check('syntax: broken JSON reported SYNTAX ERROR', badJson.startsWith('SYNTAX ERROR'));
+    check('syntax: broken JSON reports a line number (not a raw char offset)', /line \d+/.test(badJson));
+
+    // JavaScript — real `node --check` subprocess.
+    W('good.js', 'function add(a, b) {\n  return a + b;\n}\nmodule.exports = add;\n');
+    const goodJs = await provider.toolCheckSyntax('good.js');
+    check('syntax: valid JS reported VALID', goodJs.startsWith('VALID'));
+
+    W('bad.js', 'function broken( {\n  return 1;\n');
+    const badJs = await provider.toolCheckSyntax('bad.js');
+    check('syntax: broken JS reported SYNTAX ERROR', badJs.startsWith('SYNTAX ERROR'));
+    check('syntax: broken JS includes the parser message', /SyntaxError|Unexpected/.test(badJs));
+
+    // ESM syntax inside a .js file must not be mistaken for a syntax error —
+    // `node --check` rejects it in script mode, so the module-mode retry matters.
+    W('esm.js', 'import fs from "fs";\nexport const x = 1;\n');
+    const esmJs = await provider.toolCheckSyntax('esm.js');
+    check('syntax: ESM-in-.js falls back to module mode instead of false-failing', esmJs.startsWith('VALID'));
+
+    // Unknown/unsupported type must NOT be reported as passing.
+    W('notes.xyz', 'this is not any known language');
+    const unknown = await provider.toolCheckSyntax('notes.xyz');
+    check('syntax: unsupported type reports COULD NOT VERIFY', unknown.startsWith('COULD NOT VERIFY'));
+    check('syntax: COULD NOT VERIFY explicitly states it is not a pass', /NOT a pass/.test(unknown));
+
+    // Missing file → a clear error, not a crash and not a false pass.
+    const missing = await provider.toolCheckSyntax('does-not-exist.json');
+    check('syntax: missing file errors clearly (never reported VALID)',
+      missing.startsWith('Error') && !missing.includes('VALID'));
+
+    // Containment still applies — a path outside the workspace is refused.
+    const outside = await provider.toolCheckSyntax(path.join(os.tmpdir(), 'elsewhere.json'));
+    check('syntax: path outside the workspace refused', /Error/.test(outside) && !outside.startsWith('VALID'));
+
+    // get_diagnostics silence must no longer read as "file is clean".
+    ctrl.reset();
+    const diagEmpty = await provider.toolGetDiagnostics('good.js');
+    check('diagnostics: empty result no longer implies the file is valid',
+      /does NOT prove|check_syntax/.test(diagEmpty));
+
+    // Post-write fallback: a broken JSON write must surface a failure even
+    // though the mock reports no LSP diagnostics at all.
+    const brokenVerdict = await provider._syntaxVerdictAfterWrite(path.join(tmp, 'bad.json'));
+    check('post-write: broken file caught with no language extension installed',
+      /POST-EDIT SYNTAX CHECK FAILED/.test(brokenVerdict));
+    const goodVerdict = await provider._syntaxVerdictAfterWrite(path.join(tmp, 'good.js'));
+    check('post-write: a verified-clean edit stays silent', goodVerdict === '');
+    // A type with a real on-demand checker gets nudged to verify...
+    W('script.py', 'x = 1\n');
+    const pyVerdict = await provider._syntaxVerdictAfterWrite(path.join(tmp, 'script.py'));
+    check('post-write: a checkable type nudges the model to verify it',
+      /NOT AUTO-VERIFIED/.test(pyVerdict) && /check_syntax/.test(pyVerdict));
+    // ...but a type with NO checker must stay silent. Telling the model to call
+    // check_syntax on a .md only burned an iteration to be told COULD NOT VERIFY.
+    const unknownVerdict = await provider._syntaxVerdictAfterWrite(path.join(tmp, 'notes.xyz'));
+    check('post-write: an uncheckable type stays silent (no impossible errand)',
+      unknownVerdict === '');
+    W('readme.md', '# hi\n');
+    const mdVerdict = await provider._syntaxVerdictAfterWrite(path.join(tmp, 'readme.md'));
+    check('post-write: markdown writes produce no verification noise', mdVerdict === '');
+
+    // check_syntax must refuse an oversized file rather than reading it onto the heap.
+    const bigPath = path.join(tmp, 'huge.json');
+    fs.writeFileSync(bigPath, '{"pad":"' + 'x'.repeat(3 * 1024 * 1024) + '"}');
+    const bigRes = await provider.toolCheckSyntax('huge.json');
+    check('syntax: oversized file refused, not read into memory',
+      bigRes.startsWith('COULD NOT VERIFY') && /larger than/.test(bigRes));
+    fs.rmSync(bigPath, { force: true });
+
+    // Regression: the checker's timeout timer was never cleared, so EVERY
+    // finished check still fired a kill later. _killProcessTree runs a blocking
+    // taskkill on Windows, so a multi-step turn (the post-write check runs on
+    // every edit) queued up dozens of them and froze the extension host — and a
+    // kill on a recycled PID can hit an unrelated process.
+    {
+      const killed = [];
+      const realKill = provider._killProcessTree;
+      provider._killProcessTree = (p) => { killed.push(p); };
+      try {
+        // Finishes in ~50ms, far inside the 150ms budget.
+        const fast = await provider._runChecker(process.execPath, ['-e', ''], tmp, 150);
+        check('runChecker: a fast command succeeds', fast.ok === true && !fast.timedOut);
+        // Wait well past the timeout — a leaked timer would fire in this window.
+        await new Promise(r => setTimeout(r, 500));
+        check('runChecker: no kill fired after the process already finished', killed.length === 0);
+
+        // The timeout must still work when a process genuinely hangs.
+        killed.length = 0;
+        const slow = await provider._runChecker(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], tmp, 200);
+        check('runChecker: a hanging command is reported as timed out', slow.timedOut === true);
+        check('runChecker: a hanging command IS killed', killed.length === 1);
+      } finally {
+        provider._killProcessTree = realKill;
+      }
+    }
+
+    // Turns started without an await (queue drain, PR review, explain-error) are
+    // fire-and-forget, so nothing upstream can catch a rejection — and an
+    // unhandled rejection in the extension host is a process-level failure, i.e.
+    // Navy dying mid-task with no explanation.
+    {
+      const src = fs.readFileSync(path.join(ROOT, 'src', 'extension.js'), 'utf8');
+      const calls = [...src.matchAll(/(?:^|[^.\w])this\.askNavy\(/g)];
+      let unguarded = 0;
+      for (const m of calls) {
+        const after = src.slice(m.index, m.index + 900);
+        // Either awaited at the call site, or it chains its own .catch().
+        const awaited = /await\s+this\.askNavy\(/.test(src.slice(Math.max(0, m.index - 12), m.index + 20));
+        if (!awaited && !/\.catch\(/.test(after.split(';')[0] + after.split(';')[1]) ) unguarded++;
+      }
+      check('async turns: every fire-and-forget askNavy has a catch', unguarded === 0,
+        unguarded + ' unguarded call(s)');
+      check('async turns: a failure handler exists', /_reportTurnFailure\s*\(err, context\)/.test(src));
+
+      // The handler must release the busy lock, or a failed background turn
+      // leaves the composer permanently disabled.
+      const body = src.slice(src.indexOf('_reportTurnFailure(err, context) {'), src.indexOf('_reportTurnFailure(err, context) {') + 800);
+      check('async turns: failure handler clears the busy lock', /isBusy\s*=\s*false/.test(body));
+      check('async turns: failure handler tells the user', /type:\s*'error'/.test(body));
+    }
+
+    // ── The freeze itself: renderBlockMarkdown could loop forever ──────────────
+    // The bug behind every "Navy randomly froze" report. The
+    // paragraph branch rejected any line starting with `|`, while the table
+    // branch only claimed one whose NEXT line was a separator row — so a table
+    // header that was the last line so far belonged to neither, `i` never
+    // advanced, and the panel was gone for good. Every streamed markdown table
+    // passes through that state, which is why it hit at random.
+    //
+    // Run in a child process with a timeout: a regression here is an infinite
+    // loop, so asserting in-process would hang this suite rather than fail it.
+    {
+      const r = require('child_process').spawnSync(
+        process.execPath, [path.join(ROOT, 'test', 'render-hang-child.js')],
+        { timeout: 60000, encoding: 'utf8', cwd: ROOT }
+      );
+      const timedOut = r.error?.code === 'ETIMEDOUT' || r.signal === 'SIGTERM';
+      check('render: markdown renderer terminates on every input (no infinite loop)',
+        !timedOut, timedOut ? 'renderer HUNG — the freeze is back' : '');
+
+      let out = null;
+      if (!timedOut) { try { out = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch {} }
+      check('render: child reported results', Boolean(out), (r.stderr || '').slice(0, 300));
+
+      if (out) {
+        // Every prefix matters: a render tick can land on any of them.
+        check('render: every prefix of a review-shaped reply terminates',
+          out.prefixes > 400 && out.prefixMs < 20000, `${out.prefixes} prefixes in ${out.prefixMs}ms`);
+        for (const [name, ms] of Object.entries(out.cases)) {
+          check(`render: "${name}" terminates`, ms < 5000, ms + 'ms');
+        }
+        // The fix must not have cost us actual markdown rendering.
+        check('render: tables still render as tables', out.render.table && out.render.rows);
+        check('render: code blocks still render', out.render.code);
+        check('render: headings still render', out.render.headings);
+        check('render: nested lists still render', out.render.nestedList);
+        check('render: blockquotes still render', out.render.blockquote);
+        check('render: non-table pipe lines are not swallowed', out.render.strayPipes);
+        check('render: a lone table header renders as text, not nothing', out.render.headerAsText);
+      }
+
+      // The guard is what makes this class of bug non-fatal in future: any
+      // branch that fails to consume a line gets the line forced out instead of
+      // spinning. Keep it — the specific fix above only covers today's case.
+      const src = fs.readFileSync(path.join(ROOT, 'media', 'main.js'), 'utf8');
+      const fn = src.slice(src.indexOf('function renderBlockMarkdown(text) {'),
+                           src.indexOf('function renderTable(lines)'));
+      check('render: the block loop has an unconditional progress guard',
+        /seenAt/.test(fn) && /if \(i === seenAt\)/.test(fn));
+      check('render: the paragraph branch always consumes its first line',
+        /const pLines = \[lines\[i\+\+\]\];/.test(fn));
+    }
+
+    // Workspace trust: declaring untrustedWorkspaces "false" stops the extension
+    // activating while STILL contributing the view container, so the Navy panel
+    // renders as an empty box with no explanation — indistinguishable from a
+    // crash. "limited" keeps the UI alive; the runtime guards below are what
+    // actually make that safe, so both halves must stay in place together.
+    {
+      const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+      check('trust: untrusted workspaces are "limited", not disabled (blank panel)',
+        pkg.capabilities?.untrustedWorkspaces?.supported === 'limited');
+
+      const src = fs.readFileSync(path.join(ROOT, 'src', 'extension.js'), 'utf8');
+      // Every path that executes code or ships file contents off the machine
+      // must refuse in an untrusted folder.
+      for (const fn of ['toolRunCommand', 'toolRunTests', 'toolRunProject', 'toolStartProcess', 'toolCheckSyntax']) {
+        const at = src.indexOf('async ' + fn + '(');
+        const body = at === -1 ? '' : src.slice(at, at + 600);
+        check(`trust: ${fn} refuses in an untrusted workspace`, /workspaceIsTrusted\(\)/.test(body));
+      }
+      check('trust: MCP servers are not launched in an untrusted workspace',
+        /workspaceIsTrusted\(\)/.test(src.slice(src.indexOf('async reloadMcpServers('), src.indexOf('async reloadMcpServers(') + 900)));
+      check('trust: embedding upload is blocked in an untrusted workspace',
+        /workspaceIsTrusted\(\)/.test(src.slice(src.indexOf('async _updateEmbeddingIndex('), src.indexOf('async _updateEmbeddingIndex(') + 900)));
+    }
+
+    // ── Security: the checker must not execute code from the inspected repo ──
+    // A repo-local py_compile.py used to be executed by `python -m py_compile`
+    // because -m puts cwd first on sys.path. Two independent guards now: the -I
+    // isolation flag, and running with cwd OUTSIDE the project.
+    {
+      const src = fs.readFileSync(path.join(ROOT, 'src', 'extension.js'), 'utf8');
+      const table = src.slice(src.indexOf('const EXTERNAL = {'), src.indexOf('const spec = EXTERNAL[ext]'));
+      check('security: python checker runs in isolated mode (-I)', /'\.py':\s*\{[^}]*'-I'/.test(table));
+      check('security: no npx in the checker table (executes repo-local binaries)', !/npx/.test(table));
+      check('security: no rustc --emit=metadata (macro-expands, reads outside workspace)', !/rustc/.test(table));
+      check('security: no bare tsc invocation in the checker table', !/tsc/.test(table));
+      // Every checker invocation must use the out-of-repo cwd constant.
+      const fnBody = src.slice(src.indexOf('async toolCheckSyntax('), src.indexOf('_isBlockedHost'));
+      const runCalls = fnBody.match(/_runChecker\([^)]*\)/g) || [];
+      check('security: every checker spawn uses the out-of-repo cwd',
+        runCalls.length > 0 && runCalls.every(c => c.includes('CHECKER_CWD')));
+    }
+
+    // Credential-shaped filenames must never be selected for embedding upload.
+    {
+      // The predicate closes over a module-level regex, so pull that in too
+      // rather than re-declaring it here (a copy would drift from the shipped one).
+      const reStart = extSrc.indexOf('const EMBED_SENSITIVE_RE = new RegExp([');
+      const reEnd = extSrc.indexOf(", 'i');", reStart) + ", 'i');".length;
+      const reSrc = extSrc.slice(reStart, reEnd);
+      const sensitive = new Function(
+        reSrc + '\n' + extractFunction(extSrc, 'function isSensitiveForEmbedding') +
+        '\nreturn isSensitiveForEmbedding;'
+      )();
+      for (const f of ['.env', '.env.production', 'secrets.json', 'my-secret.yml',
+                       'credentials.json', 'serviceAccount.json', 'foo-adminsdk-x.json',
+                       'docker-compose.yml', 'private-key.pem', 'id_rsa', 'config.local.json',
+                       'app.token.json', 'db_password.txt', '.npmrc']) {
+        check(`privacy: "${f}" excluded from embedding upload`, sensitive(f) === true);
+      }
+      for (const f of ['index.js', 'server.ts', 'README.md', 'tsconfig.json',
+                       'environment.ts', 'tokenizer.js']) {
+        check(`privacy: ordinary source "${f}" still indexed`, sensitive(f) === false);
+      }
+    }
+
+    // Inline completions must not stream arbitrary open files to a provider.
+    {
+      const reStart = extSrc.indexOf('const EMBED_SENSITIVE_RE = new RegExp([');
+      const reEnd = extSrc.indexOf(", 'i');", reStart) + ", 'i');".length;
+      const eligible = new Function('path', 'process',
+        extSrc.slice(reStart, reEnd) + '\n' +
+        extractFunction(extSrc, 'function isSensitiveForEmbedding') + '\n' +
+        extractFunction(extSrc, 'function rootBelongsToWorkspace') + '\n' +
+        extractFunction(extSrc, 'function documentEligibleForCompletion') +
+        '\nreturn documentEligibleForCompletion;'
+      )(path, process);
+      const doc = (p, scheme = 'file') => ({ uri: { scheme, fsPath: p } });
+      const ws = [tmp];
+      check('privacy: a normal workspace file is eligible', eligible(doc(path.join(tmp, 'a.js')), ws) === true);
+      check('privacy: a file outside the workspace is NOT sent',
+        eligible(doc(path.join(os.tmpdir(), 'elsewhere', 'x.js')), ws) === false);
+      check('privacy: a credentials file inside the workspace is NOT sent',
+        eligible(doc(path.join(tmp, '.env.production')), ws) === false);
+      check('privacy: a non-file scheme (untitled/output) is NOT sent',
+        eligible(doc(path.join(tmp, 'a.js'), 'untitled'), ws) === false);
+    }
+
+    // Regression: _rgRun truncates `out` back to exactly maxOut, so without a
+    // latch every following chunk re-tripped the overflow branch and killed
+    // again — measured at ~30,000 kill attempts for one broad search. The kill
+    // used to be a synchronous taskkill on the extension host thread, so that
+    // was a total editor freeze.
+    {
+      const kills = [];
+      const realKill = provider._killProcessTree;
+      provider._killProcessTree = (p) => { kills.push(p); };
+      try {
+        // A process that floods stdout far past the 1KB cap used here.
+        const res = await provider._rgRun(
+          process.execPath,
+          ['-e', 'for(let i=0;i<60000;i++)console.log("line "+i+" some matching content")'],
+          tmp,
+          1024
+        );
+        check('rg overflow: output truncated to the cap', res.out.length <= 1024);
+        check('rg overflow: process killed exactly once, not once per chunk',
+          kills.length === 1, `fired ${kills.length} times`);
+      } finally {
+        provider._killProcessTree = realKill;
+      }
+    }
+
+    // The kill itself must never block the extension host thread.
+    check('kill: no synchronous execSync anywhere in the extension',
+      !/\bexecSync\s*\(/.test(extSrc));
+
+    // Availability probe: a definitely-absent binary must resolve false (and be
+    // cached), so an uninstalled toolchain reports "could not verify", not a pass.
+    const absent = await provider._commandAvailable('navy-definitely-not-a-real-binary-xyz');
+    check('syntax: availability probe returns false for a missing binary', absent === false);
+    const node = await provider._commandAvailable(process.platform === 'win32' ? 'where' : 'sh');
+    check('syntax: availability probe returns true for a present binary', node === true);
+  } catch (e) {
+    check('check_syntax suite ran', false, e.stack || e.message);
   } finally {
     if (provider) clearTimeout(provider._cpSaveTimer);
     try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
@@ -497,6 +1139,32 @@ async function robustnessSuite() {
     fs.mkdirSync(P('docs'), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'docs', 'setup.md'), '## Setup\n\nSet the API_TOKEN environment variable before starting.\n');
     fs.writeFileSync(P('server.js'), 'const legacyPeerDeps = true; // not documentation, must not match\n');
+    // read_file must cover an ordinary source file in as few round-trips as
+    // possible. The old 500-line cap meant a 1500-line file needed ~7 calls
+    // (read_file + timid 200-line read_lines chunks the model invents itself).
+    {
+      const big = Array.from({ length: 1526 }, (_, i) => `function move${i}(board) { return board.at(${i}); }`).join('\n');
+      fs.writeFileSync(P('big-source.js'), big);
+      const out = await provider.toolReadFile('big-source.js');
+      check('read_file: a 1500-line source file is not cut at 500 lines',
+        out.split('\n').length > 900);
+      check('read_file: truncation notice states the real range shown',
+        /showed lines 1-\d+ of 1526/.test(out));
+      // The exact continuation call must be spelled out, and must not repeat the
+      // boundary line — ranges are inclusive on both ends.
+      const m = /read_lines\("big-source\.js", (\d+), (\d+)\)/.exec(out);
+      check('read_file: gives the exact next call to make', Boolean(m));
+      if (m) {
+        const shown = parseInt(/showed lines 1-(\d+)/.exec(out)[1], 10);
+        check('read_file: continuation starts right after what was shown', parseInt(m[1], 10) === shown + 1);
+        check('read_file: continuation covers the rest in ONE call', parseInt(m[2], 10) === 1526);
+      }
+      // A file that fits must come back whole, with no truncation noise.
+      fs.writeFileSync(P('small-source.js'), 'const a = 1;\nconst b = 2;\n');
+      const small = await provider.toolReadFile('small-source.js');
+      check('read_file: a small file is returned untruncated', !/FILE TRUNCATED/.test(small) && small.includes('const b = 2;'));
+    }
+
     const docsHit = await provider.toolSearchDocs('legacy-peer-deps');
     check('search_docs finds README content', /README\.md/.test(docsHit) && /legacy-peer-deps/.test(docsHit));
     const docsHit2 = await provider.toolSearchDocs('API_TOKEN');
@@ -593,6 +1261,17 @@ async function robustnessSuite() {
     check('hallucination: bare "done" NOT flagged', !fc('Done! Let me know if you need anything else.'));
     check('hallucination: function explanation NOT flagged', !fc('This function calculates the sum of two numbers.'));
     check('hallucination: empty text NOT flagged', !fc(''));
+    // Regression: live bug report — deepseek-r1:7b fabricated a multi-line
+    // "File Edit Summary" (heading/claim on separate lines) for "edit the hello
+    // world to hello job!" without ever calling a tool; the editor never changed.
+    check('hallucination: multi-line "File Edit Summary" fabrication detected', fc(
+      '### File Edit Summary\n' +
+      '- File Path: c:\\Users\\ayuba\\Downloads\\New folder (4)\\index.html\n' +
+      '- Lines Modified: 1\n' +
+      '- Content Changed: `<h1>Hello World!</h1>` -> `<h1>Hello Job!</h1>`\n\n' +
+      '### Result\n' +
+      'The "Hello World!" text has been successfully updated to "Hello Job!".'
+    ));
 
     // Intent gate: only worth checking when the user's request could plausibly
     // want a file created/changed.
@@ -603,6 +1282,10 @@ async function robustnessSuite() {
     check('intent gate: pure question does NOT request action', !pra('what does this function do?'));
     check('intent gate: greeting does NOT request action', !pra('hey, how are you?'));
     check('intent gate: empty prompt does NOT request action', !pra(''));
+    // Regression: this exact phrasing (names WHAT to change, not "file"/"script")
+    // used to slip past the old noun-adjacency requirement entirely.
+    check('intent gate: "edit the hello world to hello job!" requests action', pra('edit the hello world to hello job!'));
+    check('intent gate: "change it to say X" requests action', pra('change it to say goodbye instead'));
 
     // Weak-model name detector (drives extra anti-hallucination reinforcement)
     const sm = (n) => provider._isLikelySmallModel(n);
@@ -723,6 +1406,7 @@ async function writeLoopGuardSuite() {
     provider.projectRoot = tmp;
     const posted = [];
     provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider._wslCache = { available: false }; // skip the real wsl.exe spawn in tests
     fs.writeFileSync(path.join(tmp, 'index.html'), 'content-0');
 
     // 10 successful writes to the SAME file, then an 11th attempt, then plain
@@ -768,6 +1452,7 @@ async function hallucinationSuite() {
     provider.currentModel = 'test-model';
     const posted = [];
     provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider._wslCache = { available: false }; // skip the real wsl.exe spawn in tests
     const read = (n) => { try { return fs.readFileSync(path.join(tmp, n), 'utf8'); } catch { return null; } };
 
     // Recovery path: model hallucinates once, gets nudged, then actually calls
@@ -824,6 +1509,39 @@ async function hallucinationSuite() {
     const sys2 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
     check('systemPrompt: genuine custom prompt included', sys2.includes('Always use 2-space indentation.'));
     await cfg.update('systemPrompt', '');
+
+    // OS/shell facts must always reach the model — a wrong guess here (e.g.
+    // assuming PowerShell when run_command actually shells out via cmd.exe) is
+    // what makes command failures look like "doesn't know its own OS."
+    captured.length = 0;
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
+    await provider.askNavy('hello', false, null, [], []);
+    const sysEnv1 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+    check('env: OS stated with a project open', /Operating system: /.test(sysEnv1));
+    check('env: shell dialect stated with a project open', /run_command executes through: /.test(sysEnv1));
+
+    const savedRoot = provider.projectRoot;
+    provider.projectRoot = '';
+    captured.length = 0;
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
+    await provider.askNavy('hello', false, null, [], []);
+    const sysEnv2 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+    check('env: OS still stated with NO project open', /Operating system: /.test(sysEnv2));
+    check('env: shell dialect still stated with NO project open', /run_command executes through: /.test(sysEnv2));
+    provider.projectRoot = savedRoot;
+
+    // WSL fallback fact (Windows only, this test machine is win32): the cached
+    // detection result must reach the system prompt either way, so the model
+    // knows whether falling back to WSL for a Unix-only tool is even possible.
+    check('env: WSL cache preset reports unavailable (as set up for this suite)', sysEnv1.includes('WSL not detected'));
+    const savedWsl = provider._wslCache;
+    provider._wslCache = { available: true, distros: ['Ubuntu-22.04', 'Debian'] };
+    captured.length = 0;
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
+    await provider.askNavy('hello', false, null, [], []);
+    const sysEnv3 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+    check('env: WSL available + distro list reaches the system prompt', sysEnv3.includes('WSL available') && sysEnv3.includes('Ubuntu-22.04'));
+    provider._wslCache = savedWsl;
 
     // Weak-model reinforcement actually reaches the request for a small model,
     // and is absent for a normal-sized one.
@@ -1121,8 +1839,228 @@ async function mcpHttpSuite() {
   mgr2.stop();
 }
 
+// ── 8b. Opening / switching project folders ─────────────────────────────────
+// Regression: openFolder passed a bare Uri to updateWorkspaceFolders, which
+// takes { uri } objects — VS Code rejected the call and returned false, so the
+// folder was never added, yet Navy set projectRoot and reported success anyway.
+async function projectFolderSuite() {
+  console.log('\nproject folder open/switch:');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+  let provider, dirA, dirB;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-projA-'));
+    dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-projB-'));
+    provider = new NavyCoderViewProvider(makeContext(dirA));
+    provider.view = { webview: { postMessage: () => {} } };
+
+    const uriOf = (p) => ({ fsPath: p, scheme: 'file', path: p, toString: () => p });
+
+    // The mock enforces the real API contract, so this proves the shape matters:
+    // a bare Uri (the original bug) is rejected; a { uri } object is accepted.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    check('updateWorkspaceFolders rejects a bare Uri (the original bug shape)',
+      vscode.workspace.updateWorkspaceFolders(1, 0, uriOf(dirB)) === false);
+    check('updateWorkspaceFolders accepts a { uri } object',
+      vscode.workspace.updateWorkspaceFolders(1, 0, { uri: uriOf(dirB) }) === true);
+    check('accepted add actually landed in workspaceFolders',
+      (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirB));
+
+    // "Add to Workspace" — folder really gets added AND Navy follows it.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    provider.isBusy = false;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = 'Add to Workspace';
+    await provider.openFolder();
+    check('add-to-workspace: folder added to the workspace for real',
+      (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirB));
+    check('add-to-workspace: Navy switched its root to the new project', provider.projectRoot === dirB);
+    check('add-to-workspace: original project still open alongside',
+      (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirA));
+
+    // "Open Here" — replaces the window via vscode.openFolder, and must NOT
+    // quietly add a second root instead (that was the reported symptom).
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = 'Open Here';
+    await provider.openFolder();
+    const opened = ctrl.executedCommands.find(c => c.command === 'vscode.openFolder');
+    check('open-here: issues vscode.openFolder to replace the window', Boolean(opened));
+    check('open-here: opens the picked folder', opened && opened.args[0]?.fsPath === dirB);
+    check('open-here: does not add a second root instead of switching',
+      (vscode.workspace.workspaceFolders || []).length === 1);
+
+    // Dismissing the modal must change nothing at all.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = undefined; // dismissed
+    await provider.openFolder();
+    check('dismissed: project root unchanged', provider.projectRoot === dirA);
+    check('dismissed: workspace untouched', (vscode.workspace.workspaceFolders || []).length === 1);
+    check('dismissed: no folder opened', !ctrl.executedCommands.some(c => c.command === 'vscode.openFolder'));
+
+    // A failed add must NOT move projectRoot to a folder that isn't open.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = 'Add to Workspace';
+    const realUpdate = vscode.workspace.updateWorkspaceFolders;
+    vscode.workspace.updateWorkspaceFolders = () => false; // simulate VS Code refusing
+    await provider.openFolder();
+    vscode.workspace.updateWorkspaceFolders = realUpdate;
+    check('failed add: projectRoot NOT moved to a folder that never opened', provider.projectRoot === dirA);
+    check('failed add: user is told it failed', ctrl.shown.error.some(m => /could not add/i.test(m)));
+
+    // Mid-turn switching is refused — tools resolve paths against projectRoot live.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    provider.isBusy = true;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = 'Open Here';
+    await provider.openFolder();
+    provider.isBusy = false;
+    check('busy: refuses to switch project mid-turn', provider.projectRoot === dirA);
+    check('busy: warns the user why', ctrl.shown.warning.some(m => /stop the current task/i.test(m)));
+    check('busy: never even opened the folder picker',
+      !ctrl.executedCommands.some(c => c.command === 'vscode.openFolder'));
+
+    // Picking a folder already in the workspace just switches to it.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }, { uri: uriOf(dirB) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirB];
+    await provider.openFolder();
+    check('existing folder: switches without prompting', provider.projectRoot === dirB);
+    check('existing folder: no duplicate root added',
+      (vscode.workspace.workspaceFolders || []).length === 2);
+
+    // ── The chat must auto-link to the project that's actually open ──────────
+    // Pure containment predicate behind the guard.
+    const belongs = eval('(' + extractFunction(extSrc, 'function rootBelongsToWorkspace') + ')');
+    check('root-belongs: a workspace folder itself belongs', belongs(dirA, [dirA]));
+    check('root-belongs: a sub-directory of a workspace folder belongs',
+      belongs(path.join(dirA, 'src'), [dirA]));
+    check('root-belongs: another project does NOT belong', !belongs(dirB, [dirA]));
+    check('root-belongs: with no workspace open, anything is allowed', belongs(dirB, []));
+    check('root-belongs: empty root never belongs', !belongs('', [dirA]));
+
+    // "Open Here" must not stamp the new project's path into the OLD project's
+    // workspace settings — that stale pointer is what made a later reopen of the
+    // old project land on the wrong root until fixed by hand.
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirB];
+    ctrl.nextInfo = 'Open Here';
+    await provider.openFolder();
+    check('open-here: does not poison the old workspace settings with the new path',
+      ctrl.scoped.projectRoot?.workspaceValue !== dirB);
+
+    // A saved root pointing at a project that is NOT open must be ignored, so a
+    // freshly opened folder links up on its own instead of needing a manual fix.
+    ctrl.reset();
+    ctrl.scoped.projectRoot = { workspaceValue: dirB }; // stale pointer to another project
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    const fresh = new NavyCoderViewProvider(makeContext(dirA));
+    check('stale saved root from another project is ignored', fresh.projectRoot !== dirB);
+    fresh.view = { webview: { postMessage: () => {} } };
+    await fresh.sendWorkspaceFolders();
+    check('freshly opened project auto-links to the open folder', fresh.projectRoot === dirA);
+    clearTimeout(fresh._cpSaveTimer); clearInterval(fresh._heartbeat);
+
+    // A legitimate saved root (inside the open folder) is still honoured.
+    ctrl.reset();
+    const sub = path.join(dirA, 'packages', 'api');
+    fs.mkdirSync(sub, { recursive: true });
+    ctrl.scoped.projectRoot = { workspaceValue: sub };
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    const kept = new NavyCoderViewProvider(makeContext(dirA));
+    check('a saved sub-folder root inside the open project is still honoured', kept.projectRoot === sub);
+    clearTimeout(kept._cpSaveTimer); clearInterval(kept._heartbeat);
+  } catch (e) {
+    check('project folder suite ran', false, e.stack || e.message);
+  } finally {
+    vscode.workspace.workspaceFolders = undefined;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); }
+    for (const d of [dirA, dirB]) { try { if (d) fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  }
+}
+
+// ── 9. cancelPendingApprovals (Stop/Clear) must notify the webview ───────────
+// Regression: previously resolved pending approval promises directly with no
+// notification, leaving whatever Approve/Reject card was still pending stuck
+// with visibly-enabled but functionally dead buttons after Stop.
+async function approvalCancelSuite() {
+  console.log('\napproval cancel (Stop must not leave dead buttons):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-cancel-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    const filePath = path.join(tmp, 'a.js');
+    fs.writeFileSync(filePath, 'original');
+
+    // Pending command approval — the "Run this command?" card.
+    let cmdResolvedWith;
+    const cmdPromise = new Promise((resolve) => {
+      provider.pendingCommandApprovals.set('cmd1', { resolve: (v) => { cmdResolvedWith = v; resolve(v); } });
+    });
+
+    // Pending agent-edit approval — the main diff-card flow.
+    let editResolvedWith;
+    const editPromise = new Promise((resolve) => {
+      provider.pendingApprovals.set('edit1', { resolve: (v) => { editResolvedWith = v; resolve(v); }, filePath, kind: 'agent-edit' });
+    });
+
+    // Pending legacy applyCode approval (no `kind` — the sidebar-card apply flow).
+    let legacyResolvedWith;
+    const legacyPromise = new Promise((resolve) => {
+      provider.pendingApprovals.set('legacy1', { resolve: (v) => { legacyResolvedWith = v; resolve(v); }, filePath, search: '', replace: '', newText: 'CHANGED' });
+    });
+
+    provider.cancelPendingApprovals();
+    await Promise.all([cmdPromise, editPromise, legacyPromise]);
+
+    check('cancel: command approval resolves rejected', cmdResolvedWith === false);
+    check('cancel: command card notified so its buttons unstick',
+      posted.some(m => m.type === 'commandResolved' && m.id === 'cmd1' && m.approved === false));
+
+    check('cancel: agent-edit approval resolves to reject', editResolvedWith === 'reject');
+    check('cancel: agent-edit entry removed from the pending map', !provider.pendingApprovals.has('edit1'));
+
+    check('cancel: legacy apply card notified so its buttons unstick',
+      posted.some(m => m.type === 'diffResolved' && m.id === 'legacy1' && m.approved === false));
+    check('cancel: legacy apply did NOT write the file', fs.readFileSync(filePath, 'utf8') === 'original');
+    check('cancel: legacy apply resolves to a rejection, not a silent placeholder string', legacyResolvedWith === 'Edit rejected by user');
+
+    check('cancel: both pending maps fully drained', provider.pendingApprovals.size === 0 && provider.pendingCommandApprovals.size === 0);
+  } catch (e) {
+    check('approval cancel suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(retrievalSuite)
+  .then(semanticSearchSuite)
+  .then(syntaxCheckSuite)
   .then(robustnessSuite)
   .then(writeLoopGuardSuite)
   .then(hallucinationSuite)
@@ -1131,6 +2069,8 @@ undoRedoSuite()
   .then(geminiSuite)
   .then(mcpSuite)
   .then(mcpHttpSuite)
+  .then(projectFolderSuite)
+  .then(approvalCancelSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

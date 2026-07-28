@@ -34,7 +34,7 @@ const TOOLS = [
   },
   {
     name: 'read_lines',
-    description: 'Read a range of lines from a file (1-indexed). Use this to inspect a specific section without loading the whole file.',
+    description: 'Read a range of lines from a file (1-indexed, both ends inclusive). Use this to inspect a specific section without loading the whole file, or to continue after read_file reported a truncated file. Read in LARGE ranges (500-1500 lines at a time) — every call costs a full round-trip, so covering a file in 200-line chunks wastes several turns. Ranges are inclusive, so continue from the previous end + 1 (e.g. 1-800, then 801-1600) rather than repeating the boundary line.',
     parameters: {
       type: 'object',
       properties: {
@@ -143,7 +143,7 @@ const TOOLS = [
   },
   {
     name: 'apply_edit',
-    description: 'Apply a precise SEARCH/REPLACE edit to a file. The search string must match the file content exactly (character-for-character, including whitespace and line endings). Use write_file when you need to replace most of the file.',
+    description: 'Apply a precise SEARCH/REPLACE edit to a file. The search string must match the file content exactly (character-for-character, including whitespace and line endings). Keep search as SHORT as possible — only the exact lines that change plus the minimum surrounding context needed to make the match unique. Never pass an entire function or file as the search string when just a few lines actually change. Use edit_line for a single-line change, or write_file only when you truly need to replace most of the file.',
     parameters: {
       type: 'object',
       properties: {
@@ -196,13 +196,24 @@ const TOOLS = [
   },
   {
     name: 'get_diagnostics',
-    description: 'Get all LSP errors and warnings for the current file or a specific file. Use this to see TypeScript errors, linting issues, etc.',
+    description: 'Get all LSP errors and warnings for the current file or a specific file. Use this to see TypeScript errors, linting issues, etc. NOTE: this only reports what an installed language extension found — it returns nothing for a language the user has no extension for, which is NOT the same as the file being valid. Use check_syntax when you need a definitive answer.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to get diagnostics for. Omit for the currently active file.' }
       },
       required: []
+    }
+  },
+  {
+    name: 'check_syntax',
+    description: 'Independently verify that a file actually parses, without relying on any VS Code language extension being installed. Uses a real parser/compiler for the language (JSON parsed directly, JavaScript via "node --check", Python/TypeScript/Go/Rust/etc. via their own toolchain if installed). Clearly distinguishes "valid", "syntax error" (with line numbers), and "could not verify" — never reports a file as clean just because no checker was available. Use this after writing or editing a file when get_diagnostics returns nothing, and always for JSON/config files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'File path to syntax-check.' }
+      },
+      required: ['path']
     }
   },
   {
@@ -395,11 +406,11 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, fetch_url, web_search, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
-2. Edit requests → read_file first, then apply_edit (search string must match the file exactly).
+2. Edit requests → read_file first, then edit with the SMALLEST tool that does the job: edit_line for one line, apply_edit for a few contiguous lines (search string must match the file exactly — include ONLY the lines that actually change plus the minimum context needed to make the match unique, never the whole function or file), write_file only when most of the file's content is genuinely changing. If you find yourself putting more than ~10-15 unchanged lines into a search block just to "be safe," stop — narrow it to the real change.
 3. New file requests → use write_file with the full content.
 4. Never use run_command to write files.
 5. One tool call per XML block — wait for each result before the next.
@@ -415,9 +426,10 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 11. If a command fails (non-zero exit code), NEVER run the same command again immediately. Read the error output, identify the root cause, fix the code, THEN retry once. Repeating a failing command without a fix accomplishes nothing.
 12. NEVER call run_project if the project is already running — it will report "already running". Only call run_project once per session; use the existing server for all subsequent testing.
 13. PLANNING: For any task that will need 3 or more tool calls, START your first response with a short numbered plan (3-6 one-line steps) under a "**Plan:**" heading, BEFORE the first tool call. Then execute the steps in order. If the plan must change mid-task, state the revised step in one line before continuing. Simple one-tool questions need no plan.
-14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors.
+14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors. IMPORTANT: an empty/absent diagnostics report does NOT prove the file is valid — it usually means the user has no language extension installed for that file type. When a write reports "[SYNTAX UNVERIFIED]", or you edited a JSON/config file, or you need certainty before finishing, call check_syntax on the file: it runs a real parser and tells you definitively "valid", "syntax error at line N", or "could not verify". Never claim a file is correct on the basis of silence alone.
 15. CRITICAL — DO NOT HALLUCINATE FILE ACTIONS: Writing code in your reply text does NOT save it anywhere — it only appears in the chat. If the user asked you to create, write, save, or edit a file, you MUST call the write_file or apply_edit tool and see its result before saying it succeeded. NEVER say "created", "saved", "written", "done", or similar unless you actually called that tool THIS turn and it returned success. If you are only showing an example or discussing code without being asked to save it, say so explicitly instead of claiming completion.
-16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.`
-
+16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.
+17. COMMAND ACCURACY — check before assuming: run_command executes through the exact shell named in CURRENT ENVIRONMENT above (cmd.exe on Windows, sh on macOS/Linux) — write commands in THAT dialect, not whatever you'd default to. Shell builtins (cmd.exe: dir, cd, type, del, copy, move, mkdir, echo, set; sh: ls, cd, cat, rm, cp, mv, mkdir, echo, export) always exist — no need to check. A third-party CLI (git, node, npm, python, rg, jq, docker, etc.) may or may not be installed or on PATH — if you haven't already confirmed it works earlier this turn, check it first with "where <tool>" (cmd.exe) or "command -v <tool>" (sh) before depending on it, so a failure tells you "not installed" instead of wasting an attempt on a guess. If a command still fails with "not recognized"/"command not found", that means the tool isn't available — don't retry the same command, find or install an alternative.
+18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from cmd.exe per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.`
 
 module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT };

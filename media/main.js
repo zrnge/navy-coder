@@ -231,14 +231,26 @@ stopButton?.addEventListener('click', () => {
   vscode.postMessage({ type: 'stop' });
 });
 
-document.getElementById('commitButton')?.addEventListener('click', () => {
-  vscode.postMessage({ type: 'runCommand', command: 'navy.generateCommit' });
+// Commit/PR/Run Tests each launch a native VS Code dialog/progress flow with no
+// webview-visible busy signal to key off of (unlike Send/Stop, which track
+// `isBusy` via start/done messages) — so a rapid double-click posts the same
+// runCommand twice with no feedback that anything happened. A short disable
+// window on the clicked button is enough to stop that without needing a wider
+// protocol change to report each native command's actual completion.
+function runUtilityCommand(button, command) {
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  setTimeout(() => { button.disabled = false; }, 3000);
+  vscode.postMessage({ type: 'runCommand', command });
+}
+document.getElementById('commitButton')?.addEventListener('click', (e) => {
+  runUtilityCommand(e.currentTarget, 'navy.generateCommit');
 });
-document.getElementById('prButton')?.addEventListener('click', () => {
-  vscode.postMessage({ type: 'runCommand', command: 'navy.generatePR' });
+document.getElementById('prButton')?.addEventListener('click', (e) => {
+  runUtilityCommand(e.currentTarget, 'navy.generatePR');
 });
-document.getElementById('testButton')?.addEventListener('click', () => {
-  vscode.postMessage({ type: 'runCommand', command: 'navy.runTests' });
+document.getElementById('testButton')?.addEventListener('click', (e) => {
+  runUtilityCommand(e.currentTarget, 'navy.runTests');
 });
 
 projectSelect?.addEventListener('change', () => {
@@ -504,9 +516,38 @@ messagesEl.addEventListener('scroll', () => {
   userScrolledUp = !nearBottom;
 });
 
+// ── Webview self-watchdog ────────────────────────────────────────────────────
+// The panel runs in its own renderer, so when it stalls nothing reaches the
+// extension host log and the only symptom the user can report is "it froze,
+// I don't know why". This heartbeat measures the renderer's OWN event loop: if
+// a tick is late, the thread was blocked, and we report how long for and what
+// it was doing immediately beforehand. That turns an unreproducible freeze into
+// a line in the Navy Coder output channel.
+let _wdLastTick = Date.now();
+let _wdLastActivity = 'idle';
+let _wdReports = 0;
+setInterval(() => {
+  const now = Date.now();
+  const gap = now - _wdLastTick;
+  _wdLastTick = now;
+  // 250ms interval; anything past ~1s means the thread genuinely stopped.
+  if (gap > 1000 && _wdReports < 25) {
+    _wdReports++;
+    try {
+      vscode.postMessage({
+        type: 'perfWarning',
+        ms: gap,
+        chars: (typeof activeAssistantContent === 'string' ? activeAssistantContent.length : 0),
+        mode: `STALL — last activity "${_wdLastActivity}", dom=${document.querySelectorAll('*').length} nodes`,
+      });
+    } catch {}
+  }
+}, 250);
+
 window.addEventListener('message', (event) => {
   try {
   const message = event.data;
+  _wdLastActivity = message && message.type ? message.type : 'unknown';
 
   // Any message from the extension proves it's alive — push the dead-backend
   // watchdog out. Includes the 30s 'heartbeat' sent during long turns.
@@ -519,7 +560,12 @@ window.addEventListener('message', (event) => {
     resetPlanCard();
     activeAssistantMessage = addMessage('assistant', '');
     activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
+    _primaryBubble = activeAssistantBubble;
     activeAssistantContent = '';
+    _segmentStart = 0;
+    _needNewBubble = false;
+    _streamPre = null;
+    _perfWarned = false;
     activeFilePath = message.activeFile || '';
     updateWelcome();
     // Clear shell output from previous turn; orphan a stale terminal card so a
@@ -552,16 +598,22 @@ window.addEventListener('message', (event) => {
     if (message.type === 'done') updatePlanProgress(0, true);
     // A command still streaming when the turn ends (Stop pressed) — close its card.
     if (activeTermCard) finalizeTermCard('__stopped__');
-    // Remove the bubble when nothing VISIBLE was produced — either no content at
-    // all, or content that renders empty (e.g. a reply that was purely tool-call
-    // JSON from a small model). The tool cards remain regardless.
-    const renderedEmpty = activeAssistantBubble && !activeAssistantBubble.innerHTML.trim();
-    if ((activeAssistantContent.trim() === '' || renderedEmpty) && activeAssistantMessage) {
-      activeAssistantMessage.remove();
-      activeAssistantMessage = null;
-    } else {
-      lastAssistantMessage = activeAssistantMessage;
-      activeAssistantMessage = null;
+    // Drop bubbles that render to nothing (e.g. a reply that was purely tool-call
+    // JSON from a small model, or a trailing bubble opened for text that never
+    // arrived). Only discard the whole message when NOTHING is left — the old
+    // check deleted the entire message on an empty bubble, taking every tool card
+    // with it, even though the comment claimed the cards survived.
+    if (activeAssistantMessage) {
+      for (const b of [...activeAssistantMessage.querySelectorAll('.message-bubble')]) {
+        if (!b.innerHTML.trim()) b.remove();
+      }
+      if (!activeAssistantMessage.querySelector('.message-bubble, .activity-log, .activity-log-collapsed')) {
+        activeAssistantMessage.remove();
+        activeAssistantMessage = null;
+      } else {
+        lastAssistantMessage = activeAssistantMessage;
+        activeAssistantMessage = null;
+      }
     }
     activeAssistantBubble = null;
     activeAssistantContent = '';
@@ -631,7 +683,21 @@ window.addEventListener('message', (event) => {
     activeAssistantContent = '';
     activityLogEl = null;
     currentActivityRowEl = null;
+    activityRowsById.clear();
     activeTermCard = null;
+    lastAssistantMessage = null;
+    // A run-project server or background task/process can still be running
+    // server-side after Clear (Clear only resets the conversation, not those).
+    // Drop the now-stale DOM references so their next update doesn't write
+    // into a detached node — bgTaskEls/bgProcessPanels lazily recreate their
+    // card on the next message; the extension host re-sends runProjectStart
+    // right after 'cleared' if a project is still running, since that card
+    // has no such lazy-recreate path.
+    runProjectCardEl = null;
+    bgTaskEls.clear();
+    bgProcessPanels.clear();
+    if (tokenCounterEl) { tokenCounterEl.textContent = ''; tokenCounterEl.classList.remove('visible'); }
+    if (contextBarFill) { contextBarFill.style.width = '0%'; contextBarFill.className = 'context-bar-fill'; }
     resetPlanCard();
     messagesEl.innerHTML = '';
     messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
@@ -673,6 +739,15 @@ window.addEventListener('message', (event) => {
     const bubble = activeAssistantBubble || lastAssistantMessage?.querySelector('.message-bubble');
     const blocks = bubble?.querySelectorAll('.apply-button') || [];
     for (const button of blocks) {
+      // Only a button actually mid-apply ("...") is a candidate — a reply with
+      // several code blocks must not have ALL of them flip to "Applied" just
+      // because one file write succeeded.
+      if (button.textContent !== '...') continue;
+      const blockPath = button.closest('.code-block')?.querySelector('.code-path')?.dataset.path || '';
+      const msgPath = (message.path || '').replace(/\\/g, '/');
+      // Narrow by path when both sides have one; a trailing-segment match
+      // handles the block storing a relative path and the host an absolute one.
+      if (msgPath && blockPath && !msgPath.endsWith('/' + blockPath.replace(/\\/g, '/')) && msgPath !== blockPath) continue;
       button.textContent = 'Applied';
       button.disabled = true;
     }
@@ -685,7 +760,7 @@ window.addEventListener('message', (event) => {
         || ('run_tests' + (message.args?.filter ? ' — ' + message.args.filter : ' (auto-detected)'));
       createTermCard(message.tool, cmdText);
     } else {
-      addToolCallCard(message.tool, message.args);
+      addToolCallCard(message.tool, message.args, message.callId);
     }
     const verb = TOOL_VERB[message.tool] || message.tool;
     if (statusText) statusText.textContent = `${verb}…`;
@@ -695,7 +770,7 @@ window.addEventListener('message', (event) => {
     if ((message.tool === 'run_command' || message.tool === 'run_tests') && activeTermCard) {
       finalizeTermCard(message.result);
     } else {
-      addToolResultCard(message.tool, message.result);
+      addToolResultCard(message.tool, message.result, message.callId);
     }
     if (statusText) statusText.textContent = 'Working…';
   }
@@ -737,7 +812,11 @@ window.addEventListener('message', (event) => {
       card.classList.add(message.approved ? 'is-approved' : 'is-rejected');
       const body = card.querySelector('.diff-body');
       if (body) {
-        const changedRows = body.querySelectorAll('.diff-added, .diff-removed').length;
+        // Prefer the count recorded at render time; fall back to a DOM count only
+        // for cards created before that was tracked.
+        const changedRows = card.dataset.changeCount !== undefined
+          ? parseInt(card.dataset.changeCount, 10) || 0
+          : body.querySelectorAll('.diff-added, .diff-removed').length;
         if (message.approved && changedRows > 0) {
           // Keep a compact preview of the change (added/removed lines only) with a
           // toggle to reveal the full diff — instead of discarding it entirely.
@@ -827,6 +906,21 @@ window.addEventListener('message', (event) => {
       } else {
         queuedBadge.textContent = message.remaining + ' queued';
       }
+    }
+  }
+
+  if (message.type === 'restrictedMode') {
+    // Without this the only symptom is tools quietly refusing, which is
+    // indistinguishable from Navy being broken.
+    if (!document.querySelector('.restricted-notice')) {
+      const el = document.createElement('div');
+      el.className = 'system-notice restricted-notice';
+      el.textContent = 'This folder is not trusted, so Navy will not run commands, start toolchains or MCP servers, '
+        + 'or upload code for embeddings. Reading files and answering questions still work. '
+        + 'Use "Workspaces: Manage Workspace Trust" to enable everything.';
+      messagesEl.appendChild(el);
+      updateWelcome();
+      scrollToBottom();
     }
   }
 
@@ -1662,7 +1756,7 @@ function populateProjects(roots, current) {
 
   const addOption = document.createElement('option');
   addOption.value = '__add_folder__';
-  addOption.textContent = '+ Add folder...';
+  addOption.textContent = '+ Open project...';
   projectSelect.appendChild(addOption);
 
   // If we just added a folder, re-select the current root
@@ -1937,7 +2031,9 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     copyBtn.setAttribute('aria-label', 'Copy message');
     copyBtn.textContent = '⧉';
     copyBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'copy', text: bubble.dataset.rawMd || bubble.textContent || '' });
+      // Prefer the article: a reply split across several bubbles by tool activity
+      // records its full markdown there, so copy still yields the whole reply.
+      vscode.postMessage({ type: 'copy', text: article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '' });
       copyBtn.textContent = '✓';
       setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
     });
@@ -2023,23 +2119,110 @@ function resetPlanCard() {
   planStepCount = 0;
 }
 
-// Streaming render state
-let _streamPre = null;    // <pre> shown live during streaming (raw text, O(1) append)
+// Streaming render state. Formatted markdown is rendered live, but the parse +
+// DOM write is throttled to at most once per MD_RENDER_THROTTLE_MS regardless
+// of how many chunks arrive in between — a growing response otherwise means
+// the plan-card check and full markdown re-parse both re-run on EVERY token,
+// which gets slower as the response grows (O(n) work times up to hundreds of
+// chunks). A 150ms cap bounds the total work to a small, constant number of
+// re-parses per second no matter how fast the provider streams, while still
+// looking live to a human reader.
+let _mdRenderTimer = null;
+let _lastMdRenderAt = 0;
+let _mdRenderCost = 0;      // ms the last live render actually took
+let _streamPre = null;      // cheap plain-text element used past the size ceiling
+let _perfWarned = false;    // slow-render reported once per turn, not per tick
+let _segmentStart = 0;      // index in activeAssistantContent where this bubble starts
+let _needNewBubble = false; // tool activity happened — next text opens a new bubble
+let _primaryBubble = null;  // first bubble of the turn; carries rawMd for the copy button
+const MD_RENDER_THROTTLE_MS = 150;
+const MD_RENDER_MAX_MS = 2000;
+// Past this much accumulated text, a full re-parse costs more than live
+// formatting is worth: rendering ~60 KB of reply produces ~130 KB of HTML, and
+// re-parsing/re-laying-out that several times a second is what locked the panel
+// up. Beyond the ceiling we stream plain text (cheap, no HTML parse, no layout
+// thrash) and the complete markdown render still happens once at the end.
+const LIVE_MD_MAX_CHARS = 20000;
+
+// The throttle adapts to what rendering actually costs on THIS machine and at
+// THIS reply length, so the render loop can never occupy more than ~25% of the
+// time. A fixed 150ms interval was fine early in a reply and hopeless later,
+// when a single render exceeded the interval and renders queued back-to-back.
+function nextRenderDelay() {
+  return Math.min(MD_RENDER_MAX_MS, Math.max(MD_RENDER_THROTTLE_MS, _mdRenderCost * 4));
+}
+
+// An assistant turn interleaves prose and tool activity, but every bubble and
+// every activity log is appended to the same message — so all text collected in
+// ONE bubble that sits above ALL the tool cards. A turn that said "I'll read the
+// file", ran twenty tools, then wrote its summary rendered as: intro, summary,
+// then the work that happened between them. Read top-to-bottom the summary looked
+// missing entirely, because nothing follows the tool activity.
+//
+// Fix: when tool activity begins after the model has already written something,
+// seal that bubble. The next text starts a fresh bubble, which lands after the
+// activity log — so the transcript reads in the order things actually happened.
+function sealCurrentBubble() {
+  if (!activeAssistantBubble || _needNewBubble) return;
+  const segment = activeAssistantContent.slice(_segmentStart);
+  if (!segment.trim()) return;   // nothing written yet — keep using this bubble
+  const html = renderMarkdown(segment);
+  activeAssistantBubble.innerHTML = html;
+  if (html) attachCodeBlockActions(activeAssistantBubble);
+  _needNewBubble = true;
+  _streamPre = null;
+}
 
 function appendAssistantText(text) {
   if (!activeAssistantMessage) {
     activeAssistantMessage = addMessage('assistant', '');
     activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
+    _primaryBubble = activeAssistantBubble;
     activeAssistantContent = '';
+    _segmentStart = 0;
+    _needNewBubble = false;
+    _lastMdRenderAt = 0;
+    _mdRenderCost = 0;
+    _streamPre = null;
+    _perfWarned = false;
+  }
+
+  // First text after tool activity — open a new bubble below it.
+  if (_needNewBubble && text.trim()) {
+    const b = document.createElement('div');
+    b.className = 'message-bubble';
+    activeAssistantMessage.appendChild(b);
+    activeAssistantBubble = b;
+    _segmentStart = activeAssistantContent.length;   // before this text is added
+    _needNewBubble = false;
+    _streamPre = null;
   }
 
   activeAssistantContent += text;
+
+  const now = Date.now();
+  const wait = nextRenderDelay();
+  if (now - _lastMdRenderAt >= wait) {
+    if (_mdRenderTimer) { clearTimeout(_mdRenderTimer); _mdRenderTimer = null; }
+    renderStreamingContent();
+  } else if (!_mdRenderTimer) {
+    _mdRenderTimer = setTimeout(() => { _mdRenderTimer = null; renderStreamingContent(); }, wait - (now - _lastMdRenderAt));
+  }
+}
+
+function renderStreamingContent() {
+  const _renderStart = Date.now();
+  _lastMdRenderAt = _renderStart;
+  if (!activeAssistantBubble) return;
   maybeBuildPlanCard();
 
   // NEVER show raw <think> reasoning while streaming: drop closed blocks and,
   // if a block is still open, hide its contents behind a live indicator.
   // The final render collapses finished reasoning into the 💭 dropdown.
-  let display = activeAssistantContent.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+  // Only this bubble's slice — text written before the last tool run already
+  // lives in its own sealed bubble above the activity log.
+  let display = activeAssistantContent.slice(_segmentStart)
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
   let thinkingLive = false;
   const openIdx = display.search(/<think(?:ing)?>/i);
   if (openIdx !== -1) {
@@ -2060,33 +2243,74 @@ function appendAssistantText(text) {
     return;
   }
 
-  // Models emit stray newline-only chunks between tool calls — don't render a pre
-  // for pure whitespace or it grows into a tall blank block in the chat.
+  // Models emit stray newline-only chunks between tool calls — don't render
+  // anything for pure whitespace or it grows into a tall blank block in the chat.
   if (!display && !thinkingLive) return;
 
-  // During streaming: show raw text via textContent — O(1), no innerHTML churn,
-  // no layout reflow, no markdown parsing. Final render happens in flushAssistantText.
-  if (!_streamPre) {
-    _streamPre = document.createElement('pre');
-    _streamPre.className = 'streaming-pre';
-    activeAssistantBubble.innerHTML = '';
-    activeAssistantBubble.appendChild(_streamPre);
+  if (display.length > LIVE_MD_MAX_CHARS) {
+    // Long reply: stream as plain text. One text-node write, no HTML parse and
+    // no layout of a large tree, so cost stays flat however long the reply gets.
+    // flushAssistantText still renders the full markdown when the turn ends.
+    if (!_streamPre || _streamPre.parentNode !== activeAssistantBubble) {
+      activeAssistantBubble.innerHTML = '';
+      _streamPre = document.createElement('pre');
+      _streamPre.className = 'streaming-pre';
+      activeAssistantBubble.appendChild(_streamPre);
+    }
+    _streamPre.textContent = display + (thinkingLive ? '\n\n💭 Reasoning…' : '');
+  } else {
+    // Formatted markdown, live — an in-progress fenced code block simply falls
+    // back to plain text until its closing fence arrives, then reformats.
+    _streamPre = null;
+    activeAssistantBubble.innerHTML = renderMarkdown(display) + (thinkingLive ? '<div class="think-streaming">💭 Reasoning…</div>' : '');
+    // renderMarkdown emits Copy/Apply buttons on every completed code block. This
+    // used to run only on the final flush, so mid-stream those buttons rendered
+    // with no listeners attached — clicking Apply did nothing at all. The DOM is
+    // rebuilt each tick, so the dataset.bound guard inside is re-evaluated fresh.
+    attachCodeBlockActions(activeAssistantBubble);
   }
-  _streamPre.textContent = display + (thinkingLive ? (display ? '\n\n' : '') + '💭 Reasoning…' : '');
+
+  // Feeds the adaptive throttle: if this render was expensive, the next one is
+  // scheduled proportionally further out instead of piling up behind it.
+  _mdRenderCost = Date.now() - _renderStart;
+
+  // A stalled webview logs nothing to the extension host, so report slow renders
+  // upward — they show up in the Navy Coder output channel, where they can
+  // actually be found. Reported once per turn so a slow machine can't spam it.
+  if (_mdRenderCost > 250 && !_perfWarned) {
+    _perfWarned = true;
+    vscode.postMessage({
+      type: 'perfWarning',
+      ms: _mdRenderCost,
+      chars: activeAssistantContent.length,
+      mode: display.length > LIVE_MD_MAX_CHARS ? 'plain-text' : 'markdown',
+    });
+  }
 
   // rAF-batched — at most one scroll write per painted frame.
   scrollToBottom();
 }
 
 function flushAssistantText() {
-  _streamPre = null;
+  if (_mdRenderTimer) { clearTimeout(_mdRenderTimer); _mdRenderTimer = null; }
+  // Reset the throttle window here, not just when appendAssistantText lazily
+  // creates a new message — the 'start' handler pre-creates activeAssistantMessage
+  // directly (and calls flushAssistantText first), so without this the first
+  // chunk of a brand-new response could inherit a very recent timestamp from the
+  // PREVIOUS response and get needlessly delayed instead of painting immediately.
+  _lastMdRenderAt = 0;
+  _mdRenderCost = 0;
+  _streamPre = null;   // the bubble is about to be replaced by the final render
 
   if (!activeAssistantBubble || !activeAssistantContent) return;
-  // Single full markdown render now that streaming is complete. Always assign —
-  // even when the result is empty — so a stale streaming <pre> (e.g. whitespace-only
-  // or tool-XML-only content) never lingers as a tall blank block in the chat.
-  activeAssistantBubble.dataset.rawMd = activeAssistantContent; // for the copy-message button
-  const rendered = renderMarkdown(activeAssistantContent);
+  // The copy button lives on the FIRST bubble and must yield the whole reply,
+  // even when it was split across several bubbles by tool activity.
+  (_primaryBubble || activeAssistantBubble).dataset.rawMd = activeAssistantContent;
+  if (activeAssistantMessage) activeAssistantMessage.dataset.rawMd = activeAssistantContent;
+  // Final render of THIS bubble's slice — earlier segments were already given
+  // their final render when they were sealed. Always assign, even when empty, so
+  // a stale streaming <pre> never lingers as a tall blank block in the chat.
+  const rendered = renderMarkdown(activeAssistantContent.slice(_segmentStart));
   activeAssistantBubble.innerHTML = rendered;
   if (rendered) attachCodeBlockActions(activeAssistantBubble);
   scrollToBottom();
@@ -2253,7 +2477,13 @@ function renderMarkdown(text) {
   // Relaxed: handles [\w.+-] language names, optional trailing text on fence line,
   // optional trailing whitespace before closing fence.
   const segments = [];
-  const codeRe = /(?:^|\n)(`{3,})([\w.+\-]*)(?::([^\s\n]+))?[^\n]*\n([\s\S]*?)\n\1[ \t]*(?=$|\n)/g;
+  // The fence length is bounded on purpose. `{3,}` combined with the \1
+  // backreference backtracks quadratically over a long run of backticks —
+  // measured at 14.5 SECONDS of frozen renderer for a 160k-backtick run, and
+  // this regex runs on every render of every reply. Real fences are 3 or 4
+  // backticks; capping at 8 keeps every legitimate form parsing identically
+  // while making the pathological case constant-time.
+  const codeRe = /(?:^|\n)(`{3,8})([\w.+\-]*)(?::([^\s\n]+))?[^\n]*\n([\s\S]*?)\n\1[ \t]*(?=$|\n)/g;
   let pos = 0;
   let m;
   while ((m = codeRe.exec(cleaned)) !== null) {
@@ -2277,8 +2507,23 @@ function renderBlockMarkdown(text) {
   const lines = text.split('\n');
   const out = [];
   let i = 0;
+  let seenAt = -1;
 
   while (i < lines.length) {
+    // Unconditional progress guard. Every branch below is *supposed* to advance
+    // `i`, but this loop runs on partial, model-generated text on every render,
+    // so a branch that declines a line it was expected to claim costs the user
+    // the whole panel — permanently. Rather than trusting each branch to be
+    // exhaustive, notice when a line has already been offered around once and
+    // force it out as a paragraph. Worst case a future bug mis-renders one
+    // line; it can no longer hang the renderer.
+    if (i === seenAt) {
+      out.push(`<p>${renderInline(lines[i])}</p>`);
+      i++;
+      continue;
+    }
+    seenAt = i;
+
     const line = lines[i];
     const trimmed = line.trim();
 
@@ -2328,7 +2573,20 @@ function renderBlockMarkdown(text) {
     }
 
     // — paragraph: gather consecutive "plain" lines —
-    const pLines = [];
+    // The first line is consumed unconditionally, and that is load-bearing.
+    // Every branch above has already declined this line, so if the loop
+    // conditions below could reject it too, `i` would never advance and this
+    // while-loop would spin on the same line forever — freezing the entire
+    // panel with no error, no log, and no way out but killing the window.
+    //
+    // It was reachable, and common: the loop rejects any line starting with
+    // `|`, while the table branch only claims one whose NEXT line is a
+    // separator row. A table header is therefore fatal for as long as it is the
+    // last line received — which is precisely what every streamed markdown
+    // table looks like in the gap before its `|---|---|` arrives. Whether a
+    // render tick landed in that gap decided whether Navy froze, which is why
+    // it looked random.
+    const pLines = [lines[i++]];
     while (
       i < lines.length &&
       lines[i].trim() !== '' &&
@@ -2528,9 +2786,18 @@ const WHEEL_SVG = `<svg class="spin-wheel" viewBox="0 0 24 24" width="14" height
 
 let activityLogEl = null;
 let currentActivityRowEl = null;
+// Rows keyed by the extension host's per-call id — needed because a toolResult
+// doesn't always arrive right after its own toolCall: parallel read-only calls
+// can finish out of order, and short-circuited calls (dedup/blocked-retry/hard-cap)
+// jump straight from toolCall to toolResult. currentActivityRowEl alone can't
+// tell those results apart from whatever OTHER call happened to run last.
+const activityRowsById = new Map();
 
 function getOrCreateActivityLog() {
   if (!activityLogEl) {
+    // Close off whatever the model has said so far, so this activity lands
+    // BELOW it and anything written afterwards lands below the activity.
+    sealCurrentBubble();
     activityLogEl = document.createElement('div');
     activityLogEl.className = 'activity-log';
     // Attach inside the active assistant message so it's visually grouped with
@@ -2544,10 +2811,11 @@ function getOrCreateActivityLog() {
 function removeToolProgress() {
   if (activityLogEl) { activityLogEl.remove(); activityLogEl = null; }
   currentActivityRowEl = null;
+  activityRowsById.clear();
 }
 
 function collapseToolProgress() {
-  if (!activityLogEl) { currentActivityRowEl = null; return; }
+  if (!activityLogEl) { currentActivityRowEl = null; activityRowsById.clear(); return; }
   // Remove any leftover "Thinking" placeholder
   activityLogEl.querySelector('.thinking-row')?.remove();
   const rows = activityLogEl.querySelectorAll('.activity-row');
@@ -2555,6 +2823,7 @@ function collapseToolProgress() {
     activityLogEl.remove();
     activityLogEl = null;
     currentActivityRowEl = null;
+    activityRowsById.clear();
     return;
   }
   const errors = activityLogEl.querySelectorAll('.is-error').length;
@@ -2575,6 +2844,7 @@ function collapseToolProgress() {
   activityLogEl.appendChild(details);
   activityLogEl = null;
   currentActivityRowEl = null;
+  activityRowsById.clear();
 }
 
 function buildResultPreview(tool, result) {
@@ -2645,7 +2915,7 @@ function buildResultPreview(tool, result) {
   }
 }
 
-function addToolCallCard(tool, args) {
+function addToolCallCard(tool, args, callId) {
   // Remove the "Thinking" placeholder row when a real tool call arrives.
   if (tool !== '__thinking__' && activityLogEl) {
     const placeholder = activityLogEl.querySelector('.thinking-row');
@@ -2677,12 +2947,14 @@ function addToolCallCard(tool, args) {
 
   log.appendChild(row);
   currentActivityRowEl = row;
+  if (callId) activityRowsById.set(callId, row);
   scrollToBottom();
 }
 
-function addToolResultCard(tool, result) {
-  const row = currentActivityRowEl;
+function addToolResultCard(tool, result, callId) {
+  const row = (callId && activityRowsById.get(callId)) || currentActivityRowEl;
   if (!row) return;
+  if (callId) activityRowsById.delete(callId);
 
   const isError = typeof result === 'string' && result.startsWith('Error');
   row.classList.remove('running');
@@ -2856,6 +3128,12 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   body.innerHTML = html;
   card.appendChild(body);
 
+  // Record the REAL change counts. diffResolved used to re-derive this by
+  // counting .diff-added/.diff-removed elements, which undercounts whenever the
+  // renderer truncated rows — and a count of 0 made it delete the whole diff
+  // body, so a genuine edit showed a card with no changes in it.
+  card.dataset.changeCount = String(added + removed);
+
   messagesEl.appendChild(card);
   // No smooth scrollIntoView here — it fights the instant streaming scroll and
   // causes visible rubber-banding. One rAF-pinned scroll keeps motion consistent.
@@ -2945,20 +3223,49 @@ function renderDiff(oldText, newText) {
   const newLines = newText.split('\n');
   const ops = computeLCS(oldLines, newLines);
 
-  // Fall back to simple sequential diff for very large files.
+  // Fall back to simple sequential diff for very large files (computeLCS bails
+  // above ~633 lines, so this path is common, not exotic).
   if (!ops) {
-    let html = '', added = 0, removed = 0, rows = 0;
     const max = Math.max(oldLines.length, newLines.length);
+    // Mark changed lines first, then show only those ± CONTEXT — same as the LCS
+    // path below. Emitting every unchanged line instead would burn the whole
+    // MAX_ROWS budget on leading context, so a change past line 400 produced a
+    // diff body with NO changed rows in it at all.
+    const changedAt = new Uint8Array(max);
+    let added = 0, removed = 0;
     for (let k = 0; k < max; k++) {
-      const changedHere = !(k < oldLines.length && k < newLines.length && oldLines[k] === newLines[k]);
-      if (!changedHere) {
-        if (rows < MAX_ROWS) { html += diffRow(' ', 'diff-unchanged', null, null, oldLines[k]); rows++; }
+      if (!(k < oldLines.length && k < newLines.length && oldLines[k] === newLines[k])) {
+        changedAt[k] = 1;
+        if (k < oldLines.length) removed++;
+        if (k < newLines.length) added++;
+      }
+    }
+    const visible = new Uint8Array(max);
+    for (let k = 0; k < max; k++) {
+      if (!changedAt[k]) continue;
+      for (let d = Math.max(0, k - CONTEXT); d <= Math.min(max - 1, k + CONTEXT); d++) visible[d] = 1;
+    }
+
+    let html = '', rows = 0, truncated = false;
+    let k = 0;
+    while (k < max) {
+      if (!visible[k]) {
+        let skip = 0;
+        while (k < max && !visible[k]) { skip++; k++; }
+        html += `<div class="diff-skip">↕ ${skip} unchanged line${skip > 1 ? 's' : ''}</div>`;
         continue;
       }
-      if (k < oldLines.length) { removed++; if (rows < MAX_ROWS) { html += diffRow('-', 'diff-removed', k+1, null, oldLines[k]); rows++; } }
-      if (k < newLines.length) { added++;   if (rows < MAX_ROWS) { html += diffRow('+', 'diff-added',   null, k+1, newLines[k]); rows++; } }
+      if (rows >= MAX_ROWS) { truncated = true; break; }
+      if (!changedAt[k]) {
+        html += diffRow(' ', 'diff-unchanged', k + 1, k + 1, oldLines[k]);
+        rows++;
+      } else {
+        if (k < oldLines.length) { html += diffRow('-', 'diff-removed', k + 1, null, oldLines[k]); rows++; }
+        if (k < newLines.length && rows < MAX_ROWS) { html += diffRow('+', 'diff-added', null, k + 1, newLines[k]); rows++; }
+      }
+      k++;
     }
-    if (rows >= MAX_ROWS) {
+    if (truncated) {
       html += `<div class="diff-skip">↕ diff truncated — use the editor diff view for the full change</div>`;
     }
     return { html, added, removed };
@@ -3082,7 +3389,6 @@ if (typeof ResizeObserver === 'function') {
 }
 
 // Initialize — signal readiness so the extension sends all startup state.
-console.log('Navy Coder webview script loaded');
 setStatus('Loading...');
 updateAddButton();
 updateSendButton();

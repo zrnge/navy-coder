@@ -2,12 +2,104 @@ const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./provide
 const { openAiCompatBase, providerDisplayName } = require('./providers/endpoints.js');
 const { McpManager } = require('./providers/mcp.js');
 const { formatProviderError } = require('./providers/errors.js');
+const { getEmbeddings, cosineSimilarity } = require('./providers/embeddings.js');
 const { getWebviewHtml } = require('./webview-html.js');
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
-const { spawn, execSync } = require('child_process');
+// Deliberately NOT importing execSync: every child process here is launched from
+// the extension host thread, and a synchronous spawn there freezes the editor.
+const { spawn } = require('child_process');
 const crypto = require('crypto');
+
+// package.json declares untrustedWorkspaces.supported = false, so VS Code should
+// never activate Navy in a restricted window. This is the belt-and-braces check
+// for the paths that spawn processes or upload file contents: trust can be
+// revoked while a session is live, and a manifest flag is not a runtime guard.
+// Defaults to trusted when the API is unavailable (older VS Code) rather than
+// bricking the extension.
+function workspaceIsTrusted() {
+  return vscode.workspace.isTrusted !== false;
+}
+
+// Manifest support is "limited", not false: declaring false leaves the view
+// container contributed but the extension never activates, so the panel renders
+// as an empty box with no explanation — which reads as a crash. Navy stays
+// usable for reading and answering; only the operations that would execute
+// code from, or upload code out of, an untrusted folder are refused here.
+const UNTRUSTED_REFUSAL = (what) =>
+  `Refused: this workspace is not trusted, so Navy will not ${what} in it. `
+  + `Tell the user to trust the folder (Workspaces: Manage Workspace Trust) if they want this. `
+  + `Reading files and answering questions still work — do not retry this tool.`;
+
+// Syntax checkers run with cwd set OUTSIDE the project on purpose: a checker
+// must never resolve a module, plugin, or binary out of the repository it is
+// inspecting (that is how `python -m` and `npx` turned a parse into code
+// execution). The temp dir is stable, writable, and contains nothing of ours.
+const CHECKER_CWD = require('os').tmpdir();
+// Cap what check_syntax will read — an unbounded readFile on the extension
+// host's heap is an OOM waiting to happen on a repo with a large data file.
+const CHECK_SYNTAX_MAX_BYTES = 2 * 1024 * 1024;
+// Ceiling on the persisted embedding cache. Stringify/parse of this file happen
+// synchronously on the extension host thread, so an unbounded index is a UI
+// freeze; past this size we simply don't persist and re-index next session.
+const EMBED_INDEX_MAX_BYTES = 24 * 1024 * 1024;
+
+// Is a saved project root actually meaningful for the folders open in THIS
+// window? A root that belongs to some other project is worse than no root at
+// all: Navy silently operates on a project the user isn't looking at. Accepts a
+// root that IS a workspace folder or lives inside one (picking a sub-directory
+// as the project root is legitimate). Pure, so it's directly testable.
+function rootBelongsToWorkspace(root, folderPaths) {
+  if (!root) return false;
+  if (!folderPaths || folderPaths.length === 0) return true; // no workspace to contradict it
+  const fold = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const r = fold(path.normalize(root));
+  return folderPaths.some((f) => {
+    const n = fold(path.normalize(f));
+    return r === n || r.startsWith(n + path.sep);
+  });
+}
+
+// Shared by _collectRelevance (keyword search) and _listCodeFiles (embedding
+// index) — both walk the same repo the same way, so a single definition
+// keeps their notion of "a code file worth looking at" from drifting apart.
+const RELEVANCE_SKIP_DIRS = new Set(['node_modules','.git','dist','build','out','.next','.nuxt','__pycache__','.venv','venv','coverage','.cache','.navy','vendor','target']);
+const RELEVANCE_CODE_EXTS = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.go','.rs','.java','.rb','.php','.c','.h','.cpp','.hpp','.cc','.cs','.swift','.kt','.scala','.vue','.svelte','.sql','.sh','.md','.json','.yml','.yaml','.toml']);
+
+// Files whose CONTENTS must never be uploaded to an embeddings API. Keyword
+// search reads these locally, which is fine; the embedding index sends bytes to
+// a third party, so it needs a much stricter filter. Deliberately matches on
+// the filename rather than the extension, because the risky ones share
+// extensions with ordinary source (docker-compose.yml, serviceAccount.json).
+const EMBED_SENSITIVE_RE = new RegExp([
+  '(^|[.\\-_])secrets?([.\\-_]|$)',
+  '(^|[.\\-_])credentials?([.\\-_]|$)',
+  '(^|[.\\-_])passwords?([.\\-_]|$)',
+  // Needs a trailing boundary or it swallows ordinary source like tokenizer.js.
+  '(^|[.\\-_])tokens?([.\\-_]|$)',
+  '(^|[.\\-_])apikey',
+  '(^|[.\\-_])api[.\\-_]?keys?([.\\-_]|$)',
+  '^\\.env',
+  '(^|[.\\-_])env\\.',
+  'serviceaccount',
+  'service[-_]account',
+  '[-_]adminsdk',
+  '(^|[.\\-_])private[.\\-_]?key',
+  '(^|[.\\-_])id_(rsa|dsa|ecdsa|ed25519)',
+  '\\.(pem|key|pfx|p12|keystore|jks|ppk|asc|gpg)$',
+  '(^|[.\\-_])htpasswd',
+  '(^|[.\\-_])npmrc',
+  '(^|[.\\-_])pypirc',
+  '(^|[.\\-_])netrc',
+  '^docker-compose',
+  '(^|[.\\-_])local\\.(json|ya?ml|toml)$',
+].join('|'), 'i');
+
+function isSensitiveForEmbedding(relPath) {
+  const name = String(relPath || '').split(/[\\/]/).pop() || '';
+  return EMBED_SENSITIVE_RE.test(name);
+}
 
 // Literal string replacement — avoids String.replace's $ meta-char interpolation.
 // Returns the edited string, null if not found, or an Error if ambiguous (>1 match).
@@ -86,10 +178,17 @@ class NavyCoderViewProvider {
     // always applies, but the global value is only trusted when NO workspace is open —
     // otherwise a root saved in a folderless window would leak into every workspace.
     const rootInfo = vscode.workspace.getConfiguration('navy').inspect('projectRoot');
-    const savedRoot = vscode.workspace.workspaceFolders?.length
+    const folderPaths = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
+    const savedRoot = folderPaths.length
       ? (rootInfo?.workspaceValue || '')
       : (rootInfo?.workspaceValue || rootInfo?.globalValue || '');
-    this.projectRoot = (savedRoot && fs.existsSync(savedRoot)) ? savedRoot : '';
+    // The saved root must still exist AND belong to the folders open right now.
+    // Without the second check, a root left over from a different project makes
+    // the chat silently operate on a project that isn't open, forcing the user to
+    // fix it by hand in the picker every time they open that folder.
+    this.projectRoot = (savedRoot && fs.existsSync(savedRoot) && rootBelongsToWorkspace(savedRoot, folderPaths))
+      ? savedRoot
+      : '';
     this.messageQueue = [];   // queued prompts while a turn is in progress
     this.isBusy = false;
     this.modelContextLength = null; // fetched from Ollama /api/show
@@ -136,6 +235,11 @@ class NavyCoderViewProvider {
           this.view?.webview.postMessage({ type: 'thinkingLevel', level: this.thinkingLevel });
           await this.sendWorkspaceFolders();
           await this.loadProjectSession();
+          // Say plainly when tools are restricted, rather than letting the user
+          // discover it by watching every command get refused.
+          if (!workspaceIsTrusted()) {
+            this.view?.webview.postMessage({ type: 'restrictedMode' });
+          }
           break;
         case 'ask':
           await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || []);
@@ -201,6 +305,20 @@ class NavyCoderViewProvider {
         case 'copy':
           await vscode.env.clipboard.writeText(message.text || '');
           break;
+        // The webview runs in its own renderer, so when the panel stalls nothing
+        // appears in the extension host log — which makes "Navy froze" almost
+        // impossible to diagnose from the outside. The webview reports slow
+        // renders here so they land in the Navy Coder output channel instead.
+        case 'perfWarning': {
+          const line = `webview ${message.ms}ms | ${message.chars} chars | ${message.mode || ''}`;
+          this.log?.(line);
+          // A stall is the thing we've been unable to catch, so make it
+          // impossible to miss rather than burying it in the output channel.
+          if (String(message.mode || '').startsWith('STALL')) {
+            this.outputChannelShow?.();
+          }
+          break;
+        }
         case 'runCommand':
           // Defense in depth: the webview renders model output, so never let it invoke
           // arbitrary VS Code commands (e.g. terminal.sendSequence → shell execution).
@@ -222,10 +340,7 @@ class NavyCoderViewProvider {
             await this.sendWorkspaceFolders(); // re-send current root so the dropdown reverts
             break;
           }
-          this.projectRoot = message.root || '';
-          await this._persistProjectRoot(this.projectRoot);
-          await this.sendWorkspaceFolders();
-          await this.loadProjectSession();
+          await this._switchProjectRoot(message.root || '');
           break;
         case 'setThinkingLevel':
           this.setThinkingLevel(message.level);
@@ -356,17 +471,40 @@ class NavyCoderViewProvider {
     });
   }
 
+  // Last-resort handler for turns started without an await (queue drain, PR
+  // review, explain-error). Those are fire-and-forget by design, so nothing
+  // upstream can catch a rejection — and an unhandled rejection in the
+  // extension host is a process-level failure, i.e. Navy dying mid-task with no
+  // explanation. Surface it in the chat and the log instead, and always release
+  // the busy lock so the UI can't be left permanently stuck.
+  _reportTurnFailure(err, context) {
+    const msg = (err && err.message) || String(err);
+    this.log?.(`turn failed (${context}): ${msg}`);
+    try {
+      this.isBusy = false;
+      if (this.statusBarItem) this.statusBarItem.text = '☸ Navy';
+      this.view?.webview.postMessage({ type: 'done' });
+      this.view?.webview.postMessage({
+        type: 'error',
+        message: `Navy hit an unexpected error during ${context}: ${msg}`,
+      });
+    } catch {}
+  }
+
   // Resolve all queued approval promises so the agentic loop is not abandoned.
+  // Routed through the SAME resolveApproval/resolveCommandApproval paths a real
+  // user rejection uses (treating "cancel" as "reject") — those are the only
+  // places that post diffResolved/commandResolved back to the webview. Resolving
+  // the promises directly here (the previous approach) left whatever
+  // Approve/Reject card was still pending stuck with visibly-enabled but dead
+  // buttons after Stop, since nothing ever told the webview it was resolved.
   cancelPendingApprovals() {
-    for (const [, approval] of this.pendingApprovals) {
-      approval.resolve('Edit cancelled');
+    for (const id of [...this.pendingApprovals.keys()]) {
+      this.resolveApproval(id, false);
     }
-    this.pendingApprovals.clear();
-    for (const [, approval] of this.pendingCommandApprovals) {
-      approval.resolve(false);
+    for (const id of [...this.pendingCommandApprovals.keys()]) {
+      this.resolveCommandApproval(id, false);
     }
-    this.pendingCommandApprovals.clear();
-    this.sendPendingApprovalsUpdate();
   }
 
   resolveCommandApproval(id, approved) {
@@ -408,6 +546,16 @@ class NavyCoderViewProvider {
     this._persistCheckpoints();
     this.editedRanges.clear();
     this.view?.webview.postMessage({ type: 'cleared' });
+    // A run-project dev server is deliberately NOT killed by Clear (Clear resets
+    // the conversation, not your running work) — but its card has no lazy
+    // recreate path like background-task/process cards do, so without this it
+    // silently vanishes from the UI while the server keeps running underneath.
+    const runProject = this.bgProcesses.get('__run_project__');
+    if (runProject?.proc) {
+      const projectName = path.basename(this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
+      this.view?.webview.postMessage({ type: 'runProjectStart', projectName, command: runProject.command });
+      if (runProject.url) this.view?.webview.postMessage({ type: 'runProjectReady', url: runProject.url });
+    }
     this.saveProjectSession();
     this.loadProjectMemory().then(mem =>
       this.view?.webview.postMessage({ type: 'sessionLoaded', count: 0, memory: mem, projectRoot: this.projectRoot })
@@ -504,19 +652,38 @@ class NavyCoderViewProvider {
   }
 
   async openFolder() {
+    // Switching the project root mid-turn would make executing tools resolve
+    // paths against a different project than the one they started in — edits
+    // would land in the wrong repo. setProjectRoot already refuses this; this
+    // path sets projectRoot too, so it has to refuse for the same reason.
+    if (this.isBusy) {
+      vscode.window.showWarningMessage('Navy is working — stop the current task before switching projects.');
+      return;
+    }
+
     const result = await vscode.window.showOpenDialog({
       canSelectFiles: false,
       canSelectFolders: true,
       canSelectMany: false,
-      openLabel: 'Add Navy project'
+      openLabel: 'Open Navy project'
     });
     if (!result || result.length === 0) return;
     const picked = result[0].fsPath;
     const uri = vscode.Uri.file(picked);
     const folders = vscode.workspace.workspaceFolders || [];
-    const exists = folders.some((f) => f.uri.fsPath === picked);
+    // Case-fold on Windows: the open dialog can return "E:\Proj" for a folder
+    // stored as "e:\Proj", and a case-sensitive compare would then offer to
+    // "add" a project that is already open.
+    const foldPath = (p) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p));
+    const exists = folders.some((f) => foldPath(f.uri.fsPath) === foldPath(picked));
 
-    if (!exists && folders.length === 0) {
+    // Already part of this workspace — just point Navy at it.
+    if (exists) {
+      await this._switchProjectRoot(picked);
+      return;
+    }
+
+    if (folders.length === 0) {
       // No workspace open — actually open the folder (Explorer, language servers,
       // file watching), exactly like File → Open Folder. Persist the root first:
       // opening a folder reloads the window, and the fresh session derives its
@@ -527,15 +694,58 @@ class NavyCoderViewProvider {
       return; // window reloads — nothing more to do in this session
     }
 
-    if (!exists) {
-      // Workspace already open — add the project as an additional workspace folder
-      // so the current one stays available, and reveal it so it's visibly loaded.
-      await vscode.workspace.updateWorkspaceFolders(folders.length, 0, uri);
-      try { await vscode.commands.executeCommand('revealInExplorer', uri); } catch {}
+    // A workspace is already open. Previously this silently turned the window
+    // into an untitled multi-root workspace, which is not what most people mean
+    // by "open another project" — they expect the new one to replace the current
+    // one. Both are legitimate, so ask rather than guessing.
+    const name = path.basename(picked);
+    const choice = await vscode.window.showInformationMessage(
+      `Open "${name}"?`,
+      {
+        modal: true,
+        detail: 'Open here replaces the current project in this window (like File → Open Folder).\n\n'
+              + 'Add to workspace keeps the current project open alongside it, so you can switch between them from Navy\'s project selector.',
+      },
+      'Open Here', 'Add to Workspace'
+    );
+    if (!choice) return; // dismissed — leave everything as it was
+
+    if (choice === 'Open Here') {
+      // Deliberately do NOT persist here. _persistProjectRoot writes to the
+      // CURRENT workspace's settings, and we're about to leave that workspace —
+      // so saving would stamp the new project's path into the OLD project's
+      // .vscode/settings.json. Reopening the old project later would then point
+      // Navy at a folder that isn't open, which is exactly the "chat isn't
+      // linked to the project I just opened" symptom. The reloaded window
+      // derives its root from its own workspace folder instead.
+      this.projectRoot = picked;
+      await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: false });
+      return; // window reloads
     }
 
-    this.projectRoot = picked;
-    await this._persistProjectRoot(picked);
+    // updateWorkspaceFolders takes { uri } objects, NOT bare Uris — passing a
+    // bare Uri leaves `.uri` undefined, so VS Code rejects the call and returns
+    // false. That was the original bug: the folder was never added, but Navy set
+    // projectRoot and reported success anyway, so the UI claimed a project that
+    // the editor had never actually opened.
+    const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri });
+    if (!added) {
+      vscode.window.showErrorMessage(`Navy could not add "${name}" to this workspace. Try File → Add Folder to Workspace.`);
+      return; // do NOT move projectRoot to a folder that isn't actually open
+    }
+    try { await vscode.commands.executeCommand('revealInExplorer', uri); } catch {}
+
+    // onDidChangeWorkspaceFolders re-sends the folder list once VS Code has
+    // applied the change, so the dropdown picks the new folder up on its own.
+    await this._switchProjectRoot(picked);
+  }
+
+  // Point Navy at an already-available root: persist it, refresh the picker, and
+  // load that project's session. Shared by openFolder and the picker so both
+  // paths can't drift.
+  async _switchProjectRoot(root) {
+    this.projectRoot = root;
+    await this._persistProjectRoot(root);
     await this.sendWorkspaceFolders();
     await this.loadProjectSession();
   }
@@ -957,18 +1167,42 @@ class NavyCoderViewProvider {
 
     const rootKnown = root && root !== 'none';
     const projectName = rootKnown ? path.basename(root) : null;
-    const osPlatform = process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
+    const isWinShell = process.platform === 'win32';
+    const osPlatform = isWinShell ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
+    // The exact shell run_command executes through — NOT just the OS family.
+    // A model that only hears "Windows" reasonably assumes PowerShell (the
+    // modern default terminal); run_command always shells out via cmd.exe, so
+    // PowerShell-style syntax (Get-ChildItem, $env:VAR, semicolon chaining)
+    // fails in a way that looks like "doesn't know its own OS" but is really
+    // just the wrong shell dialect for what it's actually running through.
+    const shellName = isWinShell ? 'cmd.exe' : 'sh';
+    const shellNote = isWinShell
+      ? 'cmd.exe syntax — NOT PowerShell: %VAR% for env vars, & or && to chain, "dir" not "Get-ChildItem", "del" not "Remove-Item".'
+      : 'POSIX sh/bash-compatible syntax.';
     const nowStr = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+    // Cached after the first check (see _detectWsl) — a Unix-only tool (gcc,
+    // make, …) that isn't on the Windows PATH may still exist inside WSL.
+    const wslInfo = isWinShell ? await this._detectWsl() : { available: false };
+    const wslNote = isWinShell
+      ? (wslInfo.available
+          ? `WSL available (distros: ${wslInfo.distros.join(', ')}) — for a Unix-only tool not on the Windows PATH, try running it via WSL, e.g.: wsl <command>. Windows paths need converting (C:\\foo\\bar → /mnt/c/foo/bar, or use "wsl wslpath 'C:\\foo\\bar'" to convert).`
+          : 'WSL not detected — Unix-only tools with no Windows build are genuinely unavailable unless the user installs WSL.')
+      : null;
 
-    let systemContent = TOOL_PROMPT;
+    // OS/shell facts are always included — even with no project open, a wrong
+    // guess here (e.g. assuming PowerShell or a Unix tool on Windows) is what
+    // makes run_command calls fail in ways that look like blind guessing.
+    let systemContent = TOOL_PROMPT
+      + `\n\n## CURRENT ENVIRONMENT (these are facts, do NOT guess or invent alternatives)\n`
+      + `- Operating system: ${osPlatform}\n`
+      + `- run_command executes through: ${shellName} (${shellNote})\n`
+      + (wslNote ? `- ${wslNote}\n` : '')
+      + `- Date/time: ${nowStr}\n`;
     if (!rootKnown) {
-      systemContent += `\n\n## WARNING: NO PROJECT DETECTED\nThe user has not opened a folder in VS Code. You do NOT know the project name or path. Do NOT invent or guess them. If asked about the project, tell the user to open a folder first (File → Open Folder).`;
+      systemContent += `- Project: NONE — no folder is open in VS Code. Do NOT invent a project name or path; tell the user to open a folder first (File → Open Folder).`;
     } else {
-      systemContent += `\n\n## CURRENT ENVIRONMENT (these are facts, do NOT guess or invent alternatives)\n`
-        + `- Project name: ${projectName}\n`
+      systemContent += `- Project name: ${projectName}\n`
         + `- Project root: ${root}\n`
-        + `- Operating system: ${osPlatform}\n`
-        + `- Date/time: ${nowStr}\n`
         + `If asked about the project name, directory, or OS, answer using ONLY the values above.`;
     }
     // Cap each variable section so the system prompt can't itself overflow the
@@ -1274,13 +1508,17 @@ class NavyCoderViewProvider {
         // Read-only tools are safe to run in parallel; writes must be sequential.
         const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
           'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
-          'find_symbol','find_references',
+          'check_syntax','find_symbol','find_references',
           'web_search','fetch_url','get_terminal_output','read_process_output']);
 
         // Tools whose results are stable — dedup prevents re-reading the same file in a loop.
         // web_search included so a weak model can't spin on the same query repeatedly.
+        // Deliberately EXCLUDES check_syntax and get_diagnostics: verifying a file,
+        // fixing it, then re-verifying is the correct workflow, and deduping the
+        // second check returns a stale "content unchanged" answer that tells the
+        // model its fix didn't land (or that a broken file is still fine).
         const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
+          'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame',
           'find_symbol','find_references','web_search']);
         // Command tools where repeated failure is tracked.
         const COMMAND_TOOLS = new Set(['run_command', 'run_tests']);
@@ -1299,7 +1537,13 @@ class NavyCoderViewProvider {
             const key = tool.name + ':' + JSON.stringify(tool.args || {});
             if (seenReadCalls.has(key)) {
               const r = '[Already retrieved — content unchanged. Use your existing context and take action now instead of re-reading.]';
-              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r });
+              // Short-circuited calls still get their own visible card, tagged
+              // with a unique callId — without this, the webview had no card to
+              // attribute the result to and silently overwrote whatever OTHER
+              // tool card happened to be on screen last.
+              const callId = this.generateId();
+              this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args, callId });
+              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r, callId });
               toolResults.push(makeToolResult(tool, r));
               continue;
             }
@@ -1311,7 +1555,9 @@ class NavyCoderViewProvider {
             const n = failedCommands.get(cmdKey) || 0;
             if (n >= 2) {
               const r = `[Blocked: this command has already failed ${n} time(s) in a row. Do NOT retry — diagnose the error output above, fix the code, then run again.]`;
-              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r });
+              const callId = this.generateId();
+              this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args, callId });
+              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r, callId });
               toolResults.push(makeToolResult(tool, r));
               continue;
             }
@@ -1324,7 +1570,9 @@ class NavyCoderViewProvider {
             const editCount = fileEditCounts.get(tool.args.path) || 0;
             if (editCount >= FILE_EDIT_HARD_CAP) {
               const r = `[Blocked: ${tool.args.path} has already been edited ${editCount} times this turn with no finish(). This file will not accept further edits this turn. Call get_diagnostics on it and either explain to the user what's still wrong (and why you can't fix it automatically) or call finish() now.]`;
-              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r });
+              const callId = this.generateId();
+              this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args, callId });
+              this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result: r, callId });
               toolResults.push(makeToolResult(tool, r));
               continue;
             }
@@ -1334,9 +1582,13 @@ class NavyCoderViewProvider {
 
         if (toolsToRun.length > 1 && toolsToRun.every(t => READ_ONLY.has(t.name))) {
           const parallel = await Promise.all(toolsToRun.map(async tool => {
-            this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args });
+            // Each call gets its own id so results — which can complete out of
+            // order relative to each other since they run concurrently — always
+            // update the card that actually belongs to them.
+            const callId = this.generateId();
+            this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args, callId });
             const result = await this.executeTool(tool);
-            this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result });
+            this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result, callId });
             return makeToolResult(tool, result);
           }));
           toolResults.push(...parallel);
@@ -1345,7 +1597,8 @@ class NavyCoderViewProvider {
             // Stop pressed mid-iteration — don't execute the remaining tools (a write
             // tool would still hit disk after the user asked everything to halt).
             if (this.abortController.signal.aborted) break;
-            this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args });
+            const callId = this.generateId();
+            this.view?.webview.postMessage({ type: 'toolCall', tool: tool.name, args: tool.args, callId });
 
             // Pre-call: check whether the file exists so we can label it 'created' vs 'modified'.
             let _fileIsNew = false;
@@ -1362,7 +1615,13 @@ class NavyCoderViewProvider {
               if (typeof result === 'string' && /^Exit code: [^0\n]/.test(result)) {
                 const n = (failedCommands.get(cmdKey) || 0) + 1;
                 failedCommands.set(cmdKey, n);
-                result += '\n\n[SYSTEM: This command failed. Do NOT run it again without first diagnosing the error and fixing the code. Analyze the output above, find the root cause, apply a fix, then retry.]';
+                // A "not found"-shaped failure is a missing/PATH problem, not a code
+                // bug — point at that specifically instead of the generic "diagnose
+                // and fix the code" nudge, which doesn't apply here.
+                const notFound = /is not recognized as an internal or external command|command not found|No such file or directory.*(?:PATH|command)/i.test(result);
+                result += notFound
+                  ? `\n\n[SYSTEM: This command failed because the program isn't installed or isn't on PATH — this is NOT a code bug. Verify with "where <tool>" (cmd.exe) or "command -v <tool>" (sh) before trying again, and use an alternative if it's genuinely unavailable.]`
+                  : '\n\n[SYSTEM: This command failed. Do NOT run it again without first diagnosing the error and fixing the code. Analyze the output above, find the root cause, apply a fix, then retry.]';
               } else if (typeof result === 'string' && result.startsWith('Exit code: 0')) {
                 failedCommands.delete(cmdKey);
               }
@@ -1400,7 +1659,7 @@ class NavyCoderViewProvider {
               taskChanges.touched.set(tool.args?.name || 'symbol', 'renamed');
             }
 
-            this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result });
+            this.view?.webview.postMessage({ type: 'toolResult', tool: tool.name, result, callId });
             toolResults.push(makeToolResult(tool, result));
           }
         }
@@ -1467,7 +1726,13 @@ class NavyCoderViewProvider {
       if (this.messageQueue.length > 0) {
         const next = this.messageQueue.shift();
         this.view?.webview.postMessage({ type: 'queueDrained', remaining: this.messageQueue.length });
-        setImmediate(() => this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || []));
+        // Fire-and-forget, so it MUST carry its own catch: an unhandled
+        // rejection out of the turn loop can take down the extension host,
+        // which surfaces to the user as Navy simply dying mid-task.
+        setImmediate(() => {
+          this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || [])
+            .catch(e => this._reportTurnFailure(e, 'queued message'));
+        });
       }
     }
   }
@@ -1534,9 +1799,9 @@ class NavyCoderViewProvider {
   // the word "done") to avoid false positives on ordinary explanations.
   _looksLikeFalseCompletionClaim(text) {
     if (!text || !text.trim()) return false;
-    const verb = 'creat(?:ed|e)|written|wrote|writing|sav(?:ed|e)|add(?:ed)?|updat(?:ed|e)|modif(?:ied|y)|fix(?:ed)?|implement(?:ed)?|generat(?:ed|e)|appl(?:ied|y)';
+    const verb = 'creat(?:ed|e)|written|wrote|writing|sav(?:ed|e)|add(?:ed)?|updat(?:ed|e)|modif(?:ied|y)|fix(?:ed)?|implement(?:ed)?|generat(?:ed|e)|appl(?:ied|y)|edit(?:ed|s)?|chang(?:ed|e)';
     // Generic nouns PLUS an actual filename pattern (hello.py, config.json, …) —
-    // real replies almost always name the file, not the word "file" itself.
+    // real replies often name the file, not the word "file" itself.
     const filename = '\\w[\\w-]*\\.[a-zA-Z0-9]{1,5}';
     const noun = '(?:file|script|function|class|module|component|program|' + filename + ')';
     // The gap allows periods (filenames contain them) but is capped short and
@@ -1544,7 +1809,14 @@ class NavyCoderViewProvider {
     const gap = '[^\\n]{0,40}';
     const re1 = new RegExp('\\b(?:' + verb + ')\\b' + gap + noun, 'i');
     const re2 = new RegExp(noun + gap + '\\b(?:has been|is now|was)?\\s*(?:' + verb + ')\\b', 'i');
-    return re1.test(text) || re2.test(text);
+    // Narrative/structured "I'm done" phrasing doesn't always sit on the same
+    // line as a filename — a fabricated "File Edit Summary" block can put the
+    // heading on one line and "...has been successfully updated" several lines
+    // later, which re1/re2 (newline-free gap) can never bridge. This call only
+    // ever runs when NO tool was used this turn, so any claim of completion —
+    // regardless of what noun it's near — is inherently suspicious here.
+    const re3 = /\b(?:(?:has|have)\s+been|i'?ve|successfully)\s+(?:successfully\s+)?(?:updated|changed|modified|created|fixed|applied|edited|saved|written)\b/i;
+    return re1.test(text) || re2.test(text) || re3.test(text);
   }
 
   // Gate for the hallucination guard: only worth checking a response for a false
@@ -1566,9 +1838,14 @@ class NavyCoderViewProvider {
 
   _promptRequestsFileAction(prompt) {
     if (!prompt) return false;
-    return /\b(write|create|generate|make|add|implement|build)\b[^.\n]{0,60}\b(file|script|function|class|module|component|program|test)\b/i.test(prompt)
-        || /\b(fix|edit|update|modify|refactor|rewrite|change|save|apply)\b[^.\n]{0,60}\b(file|script|function|class|module|component|program|code|bug)\b/i.test(prompt)
-        || /\b(write|create|generate|make|save)\s+(a|an|the|this|me)?\s*\w[\w-]*\.[a-zA-Z0-9]{1,5}\b/i.test(prompt);
+    // Broad by design: any directive/action verb in a coding-assistant prompt is
+    // presumptively about the code/file the user has open. Requiring a specific
+    // noun (file/script/function/…) to follow it — the previous approach — is a
+    // closed keyword list that misses everyday phrasing like "edit the hello
+    // world to hello job!" (names WHAT to change, not the word "file"). A false
+    // positive here only costs one harmless internal nudge; a false negative
+    // lets a fabricated "it's done" claim reach the user unchecked.
+    return /\b(write|create|generate|make|add|implement|build|fix|edit|update|modify|refactor|rewrite|change|save|apply|delete|remove|rename)\b/i.test(prompt);
   }
 
   // Normalize native tool calls to the exact OpenAI shape before they go into the
@@ -1613,6 +1890,13 @@ class NavyCoderViewProvider {
     try {
       const config = vscode.workspace.getConfiguration('navy').get('mcpServers', {});
       if (!config || !Object.keys(config).length) { this.mcp.stop(); return; }
+      // MCP servers are launched as local processes (or given the project's
+      // network context) — never start them for a folder the user hasn't trusted.
+      if (!workspaceIsTrusted()) {
+        this.mcp.stop();
+        this.log?.('MCP servers not started: workspace is not trusted');
+        return;
+      }
       const results = await this.mcp.start(config);
       const ok = results.filter(r => !r.error);
       const bad = results.filter(r => r.error);
@@ -1706,6 +1990,7 @@ class NavyCoderViewProvider {
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
         case 'get_diagnostics': return await this.toolGetDiagnostics(tool.args.path);
+        case 'check_syntax': return await this.toolCheckSyntax(tool.args.path);
         case 'fetch_url': return await this.toolFetchUrl(tool.args.url);
         case 'get_terminal_output': return await this.toolGetTerminalOutput(tool.args.lines);
         case 'run_tests': return await this.toolRunTests(tool.args.filter);
@@ -1730,14 +2015,56 @@ class NavyCoderViewProvider {
       await new Promise(r => setTimeout(r, 900));
       const diags = vscode.languages.getDiagnostics(vscode.Uri.file(filePath))
         .filter(d => d.severity === 0 || d.severity === 1); // errors + warnings only
-      if (!diags.length) return '';
-      const lines = diags.slice(0, 10).map(d => {
-        const sev = d.severity === 0 ? 'Error' : 'Warning';
-        return `[${sev}] line ${d.range.start.line + 1}: ${d.message}`;
-      });
-      const more = diags.length > 10 ? `\n…and ${diags.length - 10} more` : '';
-      return `\n\n[POST-EDIT DIAGNOSTICS for ${path.basename(filePath)} — fix any Errors before finishing:]\n${lines.join('\n')}${more}`;
+      if (diags.length) {
+        const lines = diags.slice(0, 10).map(d => {
+          const sev = d.severity === 0 ? 'Error' : 'Warning';
+          return `[${sev}] line ${d.range.start.line + 1}: ${d.message}`;
+        });
+        const more = diags.length > 10 ? `\n…and ${diags.length - 10} more` : '';
+        return `\n\n[POST-EDIT DIAGNOSTICS for ${path.basename(filePath)} — fix any Errors before finishing:]\n${lines.join('\n')}${more}`;
+      }
+
+      // No LSP diagnostics is NOT proof the file is fine — it usually means the
+      // user has no language extension installed for this file type (or the
+      // server hasn't analyzed a file that was never opened). Fall back to a
+      // real parser so a syntactically broken file can't sail through as clean.
+      const verdict = await this._syntaxVerdictAfterWrite(filePath);
+      if (verdict) return verdict;
+      return '';
     } catch { return ''; }
+  }
+
+  // Post-write syntax fallback. Only runs the CHEAP, always-available checkers
+  // (JSON parse, node --check) — shelling out to an external toolchain after
+  // every single edit would add seconds of latency to the agent loop, so those
+  // stay opt-in via the check_syntax tool. Returns '' when there's nothing
+  // useful to say, so a clean edit stays quiet.
+  async _syntaxVerdictAfterWrite(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    // Checked inline after every write: cheap, no external process.
+    const CHEAP = ['.json', '.js', '.jsx', '.mjs', '.cjs'];
+    // Has a real checker, but it costs a process spawn — too slow to run after
+    // every edit, so the model is nudged to call check_syntax itself instead.
+    const CHECKABLE_ON_DEMAND = ['.py', '.rb', '.php', '.go'];
+    const base = path.basename(filePath);
+
+    if (CHEAP.includes(ext)) {
+      const result = await this.toolCheckSyntax(filePath);
+      if (typeof result === 'string' && result.startsWith('SYNTAX ERROR')) {
+        return `\n\n[POST-EDIT SYNTAX CHECK FAILED for ${base} — you broke this file, fix it before finishing:]\n${result}`;
+      }
+      return ''; // verified valid — stay quiet, the edit is fine
+    }
+
+    if (CHECKABLE_ON_DEMAND.includes(ext)) {
+      return `\n\n[NOT AUTO-VERIFIED: no language extension reported diagnostics for ${base}. Navy can check "${ext}" on demand — if this edit could have broken syntax, call check_syntax on it before finishing.]`;
+    }
+
+    // Everything else (.md, .css, .html, .txt, …): there is no checker to call,
+    // so telling the model to call one just burned an iteration to be told
+    // "COULD NOT VERIFY". Say nothing rather than send it on an errand that
+    // cannot succeed — a markdown file has no syntax to break.
+    return '';
   }
 
   // Resolves paths to absolute and enforces workspace containment to prevent
@@ -1747,8 +2074,8 @@ class NavyCoderViewProvider {
     if (!root) throw new Error('No project root — open a folder before using file tools');
 
     const candidate = path.isAbsolute(inputPath) ? inputPath : path.join(root, inputPath);
-    // Windows paths are case-insensitive — compare case-folded there so "e:\code ex\…"
-    // isn't falsely rejected against a root of "E:\Code Ex". Containment is unaffected.
+    // Windows paths are case-insensitive — compare case-folded there so "c:\my project\…"
+    // isn't falsely rejected against a root of "C:\My Project". Containment is unaffected.
     const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
     const normalRoot = fold(path.normalize(root));
     const normalCandidate = fold(path.normalize(candidate));
@@ -1809,14 +2136,32 @@ class NavyCoderViewProvider {
     const text = await this.readFileText(filePath);
     if (text === null) return 'Error: could not read ' + inputPath;
     const lines = text.split('\n');
-    const MAX_READ_LINES = 500;
+    // The CHARACTER cap is the real guard — it's what actually bounds context
+    // cost. The line cap only exists so a file of very long lines still gets cut
+    // somewhere sensible. It used to be 500, which truncated most real source
+    // files and forced the model into a multi-call chunked read just to see one
+    // file; the character cap already prevented anything genuinely huge from
+    // getting through, so the low line cap only cost round-trips.
+    const MAX_READ_LINES = 1500;
     const MAX_READ_CHARS = 60000; // guards minified single-line files that dodge the line cap
-    if (lines.length > MAX_READ_LINES) {
-      const truncated = lines.slice(0, MAX_READ_LINES).join('\n');
-      return truncated.slice(0, MAX_READ_CHARS) + `\n\n[FILE TRUNCATED: showing ${MAX_READ_LINES} of ${lines.length} lines. Use read_lines("${inputPath}", startLine, endLine) to read other sections.]`;
-    }
-    if (text.length > MAX_READ_CHARS) {
-      return text.slice(0, MAX_READ_CHARS) + `\n\n[FILE TRUNCATED: showing ${MAX_READ_CHARS} of ${text.length} characters.]`;
+
+    if (lines.length > MAX_READ_LINES || text.length > MAX_READ_CHARS) {
+      let shown = lines.slice(0, MAX_READ_LINES).join('\n');
+      let shownLines = Math.min(lines.length, MAX_READ_LINES);
+      if (shown.length > MAX_READ_CHARS) {
+        shown = shown.slice(0, MAX_READ_CHARS);
+        shownLines = shown.split('\n').length; // stay accurate after a char-based cut
+      }
+      if (shownLines >= lines.length) return shown; // nothing actually withheld
+      // Hand the model the exact next call. Left to itself it picks timid
+      // 200-line windows and burns a turn per chunk; the range is spelled out
+      // so continuing costs the fewest possible round-trips.
+      const nextStart = shownLines + 1;
+      const nextEnd = Math.min(lines.length, shownLines + MAX_READ_LINES);
+      return shown
+        + `\n\n[FILE TRUNCATED: showed lines 1-${shownLines} of ${lines.length}.`
+        + ` To continue, call read_lines("${inputPath}", ${nextStart}, ${nextEnd}).`
+        + ` Read in large ranges like that — small 100-200 line chunks waste a turn each.]`;
     }
     return text;
   }
@@ -1876,9 +2221,21 @@ class NavyCoderViewProvider {
     return new Promise((resolve) => {
       const proc = spawn(rgPath, args, { cwd });
       let out = '';
+      // `out` is truncated back to exactly maxOut, so without this flag the very
+      // next data chunk re-trips the condition and kills again — and again, for
+      // every chunk still in flight before the process actually dies. Measured
+      // at ~30,000 kill attempts for a single broad search. Combined with a
+      // synchronous kill that was a total editor freeze, which is why the kill
+      // is now non-blocking too (see _killProcessTree).
+      let killed = false;
       proc.stdout.on('data', d => {
+        if (killed) return;                 // stop accumulating once we've given up
         out += d.toString();
-        if (out.length > maxOut) { out = out.slice(0, maxOut); this._killProcessTree(proc); }
+        if (out.length > maxOut) {
+          out = out.slice(0, maxOut);
+          killed = true;
+          this._killProcessTree(proc);
+        }
       });
       proc.stderr.on('data', () => {});
       proc.on('close', code => resolve({ code: code ?? 0, out }));
@@ -2162,13 +2519,216 @@ class NavyCoderViewProvider {
       targetUri = editor.document.uri;
     }
     const diags = vscode.languages.getDiagnostics(targetUri);
-    if (diags.length === 0) return 'No diagnostics (no errors or warnings).';
+    if (diags.length === 0) {
+      // An empty diagnostics list is NOT proof of validity — it usually just
+      // means no language extension is installed for this file type. Saying
+      // "no errors" here is exactly how a broken file gets reported as clean.
+      return 'No diagnostics reported. NOTE: this only means no installed language extension flagged this file — it does NOT prove the file is valid. Call check_syntax for a definitive answer.';
+    }
     return diags.map(d => {
       const sev = ['Error', 'Warning', 'Info', 'Hint'][d.severity] || '?';
       const line = d.range.start.line + 1;
       const col = d.range.start.character + 1;
       return `[${sev}] line ${line}:${col} — ${d.message}${d.source ? ' (' + d.source + ')' : ''}`;
     }).join('\n');
+  }
+
+  // Is an external command available on PATH? Cached per session — this is used
+  // on the post-write path, so re-probing for every edit would add real latency.
+  async _commandAvailable(bin) {
+    this._binAvailable = this._binAvailable || new Map();
+    if (this._binAvailable.has(bin)) return this._binAvailable.get(bin);
+    const probe = await new Promise((resolve) => {
+      let timer = null;
+      const settle = (v) => { if (timer) { clearTimeout(timer); timer = null; } resolve(v); };
+      try {
+        const isWin = process.platform === 'win32';
+        const child = spawn(isWin ? 'where' : 'command', isWin ? [bin] : ['-v', bin],
+          { shell: !isWin, windowsHide: true });
+        child.on('close', (code) => settle(code === 0));
+        child.on('error', () => settle(false));
+        timer = setTimeout(() => settle(false), 2500);
+      } catch { settle(false); }
+    });
+    this._binAvailable.set(bin, probe);
+    return probe;
+  }
+
+  // Runs an external checker and resolves { ok, output }. Never throws.
+  _runChecker(bin, args, cwd, timeout = 15000) {
+    return new Promise((resolve) => {
+      let out = '';
+      let done = false;
+      let timer = null;
+      const finish = (r) => {
+        if (done) return;
+        done = true;
+        // Clearing this matters a lot: the timer below runs a BLOCKING taskkill
+        // on the extension host's main thread. Leaving it armed after the
+        // process had already exited meant every syntax check fired a pointless
+        // kill 15s later — and since the post-write check runs on every edit,
+        // a multi-step turn queued up dozens of them, freezing the UI in bursts.
+        // Worse, PIDs get recycled, so a stale kill can hit an unrelated process.
+        if (timer) { clearTimeout(timer); timer = null; }
+        resolve(r);
+      };
+      try {
+        const child = spawn(bin, args, { cwd, windowsHide: true });
+        child.stdout?.on('data', (d) => { out += d.toString(); });
+        child.stderr?.on('data', (d) => { out += d.toString(); });
+        child.on('close', (code) => finish({ ok: code === 0, output: out.trim() }));
+        child.on('error', (e) => finish({ ok: false, output: '', spawnError: e.message }));
+        timer = setTimeout(() => {
+          if (done) return; // never kill a process that already finished
+          this._killProcessTree(child);
+          finish({ ok: false, output: out.trim(), timedOut: true });
+        }, timeout);
+      } catch (e) {
+        finish({ ok: false, output: '', spawnError: e.message });
+      }
+    });
+  }
+
+  // Pin down WHERE a JSON parse failed. V8's message format varies: sometimes it
+  // already carries "(line N column M)", sometimes only a character offset, and
+  // sometimes neither (just a truncated context snippet). The last case is
+  // common and the least actionable, so fall back to a string-aware bracket
+  // scan that names the offending line and its matching opener. Pure.
+  _jsonErrorLocation(content, message) {
+    const direct = /\(line (\d+) column (\d+)\)/.exec(message);
+    if (direct) return ` (line ${direct[1]}, column ${direct[2]})`;
+
+    const pos = /position (\d+)/.exec(message);
+    if (pos) {
+      const upto = content.slice(0, parseInt(pos[1], 10));
+      const line = upto.split('\n').length;
+      const col = upto.length - upto.lastIndexOf('\n');
+      return ` (line ${line}, column ${col})`;
+    }
+
+    // No position in the message — locate the structural problem ourselves.
+    const stack = [];
+    let inStr = false, esc = false, line = 1;
+    for (const ch of content) {
+      if (ch === '\n') { line++; continue; }
+      if (esc) { esc = false; continue; }
+      if (inStr) {
+        if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === '{' || ch === '[') { stack.push({ ch, line }); continue; }
+      if (ch === '}' || ch === ']') {
+        const open = stack.pop();
+        const wanted = ch === '}' ? '{' : '[';
+        if (!open) return ` (line ${line} — unexpected "${ch}" with nothing open)`;
+        if (open.ch !== wanted) return ` (line ${line} — "${ch}" closes a "${open.ch}" that was opened on line ${open.line})`;
+      }
+    }
+    if (stack.length) {
+      const last = stack[stack.length - 1];
+      return ` (line ${last.line} — "${last.ch}" is never closed)`;
+    }
+    return '';
+  }
+
+  // Independent syntax verification that does NOT depend on any VS Code language
+  // extension being installed. Three outcomes, always clearly distinguished:
+  //   VALID          — a real parser accepted the file
+  //   SYNTAX ERROR   — a real parser rejected it (with the parser's own message)
+  //   COULD NOT VERIFY — no checker available; explicitly NOT a pass
+  async toolCheckSyntax(filePath) {
+    if (!filePath) return 'Error: path is required.';
+    if (!workspaceIsTrusted()) {
+      return 'COULD NOT VERIFY — this workspace is not trusted, so Navy will not start language toolchains in it. This is NOT a pass.';
+    }
+    let abs;
+    try { abs = this.resolveWorkspacePath(filePath); }
+    catch (e) { return 'Error: ' + e.message; }
+
+    const base = path.basename(abs);
+    const ext = path.extname(abs).toLowerCase();
+
+    // Never read an unbounded file onto the extension host's heap — every other
+    // reader in Navy caps its input, and a multi-GB log or data dump would
+    // otherwise OOM the host before any parser ever saw it.
+    try {
+      const st = await fs.promises.stat(abs);
+      if (st.size > CHECK_SYNTAX_MAX_BYTES) {
+        return `COULD NOT VERIFY — ${base} is ${(st.size / 1048576).toFixed(1)} MB, larger than the ${CHECK_SYNTAX_MAX_BYTES / 1048576} MB syntax-check limit. This is NOT a pass.`;
+      }
+    } catch (e) {
+      return `Error: could not read ${filePath}: ${e.message}`;
+    }
+
+    let content;
+    try { content = await fs.promises.readFile(abs, 'utf8'); }
+    catch (e) { return `Error: could not read ${filePath}: ${e.message}`; }
+
+    // ── In-process checks: no external toolchain, always available ────────────
+    if (ext === '.json') {
+      try {
+        JSON.parse(content);
+        return `VALID — ${base} parses as JSON.`;
+      } catch (e) {
+        return `SYNTAX ERROR in ${base}${this._jsonErrorLocation(content, e.message)}: ${e.message}`;
+      }
+    }
+
+    // node --check parses without executing. The extension host IS Node, so
+    // process.execPath is guaranteed present — no availability probe needed.
+    // cwd is deliberately the OS temp dir, not the project: a checker must never
+    // resolve anything out of the repository being inspected.
+    if (['.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+      // --check rejects ESM-only syntax in .js files unless told it's a module;
+      // try script mode first, then module mode before declaring a real error.
+      const asScript = await this._runChecker(process.execPath, ['--check', abs], CHECKER_CWD);
+      if (asScript.ok) return `VALID — ${base} parses as JavaScript.`;
+      const asModule = await this._runChecker(process.execPath, ['--input-type=module', '--check', abs], CHECKER_CWD);
+      if (asModule.ok) return `VALID — ${base} parses as an ES module.`;
+      return `SYNTAX ERROR in ${base}:\n${(asScript.output || asModule.output || 'parse failed').slice(0, 1500)}`;
+    }
+
+    // ── External toolchains ───────────────────────────────────────────────────
+    // SECURITY: every entry here must be a PARSE-ONLY invocation that cannot
+    // execute, import, or resolve anything from the repository being checked.
+    // Removed deliberately, do not re-add without solving the underlying problem:
+    //   • python -m py_compile  — `-m` puts cwd first on sys.path, so a repo
+    //     containing py_compile.py had its code executed. Fixed with -I
+    //     (isolated: ignores cwd, PYTHON* env, and user site-packages).
+    //   • npx tsc (.ts/.tsx)    — resolves and RUNS <repo>/node_modules/.bin/tsc,
+    //     i.e. a binary shipped by the repo. Also never spawned on Windows
+    //     (bare spawn can't resolve npx.cmd). And tsc given a filename ignores
+    //     tsconfig.json, so it reported type errors as syntax errors.
+    //   • rustc --emit=metadata — macro-expands, so include!("<abs path>") reads
+    //     files outside the workspace and echoes them into the error output.
+    const EXTERNAL = {
+      // -I is isolated mode: cwd is NOT added to sys.path, so a repo-local
+      // py_compile.py can no longer hijack the check. Verified: still reports
+      // SyntaxError with exit 1 on a broken file.
+      '.py':  { bin: 'python', args: ['-I', '-m', 'py_compile', abs], alt: 'python3' },
+      '.rb':  { bin: 'ruby',   args: ['--disable-gems', '-c', abs] },
+      '.php': { bin: 'php',    args: ['-n', '-l', abs] },   // -n: ignore php.ini
+      '.go':  { bin: 'gofmt',  args: ['-e', abs] },         // pure parser, no build
+    };
+
+    const spec = EXTERNAL[ext];
+    if (!spec || !spec.bin) {
+      return `COULD NOT VERIFY — Navy has no safe parse-only checker for "${ext || base}". This is NOT a pass: the file may or may not be valid. Read it back and inspect it manually, or run the project's own build/lint command (e.g. tsc, cargo check) via run_command if you need certainty.`;
+    }
+
+    let bin = spec.bin;
+    if (!(await this._commandAvailable(bin))) {
+      if (spec.alt && await this._commandAvailable(spec.alt)) bin = spec.alt;
+      else return `COULD NOT VERIFY — "${spec.bin}" is not installed or not on PATH, so ${base} could not be syntax-checked. This is NOT a pass. Either install it, or verify the file another way.`;
+    }
+
+    const res = await this._runChecker(bin, spec.args, CHECKER_CWD);
+    if (res.timedOut) return `COULD NOT VERIFY — the ${bin} syntax check for ${base} timed out. This is NOT a pass.`;
+    if (res.spawnError) return `COULD NOT VERIFY — could not run ${bin}: ${res.spawnError}. This is NOT a pass.`;
+    if (res.ok) return `VALID — ${base} passed the ${bin} syntax check.`;
+    return `SYNTAX ERROR in ${base} (reported by ${bin}):\n${(res.output || 'check failed with no output').slice(0, 1500)}`;
   }
 
   // Block private/local addresses: loopback, RFC-1918, link-local, IPv6 loopback,
@@ -2241,6 +2801,7 @@ class NavyCoderViewProvider {
   }
 
   async toolRunTests(filter) {
+    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('run tests');
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'No workspace open.';
 
@@ -2887,7 +3448,56 @@ class NavyCoderViewProvider {
     this._afterUndoRedo();
   }
 
+  // Detects WSL availability + installed distros on Windows so the model can
+  // fall back to it for Unix-only tools (gcc, make, …) that aren't on the
+  // Windows PATH — checked once per session and cached, not per-turn, since
+  // spawning wsl.exe costs real time and the answer never changes mid-session.
+  async _detectWsl() {
+    if (process.platform !== 'win32') return { available: false };
+    if (this._wslCache) return this._wslCache;
+    this._wslCache = await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        resolve(result);
+      };
+      try {
+        const child = spawn('wsl.exe', ['--list', '--quiet'], { windowsHide: true });
+        let buf = Buffer.alloc(0);
+        child.stdout?.on('data', (d) => { buf = Buffer.concat([buf, d]); });
+        child.on('close', (code) => {
+          // A non-zero exit means "no distributions installed" (or WSL not
+          // provisioned) — and wsl.exe prints that explanation to stdout. Without
+          // this check the message itself was parsed as the distro list, so Navy
+          // told the model WSL was available and rule 18 sent it chasing every
+          // missing Unix tool through a `wsl` prefix that could never work.
+          if (code !== 0) return finish({ available: false });
+          // wsl.exe emits UTF-16LE when its output isn't attached to a real
+          // console (always true for a spawned child) — decoding as UTF-8
+          // here would produce garbled text interleaved with null bytes.
+          let text = buf.toString('utf16le').replace(/\0/g, '').trim();
+          if (!text) text = buf.toString('utf8').replace(/\0/g, '').trim();
+          const distros = text.split(/\r?\n/)
+            .map(s => s.trim())
+            // A distro name is a single short token; prose sentences are not.
+            .filter(s => s && !/\s/.test(s) && s.length <= 64);
+          finish({ available: distros.length > 0, distros });
+        });
+        child.on('error', () => finish({ available: false }));
+        // Never let this delay a turn — treat "still running after 3s" as unavailable.
+        timer = setTimeout(() => finish({ available: false }), 3000);
+      } catch {
+        finish({ available: false });
+      }
+    });
+    return this._wslCache;
+  }
+
   async toolRunCommand(command, timeout = 30000) {
+    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('run shell commands');
     const config = vscode.workspace.getConfiguration('navy');
     const approvalMode = config.get('approvalMode', 'ask-always');
 
@@ -2987,6 +3597,7 @@ class NavyCoderViewProvider {
   }
 
   async toolRunProject(command = null) {
+    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('start the project');
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'Error: No project folder open. Ask the user to open a folder first.';
 
@@ -3056,6 +3667,7 @@ class NavyCoderViewProvider {
   }
 
   async toolStartProcess(id, command) {
+    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('start background processes');
     if (!id || !command) return 'Error: id and command are required.';
     const prior = this.bgProcesses.get(id);
     if (prior?.proc) return `Error: a process named "${id}" is already running.`;
@@ -3120,12 +3732,20 @@ class NavyCoderViewProvider {
   // Kill a spawned process AND its entire child tree (npm → node, etc.).
   // On Windows uses taskkill /F /T; on Unix kills the process group (requires detached: true on spawn).
   _killProcessTree(proc) {
-    if (!proc?.pid) return;
+    if (!proc?.pid || proc.killed) return;
     try {
       if (process.platform === 'win32') {
-        try { execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: 'ignore', timeout: 5000 }); } catch {}
+        // spawn, NOT execSync. This is called from stream handlers, timers, and
+        // the tool loop — all on the extension host thread. A synchronous
+        // taskkill blocks that thread for as long as the child takes to die
+        // (up to the 5s timeout), which freezes the whole editor. Killing is
+        // fire-and-forget: nothing here needs to wait for it to complete.
+        const killer = spawn('taskkill', ['/F', '/T', '/PID', String(proc.pid)], {
+          stdio: 'ignore', windowsHide: true, detached: false,
+        });
+        killer.on('error', () => {}); // taskkill missing/denied — nothing to do
       } else {
-        try { process.kill(-proc.pid, 'SIGTERM'); } catch { proc.kill(); }
+        try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill(); } catch {} }
       }
     } catch {}
   }
@@ -3449,7 +4069,8 @@ class NavyCoderViewProvider {
 
     const prompt = `You are reviewing a pull request. For every real problem you find:\n1. Quote the relevant code snippet.\n2. Explain the bug or concern.\n3. Show the corrected version.\n\nAlso summarise overall quality at the end.\n\n\`\`\`diff\n${diff.slice(0, 80000)}\n\`\`\``;
     await this.focus();
-    this.askNavy(prompt, false, null, []);
+    this.askNavy(prompt, false, null, [])
+      .catch(e => this._reportTurnFailure(e, 'PR review'));
   }
 
   async exportConversation(conversationText) {
@@ -3531,8 +4152,6 @@ class NavyCoderViewProvider {
     if (this._relCache && this._relCache.key === cacheKey && Date.now() - this._relCache.time < 30_000) {
       return this._relCache.hits;
     }
-    const SKIP = new Set(['node_modules','.git','dist','build','out','.next','.nuxt','__pycache__','.venv','venv','coverage','.cache','.navy','vendor','target']);
-    const CODE = new Set(['.js','.jsx','.ts','.tsx','.mjs','.cjs','.py','.go','.rs','.java','.rb','.php','.c','.h','.cpp','.hpp','.cc','.cs','.swift','.kt','.scala','.vue','.svelte','.sql','.sh','.md','.json','.yml','.yaml','.toml']);
     const DEF_KW = 'function|class|def|const|let|var|interface|type|struct|enum|fn|func|trait|impl|module|component';
     // Compile the term + definition regexes ONCE (not per file) — a repo scan is
     // up to maxFiles × terms iterations, so per-file compilation is pure waste.
@@ -3551,11 +4170,11 @@ class NavyCoderViewProvider {
       for (const e of entries) {
         if (scanned >= maxFiles) return;
         if (e.isDirectory()) {
-          if (!SKIP.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name));
+          if (!RELEVANCE_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name));
           continue;
         }
         const ext = path.extname(e.name).toLowerCase();
-        if (!CODE.has(ext)) continue;
+        if (!RELEVANCE_CODE_EXTS.has(ext)) continue;
         const full = path.join(dir, e.name);
         let text;
         try {
@@ -3585,17 +4204,270 @@ class NavyCoderViewProvider {
     return hits;
   }
 
+  // ── Semantic search (opt-in via navy.embeddingModel) ────────────────────────
+  // File-level embeddings, persisted to .navy/embeddings.json, incrementally
+  // updated (only new/changed files are re-embedded). Purely additive to the
+  // keyword ranker above — with no embeddingModel configured, or a provider
+  // that can't actually produce embeddings, toolFindRelevantFiles behaves
+  // exactly as it always has.
+
+  async _loadEmbeddingIndex(root) {
+    if (this._embedIndexCache?.root === root) return this._embedIndexCache;
+    const dir = this.getNavyDir();
+    let stored = { model: '', provider: '', files: {} };
+    if (dir) {
+      try {
+        const buf = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'embeddings.json')));
+        const parsed = JSON.parse(Buffer.from(buf).toString('utf8'));
+        if (parsed && typeof parsed === 'object') stored = { model: parsed.model || '', provider: parsed.provider || '', files: parsed.files || {} };
+      } catch {}
+    }
+    this._embedIndexCache = { root, ...stored };
+    return this._embedIndexCache;
+  }
+
+  _saveEmbeddingIndex() {
+    clearTimeout(this._embedSaveTimer);
+    this._embedSaveTimer = setTimeout(async () => {
+      const dir = await this.ensureNavyDir();
+      if (!dir || !this._embedIndexCache) return;
+      try {
+        const { model, provider, files } = this._embedIndexCache;
+        // Vectors are stored rounded to 5 decimals. Full float64 precision costs
+        // ~3x the bytes and buys nothing — cosine similarity over 1500 files is
+        // not sensitive at that scale, and JSON.stringify + Buffer.from both run
+        // synchronously on the extension host's main thread, so the raw form
+        // meant a multi-tens-of-MB stringify freezing the UI after every index
+        // update, and the same again parsing it back on the next session.
+        const compact = {};
+        for (const [rel, f] of Object.entries(files)) {
+          compact[rel] = { mtimeMs: f.mtimeMs, size: f.size, vector: f.vector.map(n => Math.round(n * 1e5) / 1e5) };
+        }
+        const json = JSON.stringify({ model, provider, files: compact });
+        if (json.length > EMBED_INDEX_MAX_BYTES) {
+          this.log?.(`semantic index not persisted: ${(json.length / 1048576).toFixed(1)} MB exceeds the ${EMBED_INDEX_MAX_BYTES / 1048576} MB cache limit (search still works this session, it just re-indexes next time)`);
+          return;
+        }
+        await vscode.workspace.fs.writeFile(vscode.Uri.file(path.join(dir, 'embeddings.json')), Buffer.from(json, 'utf8'));
+      } catch (e) { this.log?.('embedding index persist failed: ' + e.message); }
+    }, 500);
+  }
+
+  // Stat-only walk (no content read) — used to detect which files need
+  // (re-)embedding without paying the cost of reading files that haven't changed.
+  // The contents of everything returned here get POSTed to a third-party
+  // embeddings API, so this list is filtered far more conservatively than the
+  // keyword walker: credential-shaped filenames are dropped outright, and
+  // anything the repo gitignores is skipped (gitignored files are exactly the
+  // ones most likely to hold local secrets).
+  async _listCodeFiles(root, { maxFiles = 1500, maxBytes = 300 * 1024 } = {}) {
+    const ignored = await this._gitIgnoredSet(root);
+    const out = [];
+    const skipped = { sensitive: 0, gitignored: 0 };
+    let scanned = 0;
+    const walk = async (dir) => {
+      if (scanned >= maxFiles) return;
+      let entries;
+      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (scanned >= maxFiles) return;
+        if (e.isDirectory()) {
+          if (!RELEVANCE_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) await walk(path.join(dir, e.name));
+          continue;
+        }
+        const ext = path.extname(e.name).toLowerCase();
+        if (!RELEVANCE_CODE_EXTS.has(ext)) continue;
+        if (isSensitiveForEmbedding(e.name)) { skipped.sensitive++; continue; }
+        const full = path.join(dir, e.name);
+        const rel = path.relative(root, full).replace(/\\/g, '/');
+        if (ignored.has(rel)) { skipped.gitignored++; continue; }
+        let st;
+        try { st = await fs.promises.stat(full); } catch { continue; }
+        if (st.size > maxBytes) continue;
+        scanned++;
+        out.push({ rel, full, mtimeMs: st.mtimeMs, size: st.size });
+      }
+    };
+    await walk(root);
+    if (skipped.sensitive || skipped.gitignored) {
+      this.log?.(`semantic index: skipped ${skipped.sensitive} credential-shaped and ${skipped.gitignored} gitignored file(s) — their contents were not uploaded`);
+    }
+    return out;
+  }
+
+  // Repo-relative paths git considers ignored. Uses git itself so real
+  // .gitignore semantics (negations, nested files, globs) are respected rather
+  // than reimplemented. Returns an empty set when git isn't available or this
+  // isn't a repo — the credential-name filter still applies in that case.
+  async _gitIgnoredSet(root) {
+    if (this._gitIgnoredCache?.root === root && Date.now() - this._gitIgnoredCache.time < 60_000) {
+      return this._gitIgnoredCache.set;
+    }
+    const set = new Set();
+    try {
+      // runGit already runs in the project root.
+      const out = await this.runGit(['ls-files', '--others', '--ignored', '--exclude-standard']);
+      for (const line of String(out || '').split(/\r?\n/)) {
+        const t = line.trim();
+        if (t) set.add(t.replace(/\\/g, '/'));
+      }
+    } catch { /* not a repo / git missing — name filter still applies */ }
+    this._gitIgnoredCache = { root, time: Date.now(), set };
+    return set;
+  }
+
+  // Incrementally (re-)embeds only new/changed files, drops entries for
+  // deleted files, and persists. Returns the up-to-date file→{vector} map, or
+  // null when semantic search isn't usable this session (not configured, or
+  // the provider/model rejected the request) — callers treat null as
+  // "unavailable" and silently fall back, never as an error.
+  async _updateEmbeddingIndex(root) {
+    const config = vscode.workspace.getConfiguration('navy');
+    const model = config.get('embeddingModel', '').trim();
+    if (!model) return null;
+    // Uploading repo contents from a folder the user explicitly declined to
+    // trust would be the worst possible time to do it.
+    if (!workspaceIsTrusted()) return null;
+    const provider = config.get('provider', 'ollama');
+    // Already failed once this session for this exact provider+model — don't
+    // hammer a broken endpoint on every single find_relevant_files call.
+    if (this._embedUnavailable === provider + ':' + model) return null;
+
+    // find_relevant_files is READ_ONLY, so two calls in one iteration run
+    // concurrently. Without this, both would compute the same "needs embedding"
+    // list (neither has written results yet) and upload the entire repo twice —
+    // double cost, and a resulting 429 would latch _embedUnavailable and kill
+    // semantic search for the rest of the session. Concurrent callers share the
+    // in-flight run instead.
+    if (this._embedInFlight) return this._embedInFlight;
+    this._embedInFlight = this._updateEmbeddingIndexInner(root, config, model, provider)
+      .finally(() => { this._embedInFlight = null; });
+    return this._embedInFlight;
+  }
+
+  async _updateEmbeddingIndexInner(root, config, model, provider) {
+    const index = await this._loadEmbeddingIndex(root);
+    // A model or provider change invalidates the whole index — vectors from
+    // different embedding spaces aren't comparable to each other.
+    if (index.model !== model || index.provider !== provider) {
+      index.model = model; index.provider = provider; index.files = {};
+    }
+
+    const current = await this._listCodeFiles(root);
+    const currentRels = new Set(current.map(f => f.rel));
+    for (const rel of Object.keys(index.files)) {
+      if (!currentRels.has(rel)) delete index.files[rel];
+    }
+
+    const toEmbed = current.filter(f => {
+      const cached = index.files[f.rel];
+      return !cached || cached.mtimeMs !== f.mtimeMs || cached.size !== f.size;
+    });
+    if (toEmbed.length === 0) return Object.keys(index.files).length ? index.files : null;
+
+    const apiBase = config.get('apiBase', '');
+    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const apiKey = await this.context.secrets.get('navy.apiKey.' + provider) || await this.context.secrets.get('navy.apiKey') || '';
+
+    const BATCH = 32;
+    for (let i = 0; i < toEmbed.length; i += BATCH) {
+      const batch = toEmbed.slice(i, i + BATCH);
+      const texts = await Promise.all(batch.map(async f => {
+        let content = '';
+        try { content = await fs.promises.readFile(f.full, 'utf8'); } catch {}
+        // Path + a leading slice — enough to capture imports/signature/purpose
+        // without embedding whole large files (cost and token-limit reasons).
+        return f.rel + '\n\n' + content.slice(0, 1500);
+      }));
+      let vectors;
+      try {
+        vectors = await getEmbeddings(provider, model, texts, { apiBase, host, apiKey });
+      } catch (e) {
+        this.log?.('semantic search disabled — embeddings request failed: ' + e.message);
+        this._embedUnavailable = provider + ':' + model;
+        return Object.keys(index.files).length ? index.files : null; // keep whatever was already indexed
+      }
+      // Only cache a vector that is actually usable. Caching a malformed one
+      // alongside a valid mtime/size would poison the index permanently: the
+      // change check would never re-embed it, and every later similarity call
+      // would throw on it.
+      batch.forEach((f, j) => {
+        const v = vectors[j];
+        if (Array.isArray(v) && v.length) {
+          index.files[f.rel] = { mtimeMs: f.mtimeMs, size: f.size, vector: v };
+        } else {
+          delete index.files[f.rel];
+          this.log?.(`semantic index: provider returned no usable vector for ${f.rel} — skipped`);
+        }
+      });
+    }
+    this._saveEmbeddingIndex();
+    return index.files;
+  }
+
+  // Embeds the query and scores every indexed file by cosine similarity.
+  // Returns null when semantic search isn't usable at all this session
+  // (not configured, index empty, or the query embedding call failed).
+  async _semanticCandidates(root, query) {
+    const files = await this._updateEmbeddingIndex(root);
+    if (!files || !Object.keys(files).length) return null;
+    const config = vscode.workspace.getConfiguration('navy');
+    const model = config.get('embeddingModel', '').trim();
+    const provider = config.get('provider', 'ollama');
+    const apiBase = config.get('apiBase', '');
+    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const apiKey = await this.context.secrets.get('navy.apiKey.' + provider) || await this.context.secrets.get('navy.apiKey') || '';
+    let queryVec;
+    try {
+      [queryVec] = await getEmbeddings(provider, model, [query], { apiBase, host, apiKey });
+    } catch { return null; }
+    if (!queryVec) return null;
+    return Object.entries(files)
+      .map(([rel, f]) => ({ rel, similarity: cosineSimilarity(queryVec, f.vector) }))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, 15);
+  }
+
+  // Pure merge: keyword-ranked hits + semantic candidates → one combined,
+  // re-sorted list. A file present in both gets a semantic bonus added to its
+  // keyword score; a semantic-only file (no keyword overlap at all — the
+  // whole point of semantic search) is added as a new entry, above a
+  // similarity floor so weakly-related files don't pollute the results just
+  // because they ranked highest among a bad match set.
+  _blendSemanticRanking(ranked, semantic, threshold = 0.45) {
+    const bySemantic = new Map(semantic.map(s => [s.rel, s.similarity]));
+    const seen = new Set(ranked.map(h => h.rel));
+    const merged = ranked.map(h => {
+      const sim = bySemantic.get(h.rel);
+      if (sim === undefined) return h;
+      return { ...h, score: h.score + Math.round(sim * 20), semantic: true };
+    });
+    for (const s of semantic) {
+      if (seen.has(s.rel) || s.similarity < threshold) continue;
+      merged.push({ rel: s.rel, count: 0, matched: [], inName: false, defs: false, semantic: true, score: Math.round(s.similarity * 20) });
+    }
+    return merged.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+  }
+
   async toolFindRelevantFiles(query, maxResults = 8) {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'No workspace open.';
     const terms = this._tokenizeQuery(query);
     if (!terms.length) return 'Give a more specific query — identifiers, symbol names, or distinctive keywords.';
     const hits = await this._collectRelevance(root, terms);
-    const ranked = this._rankRelevance(hits, terms).slice(0, Math.max(1, Math.min(maxResults || 8, 25)));
+    let ranked = this._rankRelevance(hits, terms);
+
+    let usedSemantic = false;
+    try {
+      const semantic = await this._semanticCandidates(root, query);
+      if (semantic && semantic.length) { ranked = this._blendSemanticRanking(ranked, semantic); usedSemantic = true; }
+    } catch (e) { this.log?.('semantic search failed, using keyword results only: ' + e.message); }
+
+    ranked = ranked.slice(0, Math.max(1, Math.min(maxResults || 8, 25)));
     if (!ranked.length) return `No files matched: ${terms.map(t => t.term).join(', ')}`;
-    const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}\n`;
+    const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}${usedSemantic ? ' (keyword + semantic)' : ''}\n`;
     return header + ranked.map(h =>
-      `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}; matched: ${h.matched.join(', ') || '—'}]`
+      `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}${h.semantic ? ', semantic-match' : ''}; matched: ${h.matched.join(', ') || '—'}]`
     ).join('\n');
   }
 
@@ -3854,7 +4726,8 @@ class NavyCoderViewProvider {
       vscode.window.showInformationMessage('Please copy the terminal error to your clipboard first.');
       return;
     }
-    this.askNavy(`I encountered this error. Please explain it and how to fix it:\n\n\`\`\`\n${clipboardText.slice(0, 5000)}\n\`\`\``, true);
+    this.askNavy(`I encountered this error. Please explain it and how to fix it:\n\n\`\`\`\n${clipboardText.slice(0, 5000)}\n\`\`\``, true)
+      .catch(e => this._reportTurnFailure(e, 'explain terminal error'));
   }
 
   async runTestsCommand() {
@@ -3971,6 +4844,33 @@ class NavyCodeLensProvider {
   }
 }
 
+// Should Navy send this document's contents to a completion provider?
+// Inline completions fire on every keystroke, so an over-broad registration
+// silently streams whatever file happens to be open — including credential
+// files a user opened just to read. Requires: a real on-disk file, inside the
+// workspace, that isn't credential-shaped. Pure apart from the two inputs.
+function documentEligibleForCompletion(document, folderPaths) {
+  if (!document || document.uri?.scheme !== 'file') return false;
+  const fsPath = document.uri.fsPath || '';
+  if (!fsPath) return false;
+  if (isSensitiveForEmbedding(fsPath)) return false; // same credential-name filter
+  return rootBelongsToWorkspace(fsPath, folderPaths);
+}
+
+// A model given both prefix and suffix context (FIM) sometimes "overshoots"
+// and echoes part of the suffix back at the end of its completion instead of
+// stopping right before it. Trims the longest matching overlap between the
+// end of `completion` and the start of `suffix`, so that text isn't inserted
+// twice. Pure — greedy longest-match, capped so it can't scan huge strings.
+function stripSuffixOverlap(completion, suffix) {
+  if (!completion || !suffix) return completion;
+  const maxCheck = Math.min(completion.length, suffix.length, 200);
+  for (let n = maxCheck; n > 0; n--) {
+    if (completion.slice(-n) === suffix.slice(0, n)) return completion.slice(0, -n);
+  }
+  return completion;
+}
+
 function activate(context) {
   const proposedProvider = new NavyProposedContentProvider();
   context.__navyProposedProvider = proposedProvider;
@@ -3982,6 +4882,15 @@ function activate(context) {
   const outputChannel = vscode.window.createOutputChannel('Navy Coder');
   context.subscriptions.push(outputChannel);
   provider.log = (line) => outputChannel.appendLine(new Date().toISOString().slice(11, 19) + '  ' + line);
+  // Reveal the channel (without stealing focus) the first time the webview
+  // reports a stall — a randomly-freezing panel is only diagnosable if the
+  // evidence surfaces on its own rather than waiting to be looked for.
+  let _shownForStall = false;
+  provider.outputChannelShow = () => {
+    if (_shownForStall) return;
+    _shownForStall = true;
+    try { outputChannel.show(true); } catch {}
+  };
 
   // First-run welcome — point new users at the sidebar so they know where Navy lives.
   if (!context.globalState.get('navy.welcomed')) {
@@ -4004,13 +4913,22 @@ function activate(context) {
   context.subscriptions.push(statusBar);
   provider.statusBarItem = statusBar;
 
-  // Inline ghost-text completions — routes to the active provider with debounce.
+  // Inline ghost-text completions — routes to the active provider (or the
+  // separate, faster navy.completionModel if set) with debounce.
   let _inlineReqId = 0;
   const inlineCompletionProvider = {
     async provideInlineCompletionItems(document, position, _ctx, token) {
       const config = vscode.workspace.getConfiguration('navy');
       if (!config.get('inlineCompletions', false)) return [];
-      const model = config.get('model', '');
+      if (!workspaceIsTrusted()) return [];
+      // Registered on '**', so this is where scope is actually enforced: only
+      // real files inside the workspace, never credential-shaped ones.
+      const folderPaths = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
+      if (!documentEligibleForCompletion(document, folderPaths)) return [];
+      // A separate model exists specifically so completions (which need low
+      // latency) don't have to share a slow/large chat model just because
+      // that's what navy.model is set to.
+      const model = config.get('completionModel', '').trim() || config.get('model', '');
       if (!model) return [];
 
       const reqId = ++_inlineReqId;
@@ -4020,6 +4938,12 @@ function activate(context) {
       const startLine = Math.max(0, position.line - 20);
       const prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
       if (!prefix.trim()) return [];
+      // Fill-in-middle context: code AFTER the cursor. Without this the model
+      // has no idea a closing brace/return/next statement is right there and
+      // routinely duplicates or contradicts it — this matters most for
+      // completions requested mid-function, the common case while editing.
+      const endLine = Math.min(document.lineCount, position.line + 20);
+      const suffix = document.getText(new vscode.Range(position, new vscode.Position(endLine, 0))).slice(0, 2000);
 
       const aiProvider = config.get('provider', 'ollama');
       const host       = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
@@ -4034,10 +4958,12 @@ function activate(context) {
         let completion = '';
 
         if (aiProvider === 'ollama') {
+          // Ollama's /api/generate has native FIM support via `suffix` for
+          // FIM-capable models (qwen2.5-coder, deepseek-coder, codegemma, …).
           const res = await fetch(host + '/api/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model, prompt: prefix, stream: false,
+            body: JSON.stringify({ model, prompt: prefix, suffix, stream: false,
               options: { temperature: 0.05, num_predict: 80, stop: ['\n\n', '```', '\nfunction ', '\nclass ', '\ndef '] } }),
             signal: ctrl.signal,
           });
@@ -4052,13 +4978,13 @@ function activate(context) {
             headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey,
               'anthropic-version': '2023-06-01' },
             body: JSON.stringify({ model, max_tokens: 80, temperature: 0.05,
-              system: 'You are a code completion engine. Output ONLY the continuation — no explanation, no markdown fences.',
-              messages: [{ role: 'user', content: 'Complete this code at the cursor:\n' + prefix }] }),
+              system: 'You are a code completion engine filling in the gap between CODE BEFORE and CODE AFTER. Output ONLY the missing middle — no explanation, no markdown fences, and do NOT repeat any part of CODE AFTER.',
+              messages: [{ role: 'user', content: `CODE BEFORE:\n${prefix}\n\nCODE AFTER:\n${suffix}` }] }),
             signal: ctrl.signal,
           });
           if (!res.ok) return [];
           const data = await res.json();
-          completion = (data.content?.[0]?.text || '').trimEnd();
+          completion = stripSuffixOverlap((data.content?.[0]?.text || '').trimEnd(), suffix);
 
         } else {
           const base = openAiCompatBase(aiProvider, apiBase, host) || host;
@@ -4069,14 +4995,14 @@ function activate(context) {
             headers,
             body: JSON.stringify({ model, max_tokens: 80, temperature: 0.05,
               messages: [
-                { role: 'system', content: 'You are a code completion engine. Output ONLY the continuation — no explanation, no markdown fences, no repeating existing code.' },
-                { role: 'user', content: prefix },
+                { role: 'system', content: 'You are a code completion engine filling in the gap between CODE BEFORE and CODE AFTER. Output ONLY the missing middle — no explanation, no markdown fences, no repeating CODE BEFORE, and do NOT repeat any part of CODE AFTER.' },
+                { role: 'user', content: `CODE BEFORE:\n${prefix}\n\nCODE AFTER:\n${suffix}` },
               ] }),
             signal: ctrl.signal,
           });
           if (!res.ok) return [];
           const data = await res.json();
-          completion = (data.choices?.[0]?.message?.content || '').trimEnd();
+          completion = stripSuffixOverlap((data.choices?.[0]?.message?.content || '').trimEnd(), suffix);
         }
 
         if (!completion || token.isCancellationRequested) return [];

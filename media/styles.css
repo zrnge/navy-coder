@@ -19,6 +19,11 @@
   --amber:        var(--vscode-charts-yellow, #d29922);
   --radius:       8px;
   --radius-sm:    5px;
+  /* Aliases some rules reference under a different name than the canonical
+     variable above — kept in sync with it rather than duplicating values. */
+  --accent:       var(--gold);
+  --fg:           var(--text);
+  --mono:         var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
 }
 
 * {
@@ -1358,6 +1363,7 @@ textarea:focus {
 
 .diff-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 14px;
   border-bottom: 1px solid rgba(88, 166, 255, 0.1);
@@ -1365,6 +1371,12 @@ textarea:focus {
 }
 
 .diff-actions button {
+  /* min-width:0 lets the button shrink below its text's intrinsic width instead
+     of forcing the row wider than a narrow sidebar; flex-wrap above is the main
+     fix (the button drops to its own line rather than overflowing/clipping),
+     this is the fallback for when even one button alone is still too wide. */
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 8px 20px;
   font-size: 13px;
   font-weight: 700;
@@ -1373,6 +1385,7 @@ textarea:focus {
   cursor: pointer;
   transition: opacity 0.15s, transform 0.1s;
   letter-spacing: 0.3px;
+  white-space: nowrap;
 }
 
 .diff-approve {
