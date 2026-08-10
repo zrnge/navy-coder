@@ -474,6 +474,14 @@ select option:hover {
   max-width: 100%;
   word-break: break-word;
 }
+/* A turn is split into several bubbles so tool cards can sit between them (see
+   sealCurrentBubble). Sealing an as-yet-unwritten bubble is what keeps later
+   text below the card it follows, and that legitimately leaves an empty bubble
+   behind — which must take up no space at all, or every such turn gains a
+   phantom gap where nothing was ever written. */
+.message-bubble:empty {
+  display: none;
+}
 
 /* User bubble: clearly tinted so it stands out from the dark background */
 .message.user .message-bubble {
@@ -1462,14 +1470,17 @@ textarea:focus {
 #thinkingLevelSelect option { background: var(--surface); color: var(--text); }
 
 /* ── Context length badge ─────────────────────────────────────────────────── */
-.context-length-badge {
+/* Context-window picker. Sits among the status badges rather than with the
+   other selects, because it belongs to the model the counters next to it are
+   describing. Slightly shorter than .select-compact's 24px so it doesn't
+   out-weigh the badges it sits beside. Hidden outright (inline style, set by
+   renderContextWindowSelect) whenever no window is known for the active
+   model — an empty picker is worse than none. */
+.context-select {
+  height: 20px;
   font-size: 10px;
-  color: var(--muted);
-  white-space: nowrap;
-  padding: 2px 5px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  cursor: default;
+  font-weight: 500;
+  max-width: 130px;
 }
 
 /* ── Memory button & panel ───────────────────────────────────────────────── */
@@ -1846,6 +1857,104 @@ textarea:focus {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--border-hover);
+}
+
+/* ── Session tabs (one per open project) ──────────────────────────────────
+   Underline style (VS Code editor tabs / browser tabs), not boxed pills —
+   sits flush inside the topbar as its own row, same height class as row1/2. */
+.session-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  height: 28px;
+  padding: 0 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-shrink: 0;
+  /* No scrollbar-width here — the global ::-webkit-scrollbar rules below
+     already thin every scrollbar in this webview, this one included. */
+}
+.session-tabs:empty {
+  display: none; /* a single implicit session shouldn't show an empty strip */
+}
+.session-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 150px;
+  flex-shrink: 0;
+}
+.session-tab:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.session-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--gold);
+}
+.session-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-tab-spinner {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--gold);
+  border-top-color: transparent;
+  animation: session-tab-spin 0.8s linear infinite;
+}
+@keyframes session-tab-spin {
+  to { transform: rotate(360deg); }
+}
+.session-tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.session-tab-close:hover {
+  color: var(--text);
+  background: var(--border);
+}
+.session-tab-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  border-radius: var(--radius-sm);
+}
+.session-tab-add:hover {
+  color: var(--text);
+  background: var(--surface-hover);
 }
 
 /* ── Context fill bar (3px gradient strip below topbar) ──────────────────── */
@@ -2695,6 +2804,58 @@ textarea:focus-visible,
 }
 .term-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 10px; }
 .term-in-row { background: var(--surface); }
+/* Copy button on a terminal card — command output is the thing most likely to
+   be pasted into an issue, and it was the only block with no way to copy it.
+   Revealed on hover so it doesn't compete with the status label. */
+.term-copy-btn {
+  flex: 0 0 auto;
+  margin-left: 4px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s, border-color 0.12s;
+}
+.term-card:hover .term-copy-btn,
+.term-copy-btn:focus { opacity: 1; }
+.term-copy-btn:hover { color: var(--text); border-color: var(--border-hover); }
+
+/* The diff card's filename is a real control now: it opens the file, which is
+   what the truncation notice tells you to do. Styled as text so the header
+   still reads as a header. */
+.diff-open-btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.diff-open-btn:hover { text-decoration: underline; }
+
+/* Approval-queue entries jump to their card, so they must look clickable. */
+.approval-item { cursor: pointer; }
+.approval-item:hover { color: var(--text); text-decoration: underline; }
+
+/* "Show N earlier messages" — a restore renders only the most recent slice. */
+.history-more-btn {
+  display: block;
+  margin: 4px auto 10px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.history-more-btn:hover { color: var(--text); border-color: var(--border-hover); }
 .term-out-row { border-top: 1px solid var(--border); }
 .term-label {
   font-size: 9px; font-weight: 700; letter-spacing: 0.08em;

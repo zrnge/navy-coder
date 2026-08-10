@@ -64,7 +64,8 @@ const TOOLS = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Absolute or workspace-relative directory path.' },
-        maxDepth: { type: 'number', description: 'How many directory levels deep to list (default 1).' }
+        maxDepth: { type: 'number', description: 'How many directory levels deep to list (default 1).' },
+        folder: { type: 'string', description: 'Optional: target a specific open workspace folder by path or name, in a multi-root workspace. A relative `path` is then resolved against that folder instead of the active project. Omit to use the active project.' }
       },
       required: ['path']
     }
@@ -75,7 +76,8 @@ const TOOLS = [
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Text or regex to search for.' }
+        query: { type: 'string', description: 'Text or regex to search for.' },
+        folder: { type: 'string', description: 'Optional: target a specific open workspace folder by path or name, in a multi-root workspace. Omit to search the active project.' }
       },
       required: ['query']
     }
@@ -247,7 +249,8 @@ const TOOLS = [
     parameters: { type: 'object', properties: {
       query: { type: 'string', description: 'Text or regex to search for.' },
       filePattern: { type: 'string', description: 'Optional glob to restrict search, e.g. "*.ts" or "src/**".' },
-      contextLines: { type: 'number', description: 'Lines of context to show around each match (default 2).' }
+      contextLines: { type: 'number', description: 'Lines of context to show around each match (default 2).' },
+      folder: { type: 'string', description: 'Optional: target a specific open workspace folder by path or name, in a multi-root workspace. Omit to search the active project.' }
     }, required: ['query'] }
   },
   {
@@ -328,7 +331,8 @@ const TOOLS = [
       type: 'object',
       properties: {
         query: { type: 'string', description: 'The task description, question, or space-separated keywords / symbol names to rank files against.' },
-        maxResults: { type: 'number', description: 'How many ranked files to return (default 8).' }
+        maxResults: { type: 'number', description: 'How many ranked files to return (default 8).' },
+        folder: { type: 'string', description: 'Optional: target a specific open workspace folder by path or name, in a multi-root workspace (see the repository map\'s "Other open folders" line). Omit to search the active project. Note: semantic/embedding-based ranking only applies to the active project even when this is set — keyword and language-server matches still work for any folder.' }
       },
       required: ['query']
     }
@@ -382,6 +386,18 @@ const TOOLS = [
     }
   },
   {
+    name: 'delegate_research',
+    description: 'Delegate a focused, READ-ONLY investigation to an isolated sub-agent and get back only its written summary — use this for a broad question that would otherwise take many read/search calls and fill up YOUR OWN context with detail you only need the CONCLUSION of (e.g. "how does authentication work in this codebase", "find every place X is called and summarize the pattern", "investigate why Y might be failing"). The sub-agent has no memory of this conversation (describe the task fully) and can read, search, and browse the codebase, but cannot write, delete, rename, run commands, or delegate further — for making changes, do that yourself directly, do not delegate it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'A clear, self-contained description of what to investigate. The sub-agent starts with NO context from this conversation, so include everything it needs.' },
+        maxSteps: { type: 'number', description: 'Maximum tool-use iterations for the sub-agent (default 12, capped at 20).' }
+      },
+      required: ['task']
+    }
+  },
+  {
     name: 'finish',
     description: 'Signal that the task is fully complete and no further tool calls are needed.',
     parameters: { type: 'object', properties: {} }
@@ -406,7 +422,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, delegate_research, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
@@ -430,6 +446,7 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 15. CRITICAL — DO NOT HALLUCINATE FILE ACTIONS: Writing code in your reply text does NOT save it anywhere — it only appears in the chat. If the user asked you to create, write, save, or edit a file, you MUST call the write_file or apply_edit tool and see its result before saying it succeeded. NEVER say "created", "saved", "written", "done", or similar unless you actually called that tool THIS turn and it returned success. If you are only showing an example or discussing code without being asked to save it, say so explicitly instead of claiming completion.
 16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.
 17. COMMAND ACCURACY — check before assuming: run_command executes through the exact shell named in CURRENT ENVIRONMENT above (cmd.exe on Windows, sh on macOS/Linux) — write commands in THAT dialect, not whatever you'd default to. Shell builtins (cmd.exe: dir, cd, type, del, copy, move, mkdir, echo, set; sh: ls, cd, cat, rm, cp, mv, mkdir, echo, export) always exist — no need to check. A third-party CLI (git, node, npm, python, rg, jq, docker, etc.) may or may not be installed or on PATH — if you haven't already confirmed it works earlier this turn, check it first with "where <tool>" (cmd.exe) or "command -v <tool>" (sh) before depending on it, so a failure tells you "not installed" instead of wasting an attempt on a guess. If a command still fails with "not recognized"/"command not found", that means the tool isn't available — don't retry the same command, find or install an alternative.
-18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from cmd.exe per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.`
+18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from cmd.exe per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.
+19. DELEGATION: for a broad investigation you don't need to keep the raw detail of — "how does X work here", "find every place Y is used and summarize the pattern" — prefer delegate_research over doing it yourself with many read/search calls: you get back only the written conclusion instead of filling your own context with files you won't need again. Do NOT delegate anything that needs to WRITE, run a command, or that's simple enough to resolve in 1-2 tool calls yourself — delegation has overhead and the sub-agent can't act on what it finds.`
 
 module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT };

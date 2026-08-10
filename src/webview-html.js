@@ -74,7 +74,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
           <span id="queuedBadge" class="queued-badge" style="display:none"></span>
           <span id="statusText" class="status-text"></span>
           <span id="rulesBadge" class="rules-badge" title="Project rules active">RULES</span>
-          <span id="contextLength" class="context-length-badge" title="Context window"></span>
+          <!-- Populated from whatever window the ACTIVE model actually reports
+               (see resolveModelContext / fetchModelContext) — the options are
+               built per model, not a fixed list, so a 1M-token model offers
+               sizes an 8k one never will. Hidden entirely while no window is
+               known, rather than offering a guess. -->
+          <select id="contextSelect" class="select-compact context-select" title="Context window"></select>
           <span id="tokenCounter" class="token-counter" title="Tokens used"></span>
           <span id="inlineEditBadge" class="inline-edit-badge"></span>
         </div>
@@ -140,6 +145,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
         <select id="projectSelect" title="Project directory" class="select-project"></select>
         <select id="modelSelect" title="Model" class="select-model"></select>
       </div>
+      <!-- Row 3: session tabs — one per open project. A background tab's turn
+           keeps running (see its spinner) but only the active tab's
+           conversation is rendered; switching snaps to that project's
+           accumulated state. Part of the topbar (not a separate .app grid
+           row) so it lays out exactly like row 1/row 2 above it. -->
+      <div id="sessionTabs" class="session-tabs" role="tablist"></div>
     </header>
     <div class="context-bar"><div id="contextBarFill" class="context-bar-fill ok"></div></div>
 

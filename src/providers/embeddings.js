@@ -58,10 +58,18 @@ async function getEmbeddings(provider, model, texts, { apiBase, host, apiKey, si
   return vectors;
 }
 
+// Throws on a dimension mismatch instead of silently comparing a truncated
+// prefix — two vectors from different embedding spaces (or a corrupted cache
+// entry) produce a plausible-looking but meaningless score if truncated
+// rather than rejected outright. Callers (toolFindRelevantFiles) already
+// catch and fall back to keyword-only search, so surfacing this loudly costs
+// nothing and prevents a silent-wrong-answer failure mode.
 function cosineSimilarity(a, b) {
-  const len = Math.min(a.length, b.length);
+  if (a.length !== b.length) {
+    throw new Error(`cosineSimilarity: dimension mismatch (${a.length} vs ${b.length}) — vectors are not comparable`);
+  }
   let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < len; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
   if (na === 0 || nb === 0) return 0;
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }

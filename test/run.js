@@ -205,7 +205,7 @@ console.log('\nwebview DOM:');
   check('diff card has expand button', card && Boolean(card.querySelector('.diff-expand-btn')));
   check('changed line visible in preview', card && card.textContent.includes('TWO'));
 
-  // Regression: a LARGE file (over computeLCS's ~633-line bail-out) whose change
+  // Regression: a LARGE file (over the old computeLCS's ~633-line bail-out) whose change
   // lands past the renderer's 400-row budget used to produce a diff body with no
   // changed rows in it — and diffResolved then deleted the body entirely, so an
   // edit that really happened showed a card with no diff.
@@ -227,6 +227,106 @@ console.log('\nwebview DOM:');
       bigCard && Boolean(bigCard.querySelector('.diff-body')));
     check('large-file diff: change still visible after resolution',
       bigCard && bigCard.textContent.includes('CHANGED_DEEP_LINE'));
+  }
+
+  // ── computeMyersDiff: direct correctness + ceiling tests ──────────────────
+  // Round-trip reconstruction is the strongest possible check here — it's
+  // agnostic to WHICH shortest edit script the algorithm picked among ties,
+  // it only demands that separating the ops back into "what came from old"
+  // vs "what came from new" reproduces both inputs EXACTLY. Any backtracking
+  // bug (a real risk in a hand-rolled Myers implementation) fails this.
+  {
+    const reconstruct = (ops) => {
+      const oldOut = [], newOut = [];
+      for (const op of ops) {
+        if (op.t === '=') { oldOut.push(op.line); newOut.push(op.line); }
+        else if (op.t === '-') { oldOut.push(op.line); }
+        else if (op.t === '+') { newOut.push(op.line); }
+      }
+      return { old: oldOut, new: newOut };
+    };
+    const roundTrips = (oldLines, newLines) => {
+      const ops = window.computeMyersDiff(oldLines, newLines);
+      if (!ops) return false;
+      const rec = reconstruct(ops);
+      return JSON.stringify(rec.old) === JSON.stringify(oldLines)
+        && JSON.stringify(rec.new) === JSON.stringify(newLines);
+    };
+
+    check('myers diff: identical arrays round-trip (all "=" ops)', roundTrips(['a', 'b', 'c'], ['a', 'b', 'c']));
+    check('myers diff: pure insertion round-trips', roundTrips(['a', 'b', 'c'], ['a', 'X', 'b', 'c']));
+    check('myers diff: pure deletion round-trips', roundTrips(['a', 'b', 'c'], ['a', 'c']));
+    check('myers diff: pure replacement round-trips', roundTrips(['a', 'b', 'c'], ['a', 'X', 'c']));
+    check('myers diff: both empty returns []', JSON.stringify(window.computeMyersDiff([], [])) === '[]');
+    check('myers diff: old empty (all insertions) round-trips', roundTrips([], ['a', 'b']));
+    check('myers diff: new empty (all deletions) round-trips', roundTrips(['a', 'b'], []));
+
+    // The actual ceiling fix: a 5000-line file (nearly 8x the old ~633-line
+    // hard cap) with a handful of scattered small edits — this used to be
+    // IMPOSSIBLE to diff exactly (computeLCS bailed on file size alone); now
+    // it stays fast because cost tracks the tiny number of real differences,
+    // not the file size.
+    {
+      const big = Array.from({ length: 5000 }, (_, i) => 'line ' + i);
+      const bigNew = big.slice();
+      bigNew.splice(2500, 0, 'INSERTED_LINE'); // a pure insertion, not just a same-index change
+      bigNew[100] = 'CHANGED_LINE_100';
+      bigNew[4900] = 'CHANGED_LINE_4900';
+      const t0 = Date.now();
+      const ops = window.computeMyersDiff(big, bigNew);
+      const elapsedMs = Date.now() - t0;
+      check('myers diff: exact diff succeeds well past the old 633-line ceiling', Boolean(ops));
+      check('myers diff: stays fast on a large file with a small edit', elapsedMs < 1000, elapsedMs + 'ms');
+      const rec = ops && reconstruct(ops);
+      check('myers diff: large-file round-trip is exact (old side)', rec && JSON.stringify(rec.old) === JSON.stringify(big));
+      check('myers diff: large-file round-trip is exact (new side)', rec && JSON.stringify(rec.new) === JSON.stringify(bigNew));
+      // Proves real alignment (not the naive index-compare fallback, which
+      // would treat every line after an insertion as changed): only the 3
+      // actual edits should produce non-"=" ops.
+      const changedOps = ops ? ops.filter(o => o.t !== '=').length : Infinity;
+      check('myers diff: an insertion does not cascade into hundreds of spurious changes',
+        changedOps <= 6, changedOps + ' changed ops');
+    }
+
+    // Pathological case: two huge, almost entirely DIFFERENT files (the one
+    // case that genuinely doesn't benefit from line alignment) — must bail
+    // out (null, same contract as before) rather than hang.
+    {
+      const hugeA = Array.from({ length: 3000 }, (_, i) => 'unique-old-' + i);
+      const hugeB = Array.from({ length: 3000 }, (_, i) => 'unique-new-' + i);
+      const t0 = Date.now();
+      const ops = window.computeMyersDiff(hugeA, hugeB);
+      const elapsedMs = Date.now() - t0;
+      check('myers diff: bails (null) on a huge near-total rewrite instead of hanging', ops === null);
+      check('myers diff: the bailout itself stays bounded and fast', elapsedMs < 2000, elapsedMs + 'ms');
+    }
+  }
+
+  // ── renderTokenCounter: cost/spend display ────────────────────────────────
+  {
+    send({ type: 'tokenCount', prompt: 5, completion: 5, total: 10, sessionPrompt: 1000, sessionCompletion: 1000, sessionTotal: 2000, estimatedCost: 0.006, costKnown: true });
+    const counter = $('#tokenCounter');
+    check('token counter: shows the SESSION total, not just this turn\'s 10', counter.textContent.includes('2,000'));
+    check('token counter: shows a known cost estimate', counter.textContent.includes('$0.01') || counter.textContent.includes('0.0060'));
+    check('token counter: tooltip discloses it\'s an estimate, not a live rate', /not a live rate/.test(counter.title));
+    check('token counter: becomes visible', counter.classList.contains('visible'));
+
+    send({ type: 'tokenCount', prompt: 5, completion: 5, total: 10, sessionPrompt: 1000, sessionCompletion: 1000, sessionTotal: 2000, estimatedCost: 0.5, costKnown: false });
+    check('token counter: a partial (costKnown:false) total is marked with a "+"', $('#tokenCounter').textContent.includes('+'));
+
+    send({ type: 'tokenCount', prompt: 5, completion: 5, total: 10, sessionPrompt: 1000, sessionCompletion: 1000, sessionTotal: 2000, estimatedCost: null, costKnown: true });
+    check('token counter: an unrecognized model shows tokens with no dollar figure (never a guess)',
+      !$('#tokenCounter').textContent.includes('$'));
+    check('token counter: tooltip says the estimate is unavailable, not silently omitted',
+      /unavailable/.test($('#tokenCounter').title));
+
+    send({ type: 'tokenCount', prompt: 0, completion: 0, total: 0, sessionPrompt: 0, sessionCompletion: 0, sessionTotal: 0, estimatedCost: null, costKnown: true });
+    check('token counter: a zero session total hides the counter entirely', !$('#tokenCounter').classList.contains('visible'));
+
+    // sessionLoaded (restoring a chat / switching tabs) must render identically.
+    send({ type: 'sessionLoaded', count: 3, memory: '', projectRoot: 'e:/p', sessionPrompt: 500, sessionCompletion: 500, sessionTotal: 1000, estimatedCost: 0, costKnown: true });
+    check('sessionLoaded: restoring a chat shows its accumulated usage immediately',
+      $('#tokenCounter').textContent.includes('1,000') && $('#tokenCounter').classList.contains('visible'));
   }
 
   // A genuinely empty diff (no changes at all) should still collapse its body —
@@ -306,6 +406,65 @@ console.log('\nwebview DOM:');
     check('report order: summary is its own bubble, not merged into the intro', summaryIdx !== introIdx);
     check('report order: copy still yields the whole reply',
       /reading the full file[\s\S]*Done:/.test(msg.dataset.rawMd || ''));
+  }
+
+  // Regression: a turn with tool activity in MORE than one place (reasoning →
+  // tools → reasoning again → tools → summary — a real multi-iteration agent
+  // turn, not just a single split) used to merge everything after the FIRST
+  // batch of tool calls into one bubble. A SECOND round of reasoning midway
+  // through the turn then rendered as if it happened at the very start,
+  // because <think> extraction hoists reasoning to the top of whatever text
+  // segment contains it — and that segment wrongly spanned the entire rest
+  // of the turn. Each batch of tool activity now gets its own log, so each
+  // round of reasoning stays isolated to its own bubble, in its real position.
+  {
+    send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '' });
+    send({ type: 'chunk', text: '<think>reasoning about the codebase</think>Let me look at the entry point.' });
+    send({ type: 'toolCall', tool: 'read_file', args: { path: 'index.js' }, callId: 'multi1' });
+    send({ type: 'toolResult', tool: 'read_file', result: 'ok', callId: 'multi1' });
+    send({ type: 'chunk', text: '<think>now checking the config too</think>Now checking the config file.' });
+    send({ type: 'toolCall', tool: 'read_file', args: { path: 'config.js' }, callId: 'multi2' });
+    send({ type: 'toolResult', tool: 'read_file', result: 'ok', callId: 'multi2' });
+    send({ type: 'chunk', text: '\n\n**Summary:** this project is a config-driven app.' });
+    send({ type: 'done' });
+
+    const msg2 = [...window.document.querySelectorAll('.message.assistant')].pop();
+    const kids2 = [...msg2.children];
+    const logIdxs = kids2.map((c, i) => /activity-log/.test(c.className) ? i : -1).filter(i => i !== -1);
+    const reasoning1Idx = kids2.findIndex(c => /reasoning about the codebase/.test(c.textContent || ''));
+    const reasoning2Idx = kids2.findIndex(c => /now checking the config too/.test(c.textContent || ''));
+    const summaryIdx2 = kids2.findIndex(c => /Summary:/.test(c.textContent || ''));
+
+    check('multi-phase: two SEPARATE activity-log segments, not one merged log', logIdxs.length === 2);
+    check('multi-phase: both rounds of reasoning are present', reasoning1Idx !== -1 && reasoning2Idx !== -1);
+    check('multi-phase: the SECOND round of reasoning is its own bubble, not merged into the first (the reported bug)',
+      reasoning1Idx !== reasoning2Idx);
+    check('multi-phase: real chronological order — reasoning1, tools A, reasoning2, tools B, summary',
+      reasoning1Idx < logIdxs[0] && logIdxs[0] < reasoning2Idx && reasoning2Idx < logIdxs[1] && logIdxs[1] < summaryIdx2);
+    // Both segments must actually collapse on 'done' — not just the latest
+    // one (collapseToolProgress used to only ever finalize whichever single
+    // activityLogEl it currently pointed at).
+    check('multi-phase: the FIRST log segment collapsed too, not left as raw uncollapsed rows',
+      Boolean(kids2[logIdxs[0]]?.querySelector('.activity-log-collapsed')));
+    check('multi-phase: the SECOND log segment collapsed as well',
+      Boolean(kids2[logIdxs[1]]?.querySelector('.activity-log-collapsed')));
+  }
+
+  // Regression: resetThreadDisplay() (Clear Chat / switching tabs) used to
+  // null out the old standalone activityLogEl variable but never touch
+  // allActivityLogEls — so a reset mid-turn (with an uncollapsed segment
+  // still in the array) left a stale, now-detached reference behind instead
+  // of genuinely starting fresh. Reset is now the single source of truth
+  // (allActivityLogEls itself, via currentActivityLog()) with nothing left
+  // to fall out of sync.
+  {
+    send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '' });
+    send({ type: 'toolCall', tool: 'read_file', args: { path: 'x.js' }, callId: 'reset-test-1' });
+    check('resetThreadDisplay: an activity log genuinely exists mid-turn, before any reset',
+      Boolean(window.currentActivityLog()));
+    window.resetThreadDisplay(); // simulates Clear Chat / a tab switch mid-turn
+    check('resetThreadDisplay: currentActivityLog() is null right after reset — no stale segment lingers',
+      window.currentActivityLog() === null);
   }
 
   // A turn that produces tool activity but no text at all must keep the tool
@@ -431,6 +590,143 @@ console.log('\nwebview DOM:');
   check('model filter narrows options', $('#modelSelect').options.length === 1 && $('#modelSelect').value === 'openai/gpt-4o');
   window.populateModels(['a', 'b'], 'a');
   check('model filter hides for small lists', filterInp.style.display === 'none');
+
+  // Multi-session tab strip: the backend tags every message with a sessionId
+  // (added in the extension-side wrapper, not reproduced here — these sends
+  // set it explicitly to drive the gate directly). None of the messages sent
+  // earlier in this suite carried one, so activeSessionId is still null;
+  // establishing it via a real sessionList message exercises the same
+  // "adopt on first sight" path a real startup would.
+  send({ type: 'sessionList', sessionId: 'session-A', sessions: [
+    { id: 'session-A', name: 'ProjA', root: '/path/to/ProjA', busy: false, active: true },
+    { id: 'session-B', name: 'ProjB', root: '/path/to/ProjB', busy: true, active: false },
+  ] });
+  check('multi-session: tab strip renders one tab per session', $('#sessionTabs').querySelectorAll('.session-tab').length === 2);
+  check('multi-session: active tab is marked active', $('#sessionTabs').querySelector('.session-tab.active')?.title === 'ProjA');
+  check('multi-session: a busy background tab shows a spinner', $('#sessionTabs').querySelector('.session-tab.busy .session-tab-spinner') !== null);
+
+  // Regression: a backend-initiated switch with NO prior click (e.g.
+  // opening a new tab, or closeSessionTab falling back to a sibling) must
+  // highlight the NEW tab on THIS FIRST sessionList render — not lag by one
+  // extra render. renderSessionTabs used to run BEFORE the activeSessionId
+  // correction below, so the strip rendered against the STALE id and stayed
+  // visually stuck on the old tab until some later, unrelated update
+  // happened to trigger a re-render (surfaced as "the blue active tab
+  // doesn't move until you click away and back").
+  send({ type: 'sessionList', sessionId: 'session-A', sessions: [
+    { id: 'session-A', name: 'ProjA', root: '/path/to/ProjA', busy: false, active: false },
+    { id: 'session-B', name: 'ProjB', root: '/path/to/ProjB', busy: true, active: false },
+    { id: 'session-New', name: 'New Chat', root: '/path/to/ProjA', busy: false, active: true },
+  ] });
+  check('multi-session: a backend-initiated switch (no prior click) highlights the NEW tab immediately',
+    $('#sessionTabs').querySelector('.session-tab.active')?.title === 'New Chat');
+  check('multi-session: the previously-active tab loses the highlight on that same render',
+    !$('#sessionTabs').querySelector('.session-tab[title="ProjA"]')?.classList.contains('active'));
+  // Restore the two-tab baseline the rest of this suite expects.
+  send({ type: 'sessionList', sessionId: 'session-A', sessions: [
+    { id: 'session-A', name: 'ProjA', root: '/path/to/ProjA', busy: false, active: true },
+    { id: 'session-B', name: 'ProjB', root: '/path/to/ProjB', busy: true, active: false },
+  ] });
+
+  // Clicking a different tab posts switchSessionTab and adopts it immediately
+  // (before the extension even responds).
+  window.__posted.length = 0;
+  const tabB = [...$('#sessionTabs').querySelectorAll('.session-tab')].find(t => t.title === 'ProjB');
+  tabB.click();
+  check('multi-session: clicking a tab posts switchSessionTab with its id',
+    window.__posted.some(m => m.type === 'switchSessionTab' && m.sessionId === 'session-B'));
+
+  // Now viewing session-B — a message still tagged for session-A (the tab we
+  // just left) belongs to a background turn and must not touch this thread.
+  const messageCountBefore = window.document.querySelectorAll('.message').length;
+  send({ type: 'chunk', text: 'INVISIBLEMARKERONE', sessionId: 'session-A' });
+  check('multi-session: a message tagged for a background tab does not touch the visible thread',
+    window.document.querySelectorAll('.message').length === messageCountBefore
+    && !window.document.body.textContent.includes('INVISIBLEMARKERONE'));
+
+  // A message tagged for the CURRENTLY active tab (session-B) is processed
+  // normally. Markdown rendering is throttled (150ms) and only force-flushed
+  // by 'done' — send that before checking, same as the earlier tests in this
+  // suite that check bubble text after a 'done'.
+  send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '', sessionId: 'session-B' });
+  send({ type: 'chunk', text: 'VISIBLEMARKERTWO', sessionId: 'session-B' });
+  send({ type: 'done', sessionId: 'session-B' });
+  check('multi-session: a message tagged for the active tab renders normally',
+    window.document.body.textContent.includes('VISIBLEMARKERTWO'));
+
+  // Close (✕) and new-tab (+) controls post their respective messages.
+  window.__posted.length = 0;
+  $('#sessionTabs .session-tab.active .session-tab-close')?.click();
+  check('multi-session: the close button posts closeSessionTab', window.__posted.some(m => m.type === 'closeSessionTab'));
+  window.__posted.length = 0;
+  $('#sessionTabs .session-tab-add')?.click();
+  check('multi-session: the + button posts newSessionTab', window.__posted.some(m => m.type === 'newSessionTab'));
+
+  // Regression: switching via a path OTHER than a tab click (the legacy
+  // dropdown, openFolder) never optimistically updates activeSessionId —
+  // only the tab strip's own click handler does that. Those paths instead
+  // rely on 'workspaceFolders' to correct this webview's notion of the
+  // active session — specifically from `sessionId` (the opaque session id,
+  // uniformly tagged on every message), NOT `current` (the project ROOT
+  // path, a completely different value used only to populate the dropdown).
+  // `current` is deliberately given a value that looks nothing like
+  // `sessionId` here, matching the real shape (session ids are generated,
+  // roots are filesystem paths) — a version of this fix that mixed the two
+  // fields up would still "accidentally" pass if they happened to be equal,
+  // which is exactly what happened once already. Without correctly reading
+  // `sessionId` here, activeSessionId would stay stuck on session-B and
+  // every subsequent message for session-C (chat restore, the dropdown's own
+  // update) would be wrongly gated out as "a background tab".
+  send({ type: 'workspaceFolders', sessionId: 'session-C', current: '/path/to/project-C', roots: ['/path/to/project-C'] });
+  send({ type: 'start', model: 'm', activeFile: '', activeLanguage: '', sessionId: 'session-C' });
+  send({ type: 'chunk', text: 'DROPDOWNSWITCHMARKER', sessionId: 'session-C' });
+  send({ type: 'done', sessionId: 'session-C' });
+  check('multi-session: a non-tab-click switch (workspaceFolders.sessionId, not .current) still updates the active session',
+    window.document.body.textContent.includes('DROPDOWNSWITCHMARKER'));
+
+  // Regression: a blank "New Chat" tab (current === '') must show an explicit
+  // placeholder in the project dropdown, not silently default to whatever
+  // the first real folder in the list happens to be.
+  send({ type: 'workspaceFolders', sessionId: 'session-C', current: '', roots: ['/path/to/project-C'] });
+  check('project dropdown: blank tab shows an explicit "select a project" placeholder, not the first real folder',
+    $('#projectSelect').value === '');
+
+  // Global catalog entries — "other projects Navy remembers" that aren't
+  // part of THIS window's workspace — render as a separate optgroup, and
+  // picking one routes through openCatalogProject (the open-here/add-to-
+  // workspace choice), never a direct setProjectRoot switch.
+  send({
+    type: 'workspaceFolders', sessionId: 'session-C', current: '/path/to/project-C',
+    roots: ['/path/to/project-C'], catalog: [{ path: '/path/to/other-proj', name: 'other-proj' }],
+  });
+  const catalogGroup = [...$('#projectSelect').querySelectorAll('optgroup')].find(g => g.label === 'Other projects');
+  check('project dropdown: catalog entries render in their own optgroup', Boolean(catalogGroup));
+  const catalogOption = catalogGroup?.querySelector('option');
+  check('project dropdown: catalog option is labeled by name, not the raw path', catalogOption?.textContent === 'other-proj');
+  check('project dropdown: catalog option value carries the real path (prefixed, so the change handler can tell it apart)',
+    catalogOption?.value === '__catalog__:/path/to/other-proj');
+
+  window.__posted.length = 0;
+  $('#projectSelect').value = catalogOption.value;
+  $('#projectSelect').dispatchEvent(new window.Event('change', { bubbles: true }));
+  const catalogPick = window.__posted.find(m => m.type === 'openCatalogProject');
+  check('project dropdown: picking a catalog entry posts openCatalogProject with the real (unprefixed) path',
+    catalogPick?.root === '/path/to/other-proj');
+  check('project dropdown: picking a catalog entry never posts a direct setProjectRoot',
+    !window.__posted.some(m => m.type === 'setProjectRoot'));
+
+  // Regression: an ordinary already-open root must still switch directly —
+  // the catalog branch above must not have hijacked the normal path.
+  window.__posted.length = 0;
+  $('#projectSelect').value = '/path/to/project-C';
+  $('#projectSelect').dispatchEvent(new window.Event('change', { bubbles: true }));
+  check('project dropdown: picking an already-open root still posts a direct setProjectRoot',
+    window.__posted.some(m => m.type === 'setProjectRoot' && m.root === '/path/to/project-C'));
+
+  // No catalog entries → no stray empty optgroup.
+  send({ type: 'workspaceFolders', sessionId: 'session-C', current: '/path/to/project-C', roots: ['/path/to/project-C'], catalog: [] });
+  check('project dropdown: no optgroup at all when the catalog is empty',
+    ![...$('#projectSelect').querySelectorAll('optgroup')].some(g => g.label === 'Other projects'));
 
   // The webview runs a permanent stall-detector interval (correct there — it
   // lives as long as the panel). Under jsdom that timer keeps node's event loop
@@ -724,7 +1020,1383 @@ async function semanticSearchSuite() {
   }
 }
 
-// ── 6c. check_syntax — real parsers, independent of any language extension ───
+// ── 6c. Retrieval upgrades — chunked embeddings + real LSP symbol blending ───
+async function retrievalUpgradesSuite() {
+  console.log('\nretrieval upgrades (chunked embeddings + LSP blend):');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+
+  // Chunking: a symbol buried well past the OLD single-file 1,500-char /
+  // one-window cutoff must now be findable by semantic search.
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-chunking-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    await vscode.workspace.getConfiguration().update('embeddingModel', 'fake-embed');
+    await vscode.workspace.getConfiguration().update('provider', 'ollama');
+
+    // 200 lines: filler lines are long enough (~50 chars each) that the
+    // marker function, placed at line 150, sits well past 1,500 chars into
+    // the file — unreachable by the pre-chunking single-slice embed. With
+    // 120-line windows / 20-line overlap it lands in the SECOND chunk
+    // (lines 101-200), never the first (1-120), so finding it proves multi-
+    // chunk indexing actually happened rather than being a lucky truncation.
+    const lines = [];
+    for (let i = 1; i <= 200; i++) {
+      lines.push(i === 150
+        ? 'function trackActiveUserSession(id){ registry.set(id, Date.now()); }'
+        : `// filler filler filler filler filler filler line ${i}`);
+    }
+    fs.writeFileSync(path.join(tmp, 'bigfile.js'), lines.join('\n'));
+
+    // Content-based fake embedder (not an exact-string lookup) so the test
+    // doesn't have to reproduce chunkFileForEmbedding's exact slicing math.
+    const vectorFor = (text) => {
+      if (text.includes('trackActiveUserSession')) return [0.9, 0.1, 0];
+      if (text.includes('logged-in user')) return [0.85, 0.15, 0]; // the query text
+      return [0, 0, 1]; // filler / unrelated chunks
+    };
+    const capturedTexts = [];
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      capturedTexts.push(...body.input);
+      return { ok: true, status: 200, json: async () => ({ embeddings: body.input.map(vectorFor) }) };
+    };
+
+    const out = await provider.toolFindRelevantFiles('how do we keep track of a logged-in user between requests', 5);
+    check('chunking: the marker line actually reached the embedder (proves the 1,500-char cutoff was bypassed)',
+      capturedTexts.some(t => t.includes('trackActiveUserSession')));
+    check('chunking: file containing a symbol past the old cutoff is now found via semantic search', out.includes('bigfile.js'));
+    check('chunking: reported hit points at the chunk that actually matched (lines 101-200), not the whole file',
+      /bigfile\.js.*semantic-match at lines 101-200/.test(out));
+  } catch (e) {
+    check('chunking suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    await vscode.workspace.getConfiguration().update('embeddingModel', '');
+    await vscode.workspace.getConfiguration().update('provider', 'ollama');
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    provider = null; tmp = null;
+  }
+
+  // LSP symbol blend: a real language-server definition surfaces a file with
+  // ZERO keyword overlap with the query, same as semantic search does — but
+  // needs no embeddingModel configured at all.
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-lspblend-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    await vscode.workspace.getConfiguration().update('embeddingModel', ''); // semantic search off — isolates the LSP path
+
+    fs.writeFileSync(path.join(tmp, 'helper-utils.js'), 'function unrelatedHelper(x){ return x*2; }');
+
+    // Query is a single distinctive identifier so _tokenizeQuery's top term
+    // is exactly this name (whole-identifier weight 2 beats any split part).
+    ctrl.nextWorkspaceSymbols = [{
+      name: 'AuthTokenValidator',
+      location: { uri: { fsPath: path.join(tmp, 'helper-utils.js') }, range: { start: { line: 0, character: 0 } } },
+    }];
+    const withLsp = await provider.toolFindRelevantFiles('AuthTokenValidator', 5);
+    check('LSP blend: a real language-server definition surfaces a file with no keyword overlap',
+      withLsp.includes('helper-utils.js'));
+    check('LSP blend: annotated as an LSP match, not a keyword/semantic guess', /helper-utils\.js.*LSP-defines/.test(withLsp));
+
+    // Negative control: same query, no language server answers this time —
+    // the file must NOT surface, proving the LSP data was what found it above.
+    ctrl.nextWorkspaceSymbols = null;
+    const withoutLsp = await provider.toolFindRelevantFiles('AuthTokenValidator', 5);
+    check('LSP blend: without a language-server answer, the same query does NOT surface the file',
+      !withoutLsp.includes('helper-utils.js'));
+  } catch (e) {
+    check('LSP symbol blend suite ran', false, e.stack || e.message);
+  } finally {
+    await vscode.workspace.getConfiguration().update('embeddingModel', '');
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+
+  // Repo-map symbol outline: buildRepoMap enriches code files with a
+  // function/class/method outline via the SAME real language-server
+  // infrastructure (executeDocumentSymbolProvider) the LSP blend above uses
+  // — not a new parser. Previously the map was pure filenames with zero
+  // symbol information, regardless of what language servers were active.
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-repomap-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    fs.writeFileSync(path.join(tmp, 'auth.js'), 'function login(){}\nfunction logout(){}\nconst x = 1;\n');
+    fs.writeFileSync(path.join(tmp, 'plain.txt'), 'not code');
+
+    const authPath = path.join(tmp, 'auth.js');
+    ctrl.nextDocumentSymbols = new Map([
+      [authPath, [
+        { name: 'login', kind: vscode.SymbolKind.Function },
+        { name: 'logout', kind: vscode.SymbolKind.Function },
+        { name: 'x', kind: vscode.SymbolKind.Variable }, // NOT "interesting" — must be filtered out
+      ]],
+    ]);
+    const map = await provider.buildRepoMap();
+    check('repo map: a code file is enriched with its function outline', /auth\.js.*— login, logout/.test(map));
+    check('repo map: uninteresting symbol kinds (variables/constants) are filtered out', !map.includes(', x'));
+    check('repo map: a file with no code extension is never queried and shows as a plain filename',
+      map.includes('plain.txt') && !/plain\.txt.*—/.test(map));
+
+    // Negative control: no language server answers at all — the map must be
+    // IDENTICAL in shape to the old plain-filename behavior, not broken.
+    provider._repoMapCache = null;
+    ctrl.nextDocumentSymbols = null;
+    const mapNoLsp = await provider.buildRepoMap();
+    check('repo map: with no language server, files show as plain filenames (unchanged behavior)',
+      mapNoLsp.includes('auth.js') && !mapNoLsp.includes(' — login'));
+
+    // A hung/slow provider must not stall the whole map build — and running
+    // the (capped, per-call time-boxed) fetches in parallel means the total
+    // cost stays close to ONE timeout window, not one per file.
+    provider._repoMapCache = null;
+    const realExecuteCommand = vscode.commands.executeCommand;
+    vscode.commands.executeCommand = async (cmd, ...args) => {
+      if (cmd === 'vscode.executeDocumentSymbolProvider') return new Promise(() => {}); // never resolves
+      return realExecuteCommand(cmd, ...args);
+    };
+    const t0 = Date.now();
+    const mapHung = await provider.buildRepoMap();
+    const elapsed = Date.now() - t0;
+    vscode.commands.executeCommand = realExecuteCommand;
+    check('repo map: a hung language server does not stall the map build past its timeout', elapsed < 2000, elapsed + 'ms');
+    check('repo map: still returns a usable map despite the hang', mapHung.includes('auth.js'));
+  } catch (e) {
+    check('repo map symbol outline suite ran', false, e.stack || e.message);
+  } finally {
+    ctrl.nextDocumentSymbols = null;
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6e. Command-execution sandboxing (navy.sandboxMode) ───────────────────
+async function sandboxSuite() {
+  console.log('\ncommand-execution sandboxing (navy.sandboxMode):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+
+  // Pure: stripJsonComments must not mistake a comment marker inside a quoted
+  // string (e.g. a URL) for a real comment, and must strip real // and /* */
+  // comments so devcontainer.json (which commonly has them) parses as JSON.
+  {
+    const stripJsonComments = eval('(' + extractFunction(extSrc, 'function stripJsonComments') + ')');
+    const withComments = '{\n  // a line comment\n  "image": "foo:latest", /* inline */\n  "url": "https://example.com" // trailing\n}';
+    let parsed;
+    check('stripJsonComments: result still parses as JSON', (() => { try { parsed = JSON.parse(stripJsonComments(withComments)); return true; } catch { return false; } })());
+    check('stripJsonComments: real values survive', parsed?.image === 'foo:latest');
+    check('stripJsonComments: "//" inside a quoted string is NOT treated as a comment', parsed?.url === 'https://example.com');
+  }
+
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sandbox-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // sandboxMode 'off' (default) — must not even ask whether Docker is
+    // available; a passthrough that touches Docker at all would add latency
+    // to every command for the overwhelming majority of users who never
+    // enable this.
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'off');
+    let dockerAvailableCalled = false;
+    provider._dockerAvailable = async () => { dockerAvailableCalled = true; return true; };
+    const passthrough = await provider._maybeWrapForSandbox({ bin: 'echo', args: ['hi'], cwd: tmp, verbatim: false });
+    check('sandboxMode off: bin/args/cwd returned completely unchanged',
+      passthrough.bin === 'echo' && passthrough.args.length === 1 && passthrough.args[0] === 'hi' && passthrough.cwd === tmp);
+    check('sandboxMode off: never even checks Docker availability', !dockerAvailableCalled);
+
+    // sandboxMode 'docker' + Docker not available → refuses, never falls
+    // back to running unsandboxed (that would be a false sense of safety).
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'docker');
+    provider._dockerAvailable = async () => false;
+    const noDocker = await provider._maybeWrapForSandbox({ bin: 'echo', args: ['hi'], cwd: tmp, verbatim: false });
+    check('sandboxMode docker + Docker not running: refuses', noDocker.refused === true);
+    check('sandboxMode docker + Docker not running: message is actionable', /Docker is not installed or not running/.test(noDocker.message));
+
+    // sandboxMode 'docker' + Docker available but no devcontainer/Dockerfile
+    // → refuses rather than guessing at a generic image.
+    provider._dockerAvailable = async () => true;
+    provider._resolveSandboxImage = async () => null;
+    const noConfig = await provider._maybeWrapForSandbox({ bin: 'echo', args: ['hi'], cwd: tmp, verbatim: false });
+    check('sandboxMode docker + no devcontainer/Dockerfile: refuses', noConfig.refused === true);
+    check('sandboxMode docker + no devcontainer/Dockerfile: message names the missing config',
+      /devcontainer\.json or Dockerfile/.test(noConfig.message));
+
+    // sandboxMode 'docker' + an image resolved → rewrites the spawn target
+    // to run inside it, with only the project folder mounted.
+    provider._resolveSandboxImage = async () => ({ image: 'my-project-image' });
+    const wrapped = await provider._maybeWrapForSandbox({ bin: 'bash', args: ['-c', 'echo hi'], cwd: tmp, verbatim: false });
+    check('sandboxMode docker + image resolved: bin becomes docker', wrapped.bin === 'docker');
+    check('sandboxMode docker + image resolved: mounts exactly the project root read-write at /workspace',
+      wrapped.args.includes('-v') && wrapped.args[wrapped.args.indexOf('-v') + 1] === `${tmp}:/workspace`);
+    check('sandboxMode docker + image resolved: working directory is the mounted path',
+      wrapped.args.includes('-w') && wrapped.args[wrapped.args.indexOf('-w') + 1] === '/workspace');
+    check('sandboxMode docker + image resolved: uses the resolved image', wrapped.args.includes('my-project-image'));
+    check('sandboxMode docker + image resolved: original bin/args are appended after the image',
+      wrapped.args.slice(-3).join(' ') === 'bash -c echo hi');
+    check('sandboxMode docker + image resolved: container is removed on exit (--rm)', wrapped.args.includes('--rm'));
+
+    // _spawnAndCollect must actually route through _maybeWrapForSandbox and
+    // surface a refusal as its result — never silently spawn unsandboxed.
+    provider._maybeWrapForSandbox = async () => ({ refused: true, message: 'REFUSED_FOR_TEST' });
+    const spawnResult = await provider._spawnAndCollect('echo', ['hi'], tmp, 5000);
+    check('_spawnAndCollect: a sandbox refusal is returned directly, nothing is spawned', spawnResult === 'REFUSED_FOR_TEST');
+
+    // Real filesystem resolution (no Docker needed): a devcontainer.json that
+    // declares "image" directly resolves without ever needing to build.
+    delete provider._resolveSandboxImage; // restore the real implementation
+    const dcDir = path.join(tmp, '.devcontainer');
+    fs.mkdirSync(dcDir);
+    fs.writeFileSync(path.join(dcDir, 'devcontainer.json'), '{\n  // comment devcontainer.json commonly has\n  "image": "node:20"\n}');
+    const resolvedDirect = await provider._resolveSandboxImage(tmp);
+    check('_resolveSandboxImage: devcontainer.json with "image" resolves directly (no build)', resolvedDirect?.image === 'node:20');
+
+    // No devcontainer, no Dockerfile at all → null, not a guessed image.
+    fs.rmSync(dcDir, { recursive: true, force: true });
+    const resolvedNone = await provider._resolveSandboxImage(tmp);
+    check('_resolveSandboxImage: no devcontainer/Dockerfile → null (never guesses a generic image)', resolvedNone === null);
+
+    // ── _resolveSandboxImage caches per project root (a `docker build`
+    // round-trip otherwise repeats before EVERY sandboxed command) —
+    // invalidated by the config file's mtime, not just its presence.
+    {
+      fs.mkdirSync(dcDir, { recursive: true });
+      fs.writeFileSync(path.join(dcDir, 'devcontainer.json'), '{"image": "node:20"}');
+
+      let uncachedCalls = 0;
+      const origUncached = provider._resolveSandboxImageUncached.bind(provider);
+      provider._resolveSandboxImageUncached = async (root) => { uncachedCalls++; return origUncached(root); };
+
+      const first = await provider._resolveSandboxImage(tmp);
+      const second = await provider._resolveSandboxImage(tmp);
+      check('_resolveSandboxImage: caches — a second call for the SAME unchanged project does not re-resolve',
+        uncachedCalls === 1 && first?.image === 'node:20' && second?.image === 'node:20');
+
+      // A real mtime change (not just content) must invalidate the cache.
+      const newTime = new Date(Date.now() + 5000);
+      fs.writeFileSync(path.join(dcDir, 'devcontainer.json'), '{"image": "node:22"}');
+      fs.utimesSync(path.join(dcDir, 'devcontainer.json'), newTime, newTime);
+      const third = await provider._resolveSandboxImage(tmp);
+      check('_resolveSandboxImage: editing the devcontainer invalidates the cache',
+        uncachedCalls === 2 && third?.image === 'node:22');
+
+      provider._resolveSandboxImageUncached = origUncached;
+      fs.rmSync(dcDir, { recursive: true, force: true });
+    }
+
+    // sandbox label suffix reflects the raw setting, shown in approval cards.
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'off');
+    check('_sandboxLabelSuffix: empty when off', provider._sandboxLabelSuffix() === '');
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'docker');
+    check('_sandboxLabelSuffix: shown when docker mode is set', provider._sandboxLabelSuffix() === ' (sandboxed)');
+  } catch (e) {
+    check('sandbox suite ran', false, e.stack || e.message);
+  } finally {
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'off');
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── Missing-path hint on command failure (_spawnAndCollect) ────────────────
+// A model that guesses a wrong path/filename and retries with a different
+// guess, over and over, never converges — the real name has to actually be
+// looked up. This nudges toward that instead of letting the retry loop run
+// unbounded. No hardcoding to any one scenario: the detector is a general
+// "does this output look like an OS/toolchain path-not-found error" pattern
+// match, exercised here against synthetic text AND real spawned processes.
+async function missingPathHintSuite() {
+  console.log('\nmissing-path hint on command failure:');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+
+  // Pure: the detector itself, against a range of real OS/toolchain error
+  // phrasings — including one taken verbatim from a live cross-compiler
+  // failure, not just cmd.exe's own errors — and clear negatives that must
+  // NOT trigger it (a genuine compile/logic error, a bare non-zero exit).
+  {
+    const looksLikeMissingPathError = eval('(' + extractFunction(extSrc, 'function looksLikeMissingPathError') + ')');
+    const positives = [
+      'The system cannot find the file specified.',
+      'The system cannot find the path specified.',
+      'The filename, directory name, or volume label syntax is incorrect.',
+      "'gcc' is not recognized as an internal or external command, operable program or batch file.",
+      "cc1.exe: fatal error: c:\\Users\\x\\Downloads\\hexdumb\\pe-any.c: No such file or directory\ncompilation terminated.",
+      'bash: fooo: command not found',
+      'ls: cannot access /nope: No such file or directory',
+    ];
+    for (const text of positives) {
+      check('looksLikeMissingPathError: detects — ' + JSON.stringify(text.slice(0, 40)) + '…', looksLikeMissingPathError(text));
+    }
+    const negatives = [
+      "error: expected ';' before '}' token",
+      'AssertionError: expected 2 to equal 3',
+      '',
+      'Exit code: 1\nstdout:\n\nstderr:\n',
+      'warning: unused variable \'x\'',
+    ];
+    for (const text of negatives) {
+      check('looksLikeMissingPathError: does NOT flag — ' + JSON.stringify(text.slice(0, 40)), !looksLikeMissingPathError(text));
+    }
+  }
+
+  // Real end-to-end, via a genuine spawned process through toolRunCommand —
+  // not a mock of the spawn layer.
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-missingpath-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    ctrl.config.approvalMode = 'auto-approve';
+    const isWin = process.platform === 'win32';
+
+    const missing = path.join(tmp, 'definitely-does-not-exist-' + Date.now());
+    const notFoundCmd = isWin ? `dir "${missing}"` : `ls "${missing}"`;
+    const notFoundResult = await provider.toolRunCommand(notFoundCmd, 10000);
+    check('toolRunCommand: a real not-found path gets the hint appended', /Navy: this looks like a path\/file\/command/.test(notFoundResult));
+    check('toolRunCommand: the hint tells it to list the parent, not guess again', /do not guess again/.test(notFoundResult));
+
+    const okCmd = isWin ? 'echo real-success-marker' : 'echo real-success-marker';
+    const okResult = await provider.toolRunCommand(okCmd, 10000);
+    check('toolRunCommand: a real successful command gets NO hint', !/Navy: this looks like/.test(okResult));
+
+    const badExitCmd = isWin ? 'exit 3' : 'exit 3';
+    const badExitResult = await provider.toolRunCommand(badExitCmd, 10000);
+    check('toolRunCommand: a real non-path failure (bad exit code, no path text) gets NO hint', !/Navy: this looks like/.test(badExitResult));
+  } catch (e) {
+    check('missing-path hint suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── Persistent background processes (navy.persistBackgroundProcesses) ──────
+async function persistentBgProcessSuite() {
+  console.log('\npersistent background processes (navy.persistBackgroundProcesses):');
+  const os = require('os');
+  const { spawn: nodeSpawn } = require('child_process');
+  const { vscode, ctrl } = sharedMock();
+
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // Off by default, and reflects the setting once toggled — this is the
+    // gate every persist-mode branch below is behind.
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
+    check('_persistBgEnabled: off by default', provider._persistBgEnabled() === false);
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', true);
+    check('_persistBgEnabled: true once the setting is turned on', provider._persistBgEnabled() === true);
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
+
+    // Manifest round-trip on the real filesystem (.navy/bg-processes.json).
+    await provider._addToBgManifest(tmp, { id: 'a', pid: 111, command: 'cmd-a', startedAt: 1 });
+    await provider._addToBgManifest(tmp, { id: 'b', pid: 222, command: 'cmd-b', startedAt: 2 });
+    let manifest = await provider._readBgManifest(tmp);
+    check('manifest: two added records both persisted to disk', manifest.length === 2);
+    await provider._removeFromBgManifest(tmp, 111);
+    manifest = await provider._readBgManifest(tmp);
+    check('manifest: removeFromBgManifest drops only the matching pid', manifest.length === 1 && manifest[0].pid === 222);
+    check('manifest: file actually exists on disk at .navy/bg-processes.json', fs.existsSync(path.join(tmp, '.navy', 'bg-processes.json')));
+    await provider._writeBgManifest(tmp, []); // reset for later tests
+
+    // _pidAlive: true for a pid that definitely exists (this test process
+    // itself), false for one that has genuinely already exited.
+    check('_pidAlive: true for this process\'s own pid', provider._pidAlive(process.pid) === true);
+    const shortLived = nodeSpawn('node', ['-e', ''], { cwd: tmp });
+    const deadPid = await new Promise(res => shortLived.on('exit', () => res(shortLived.pid)));
+    check('_pidAlive: false for a pid that has already exited', provider._pidAlive(deadPid) === false);
+
+    // _disposeSession must NEVER kill a persist:true entry (that's the whole
+    // point of the setting) but must still kill an ordinary one — the single
+    // most safety-critical invariant of this feature.
+    {
+      const killed = [];
+      provider._killProcessTree = (proc) => killed.push(proc.pid);
+      const fakeSession = {
+        _heartbeat: undefined, _watchdog: undefined, _cpSaveTimer: undefined,
+        bgProcesses: new Map([
+          ['persisted', { proc: { pid: 9001, killed: false }, persist: true }],
+          ['ordinary', { proc: { pid: 9002, killed: false }, persist: false }],
+        ]),
+        bgWorkers: new Map(),
+      };
+      provider._disposeSession(fakeSession);
+      check('_disposeSession: a persist:true entry is left running, never killed', !killed.includes(9001));
+      check('_disposeSession: an ordinary (non-persist) entry is still killed as before', killed.includes(9002));
+    }
+    delete provider._killProcessTree; // restore the real implementation for what follows
+
+    // toolStartProcess/toolRunProject always run the command through
+    // `cmd /c <string>` on Windows (existing, unrelated behavior — unchanged
+    // by this feature). cmd.exe's own argument parsing mishandles a string
+    // with quotes NESTED inside its outer quoting (verified directly: `cmd
+    // /c "node -e \"console.log(1)\""` silently produces no output at all)
+    // — a real, pre-existing Windows quirk of the shell-string path itself,
+    // not something this feature changes. Sidestep it in these tests the
+    // same way a real script would: write the code to a file with no spaces
+    // in its path and run `node <path>`, so no quoting is needed at all.
+    const writeNodeScript = (name, code) => {
+      const p = path.join(tmp, name);
+      fs.writeFileSync(p, code);
+      return `node ${p}`;
+    };
+
+    // ── Real end-to-end: persist mode ON ──────────────────────────────────
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', true);
+    ctrl.config.approvalMode = 'auto-approve';
+    const marker = 'BGPERSIST_MARKER_' + Date.now();
+    const startResult = await provider.toolStartProcess('logger', writeNodeScript('logger.js', `console.log('${marker}');`));
+    check('toolStartProcess (persist on): reports detached + survives-reload', /detached/.test(startResult) && /survive a window reload/.test(startResult));
+    const entry = provider.bgProcesses.get('logger');
+    check('toolStartProcess (persist on): entry is marked persist:true', entry?.persist === true);
+    check('toolStartProcess (persist on): entry has a real logPath', typeof entry?.logPath === 'string' && entry.logPath.length > 0);
+
+    manifest = await provider._readBgManifest(tmp);
+    check('toolStartProcess (persist on): manifest gained a record for it', manifest.some(r => r.id === 'logger' && r.pid === entry.pid));
+
+    // Wait for the real child to actually finish and write its output.
+    for (let i = 0; i < 50 && provider.bgProcesses.get('logger')?.proc; i++) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    check('toolStartProcess (persist on): the real process actually exited on its own', provider.bgProcesses.get('logger')?.proc == null);
+
+    const readBack = await provider.toolReadProcessOutput('logger');
+    check('toolReadProcessOutput (persist on): reads the real log file, containing the marker', readBack.includes(marker));
+    check('toolReadProcessOutput (persist on): labels the output as persisted', /persisted — logged to/.test(readBack));
+
+    manifest = await provider._readBgManifest(tmp);
+    check('toolStartProcess (persist on): manifest entry removed once the process exits naturally', !manifest.some(r => r.id === 'logger'));
+
+    // ── readFileTail: a genuinely large log returns just the tail, not the ──
+    // whole file (the actual fix — a synchronous full-file read scales with
+    // how much a chatty dev server has ever logged, not with what's asked for).
+    {
+      const bigLogPath = path.join(tmp, 'big-tail-test.log');
+      const headMarker = 'HEAD_MARKER_SHOULD_NOT_APPEAR_IN_TAIL';
+      const filler = 'x'.repeat(50000);
+      const tailMarker = 'TAIL_MARKER_' + Date.now();
+      fs.writeFileSync(bigLogPath, headMarker + filler + filler + filler + filler + tailMarker); // ~200KB, distinct markers at each end
+      const readFileTail = new Function('fs', extractFunction(extSrc, 'function readFileTail') + '\nreturn readFileTail;')(fs);
+      const tail = readFileTail(bigLogPath, 100);
+      check('readFileTail: returns a bounded slice, not the whole (~200KB) file', tail.length <= 100);
+      check('readFileTail: the slice is the REAL tail — contains the marker at the very end', tail.includes(tailMarker));
+      check('readFileTail: does not contain the marker from the start of the file', !tail.includes(headMarker));
+      try { fs.rmSync(bigLogPath, { force: true }); } catch {}
+    }
+
+    // ── Real end-to-end: persist mode OFF (default) — unchanged behavior ──
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
+    const marker2 = 'NOPERSIST_MARKER_' + Date.now();
+    await provider.toolStartProcess('logger2', writeNodeScript('logger2.js', `console.log('${marker2}');`));
+    const entry2 = provider.bgProcesses.get('logger2');
+    check('toolStartProcess (persist off): entry has no persist flag', !entry2?.persist);
+    check('toolStartProcess (persist off): entry has no logPath (uses the in-memory buffer as before)', !entry2?.logPath);
+    for (let i = 0; i < 50 && provider.bgProcesses.get('logger2')?.proc; i++) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const readBack2 = await provider.toolReadProcessOutput('logger2');
+    check('toolReadProcessOutput (persist off): still reads the live in-memory buffer, not a log file', readBack2.includes(marker2) && !/persisted/.test(readBack2));
+
+    // ── toolKillProcess on a persisted entry also cleans the manifest ─────
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', true);
+    await provider.toolStartProcess('longrun', writeNodeScript('longrun.js', 'setInterval(()=>{}, 1000);'));
+    const longEntry = provider.bgProcesses.get('longrun');
+    manifest = await provider._readBgManifest(tmp);
+    check('toolKillProcess setup: long-running persisted process is in the manifest before killing', manifest.some(r => r.id === 'longrun'));
+    const killMsg = await provider.toolKillProcess('longrun');
+    check('toolKillProcess: reports success', /killed/i.test(killMsg));
+    manifest = await provider._readBgManifest(tmp);
+    check('toolKillProcess: removes the persisted entry from the manifest too, not just bgProcesses', !manifest.some(r => r.id === 'longrun'));
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
+
+    // ── _withBgManifestLock genuinely serializes concurrent callers for the
+    // SAME project (sibling chat tabs can legitimately start/stop persisted
+    // processes at the same time — this is the actual fix for the lost-
+    // update race review found). Proven via ordering markers, same
+    // deterministic style as the global-catalog lock's own test.
+    await provider._writeBgManifest(tmp, []);
+    {
+      const order = [];
+      const p1 = provider._withBgManifestLock(tmp, async () => {
+        order.push('1-start');
+        await new Promise(r => setTimeout(r, 30));
+        order.push('1-end');
+      });
+      const p2 = provider._withBgManifestLock(tmp, async () => {
+        order.push('2-start');
+        order.push('2-end');
+      });
+      await Promise.all([p1, p2]);
+      check('_withBgManifestLock: a second caller never starts before the first finishes',
+        order.join(',') === '1-start,1-end,2-start,2-end');
+    }
+
+    // A DIFFERENT project's lock must be independent — one project's slow
+    // manifest write must never delay an unrelated project's.
+    {
+      const tmpOther = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-other-'));
+      const order = [];
+      const pSlow = provider._withBgManifestLock(tmp, async () => {
+        order.push('tmp-start');
+        await new Promise(r => setTimeout(r, 40));
+        order.push('tmp-end');
+      });
+      const pOther = provider._withBgManifestLock(tmpOther, async () => {
+        order.push('other-start');
+        order.push('other-end');
+      });
+      await Promise.all([pSlow, pOther]);
+      check('_withBgManifestLock: a different project is not serialized behind this one',
+        order.indexOf('other-start') < order.indexOf('tmp-end'));
+      try { fs.rmSync(tmpOther, { recursive: true, force: true }); } catch {}
+    }
+
+    // ── _addToBgManifest: concurrent calls for the SAME project must not
+    // lose either record — the actual bug found in review.
+    {
+      await provider._writeBgManifest(tmp, []);
+      await Promise.all([
+        provider._addToBgManifest(tmp, { id: 'concurrent-a', pid: 111111, command: 'a', startedAt: 1 }),
+        provider._addToBgManifest(tmp, { id: 'concurrent-b', pid: 222222, command: 'b', startedAt: 2 }),
+      ]);
+      const concurrentManifest = await provider._readBgManifest(tmp);
+      check('_addToBgManifest: two concurrent adds to the same project both survive',
+        concurrentManifest.some(r => r.id === 'concurrent-a') && concurrentManifest.some(r => r.id === 'concurrent-b'));
+    }
+
+    // ── _checkOrphanedBgProcesses: the "found leftovers from last time" flow ─
+    {
+      const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-orphan-'));
+      // startedAt must be the REAL spawn time, exactly as production records
+      // it: _classifyBgRecord verifies the pid's actual start time against it
+      // so a recycled pid is never mistaken for ours (and never killed).
+      const aliveStartedAt = Date.now();
+      const stillAlive = nodeSpawn('node', ['-e', 'setInterval(()=>{}, 1000)'], { cwd: tmp2 });
+      await new Promise(r => setTimeout(r, 100)); // let it actually start
+      const alreadyDead = nodeSpawn('node', ['-e', ''], { cwd: tmp2 });
+      const deadPid2 = await new Promise(res => alreadyDead.on('exit', () => res(alreadyDead.pid)));
+
+      await provider._writeBgManifest(tmp2, [
+        { id: 'alive-one', pid: stillAlive.pid, command: 'sleeper', startedAt: aliveStartedAt },
+        { id: 'dead-one', pid: deadPid2, command: 'gone', startedAt: aliveStartedAt },
+      ]);
+
+      const killedPids = [];
+      provider._killPidTree = (pid) => killedPids.push(pid);
+      ctrl.shown.warning = [];
+      ctrl.nextWarning = 'Stop All';
+      await provider._checkOrphanedBgProcesses(tmp2);
+
+      check('_checkOrphanedBgProcesses: prompts exactly once, naming the survivor', ctrl.shown.warning.length === 1 && /alive-one/.test(ctrl.shown.warning[0]));
+      check('_checkOrphanedBgProcesses: the already-dead entry is silently pruned, never named in the prompt', !/dead-one/.test(ctrl.shown.warning[0] || ''));
+      check('_checkOrphanedBgProcesses: "Stop All" kills the surviving pid', killedPids.includes(stillAlive.pid));
+      const manifestAfter = await provider._readBgManifest(tmp2);
+      check('_checkOrphanedBgProcesses: manifest is emptied after Stop All', manifestAfter.length === 0);
+      // _killPidTree was stubbed above to observe the call without a real kill —
+      // stillAlive's setInterval never clears on its own, so it must be reaped
+      // for real here or it outlives this whole test process.
+      try { process.kill(stillAlive.pid); } catch {}
+
+      // Re-checking the SAME root this window must not prompt again.
+      await provider._writeBgManifest(tmp2, [{ id: 'again', pid: process.pid, command: 'x', startedAt: 1 }]);
+      ctrl.shown.warning = [];
+      await provider._checkOrphanedBgProcesses(tmp2);
+      check('_checkOrphanedBgProcesses: does not re-prompt for a root already checked this window', ctrl.shown.warning.length === 0);
+
+      // "Leave Running" leaves the manifest and the process alone.
+      const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-orphan2-'));
+      const alive2StartedAt = Date.now();
+      const stillAlive2 = nodeSpawn('node', ['-e', 'setInterval(()=>{}, 1000)'], { cwd: tmp3 });
+      await new Promise(r => setTimeout(r, 100));
+      await provider._writeBgManifest(tmp3, [{ id: 'keep-me', pid: stillAlive2.pid, command: 'sleeper', startedAt: alive2StartedAt }]);
+      const killedPids2 = [];
+      provider._killPidTree = (pid) => killedPids2.push(pid);
+      ctrl.nextWarning = 'Leave Running';
+      await provider._checkOrphanedBgProcesses(tmp3);
+      check('_checkOrphanedBgProcesses: "Leave Running" kills nothing', killedPids2.length === 0);
+      const manifestAfter3 = await provider._readBgManifest(tmp3);
+      check('_checkOrphanedBgProcesses: "Leave Running" keeps the manifest entry', manifestAfter3.length === 1);
+
+      delete provider._killPidTree;
+      try { process.kill(stillAlive2.pid); } catch {}
+
+      // ── PID reuse: a live pid whose start time does NOT match the record is
+      // a DIFFERENT process that inherited the number. It must never be
+      // killed — this gate sits directly in front of `taskkill /F /T`.
+      {
+        const startedNow = Date.now();
+        const impostor = nodeSpawn('node', ['-e', 'setInterval(()=>{}, 1000)'], { cwd: tmp3 });
+        await new Promise(r => setTimeout(r, 100));
+        check('_classifyBgRecord: matching start time → "ours"',
+          (await provider._classifyBgRecord({ pid: impostor.pid, startedAt: startedNow })) === 'ours');
+        check('_classifyBgRecord: recycled pid (start time far off) → "gone", never killed',
+          (await provider._classifyBgRecord({ pid: impostor.pid, startedAt: startedNow - 86400000 })) === 'gone');
+        check('_classifyBgRecord: legacy record with no startedAt → "unverified", never killed',
+          (await provider._classifyBgRecord({ pid: impostor.pid })) === 'unverified');
+        check('_classifyBgRecord: a pid that is simply gone → "gone"',
+          (await provider._classifyBgRecord({ pid: deadPid2, startedAt: startedNow })) === 'gone');
+
+        // An unverifiable-but-live record is reported, kept in the manifest,
+        // and left strictly alone — dropping it would leak a real orphan.
+        const tmp4 = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-orphan3-'));
+        await provider._writeBgManifest(tmp4, [{ id: 'legacy', pid: impostor.pid, command: 'legacy-entry' }]);
+        const killedPids3 = [];
+        provider._killPidTree = (pid) => killedPids3.push(pid);
+        ctrl.shown.warning = [];
+        ctrl.nextWarning = 'Stop All'; // even if the user would say yes, there is nothing to say yes TO
+        await provider._checkOrphanedBgProcesses(tmp4);
+        check('_checkOrphanedBgProcesses: an unverifiable live record is never killed', killedPids3.length === 0);
+        check('_checkOrphanedBgProcesses: it is reported rather than silently ignored',
+          ctrl.shown.warning.length === 1 && /could not verify/.test(ctrl.shown.warning[0]));
+        check('_checkOrphanedBgProcesses: an unverifiable record stays in the manifest',
+          (await provider._readBgManifest(tmp4)).length === 1);
+        delete provider._killPidTree;
+        try { process.kill(impostor.pid); } catch {}
+        try { fs.rmSync(tmp4, { recursive: true, force: true }); } catch {}
+      }
+
+      try { fs.rmSync(tmp2, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(tmp3, { recursive: true, force: true }); } catch {}
+    }
+  } catch (e) {
+    check('persistent background process suite ran', false, e.stack || e.message);
+  } finally {
+    await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6f. Multi-root workspace awareness ──────────────────────────────────────
+async function multiRootSuite() {
+  console.log('\nmulti-root workspace awareness:');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  const uriOf = (p) => ({ fsPath: p, scheme: 'file', path: p, toString: () => p });
+
+  let provider, dirA, dirB;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rootA-'));
+    dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rootB-'));
+    provider = new NavyCoderViewProvider(makeContext(dirA));
+    provider.projectRoot = dirA;
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }, { uri: uriOf(dirB) }];
+
+    fs.writeFileSync(path.join(dirA, 'a.js'), 'function fromA(){ return 1; }');
+    fs.writeFileSync(path.join(dirB, 'b.js'), 'function fromB(){ return 2; }');
+
+    // resolveWorkspacePath: a path inside a SIBLING open folder (not the
+    // active projectRoot) is legitimate in a multi-root workspace, not a
+    // traversal attempt.
+    const resolvedSibling = provider.resolveWorkspacePath(path.join(dirB, 'b.js'));
+    check('resolveWorkspacePath: accepts a path inside a sibling open folder', resolvedSibling === path.join(dirB, 'b.js'));
+
+    // A path outside EVERY open folder must still be refused.
+    const dirC = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rootC-'));
+    let threw = false;
+    try { provider.resolveWorkspacePath(path.join(dirC, 'x.js')); } catch { threw = true; }
+    check('resolveWorkspacePath: still refuses a path outside every open folder', threw);
+    fs.rmSync(dirC, { recursive: true, force: true });
+
+    // Existing single-root behavior is unaffected: a relative path still
+    // resolves against the active projectRoot.
+    check('resolveWorkspacePath: relative paths still resolve against the active project root',
+      provider.resolveWorkspacePath('a.js') === path.join(dirA, 'a.js'));
+
+    // _resolveTargetFolder: matches by full path or by folder basename.
+    check('_resolveTargetFolder: matches a sibling folder by full path', provider._resolveTargetFolder(dirB).root === dirB);
+    check('_resolveTargetFolder: matches a sibling folder by basename', provider._resolveTargetFolder(path.basename(dirB)).root === dirB);
+    check('_resolveTargetFolder: no folder argument falls back to the active project', provider._resolveTargetFolder(undefined).root === dirA);
+    const noMatch = provider._resolveTargetFolder('this-folder-does-not-exist');
+    check('_resolveTargetFolder: an unmatched name returns an actionable error, not a silent fallback', Boolean(noMatch.error));
+
+    // search_files/search_codebase/find_relevant_files: folder argument
+    // actually redirects the search, not just accepted-and-ignored.
+    const searchFilesB = await provider.toolSearchFiles('fromB', dirB);
+    check('search_files: folder argument searches the sibling folder', searchFilesB.includes('b.js'));
+    const searchFilesA = await provider.toolSearchFiles('fromB');
+    check('search_files: omitting folder still searches only the active project', !searchFilesA.includes('b.js'));
+
+    const searchCodebaseB = await provider.toolSearchCodebase('fromB', null, 2, dirB);
+    check('search_codebase: folder argument searches the sibling folder', searchCodebaseB.includes('b.js'));
+
+    const relevantB = await provider.toolFindRelevantFiles('fromB function', 5, dirB);
+    check('find_relevant_files: folder argument ranks files from the sibling folder', relevantB.includes('b.js'));
+    check('find_relevant_files: an unmatched folder name returns an actionable error',
+      (await provider.toolFindRelevantFiles('anything', 5, 'nope-not-a-folder')).includes('does not match any open workspace folder'));
+
+    // buildRepoMap: sibling-folder hint appears only when more than one
+    // folder is actually open.
+    const mapMulti = await provider.buildRepoMap();
+    check('buildRepoMap: notes sibling open folders exist', mapMulti.includes('Other open folders') && mapMulti.includes(dirB));
+
+    provider._repoMapCache = null; // bypass the 30s cache for the single-root re-check
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    const mapSingle = await provider.buildRepoMap();
+    check('buildRepoMap: no sibling-folder hint when only one folder is open (unchanged single-root behavior)',
+      !mapSingle.includes('Other open folders'));
+  } catch (e) {
+    check('multi-root suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) clearTimeout(provider._cpSaveTimer);
+    vscode.workspace.workspaceFolders = undefined;
+    try { if (dirA) fs.rmSync(dirA, { recursive: true, force: true }); } catch {}
+    try { if (dirB) fs.rmSync(dirB, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6g. Session isolation (per-project state extracted into a Session class) ─
+// Every existing suite above already exercises the getter/setter proxies
+// indiscriminately (they ran unmodified against the new Session-backed
+// provider), which is the main proof this refactor preserves behavior. These
+// tests target what's actually NEW: switching projectRoot must retain each
+// session's in-memory state independently rather than resetting or sharing it.
+async function sessionIsolationSuite() {
+  console.log('\nsession isolation (Session class extraction):');
+  const os = require('os');
+  sharedMock();
+
+  let provider, dirA, dirB;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sessA-'));
+    dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sessB-'));
+    provider = new NavyCoderViewProvider(makeContext(dirA));
+
+    // Tabs are identified by a generated id, not by project root (a tab can
+    // exist before any project is assigned) — openNewSessionTab creates one
+    // and switchSessionTab(id) moves between them, mirroring the real UI flow.
+    const sessionA = provider.activeSessionId; // the default tab created by the constructor
+    provider.projectRoot = dirA;
+    provider.messages = [{ role: 'user', text: 'hello from A' }];
+    provider.isBusy = true;
+    provider.checkpoints.push({ kind: 'edit', filePath: path.join(dirA, 'f.js'), originalText: 'old' });
+    const writeLockA = provider._writeLock;
+    const bgProcessesA = provider.bgProcesses;
+
+    // A brand-new tab must start with a completely fresh session, not leak
+    // A's messages/busy-flag/checkpoints/locks into it.
+    await provider.openNewSessionTab();
+    const sessionB = provider.activeSessionId;
+    check('opening a new tab: gets its own distinct session id', sessionB !== sessionA);
+    provider.projectRoot = dirB;
+    check('new tab: messages start empty, not leaked from the previous session', provider.messages.length === 0);
+    check('new tab: isBusy resets, not leaked from the previous session', provider.isBusy === false);
+    check('new tab: checkpoints start empty, not leaked from the previous session', provider.checkpoints.length === 0);
+    check('new tab: bgProcesses is a SEPARATE Map instance, not shared with the previous session',
+      provider.bgProcesses !== bgProcessesA);
+    check('new tab: _writeLock is a SEPARATE lock chain, so a write in one project can never queue behind a write in the other',
+      provider._writeLock !== writeLockA);
+
+    // Switching BACK must retain A's state exactly as it was left — this is
+    // the actual point of extracting Session objects instead of just
+    // resetting everything on every switch. Uses activeSessionId directly
+    // (not switchSessionTab, which does real disk I/O via loadProjectSession
+    // — appropriate for the real UI flow, but this test targets the pure
+    // in-memory Session mechanics, same as the plain projectRoot-assignment
+    // style the rest of this suite already uses).
+    provider.activeSessionId = sessionA;
+    check('switch back to tab A: messages are exactly as left, not reloaded/reset', provider.messages.length === 1 && provider.messages[0].text === 'hello from A');
+    check('switch back to tab A: isBusy is exactly as left', provider.isBusy === true);
+    check('switch back to tab A: checkpoints are exactly as left', provider.checkpoints.length === 1);
+    check('switch back to tab A: bgProcesses is the SAME Map instance as before (identity, not a copy)', provider.bgProcesses === bgProcessesA);
+
+    // Sanity: B's state (set independently while A was active above) must
+    // still be its own, unaffected by anything done to A afterward.
+    provider.activeSessionId = sessionB;
+    check('tab B state is still isolated after further changes to A', provider.messages.length === 0 && provider.checkpoints.length === 0);
+
+    // ── _ensureProjectChatsLoaded reads a project's saved chats in parallel,
+    // not one at a time — all must still load correctly regardless.
+    let dirC;
+    try {
+      dirC = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sessC-'));
+      const chatsDir = path.join(dirC, '.navy', 'chats');
+      fs.mkdirSync(chatsDir, { recursive: true });
+      const ids = ['chat1', 'chat2', 'chat3'];
+      for (const id of ids) {
+        fs.writeFileSync(path.join(chatsDir, id + '.json'), JSON.stringify({
+          id, updated: new Date().toISOString(),
+          messages: [{ role: 'user', text: 'hello from ' + id }],
+          digest: '', checkpoints: [],
+        }));
+      }
+      const freshProvider = new NavyCoderViewProvider(makeContext(dirC));
+      await freshProvider._ensureProjectChatsLoaded(dirC);
+      const loaded = ids.map(id => freshProvider.sessions.get(id));
+      check('_ensureProjectChatsLoaded: all 3 chat files load, not just some (parallel reads)',
+        loaded.every(Boolean));
+      check('_ensureProjectChatsLoaded: each loaded chat has its own correct content, not mixed up',
+        ids.every(id => loaded.find(s => s.id === id)?.messages?.[0]?.text === 'hello from ' + id));
+      for (const session of freshProvider.sessions.values()) clearTimeout(session._cpSaveTimer);
+    } finally {
+      try { if (dirC) fs.rmSync(dirC, { recursive: true, force: true }); } catch {}
+    }
+  } catch (e) {
+    check('session isolation suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) {
+      for (const session of provider.sessions.values()) clearTimeout(session._cpSaveTimer);
+    }
+    try { if (dirA) fs.rmSync(dirA, { recursive: true, force: true }); } catch {}
+    try { if (dirB) fs.rmSync(dirB, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6h. Session-tagged postMessage + tab management (backend) ────────────────
+// Verifies the actual mechanism that lets a background tab's turn keep
+// running safely: resolveWebviewView's postMessage wrapper tags every
+// outgoing message with a session id, preferring sessionContext (so a turn
+// stays bound to the session it started in) over the live activeSessionId.
+async function sessionTaggingSuite() {
+  console.log('\nsession-tagged postMessage + tab management:');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+
+  let provider, dirA, dirB;
+  try {
+    const { NavyCoderViewProvider, sessionContext } = require('../src/extension.js');
+    dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-tagA-'));
+    dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-tagB-'));
+    provider = new NavyCoderViewProvider(makeContext(dirA));
+    // The constructor derives an initial session from shared mock config
+    // that earlier suites may have left set — prune anything but the
+    // default one so the close-tab assertions below have a deterministic
+    // session count to work from, regardless of what leaked in from another
+    // suite's state.
+    const sessionA = provider.activeSessionId;
+    for (const key of [...provider.sessions.keys()]) {
+      if (key !== sessionA) provider.sessions.delete(key);
+    }
+    provider.projectRoot = dirA; // assign a root to the default tab (id sessionA)
+
+    // A second tab, identified by its OWN generated id, independent of
+    // whatever root gets assigned to it (or not).
+    await provider.openNewSessionTab();
+    const sessionB = provider.activeSessionId;
+    provider.projectRoot = dirB;
+    provider.activeSessionId = sessionA; // back to A as "currently displayed", no disk I/O
+
+    const posted = [];
+    const fakeWebview = {
+      postMessage: (m) => { posted.push(m); return Promise.resolve(true); },
+      asWebviewUri: (u) => u,
+      cspSource: 'test-csp',
+      onDidReceiveMessage: () => ({ dispose() {} }),
+    };
+    const fakeView = { webview: fakeWebview, onDidDispose: () => {}, onDidChangeVisibility: () => {} };
+    await provider.resolveWebviewView(fakeView);
+
+    // Outside any turn, postMessage tags with whichever session is currently active.
+    posted.length = 0;
+    provider.view.webview.postMessage({ type: 'probe1' });
+    check('postMessage: tags with the live active session outside any turn', posted[0].sessionId === sessionA);
+
+    // Switching the active session changes what UN-wrapped code gets tagged with.
+    provider.activeSessionId = sessionB;
+    posted.length = 0;
+    provider.view.webview.postMessage({ type: 'probe2' });
+    check('postMessage: reflects the NEW active session after a switch (no turn in progress)', posted[0].sessionId === sessionB);
+
+    // The actual point: code running inside sessionContext.run(sessionA, ...)
+    // stays tagged with sessionA even though the active session is now
+    // sessionB — this is what keeps a background turn's messages routed to
+    // ITS OWN tab.
+    posted.length = 0;
+    await sessionContext.run(sessionA, async () => {
+      provider.view.webview.postMessage({ type: 'probe3' });
+      // Switch AGAIN mid-"turn" — must not affect this context's tagging.
+      provider.activeSessionId = sessionA; // back to A, but via the context, not the switch
+    });
+    check('postMessage: code inside sessionContext.run stays tagged with ITS session, not the live active one',
+      posted[0].sessionId === sessionA);
+
+    // And the _session getter itself resolves the same way — state accessed
+    // from inside a sessionContext.run binds to THAT session even if
+    // activeSessionId differs, which is what keeps a running turn's
+    // messages/checkpoints/etc. from leaking into whatever tab is now visible.
+    provider.activeSessionId = sessionB; // sessionB is now the live active session
+    let messagesInsideContext;
+    await sessionContext.run(sessionA, async () => {
+      messagesInsideContext = provider.messages; // should resolve to sessionA's session
+    });
+    check('_session getter: resolves to the sessionContext session, not the live active one',
+      messagesInsideContext === provider.sessions.get(sessionA).messages);
+
+    // ── Tab management: tabs are CHILDREN of a project ───────────────────
+    // Navigating between a project's own chats is purely Navy-internal — it
+    // must never write navy.projectRoot to .vscode/settings.json or touch
+    // the real VS Code Explorer/workspace. Only EXPLICITLY picking a
+    // DIFFERENT project (via _switchProjectRoot, the dropdown's path) does
+    // either of those.
+    ctrl.scoped = {}; // clear whatever earlier persistence in this suite left behind
+    ctrl.executedCommands = [];
+    provider.activeSessionId = sessionA; // sessionA: dirA
+    provider.sessions.get(sessionB).projectRoot = dirA; // rebind B to be A's sibling under the same project
+
+    await provider.switchSessionTab(sessionB);
+    check('switchSessionTab: becomes the active session', provider.activeSessionId === sessionB);
+    check('switchSessionTab: sends an updated session list', posted.some(m => m.type === 'sessionList'));
+    check('switchSessionTab: never persists navy.projectRoot (switching a project\'s own chats is not switching projects)',
+      !ctrl.scoped.projectRoot);
+    check('switchSessionTab: never touches the real VS Code Explorer/workspace',
+      !ctrl.executedCommands.some(c => c.command === 'revealInExplorer'));
+
+    // The tab strip only shows the ACTIVE PROJECT's own chats — not a flat
+    // list spanning every project ever opened.
+    const summaries = provider._sessionSummaries();
+    check('_sessionSummaries: only includes chats belonging to the active project',
+      summaries.length === 2 && summaries.every(s => s.root === dirA));
+    check('_sessionSummaries: includes both siblings',
+      summaries.some(s => s.id === sessionA) && summaries.some(s => s.id === sessionB));
+
+    // Explicitly picking a DIFFERENT project from the dropdown DOES persist
+    // and DOES reveal it in Explorer — "from the VS Code side too". Give the
+    // active chat real content first, so the switch has to spawn a fresh
+    // chat under the new project rather than silently repurposing an
+    // in-progress conversation.
+    provider.messages = [{ role: 'user', text: 'hello from B' }];
+    posted.length = 0;
+    const sessionBeforeSwitch = provider.activeSessionId;
+    await provider._switchProjectRoot(dirB);
+    check('_switchProjectRoot (dropdown pick): persists navy.projectRoot',
+      ctrl.scoped.projectRoot?.workspaceValue === dirB || ctrl.scoped.projectRoot?.globalValue === dirB);
+    check('_switchProjectRoot (dropdown pick): reveals the folder in VS Code\'s own Explorer',
+      ctrl.executedCommands.some(c => c.command === 'revealInExplorer' && c.args[0]?.fsPath === dirB));
+    check('_switchProjectRoot: a project with no chats yet and a non-blank active tab starts a FRESH chat, not a reused one',
+      provider.activeSessionId !== sessionBeforeSwitch && provider.projectRoot === dirB && provider.messages.length === 0);
+    check('_switchProjectRoot: the chat left behind on the old project is untouched, not discarded',
+      provider.sessions.has(sessionB) && provider.sessions.get(sessionB).messages.length === 1);
+    check('_switchProjectRoot (dropdown pick): also sends an updated session list',
+      posted.some(m => m.type === 'sessionList' && m.sessions.some(s => s.root === dirB && s.active)));
+    const sessionC = provider.activeSessionId; // the freshly created dirB chat
+
+    // Switching back to dirA resumes whichever chat was last active there
+    // (sessionB, from the switchSessionTab call above) — not a new one.
+    // Regression: the constructor's bootstrap placeholder (sessionA) is
+    // still blank, and this is dirA's first REAL activation this window, so
+    // it gets cleaned up in favor of the real chat instead of lingering as a
+    // dangling empty duplicate.
+    posted.length = 0;
+    await provider._switchProjectRoot(dirA);
+    check('_switchProjectRoot: switching back to a project resumes the chat you were last on',
+      provider.activeSessionId === sessionB);
+    check('_switchProjectRoot: the never-used bootstrap tab is cleaned up once a real chat for its project is found',
+      !provider.sessions.has(sessionA));
+
+    // New-tab workflow: "+" creates a chat as a CHILD of the CURRENT
+    // project — no dialog, no separate "assign a project" step.
+    let dialogShown = false;
+    const realShowOpenDialog = vscode.window.showOpenDialog;
+    vscode.window.showOpenDialog = async (...args) => { dialogShown = true; return realShowOpenDialog(...args); };
+    posted.length = 0;
+    const sessionBeforeNewTab = provider.activeSessionId;
+    await provider.openNewSessionTab();
+    check('openNewSessionTab: never opens a folder picker dialog', !dialogShown);
+    check('openNewSessionTab: switches to a brand-new session', provider.activeSessionId !== sessionBeforeNewTab);
+    check('openNewSessionTab: the new chat inherits the CURRENT project as its parent', provider.projectRoot === dirA);
+    check('openNewSessionTab: shown as "New Chat" in the tab strip (no messages yet)',
+      provider._sessionSummaries().find(s => s.id === provider.activeSessionId)?.name === 'New Chat');
+    vscode.window.showOpenDialog = realShowOpenDialog;
+    const sessionD = provider.activeSessionId;
+
+    // closeSessionTab freely closes a chat that still has a sibling under
+    // the same project, falling back to that sibling.
+    posted.length = 0;
+    await provider.closeSessionTab(sessionD);
+    check('closeSessionTab: removes the session', !provider.sessions.has(sessionD));
+    check('closeSessionTab: falls back to the remaining sibling under the same project', provider.activeSessionId === sessionB);
+
+    // Refuses to close a project's very last remaining chat. sessionC (a
+    // DIFFERENT project, dirB) existing elsewhere must not count as a
+    // sibling that makes this "safe" — tabs only compete with their own
+    // project's siblings.
+    posted.length = 0;
+    await provider.closeSessionTab(sessionB);
+    check('closeSessionTab: refuses to close a project\'s last remaining chat',
+      provider.sessions.has(sessionB) && provider.activeSessionId === sessionB);
+    check('closeSessionTab: a DIFFERENT project\'s chat count never satisfies this project\'s "last one" guard',
+      provider.sessions.has(sessionC));
+
+    // ── Project-scoped state (write lock, embeddings cache, gutter ranges) ──
+    // These must be SHARED across sibling chats on the same project, not
+    // duplicated per chat — duplicating them was a real bug: two sibling
+    // chats writing to the same file at once wouldn't serialize against
+    // each other (the write lock exists specifically to prevent
+    // interleaved writes), and each kept its own copy of the shared
+    // embeddings.json cache, so whichever chat's debounced save fired last
+    // silently discarded the other's contribution.
+    await provider.openNewSessionTab(); // sibling of sessionB, same project (dirA)
+    const sessionE = provider.activeSessionId;
+    provider._writeLock = Promise.resolve('marker-A');
+    provider._embedIndexCache = { root: dirA, marker: 'A' };
+    provider.editedRanges.set('marker-file.js', [{ start: 1, end: 2 }]);
+    const lockSetFromE = provider._writeLock;
+
+    provider.activeSessionId = sessionB; // sibling, same project — direct switch, no I/O
+    check('project-scoped write lock: shared across sibling chats on the same project',
+      provider._writeLock === lockSetFromE);
+    check('project-scoped embeddings cache: shared across sibling chats on the same project',
+      provider._embedIndexCache?.marker === 'A');
+    check('project-scoped gutter decorations: shared across sibling chats on the same project',
+      provider.editedRanges.get('marker-file.js')?.length === 1);
+
+    provider.activeSessionId = sessionC; // a DIFFERENT project (dirB)
+    check('project-scoped write lock: isolated from a DIFFERENT project',
+      provider._writeLock !== lockSetFromE);
+    check('project-scoped embeddings cache: isolated from a DIFFERENT project',
+      provider._embedIndexCache?.marker !== 'A');
+    check('project-scoped gutter decorations: isolated from a DIFFERENT project',
+      !provider.editedRanges.has('marker-file.js'));
+    provider.activeSessionId = sessionB;
+
+    // ── Message ordering: 'sessionList' (gate-exempt) must reach the
+    // frontend BEFORE any message tagged with a newly-active session that
+    // the frontend has no advance notice of — otherwise the frontend (still
+    // holding the OLD activeSessionId) silently drops 'restore'/
+    // 'sessionLoaded' via its per-message gate, and the user sees a blank
+    // thread instead of the target chat's real content.
+    posted.length = 0;
+    await provider.openNewSessionTab();
+    {
+      const listIdx = posted.findIndex(m => m.type === 'sessionList');
+      const restoreIdx = posted.findIndex(m => m.type === 'restore');
+      const loadedIdx = posted.findIndex(m => m.type === 'sessionLoaded');
+      check('openNewSessionTab: sessionList sent before restore',
+        listIdx !== -1 && restoreIdx !== -1 && listIdx < restoreIdx);
+      check('openNewSessionTab: sessionList sent before sessionLoaded',
+        listIdx !== -1 && loadedIdx !== -1 && listIdx < loadedIdx);
+    }
+    // Same regression via closeSessionTab falling back to a sibling the
+    // frontend had NO advance notice of (unlike a direct tab click, which
+    // optimistically updates the frontend's activeSessionId itself first).
+    const siblingToClose = provider.activeSessionId; // the tab just opened above
+    posted.length = 0;
+    await provider.closeSessionTab(siblingToClose);
+    {
+      const listIdx = posted.findIndex(m => m.type === 'sessionList');
+      const restoreIdx = posted.findIndex(m => m.type === 'restore');
+      check('closeSessionTab fallback: sessionList sent before restore for the sibling it switches to',
+        listIdx !== -1 && restoreIdx !== -1 && listIdx < restoreIdx);
+    }
+
+    // ── cancelPendingApprovals (Stop/Clear) vs cancelAllPendingApprovals
+    // (whole panel disposed) ─────────────────────────────────────────────
+    // Stop/Clear are per-chat actions and must not reach into an unrelated
+    // BACKGROUND tab and reject its approval. But when the whole webview
+    // panel is disposed, nothing will ever resolve a background tab's
+    // pending approval otherwise, hanging that turn forever — every
+    // session's approvals must be resolved then, not just the active one.
+    {
+      const bg = provider.sessions.get(sessionC); // dirB chat, NOT currently active
+      let bgResolved;
+      bg.pendingApprovals.set('fake-bg-approval', { kind: 'agent-edit', resolve: (v) => { bgResolved = v; } });
+
+      provider.cancelPendingApprovals(); // active-session-only
+      check('cancelPendingApprovals: leaves a DIFFERENT (background) session\'s approval untouched',
+        bg.pendingApprovals.has('fake-bg-approval') && bgResolved === undefined);
+
+      provider.cancelAllPendingApprovals();
+      check('cancelAllPendingApprovals: resolves a background session\'s approval too',
+        !bg.pendingApprovals.has('fake-bg-approval') && bgResolved === 'reject');
+    }
+
+    // First-ever project pick (nothing ever selected before) reuses the
+    // constructor's own blank bootstrap tab instead of leaving it dangling
+    // and creating a redundant second one.
+    {
+      vscode.workspace.workspaceFolders = [];
+      ctrl.scoped = {};
+      const dirD = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-tagD-'));
+      const { NavyCoderViewProvider: FreshProvider } = require('../src/extension.js');
+      const fresh = new FreshProvider(makeContext(dirD));
+      const freshBootstrapId = fresh.activeSessionId;
+      try {
+        await fresh._switchProjectRoot(dirD);
+        check('fresh install: first-ever project pick reuses the bootstrap tab instead of spawning a new one',
+          fresh.activeSessionId === freshBootstrapId && fresh.projectRoot === dirD && fresh.sessions.size === 1);
+      } finally {
+        clearTimeout(fresh._cpSaveTimer); clearInterval(fresh._heartbeat); clearTimeout(fresh._watchdog);
+        try { fs.rmSync(dirD, { recursive: true, force: true }); } catch {}
+      }
+    }
+  } catch (e) {
+    check('session tagging suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) {
+      for (const session of provider.sessions.values()) {
+        clearTimeout(session._cpSaveTimer);
+        clearInterval(session._heartbeat);
+        clearTimeout(session._watchdog);
+      }
+    }
+    try { if (dirA) fs.rmSync(dirA, { recursive: true, force: true }); } catch {}
+    try { if (dirB) fs.rmSync(dirB, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── Project cache eviction (_projectCaches must not grow unbounded) ────────
+// Without a cap, _projectCaches gains one entry (embedding index, repo map,
+// relevance/.gitignore caches) for every distinct project root ever visited
+// in this window, forever — a real memory-growth concern for a long-lived
+// window that touches many repos. Eviction must ONLY ever remove a root with
+// no currently-open chat tab, since that's the one condition guaranteeing no
+// turn/background task could be using its write lock.
+async function projectCacheEvictionSuite() {
+  console.log('\nproject cache eviction (_projectCaches cap):');
+  const os = require('os');
+  sharedMock();
+
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-cacheevict-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+
+    // ── Basic cap enforcement, cycling a single session through many roots ──
+    // Fake, non-existent paths are fine — _projectCaches is a pure in-memory
+    // Map keyed by the root string, never touches disk.
+    for (let i = 0; i < 25; i++) {
+      provider.projectRoot = `/fake/evict-proj-${i}`;
+      void provider._proj; // touch the getter — this is what creates/caches the entry
+    }
+    check('project cache: never grows past the cap even after visiting 25 distinct roots',
+      provider._projectCaches.size <= 20);
+    check('project cache: the most-recently-touched root survived', provider._projectCaches.has('/fake/evict-proj-24'));
+    check('project cache: the very first (oldest, long since abandoned) root was evicted',
+      !provider._projectCaches.has('/fake/evict-proj-0'));
+
+    // ── An OPEN root must never be evicted, no matter how stale ─────────────
+    provider = new NavyCoderViewProvider(makeContext(tmp)); // fresh instance, clean cache
+    const keepRoot = '/fake/keep-me-open';
+    provider.projectRoot = keepRoot;
+    void provider._proj; // touched once, then never again — would be the OLDEST by lastTouched
+    await provider.openNewSessionTab(); // a SECOND tab — keepRoot's session (the first tab) stays alive and open
+
+    for (let i = 0; i < 25; i++) {
+      provider.projectRoot = `/fake/churn-proj-${i}`; // the second tab churns through many other roots
+      void provider._proj;
+    }
+    check('project cache: a root with a currently-open tab survives eviction pressure even though it\'s the oldest',
+      provider._projectCaches.has(keepRoot));
+    check('project cache: still enforces the cap overall (only counting the CLOSED/churned roots)',
+      provider._projectCaches.size <= 20);
+    check('project cache: recent churned roots survive, old ones don\'t',
+      provider._projectCaches.has('/fake/churn-proj-24') && !provider._projectCaches.has('/fake/churn-proj-0'));
+
+    // ── An evicted root's pending debounced embeddings-save timer is cleared ─
+    // (not flushed — same tradeoff dispose() already makes on full shutdown),
+    // so it can't fire against a cache entry that no longer exists.
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    let timerFired = false;
+    provider.projectRoot = '/fake/evict-with-timer';
+    void provider._proj;
+    provider._embedSaveTimer = setTimeout(() => { timerFired = true; }, 30);
+    for (let i = 0; i < 25; i++) {
+      provider.projectRoot = `/fake/timerchurn-proj-${i}`;
+      void provider._proj;
+    }
+    check('project cache: the evicted root really was evicted (setup sanity check)',
+      !provider._projectCaches.has('/fake/evict-with-timer'));
+    await new Promise(r => setTimeout(r, 80));
+    check('project cache: an evicted root\'s pending embed-save timer is cleared, never fires', !timerFired);
+  } catch (e) {
+    check('project cache eviction suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) {
+      for (const session of provider.sessions.values()) {
+        clearTimeout(session._cpSaveTimer);
+        clearInterval(session._heartbeat);
+        clearTimeout(session._watchdog);
+      }
+      for (const p of provider._projectCaches.values()) clearTimeout(p.embedSaveTimer);
+    }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── Session cache eviction (this.sessions must not grow unbounded) ─────────
+// Mirrors projectCacheEvictionSuite for the sibling growth path Angle H's
+// review found: this.sessions accumulates every chat ever loaded from disk
+// or created in this window, forever, unless capped. Far more conservative
+// than the project cache though — a session holds real, possibly-unsaved
+// chat content, so the eligibility rules matter as much as the cap itself.
+async function sessionCacheEvictionSuite() {
+  console.log('\nsession cache eviction (this.sessions cap):');
+  const os = require('os');
+  sharedMock();
+
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sessevict-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    const activeId = provider.activeSessionId; // the constructor's own bootstrap session
+
+    // Fake sessions are plain objects — _evictStaleSessions only ever reads
+    // .projectRoot/.isBusy/._updated and deletes by id, so a real Session
+    // instance isn't needed to exercise it directly and fast (no disk I/O).
+    const fakeSession = (root, updated, extra = {}) => ({
+      projectRoot: root, isBusy: false, messages: [{ role: 'user', text: 'x' }],
+      _updated: updated, checkpoints: [], ...extra,
+    });
+
+    // ── Basic cap enforcement: 45 distinct, fully-saved, non-active, ────────
+    // non-last-of-their-project sessions (each its own project, 2 chats per
+    // project so "last remaining chat" never blocks eviction here).
+    provider.sessions.clear();
+    provider.sessions.set(activeId, fakeSession('/fake/sess-active', ''));
+    provider.activeSessionId = activeId;
+    for (let i = 0; i < 45; i++) {
+      const root = '/fake/sess-proj-' + i;
+      const t = new Date(2020, 0, 1, 0, 0, i).toISOString(); // strictly increasing — i=0 oldest
+      provider.sessions.set('sib-a-' + i, fakeSession(root, t));
+      provider.sessions.set('sib-b-' + i, fakeSession(root, t)); // sibling — neither is "the last chat"
+    }
+    provider._evictStaleSessions();
+    check('session cache: never grows past the cap (40) even with 91 total sessions',
+      provider.sessions.size <= 40);
+    check('session cache: the active session always survives', provider.sessions.has(activeId));
+    check('session cache: the most-recently-saved sessions survive', provider.sessions.has('sib-a-44') && provider.sessions.has('sib-b-44'));
+    check('session cache: the oldest-saved sessions were evicted', !provider.sessions.has('sib-a-0') && !provider.sessions.has('sib-b-0'));
+    check('session cache: evicting un-marks the project so it can be re-read from disk later',
+      !provider._loadedChatRoots.has('/fake/sess-proj-0'));
+
+    // ── A project's LAST remaining chat is never evicted, no matter how old ─
+    provider.sessions.clear();
+    provider.activeSessionId = activeId;
+    provider.sessions.set(activeId, fakeSession('/fake/keep-active', ''));
+    provider.sessions.set('lonely-old', fakeSession('/fake/lonely-project', new Date(2000, 0, 1).toISOString()));
+    for (let i = 0; i < 45; i++) {
+      provider.sessions.set('churn-' + i, fakeSession('/fake/churn-proj-' + i, new Date(2021, 0, 1, 0, 0, i).toISOString()));
+    }
+    provider._evictStaleSessions();
+    check('session cache: a project\'s only remaining chat survives even though it\'s the oldest',
+      provider.sessions.has('lonely-old'));
+
+    // ── A busy session is never evicted ─────────────────────────────────────
+    provider.sessions.clear();
+    provider.activeSessionId = activeId;
+    provider.sessions.set(activeId, fakeSession('/fake/keep-active2', ''));
+    provider.sessions.set('busy-old', fakeSession('/fake/busy-project', new Date(2000, 0, 1).toISOString(), { isBusy: true }));
+    provider.sessions.set('busy-old-sibling', fakeSession('/fake/busy-project', new Date(2000, 0, 2).toISOString()));
+    for (let i = 0; i < 45; i++) {
+      provider.sessions.set('churn2-' + i, fakeSession('/fake/churn2-proj-' + i, new Date(2021, 0, 1, 0, 0, i).toISOString()));
+    }
+    provider._evictStaleSessions();
+    check('session cache: a busy session is never evicted', provider.sessions.has('busy-old'));
+
+    // ── A session with nothing saved to disk yet is never evicted ──────────
+    // (empty _updated — evicting it would lose content with nowhere to
+    // reload it from).
+    provider.sessions.clear();
+    provider.activeSessionId = activeId;
+    provider.sessions.set(activeId, fakeSession('/fake/keep-active3', ''));
+    provider.sessions.set('unsaved-old', fakeSession('/fake/unsaved-project', ''));
+    provider.sessions.set('unsaved-old-sibling', fakeSession('/fake/unsaved-project', new Date(2000, 0, 1).toISOString()));
+    for (let i = 0; i < 45; i++) {
+      provider.sessions.set('churn3-' + i, fakeSession('/fake/churn3-proj-' + i, new Date(2021, 0, 1, 0, 0, i).toISOString()));
+    }
+    provider._evictStaleSessions();
+    check('session cache: a never-saved (_updated empty) session is never evicted', provider.sessions.has('unsaved-old'));
+  } catch (e) {
+    check('session cache eviction suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) {
+      for (const session of provider.sessions.values()) {
+        clearTimeout(session._cpSaveTimer);
+        clearInterval(session._heartbeat);
+        clearTimeout(session._watchdog);
+      }
+    }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6c2. Project rules — layered, not "first file wins" ──────────────────────
+// A project commonly has a tool-agnostic AGENTS.md for shared team
+// conventions AND a small tool-specific file (.cursorrules, .navyrules)
+// layering a targeted tweak on top. loadProjectRules used to return only the
+// FIRST well-known file it found, so adding either one silently discarded
+// ALL of the other.
+async function projectRulesSuite() {
+  console.log('\nproject rules (layered, not first-file-wins):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rules-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const W = (n, c) => fs.writeFileSync(path.join(tmp, n), c);
+
+    check('project rules: no files anywhere returns empty', (await provider.loadProjectRules()) === '');
+
+    W('AGENTS.md', 'Use 2-space indentation.');
+    const single = await provider.loadProjectRules();
+    check('project rules: a single file is included', single.includes('Use 2-space indentation.'));
+    check('project rules: labeled with its source file', single.includes('### From AGENTS.md'));
+
+    fs.mkdirSync(path.join(tmp, '.github'), { recursive: true });
+    W('.github/copilot-instructions.md', 'Prefer functional components.');
+    W('.cursorrules', '   '); // whitespace-only — must be skipped, not included as empty noise
+    W('.navyrules', 'Always run tests before finishing.');
+    const merged = await provider.loadProjectRules();
+    check('project rules: ALL non-empty files are merged, not just the first',
+      merged.includes('Use 2-space indentation.')
+      && merged.includes('Prefer functional components.')
+      && merged.includes('Always run tests before finishing.'));
+    check('project rules: a whitespace-only file contributes nothing',
+      !merged.includes('.cursorrules') || merged.split('### From').length === 4); // 3 real sources, not 4
+    check('project rules: broadest source (AGENTS.md) appears before the most Navy-specific (.navyrules)',
+      merged.indexOf('AGENTS.md') < merged.indexOf('.navyrules'));
+
+    fs.rmSync(path.join(tmp, 'AGENTS.md'));
+    fs.rmSync(path.join(tmp, '.github', 'copilot-instructions.md'));
+    fs.rmSync(path.join(tmp, '.cursorrules'));
+    fs.rmSync(path.join(tmp, '.navyrules'));
+
+    // Only once NONE of the well-known files exist does the Navy-managed
+    // .navy/rules.md fallback apply.
+    check('project rules: falls back to .navy/rules.md only when no well-known file exists',
+      (await provider.loadProjectRules()) === '');
+    const navyDir = await provider.ensureNavyDir();
+    fs.writeFileSync(path.join(navyDir, 'rules.md'), 'Fallback convention.');
+    check('project rules: .navy/rules.md fallback is read once it exists',
+      (await provider.loadProjectRules()) === 'Fallback convention.');
+
+    W('AGENTS.md', 'Real convention.');
+    check('project rules: a real well-known file takes priority over the .navy/rules.md fallback',
+      (await provider.loadProjectRules()).includes('Real convention.')
+      && !(await provider.loadProjectRules()).includes('Fallback convention.'));
+  } catch (e) {
+    check('project rules suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 6d. check_syntax — real parsers, independent of any language extension ───
 async function syntaxCheckSuite() {
   console.log('\ncheck_syntax (independent verification):');
   const os = require('os');
@@ -990,6 +2662,8 @@ async function syntaxCheckSuite() {
       const eligible = new Function('path', 'process',
         extSrc.slice(reStart, reEnd) + '\n' +
         extractFunction(extSrc, 'function isSensitiveForEmbedding') + '\n' +
+        extractFunction(extSrc, 'function fold(p)') + '\n' +
+        extractFunction(extSrc, 'function foldPath(p)') + '\n' +
         extractFunction(extSrc, 'function rootBelongsToWorkspace') + '\n' +
         extractFunction(extSrc, 'function documentEligibleForCompletion') +
         '\nreturn documentEligibleForCompletion;'
@@ -1373,7 +3047,10 @@ function makeOneShotBody(evt) {
     },
   };
 }
-// replies: array of { text } | { toolCalls: [{name, args}] } consumed in order.
+// replies: array of { text } | { toolCalls: [{name, args}] } | { fail: { status, text } }
+// consumed in order. `fail` simulates a non-ok HTTP response (rate limit,
+// server outage, etc.) — streamAssistant's Ollama branch throws
+// 'Ollama returned <status>: <text>' for it, same as a real failure would.
 // `captured`, if given, collects each parsed request body for inspection.
 function queueOllamaFetch(replies, captured) {
   const queue = replies.slice();
@@ -1381,6 +3058,9 @@ function queueOllamaFetch(replies, captured) {
     if (captured && init?.body) { try { captured.push(JSON.parse(init.body)); } catch {} }
     const next = queue.shift();
     if (!next) throw new Error('queueOllamaFetch: exhausted — loop ran more iterations than the test expected');
+    if (next.fail) {
+      return { ok: false, status: next.fail.status, body: true, text: async () => next.fail.text || '', headers: { get: () => null } };
+    }
     const evt = next.toolCalls
       ? { message: { role: 'assistant', content: '', tool_calls: next.toolCalls.map(tc => ({ function: { name: tc.name, arguments: JSON.stringify(tc.args || {}) } })) }, done: true, prompt_eval_count: 5, eval_count: 5 }
       : { message: { role: 'assistant', content: next.text }, done: true, prompt_eval_count: 5, eval_count: 5 };
@@ -1530,18 +3210,30 @@ async function hallucinationSuite() {
     check('env: shell dialect still stated with NO project open', /run_command executes through: /.test(sysEnv2));
     provider.projectRoot = savedRoot;
 
-    // WSL fallback fact (Windows only, this test machine is win32): the cached
-    // detection result must reach the system prompt either way, so the model
-    // knows whether falling back to WSL for a Unix-only tool is even possible.
-    check('env: WSL cache preset reports unavailable (as set up for this suite)', sysEnv1.includes('WSL not detected'));
-    const savedWsl = provider._wslCache;
-    provider._wslCache = { available: true, distros: ['Ubuntu-22.04', 'Debian'] };
-    captured.length = 0;
-    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
-    await provider.askNavy('hello', false, null, [], []);
-    const sysEnv3 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
-    check('env: WSL available + distro list reaches the system prompt', sysEnv3.includes('WSL available') && sysEnv3.includes('Ubuntu-22.04'));
-    provider._wslCache = savedWsl;
+    // WSL fallback fact: the cached detection result must reach the system
+    // prompt either way, so the model knows whether falling back to WSL for a
+    // Unix-only tool is even possible. Windows-only by design (see the
+    // isWinShell gate on wslNote in buildSystemPrompt) — the prompt correctly
+    // says nothing about WSL elsewhere, so these assert Windows behaviour and
+    // are skipped rather than failed on other platforms. Without this the
+    // whole suite is red on the CI matrix's ubuntu job.
+    if (process.platform === 'win32') {
+      check('env: WSL cache preset reports unavailable (as set up for this suite)', sysEnv1.includes('WSL not detected'));
+      const savedWsl = provider._wslCache;
+      provider._wslCache = { available: true, distros: ['Ubuntu-22.04', 'Debian'] };
+      captured.length = 0;
+      global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
+      await provider.askNavy('hello', false, null, [], []);
+      const sysEnv3 = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+      check('env: WSL available + distro list reaches the system prompt', sysEnv3.includes('WSL available') && sysEnv3.includes('Ubuntu-22.04'));
+      provider._wslCache = savedWsl;
+    } else {
+      // Only the ENVIRONMENT block's WSL note is Windows-gated — TOOL_PROMPT
+      // rule 18 mentions WSL unconditionally, so a bare !includes('WSL') would
+      // be checking the wrong string.
+      check('env: no WSL detection note on a non-Windows host (Windows-only feature)',
+        !sysEnv1.includes('WSL not detected') && !sysEnv1.includes('WSL available'));
+    }
 
     // Weak-model reinforcement actually reaches the request for a small model,
     // and is absent for a normal-sized one.
@@ -1560,6 +3252,562 @@ async function hallucinationSuite() {
     check('hallucination suite ran', false, e.stack || e.message);
   } finally {
     global.fetch = realFetch;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 7b2. Cross-turn tool activity ledger ─────────────────────────────────────
+// Replaying history for a new turn only ever carried each past turn's final
+// reply TEXT (see the "for (const item of this.messages)" loop in askNavy) —
+// so the model had no way to know it already read a file or ran a command in
+// an earlier turn unless it happened to say so in prose, and routinely re-did
+// work it had already done. _renderTurnLedger appends a compact, verifiable
+// record of what a turn actually did (reads/writes/commands) to the
+// MODEL-FACING copy of its historical reply — never to the persisted/
+// displayed text itself.
+async function toolLedgerSuite() {
+  console.log('\ncross-turn tool activity ledger:');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-ledger-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider._wslCache = { available: false }; // skip the real wsl.exe spawn in tests
+    fs.writeFileSync(path.join(tmp, 'source.js'), 'module.exports = 1;\n');
+
+    // Pure formatting checks — no model loop needed.
+    check('_describeReadCall: read_file includes the path',
+      provider._describeReadCall({ name: 'read_file', args: { path: 'a/b.js' } }) === 'read_file(a/b.js)');
+    check('_renderTurnLedger: empty/undefined meta renders nothing',
+      provider._renderTurnLedger(undefined) === '' && provider._renderTurnLedger({}) === '');
+    check('_renderTurnLedger: formats reads, writes, and commands together',
+      /read a\.js, b\.js/.test(provider._renderTurnLedger({ reads: ['a.js', 'b.js'] }))
+      && /wrote c\.js/.test(provider._renderTurnLedger({ files: ['c.js'] }))
+      && /ran "npm test" \(exit 0\)/.test(provider._renderTurnLedger({ commandLog: [{ cmd: 'npm test', exit: 0 }] })));
+
+    // Turn 1: reads source.js, writes out.js, then finishes.
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'source.js' } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'out.js', content: 'x=1' } }] },
+      { text: 'Done — read source.js and wrote out.js.' },
+    ]);
+    await provider.askNavy('do the first task', false, null, [], []);
+
+    check('turn ledger: meta.reads captured on the persisted assistant message',
+      provider.messages[1]?.meta?.reads?.some(r => r.includes('source.js')));
+    check('turn ledger: meta.files captured on the persisted assistant message',
+      provider.messages[1]?.meta?.files?.includes('out.js'));
+    check('turn ledger: never leaks into the persisted/displayed text itself',
+      !provider.messages[1].text.includes('[Tool activity'));
+
+    // Turn 2: the OUTGOING request must tell the model what turn 1 actually
+    // did, appended to THAT historical message specifically.
+    const captured = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured);
+    await provider.askNavy('do the second task', false, null, [], []);
+    const sentMessages = captured[0]?.messages || [];
+    const turn1Reply = sentMessages.find(m => m.role === 'assistant' && /read source\.js and wrote out\.js/.test(m.content || ''));
+    check('turn ledger: reaches the model on the NEXT turn',
+      Boolean(turn1Reply) && /\[Tool activity that turn/.test(turn1Reply.content));
+    check('turn ledger: names the exact file that was read',
+      /read_file\(source\.js\)/.test(turn1Reply?.content || ''));
+    check('turn ledger: names the exact file that was written',
+      /wrote out\.js/.test(turn1Reply?.content || ''));
+
+    // And it must not show up in the webview — main.js's own rendering of
+    // meta only reads files/deleted/commands, never reads/commandLog.
+    check('turn ledger: never sent to the webview as visible chat text',
+      !posted.some(m => m.type === 'chunk' && /\[Tool activity that turn/.test(m.text || '')));
+  } catch (e) {
+    check('cross-turn tool ledger suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 7b3. Cost/spend visibility ────────────────────────────────────────────────
+// This is the one feature in Navy that touches the user's actual money, so it
+// gets the most direct, precise tests in the suite: pure-function pricing math
+// (no mocking needed at all), multi-turn/mixed-provider aggregation exercised
+// by writing synthetic meta directly onto provider.messages, and ONE real
+// end-to-end turn to prove the wiring (meta captured correctly, message shape
+// correct) without needing to mock every provider's wire format.
+async function costEstimateSuite() {
+  console.log('\ncost/spend visibility:');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider, estimateCost } = require('../src/extension.js');
+
+    // ── Pure pricing math — no provider instance needed ──────────────────
+    check('estimateCost: ollama is always free regardless of "model" name', estimateCost('ollama', 'gpt-4o', 1_000_000, 1_000_000) === 0);
+    check('estimateCost: lmstudio is always free', estimateCost('lmstudio', 'claude-opus', 1_000_000, 1_000_000) === 0);
+    check('estimateCost: an unrecognized hosted model returns null, never a guess', estimateCost('anthropic', 'totally-unknown-future-model', 1000, 1000) === null);
+    const claudeCost = estimateCost('anthropic', 'claude-sonnet-5', 1_000_000, 1_000_000);
+    check('estimateCost: a known model prices input and output separately', claudeCost === 3 + 15);
+    check('estimateCost: scales linearly with token count', estimateCost('anthropic', 'claude-sonnet-5', 500_000, 0) === 1.5);
+    check('estimateCost: zero tokens costs zero (not null) for a known model', estimateCost('anthropic', 'claude-sonnet-5', 0, 0) === 0);
+
+    // ── _sessionUsage aggregation — synthetic meta, no network at all ────
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-cost-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    check('_sessionUsage: no turns yet is all zero, cost known (nothing to not-know)',
+      JSON.stringify(provider._sessionUsage()) === JSON.stringify({ prompt: 0, completion: 0, cost: 0, costKnown: true }));
+
+    // Turn 1: free (ollama). Turn 2: paid (anthropic). A session spanning a
+    // PROVIDER switch must price each turn at what actually ran it — not
+    // "whatever's configured right now" (which could misreport a paid turn
+    // as free, or vice versa, well after the fact).
+    provider.messages = [
+      { role: 'user', text: 'hi' },
+      { role: 'assistant', text: 'ok', meta: { tokens: { prompt: 1000, completion: 1000 }, provider: 'ollama', model: 'llama3' } },
+      { role: 'user', text: 'hi again' },
+      { role: 'assistant', text: 'ok again', meta: { tokens: { prompt: 1_000_000, completion: 1_000_000 }, provider: 'anthropic', model: 'claude-sonnet-5' } },
+    ];
+    const usage = provider._sessionUsage();
+    check('_sessionUsage: sums prompt/completion tokens across every turn', usage.prompt === 1_001_000 && usage.completion === 1_001_000);
+    check('_sessionUsage: prices each turn by ITS OWN provider/model, not the current config',
+      usage.cost === 18 && usage.costKnown === true); // turn 1 (ollama) contributes $0, turn 2 (claude) contributes $18
+
+    // A turn using a model with no known pricing makes the TOTAL explicitly
+    // "not fully known" (costKnown: false) rather than silently under-reporting.
+    provider.messages.push({ role: 'assistant', text: 'x', meta: { tokens: { prompt: 1000, completion: 1000 }, provider: 'anthropic', model: 'some-brand-new-model' } });
+    const usage2 = provider._sessionUsage();
+    check('_sessionUsage: costKnown flips false when any priced turn is unrecognized', usage2.costKnown === false);
+    check('_sessionUsage: still sums whatever COULD be priced, as a floor', usage2.cost === 18);
+
+    // A turn with no meta.tokens at all (e.g. a pure-chat turn that made no
+    // model call, or history from before this feature existed) is silently
+    // skipped, not treated as a zero-cost known turn or a crash.
+    provider.messages = [{ role: 'assistant', text: 'no meta here' }];
+    check('_sessionUsage: a turn with no meta.tokens is skipped cleanly', provider._sessionUsage().prompt === 0);
+
+    // ── End-to-end wiring: a real turn through askNavy ────────────────────
+    provider.messages = [];
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider._wslCache = { available: false };
+    global.fetch = queueOllamaFetch([{ text: 'done' }]); // queueOllamaFetch's mock reports prompt_eval_count/eval_count: 5 each
+    await provider.askNavy('hello', false, null, [], []);
+
+    check('turn wiring: meta.tokens captured on the persisted assistant message', provider.messages[1]?.meta?.tokens?.prompt === 5 && provider.messages[1]?.meta?.tokens?.completion === 5);
+    check('turn wiring: meta.provider/meta.model captured (ollama — the shared mock default)', provider.messages[1]?.meta?.provider === 'ollama' && Boolean(provider.messages[1]?.meta?.model));
+    const tc = posted.find(m => m.type === 'tokenCount');
+    check('turn wiring: tokenCount carries a running session total, not just this turn\'s figures',
+      Boolean(tc) && tc.sessionTotal === 10 && tc.sessionPrompt === 5 && tc.sessionCompletion === 5);
+    check('turn wiring: ollama turns price at exactly $0, known (not "unavailable")', tc.estimatedCost === 0 && tc.costKnown === true);
+
+    // A second turn must ACCUMULATE, not replace, the running total.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([{ text: 'done again' }]);
+    await provider.askNavy('hello again', false, null, [], []);
+    const tc2 = posted.find(m => m.type === 'tokenCount');
+    check('turn wiring: a second turn ACCUMULATES onto the session total (10 + 10 = 20)', tc2?.sessionTotal === 20);
+
+    // Restoring/switching a chat must reflect ITS accumulated usage right
+    // away — not require sending another message first.
+    posted.length = 0;
+    await provider.loadProjectSession();
+    const sl = posted.find(m => m.type === 'sessionLoaded');
+    check('sessionLoaded: carries the same accumulated session usage as tokenCount', sl?.sessionTotal === 20);
+
+    // A brand-new tab starts at a clean, KNOWN zero — not "unavailable".
+    posted.length = 0;
+    await provider.openNewSessionTab();
+    const slNew = posted.find(m => m.type === 'sessionLoaded');
+    check('openNewSessionTab: a fresh chat reports zero usage, not missing/unavailable',
+      slNew?.sessionTotal === 0 && slNew?.estimatedCost === null && slNew?.costKnown === true);
+  } catch (e) {
+    check('cost estimate suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    if (provider) { for (const s of provider.sessions.values()) { clearTimeout(s._cpSaveTimer); clearInterval(s._heartbeat); clearTimeout(s._watchdog); } }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── History-digest trigger — size, not just message COUNT ──────────────────
+// Nothing used to bound the size of PAST turns being replayed except a raw
+// message-count threshold (>80) — a handful of verbose turns (big files/
+// search results quoted back) could sit at hundreds of thousands of
+// characters, replayed on every iteration of every future turn, while never
+// reaching 80 messages. The digest trigger now also fires on total size, and
+// must never spend a wasted extra model call summarizing when the recency
+// floor means nothing was actually dropped.
+async function historyDigestSuite() {
+  console.log('\nhistory-digest trigger (size, not just message count):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  const isDigestCall = (req) => typeof req?.messages?.[0]?.content === 'string'
+    && req.messages[0].content.includes('You compress coding-assistant conversation history');
+
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-histdigest-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._wslCache = { available: false };
+
+    // ── A few huge messages (well under 80) must still trigger the digest ──
+    provider.messages = Array.from({ length: 15 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      text: 'x'.repeat(20000) + ' turn-' + i,
+    }));
+    {
+      const captured = [];
+      global.fetch = queueOllamaFetch([
+        { text: 'Digest: did stuff with the earlier turns.' }, // the summarization call
+        { text: 'main turn reply' },                            // the actual turn
+      ], captured);
+      await provider.askNavy('continue', false, null, [], []);
+
+      check('size trigger: 15 messages × 20,000 chars (300k, far under 80-message count) still condenses', captured.some(isDigestCall));
+      check('size trigger: sessionDigest was populated', Boolean(provider.sessionDigest && provider.sessionDigest.trim()));
+      // 10 kept (recency floor lets it keep growing until adding the next
+      // would exceed the 200k cap) + this turn's own new user+assistant = 12.
+      check('size trigger: oldest messages were actually dropped, not just digested', provider.messages.length === 12);
+      check('size trigger: the KEPT tail is the most recent messages, in original order',
+        provider.messages[0].text.includes('turn-5') && provider.messages[9].text.includes('turn-14'));
+    }
+
+    // ── An ordinary short/small session must never trigger it at all ───────
+    provider.messages = [
+      { role: 'user', text: 'hello' },
+      { role: 'assistant', text: 'hi there' },
+    ];
+    provider.sessionDigest = '';
+    {
+      const captured = [];
+      global.fetch = queueOllamaFetch([{ text: 'main turn reply' }], captured);
+      await provider.askNavy('another message', false, null, [], []);
+      check('no trigger: a small, short session never attempts a digest call', !captured.some(isDigestCall));
+      check('no trigger: sessionDigest stays empty', !provider.sessionDigest);
+    }
+
+    // ── Recency floor: fewer than MIN_KEEP messages, even if huge, must ─────
+    // never spend a wasted summarization call — there is nothing willing to
+    // be dropped, so attempting one would burn tokens for nothing.
+    provider.messages = Array.from({ length: 5 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      text: 'y'.repeat(100000) + ' turn-' + i, // 500k total, far over the 200k cap
+    }));
+    provider.sessionDigest = '';
+    {
+      const captured = [];
+      global.fetch = queueOllamaFetch([{ text: 'main turn reply' }], captured); // only ONE reply queued
+      await provider.askNavy('one more', false, null, [], []);
+      check('recency floor: fewer than MIN_KEEP huge messages skips the digest call entirely (only 1 fetch, not 2)', captured.length === 1);
+      check('recency floor: none of the original messages were silently dropped', provider.messages.length === 7); // 5 kept + this turn's 2
+      check('recency floor: sessionDigest stays empty (nothing was actually condensed)', !provider.sessionDigest);
+    }
+
+    // ── The original count-based trigger still works exactly as before ─────
+    provider.messages = Array.from({ length: 85 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      text: 'short-' + i, // tiny — this must trigger on COUNT alone, not size
+    }));
+    provider.sessionDigest = '';
+    {
+      const captured = [];
+      global.fetch = queueOllamaFetch([
+        { text: 'Digest of the oldest turns.' },
+        { text: 'main turn reply' },
+      ], captured);
+      await provider.askNavy('yet another', false, null, [], []);
+      check('count trigger: 85 tiny messages (over the 80-message count) still condenses as before', captured.some(isDigestCall));
+      // 60 kept (the original "keep last 60" target) + this turn's own 2.
+      check('count trigger: keeps exactly the same last-60 window as the original behavior', provider.messages.length === 62);
+    }
+  } catch (e) {
+    check('history-digest suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 7b4. delegate_research sub-agent ──────────────────────────────────────────
+// A tool the MODEL itself can call to spin off an isolated, read-only
+// investigation and get back only the conclusion — not the raw tool trace,
+// which stays out of the delegating turn's own context. The security-critical
+// property is enforcement: the sub-agent is refused write/command/further-
+// delegation attempts at DISPATCH time, not merely discouraged by prompt text.
+async function delegateResearchSuite() {
+  console.log('\ndelegate_research sub-agent:');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-delegate-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._wslCache = { available: false };
+    fs.writeFileSync(path.join(tmp, 'target.js'), 'function foo(){ return 42; }');
+
+    check('delegate_research: a missing/empty task is refused with a clear error, not a crash',
+      (await provider.toolDelegateResearch('', 5)).startsWith('Error:'));
+    check('delegate_research: a whitespace-only task is refused the same way',
+      (await provider.toolDelegateResearch('   ', 5)).startsWith('Error:'));
+
+    // Direct unit calls — no outer turn needed, exercises the sub-agent loop
+    // in isolation via the SAME global.fetch queue mechanism.
+    provider.abortController = new AbortController();
+
+    // Reads a file, then answers in plain text with no further tool calls —
+    // the RETURNED text must be the sub-agent's conclusion, not raw tool output.
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] },
+      { text: 'foo() returns the constant 42.' },
+    ]);
+    const basic = await provider.toolDelegateResearch('what does foo() return?', 5);
+    check('delegate_research: returns the sub-agent\'s written conclusion', basic === 'foo() returns the constant 42.');
+
+    // A write attempt inside the sub-agent is REFUSED (dispatch-level, not
+    // just discouraged by the prompt) — must not actually touch disk, and the
+    // sub-agent must be able to recover and still finish with an answer.
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'sneaky.js', content: 'not allowed' } }] },
+      { text: 'I do not have write access, so I could not make this change.' },
+    ]);
+    const refused = await provider.toolDelegateResearch('try to write a file', 5);
+    check('delegate_research: a write attempt is never actually executed', !fs.existsSync(path.join(tmp, 'sneaky.js')));
+    check('delegate_research: the sub-agent recovers and still returns a conclusion after being refused',
+      refused.includes('write access'));
+
+    // Recursion guard: a nested delegate_research attempt must be refused,
+    // not actually spawn a second sub-agent — verified by inspecting what the
+    // sub-agent's OWN next request actually contained.
+    {
+      const captured = [];
+      global.fetch = queueOllamaFetch([
+        { toolCalls: [{ name: 'delegate_research', args: { task: 'nested attempt' } }] },
+        { text: 'Understood, cannot delegate further.' },
+      ], captured);
+      await provider.toolDelegateResearch('try to recurse', 5);
+      const secondRequestMsgs = captured[1]?.messages || [];
+      const refusalMsg = secondRequestMsgs.find(m => typeof m.content === 'string' && m.content.includes('Refused') && m.content.includes('delegate_research'));
+      check('delegate_research: cannot recursively delegate — refused, not executed', Boolean(refusalMsg));
+    }
+
+    // maxSteps is enforced, not advisory — a sub-agent that never stops
+    // calling tools must be cut off, never loop forever. Exactly 3 responses
+    // queued for maxSteps=3: a 4th fetch attempt would throw "exhausted".
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] },
+    ]);
+    const capped = await provider.toolDelegateResearch('keep reading forever', 3);
+    check('delegate_research: respects maxSteps and stops instead of looping forever', /step budget/.test(capped));
+
+    // maxSteps below 1 clamps to 1 (not 0, which would never call the model
+    // at all) — proven by exactly ONE queued response being consumed.
+    global.fetch = queueOllamaFetch([{ toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] }]);
+    const clamped = await provider.toolDelegateResearch('task', 0);
+    check('delegate_research: maxSteps below 1 clamps to 1, still runs at least once', /step budget/.test(clamped));
+
+    // ── End-to-end: a full turn that delegates, with token/cost accounting ──
+    // Outer iter 1 (delegate_research) → sub-agent iter 1 (read_file) →
+    // sub-agent iter 2 (final text) → outer iter 2 (final text). 4 model
+    // calls total; queueOllamaFetch reports 5+5 tokens each = 20+20.
+    provider.messages = [];
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'delegate_research', args: { task: 'find how foo works in target.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'target.js' } }] },
+      { text: 'foo() returns 42.' },
+      { text: 'Investigated via a sub-agent: foo() returns 42.' },
+    ]);
+    await provider.askNavy('investigate target.js', false, null, [], []);
+
+    check('delegate_research (e2e): the sub-agent\'s internal steps never leak into the main chat history',
+      provider.messages.length === 2); // just the user turn + the outer turn's own final assistant message
+    check('delegate_research (e2e): the OUTER turn\'s persisted text is its own, not the sub-agent\'s raw output',
+      provider.messages[1].text === 'Investigated via a sub-agent: foo() returns 42.');
+    const toolResultMsg = posted.find(m => m.type === 'toolResult' && m.tool === 'delegate_research');
+    check('delegate_research (e2e): the tool card shows the sub-agent\'s conclusion',
+      toolResultMsg?.result === 'foo() returns 42.');
+    check('delegate_research (e2e): sub-agent token usage is folded into the turn\'s recorded total (4 calls × 5 = 20 each)',
+      provider.messages[1].meta?.tokens?.prompt === 20 && provider.messages[1].meta?.tokens?.completion === 20);
+  } catch (e) {
+    check('delegate_research suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// ── 7b5. Cross-provider failover (navy.providerFallbacks) ────────────────────
+// The one feature here that can spend money on a DIFFERENT account than the
+// one you're looking at — tested accordingly: the opt-in gate (empty by
+// default), the transient-vs-not classification (never falls back for auth/
+// quota/context-length, only rate-limit/server-outage/network), ordering,
+// malformed-entry safety, and that meta/cost attribution follows whichever
+// provider ACTUALLY served the turn, not whatever's configured as primary.
+//
+// A genuinely transient failure also engages streamAssistant's own
+// fetchWithRetry (3 attempts, real ~3s of backoff) before _streamWithFallback
+// ever sees it — that's real, correct behavior, not something to mock around,
+// so a few of these tests are deliberately slower than the rest of the suite.
+async function providerFallbackSuite() {
+  console.log('\ncross-provider failover (navy.providerFallbacks):');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+  const { isTransientProviderError } = require('../src/providers/errors.js');
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    // ── Pure classification — no network at all ──────────────────────────
+    check('isTransientProviderError: rate limit (429) is transient', isTransientProviderError('429 Too Many Requests'));
+    check('isTransientProviderError: server outage (503) is transient', isTransientProviderError('503 Service Unavailable'));
+    check('isTransientProviderError: network failure is transient', isTransientProviderError('fetch failed: ECONNREFUSED'));
+    check('isTransientProviderError: an auth error is NOT transient (a different account needs its OWN valid key, not a retry)',
+      !isTransientProviderError('401 Incorrect API key provided'));
+    check('isTransientProviderError: a quota/billing error is NOT transient', !isTransientProviderError('RESOURCE_EXHAUSTED: exceeded your current quota'));
+    check('isTransientProviderError: context-length is NOT transient', !isTransientProviderError("This model's maximum context length is 8192 tokens"));
+    check('isTransientProviderError: an unclassified error is NOT transient (never guess it\'s safe to retry elsewhere)', !isTransientProviderError('something bizarre happened'));
+
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-failover-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._wslCache = { available: false };
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider.abortController = new AbortController();
+    await vscode.workspace.getConfiguration().update('provider', 'ollama');
+    await vscode.workspace.getConfiguration().update('providerFallbacks', []);
+
+    // ── Opt-in gate: nothing configured → behaves exactly like a plain call ──
+    global.fetch = queueOllamaFetch([{ text: 'straight through, no fallback configured' }]);
+    const plain = await provider._streamWithFallback('http://localhost:11434', 'llama3', [{ role: 'user', content: 'hi' }], 0.2);
+    check('no fallbacks configured: a successful primary call passes through untouched',
+      plain.text === 'straight through, no fallback configured' && plain.usedProvider === 'ollama' && plain.usedModel === 'llama3');
+
+    // ── A non-transient primary failure NEVER engages fallback, even when
+    // fallbacks ARE configured — fast (401 isn't in fetchWithRetry's
+    // retryable set, so no internal backoff delay). Only 1 response queued:
+    // if fallback were (wrongly) attempted, the queue would throw "exhausted".
+    await vscode.workspace.getConfiguration().update('providerFallbacks', [{ provider: 'ollama', model: 'backup-model' }]);
+    global.fetch = queueOllamaFetch([{ fail: { status: 401, text: 'Incorrect API key' } }]);
+    let authErr = null;
+    try { await provider._streamWithFallback('http://localhost:11434', 'llama3', [{ role: 'user', content: 'hi' }], 0.2); }
+    catch (e) { authErr = e; }
+    check('a non-transient (auth) primary failure propagates directly, never tries a configured fallback',
+      authErr && /401/.test(authErr.message));
+
+    // ── No fallbacks configured → even a genuinely transient failure just
+    // propagates normally (the feature is a true no-op when unconfigured).
+    // Needs 3 queued failures to exhaust streamAssistant's own internal retry.
+    await vscode.workspace.getConfiguration().update('providerFallbacks', []);
+    global.fetch = queueOllamaFetch([
+      { fail: { status: 429, text: 'rate limited' } },
+      { fail: { status: 429, text: 'rate limited' } },
+      { fail: { status: 429, text: 'rate limited' } },
+    ]);
+    let noFallbackErr = null;
+    try { await provider._streamWithFallback('http://localhost:11434', 'llama3', [{ role: 'user', content: 'hi' }], 0.2); }
+    catch (e) { noFallbackErr = e; }
+    check('a transient failure with NO fallbacks configured propagates normally (opt-in, not automatic)',
+      noFallbackErr && /429/.test(noFallbackErr.message));
+
+    // ── The main mechanism: primary fails transiently → a malformed entry is
+    // skipped (no network attempt) → the next fallback fails (fast, 401) →
+    // the one after THAT succeeds. Proves gating, skip-malformed, ordering,
+    // and success all in one real transient-failure setup.
+    await vscode.workspace.getConfiguration().update('providerFallbacks', [
+      { provider: 'ollama' }, // malformed — missing "model", must be skipped without a fetch
+      { provider: 'ollama', model: 'backup-1' },
+      { provider: 'ollama', model: 'backup-2', host: 'http://backup-host:11434' },
+    ]);
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { fail: { status: 503, text: 'overloaded' } },
+      { fail: { status: 503, text: 'overloaded' } },
+      { fail: { status: 503, text: 'overloaded' } }, // exhausts the PRIMARY's internal retries
+      { fail: { status: 401, text: 'bad key' } },     // backup-1 fails (fast, non-retryable)
+      { text: 'backup-2 came through' },              // backup-2 succeeds
+    ]);
+    const result = await provider._streamWithFallback('http://localhost:11434', 'primary-model', [{ role: 'user', content: 'hi' }], 0.2);
+    check('mechanism: the malformed fallback entry is silently skipped, not attempted', result.text === 'backup-2 came through');
+    check('mechanism: falls through to the NEXT fallback when one fails', result.usedModel === 'backup-2');
+    check('mechanism: usedProvider/usedModel reflect the fallback that actually served it, not the primary', result.usedProvider === 'ollama' && result.usedModel === 'backup-2');
+    const announcements = posted.filter(m => m.type === 'chunk' && /trying fallback|Fallback succeeded/.test(m.text || ''));
+    check('mechanism: the primary\'s failure and each REAL fallback attempt are announced in the chat (never silent)',
+      announcements.some(m => /backup-1/.test(m.text)) && announcements.some(m => /backup-2/.test(m.text)) && announcements.some(m => /Fallback succeeded/.test(m.text)));
+    check('mechanism: the skipped malformed entry gets no announcement of its own',
+      !announcements.some(m => m.text.includes('undefined')));
+
+    // ── All configured fallbacks fail → throws the LAST fallback's error
+    // (not the primary's) — so the user sees what actually went wrong most
+    // recently, not a stale first-failure message.
+    await vscode.workspace.getConfiguration().update('providerFallbacks', [
+      { provider: 'ollama', model: 'backup-1' },
+      { provider: 'ollama', model: 'backup-2' },
+    ]);
+    global.fetch = queueOllamaFetch([
+      { fail: { status: 429, text: 'primary rate limited' } },
+      { fail: { status: 429, text: 'primary rate limited' } },
+      { fail: { status: 429, text: 'primary rate limited' } }, // exhausts primary
+      { fail: { status: 401, text: 'backup-1 bad key' } },
+      { fail: { status: 401, text: 'backup-2 bad key' } },
+    ]);
+    let allFailedErr = null;
+    try { await provider._streamWithFallback('http://localhost:11434', 'primary-model', [{ role: 'user', content: 'hi' }], 0.2); }
+    catch (e) { allFailedErr = e; }
+    check('all fallbacks exhausted: throws the LAST fallback\'s error, not the primary\'s stale one',
+      allFailedErr && /backup-2 bad key/.test(allFailedErr.message));
+
+    // ── Full end-to-end integration: meta.provider/meta.model and cost
+    // attribution must follow the FALLBACK that actually ran, not the
+    // primary that failed — this is separate wiring in _askNavyTurn from
+    // _streamWithFallback itself, so it needs its own real test.
+    await vscode.workspace.getConfiguration().update('providerFallbacks', [{ provider: 'ollama', model: 'backup-e2e' }]);
+    provider.messages = [];
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { fail: { status: 503, text: 'overloaded' } },
+      { fail: { status: 503, text: 'overloaded' } },
+      { fail: { status: 503, text: 'overloaded' } },
+      { text: 'Handled by the fallback model.' },
+    ]);
+    await provider.askNavy('hello', false, 'primary-e2e-model', [], []);
+    check('e2e: the turn still completes successfully via the fallback',
+      (provider.messages[1]?.text || '').includes('Handled by the fallback model.'));
+    check('e2e: meta.model records the FALLBACK model that actually ran, not the failed primary',
+      provider.messages[1]?.meta?.model === 'backup-e2e');
+    // The notice that a DIFFERENT account served this turn is persisted with
+    // the reply, not merely streamed — otherwise the record of who got billed
+    // disappears on the next window reload.
+    check('e2e: the persisted reply records that a fallback ran',
+      /Fallback succeeded/.test(provider.messages[1]?.text || ''));
+    check('e2e: the persisted reply names the reason the primary failed',
+      /trying fallback/.test(provider.messages[1]?.text || ''));
+  } catch (e) {
+    check('provider fallback suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    await vscode.workspace.getConfiguration().update('providerFallbacks', []);
     if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
     try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }
@@ -1868,18 +4116,21 @@ async function projectFolderSuite() {
     check('accepted add actually landed in workspaceFolders',
       (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirB));
 
-    // "Add to Workspace" — folder really gets added AND Navy follows it.
+    // "Add to List" — folder really gets added to the workspace, but Navy
+    // deliberately does NOT switch to it: adding a project to the list and
+    // selecting it are two separate steps (see openFolder's comment) — the
+    // user picks it from the dropdown afterward.
     ctrl.reset();
     vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
     provider.projectRoot = dirA;
     provider.isBusy = false;
     ctrl.nextOpenDialog = [dirB];
-    ctrl.nextInfo = 'Add to Workspace';
+    ctrl.nextInfo = 'Add to List';
     await provider.openFolder();
-    check('add-to-workspace: folder added to the workspace for real',
+    check('add-to-list: folder added to the workspace for real',
       (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirB));
-    check('add-to-workspace: Navy switched its root to the new project', provider.projectRoot === dirB);
-    check('add-to-workspace: original project still open alongside',
+    check('add-to-list: does NOT switch Navy\'s active project', provider.projectRoot === dirA);
+    check('add-to-list: original project still open alongside',
       (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirA));
 
     // "Open Here" — replaces the window via vscode.openFolder, and must NOT
@@ -1912,7 +4163,7 @@ async function projectFolderSuite() {
     vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
     provider.projectRoot = dirA;
     ctrl.nextOpenDialog = [dirB];
-    ctrl.nextInfo = 'Add to Workspace';
+    ctrl.nextInfo = 'Add to List';
     const realUpdate = vscode.workspace.updateWorkspaceFolders;
     vscode.workspace.updateWorkspaceFolders = () => false; // simulate VS Code refusing
     await provider.openFolder();
@@ -1934,19 +4185,29 @@ async function projectFolderSuite() {
     check('busy: never even opened the folder picker',
       !ctrl.executedCommands.some(c => c.command === 'vscode.openFolder'));
 
-    // Picking a folder already in the workspace just switches to it.
+    // Picking a folder already in the workspace via the dialog does nothing
+    // but tell the user it's already there — it's already selectable from
+    // the dropdown, and the dialog never switches regardless.
     ctrl.reset();
     vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }, { uri: uriOf(dirB) }];
     provider.projectRoot = dirA;
     ctrl.nextOpenDialog = [dirB];
     await provider.openFolder();
-    check('existing folder: switches without prompting', provider.projectRoot === dirB);
+    check('existing folder: does not switch without prompting', provider.projectRoot === dirA);
+    check('existing folder: tells the user it\'s already in the list',
+      ctrl.shown.info.some(m => /already in your project list/i.test(m)));
     check('existing folder: no duplicate root added',
       (vscode.workspace.workspaceFolders || []).length === 2);
 
     // ── The chat must auto-link to the project that's actually open ──────────
-    // Pure containment predicate behind the guard.
-    const belongs = eval('(' + extractFunction(extSrc, 'function rootBelongsToWorkspace') + ')');
+    // Pure containment predicate behind the guard — depends on the shared
+    // fold/foldPath helpers, so those are extracted alongside it.
+    const belongs = new Function('path', 'process',
+      extractFunction(extSrc, 'function fold(p)') + '\n' +
+      extractFunction(extSrc, 'function foldPath(p)') + '\n' +
+      extractFunction(extSrc, 'function rootBelongsToWorkspace') +
+      '\nreturn rootBelongsToWorkspace;'
+    )(path, process);
     check('root-belongs: a workspace folder itself belongs', belongs(dirA, [dirA]));
     check('root-belongs: a sub-directory of a workspace folder belongs',
       belongs(path.join(dirA, 'src'), [dirA]));
@@ -1993,6 +4254,649 @@ async function projectFolderSuite() {
     vscode.workspace.workspaceFolders = undefined;
     if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); }
     for (const d of [dirA, dirB]) { try { if (d) fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  }
+}
+
+// ── Global project catalog (~/.navy/projects.json) ──────────────────────────
+// A small, user-inspectable catalog of every project root Navy has ever been
+// pointed at, independent of any one window's workspace — so a project used
+// in a window that's since closed can still be resumed from the dropdown.
+// _globalProjectsDirOverride redirects it to an isolated temp dir so these
+// tests never touch the real user's home directory.
+async function globalProjectCatalogSuite() {
+  console.log('\nglobal project catalog (~/.navy/projects.json):');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+  const uriOf = (p) => ({ fsPath: p, scheme: 'file', path: p, toString: () => p });
+
+  let provider, homeDir, dirA, dirB, dirC;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-home-'));
+    dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catA-'));
+    dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catB-'));
+    dirC = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catC-'));
+    provider = new NavyCoderViewProvider(makeContext(dirA));
+    provider._globalProjectsDirOverride = path.join(homeDir, '.navy');
+    provider.view = { webview: { postMessage: () => {} } };
+
+    // ── Persistence round-trip ──────────────────────────────────────────────
+    await provider._recordProjectUsage(dirA);
+    check('catalog file actually written to disk under the overridden home dir',
+      fs.existsSync(path.join(homeDir, '.navy', 'projects.json')));
+    let list = await provider._readGlobalProjects();
+    check('a recorded project is read back with the right path and name',
+      list.length === 1 && list[0].path === dirA && list[0].name === path.basename(dirA));
+    check('a recorded project gets a real lastOpened timestamp', typeof list[0].lastOpened === 'number' && list[0].lastOpened > 0);
+
+    // ── Dedup: recording the same path again updates it, not duplicates it ──
+    await provider._recordProjectUsage(dirA);
+    list = await provider._readGlobalProjects();
+    check('recording the same project again does not duplicate it', list.length === 1);
+
+    // ── Multiple projects, sorted most-recently-used first ─────────────────
+    await provider._recordProjectUsage(dirB);
+    list = await provider._readGlobalProjects();
+    check('a second distinct project is added', list.length === 2);
+    check('sorted most-recently-used first', list[0].path === dirB && list[1].path === dirA);
+
+    // ── _withGlobalProjectsLock genuinely serializes concurrent callers ─────
+    // (the actual fix for the lost-update race a within-one-window concurrent
+    // write used to hit) — proven deterministically via ordering markers
+    // rather than relying on real fs timing to trigger a race or not.
+    {
+      const order = [];
+      const p1 = provider._withGlobalProjectsLock(async () => {
+        order.push('1-start');
+        await new Promise(r => setTimeout(r, 30));
+        order.push('1-end');
+      });
+      const p2 = provider._withGlobalProjectsLock(async () => {
+        order.push('2-start');
+        order.push('2-end');
+      });
+      await Promise.all([p1, p2]);
+      check('_withGlobalProjectsLock: a second caller never starts before the first finishes',
+        order.join(',') === '1-start,1-end,2-start,2-end');
+    }
+
+    // ── _recordProjectUsage: concurrent calls for DIFFERENT projects (same
+    // window) must not lose either update — the actual bug found in review.
+    // Deterministic BECAUSE of the lock above: with real serialization, the
+    // second call's read always happens after the first call's write, so
+    // both entries surviving isn't a matter of lucky timing.
+    {
+      await provider._writeGlobalProjects([]);
+      const dirX = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catX-'));
+      const dirY = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catY-'));
+      await Promise.all([provider._recordProjectUsage(dirX), provider._recordProjectUsage(dirY)]);
+      const concurrent = await provider._readGlobalProjects();
+      check('_recordProjectUsage: two concurrent calls for different projects both survive',
+        concurrent.some(p => p.path === dirX) && concurrent.some(p => p.path === dirY));
+      try { fs.rmSync(dirX, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(dirY, { recursive: true, force: true }); } catch {}
+    }
+
+    // ── _rmwJsonFile: detects a change from ANOTHER writer (simulating a
+    // different VS Code window's own process, which no in-memory lock can
+    // see) between its read and its write, and retries against the fresh
+    // data instead of blindly overwriting it.
+    {
+      const rmwPath = path.join(homeDir, 'rmw-test.json');
+      await provider._writeJsonFile(rmwPath, ['initial'], 'test');
+      let readCount = 0;
+      const origRead = provider._readJsonFile.bind(provider);
+      provider._readJsonFile = async (fp, fallback) => {
+        if (fp === rmwPath) {
+          readCount++;
+          // Before the RECHECK read (the 2nd call) actually reads the file,
+          // simulate an external writer — e.g. another window — landing in
+          // between, bypassing this provider's own tracked state entirely.
+          if (readCount === 2) fs.writeFileSync(rmwPath, JSON.stringify(['external-writer-was-here']));
+        }
+        return origRead(fp, fallback);
+      };
+      const rmwResult = await provider._rmwJsonFile(rmwPath, [], (l) => [...l, 'mine']);
+      provider._readJsonFile = origRead;
+      check('_rmwJsonFile: retries and merges instead of clobbering an externally-written change',
+        rmwResult.includes('external-writer-was-here') && rmwResult.includes('mine'));
+    }
+
+    // ── Stale entries (folder no longer exists) are dropped on read ────────
+    const goneDir = path.join(homeDir, 'this-folder-was-deleted');
+    await provider._writeGlobalProjects([
+      { path: dirA, name: 'a', lastOpened: 5 },
+      { path: goneDir, name: 'gone', lastOpened: 10 },
+    ]);
+    list = await provider._readGlobalProjects();
+    check('an entry whose folder no longer exists is excluded on read', list.length === 1 && list[0].path === dirA);
+
+    // ── Cap: never grows past 100, keeping the most recently used ──────────
+    {
+      const capBase = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-catcap-'));
+      const seeded = [];
+      for (let i = 0; i < 105; i++) {
+        const p = path.join(capBase, 'p' + i);
+        fs.mkdirSync(p);
+        seeded.push({ path: p, name: 'p' + i, lastOpened: i }); // p0 oldest, p104 newest of the batch
+      }
+      await provider._writeGlobalProjects(seeded);
+      const freshOne = path.join(capBase, 'fresh');
+      fs.mkdirSync(freshOne);
+      await provider._recordProjectUsage(freshOne); // Date.now() — newer than every seeded entry
+      const capped = await provider._readGlobalProjects();
+      check('catalog never exceeds 100 entries', capped.length === 100);
+      check('the just-recorded project survives the cap', capped.some(p => p.path === freshOne));
+      check('the 6 oldest seeded entries were dropped to make room (105 + 1 - 100 = 6)',
+        !capped.some(p => p.path === path.join(capBase, 'p0')) && !capped.some(p => p.path === path.join(capBase, 'p5')));
+      check('the newest seeded entries survive', capped.some(p => p.path === path.join(capBase, 'p104')));
+      try { fs.rmSync(capBase, { recursive: true, force: true }); } catch {}
+    }
+
+    // Reset to a clean, known catalog for the rest of this suite.
+    await provider._writeGlobalProjects([]);
+
+    // ── sendWorkspaceFolders: catalog excludes whatever's already shown ────
+    await provider._recordProjectUsage(dirB); // known globally, not open in this window
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    await provider.sendWorkspaceFolders();
+    const wf = posted.find(m => m.type === 'workspaceFolders');
+    check('sendWorkspaceFolders: catalog includes a globally-known project not open in this window',
+      wf?.catalog?.some(p => p.path === dirB));
+    check('sendWorkspaceFolders: catalog excludes the project already shown as an open root',
+      !wf?.catalog?.some(p => p.path === dirA));
+
+    // ── openFolder now catalogs whatever's picked, regardless of the choice ─
+    ctrl.reset();
+    await provider._writeGlobalProjects([]);
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextOpenDialog = [dirC];
+    ctrl.nextInfo = 'Open Here';
+    await provider.openFolder();
+    // _recordProjectUsage is deliberately fire-and-forget from openFolder (folder
+    // picking must never block on catalog bookkeeping) — give it a moment to land.
+    await new Promise(r => setTimeout(r, 50));
+    list = await provider._readGlobalProjects();
+    check('openFolder: the picked folder is catalogued globally', list.some(p => p.path === dirC));
+
+    // ── The dialog itself now offers "Add to Workspace", not "Add to List" ──
+    const dialogCall = ctrl.shownInfoCalls.find(c => Array.isArray(c.items) && c.items.includes('Open Here'));
+    check('openFolder: the dialog offers "Add to Workspace"', Boolean(dialogCall && dialogCall.items.includes('Add to Workspace')));
+    check('openFolder: the dialog no longer offers the old "Add to List" label', !(dialogCall && dialogCall.items.includes('Add to List')));
+
+    // ── openCatalogProject: already part of THIS window's workspace → direct switch, no dialog ──
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }, { uri: uriOf(dirB) }];
+    provider.projectRoot = dirA;
+    await provider.openCatalogProject(dirB);
+    check('openCatalogProject: an already-open root switches directly', provider.projectRoot === dirB);
+    check('openCatalogProject: no dialog shown for an already-open root', ctrl.shown.info.length === 0);
+
+    // ── openCatalogProject: not open here, workspace non-empty, "Open Here" ─
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextInfo = 'Open Here';
+    await provider.openCatalogProject(dirC);
+    const openedCmd = ctrl.executedCommands.find(c => c.command === 'vscode.openFolder');
+    check('openCatalogProject (Open Here): issues vscode.openFolder for the picked project', openedCmd?.args[0]?.fsPath === dirC);
+    check('openCatalogProject (Open Here): projectRoot updated to the picked project', provider.projectRoot === dirC);
+
+    // ── openCatalogProject: not open here, workspace non-empty, "Add to Workspace" ─
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextInfo = 'Add to Workspace';
+    await provider.openCatalogProject(dirC);
+    check('openCatalogProject (Add to Workspace): the folder is really added to the workspace',
+      (vscode.workspace.workspaceFolders || []).some(f => f.uri.fsPath === dirC));
+    check('openCatalogProject (Add to Workspace): does NOT switch — projectRoot unchanged', provider.projectRoot === dirA);
+
+    // ── openCatalogProject: dismissed dialog changes nothing ───────────────
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    ctrl.nextInfo = undefined;
+    await provider.openCatalogProject(dirC);
+    check('openCatalogProject (dismissed): projectRoot unchanged', provider.projectRoot === dirA);
+    check('openCatalogProject (dismissed): workspace unchanged', (vscode.workspace.workspaceFolders || []).length === 1);
+
+    // ── openCatalogProject: no workspace open at all → behaves like a fresh open ─
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = undefined;
+    provider.projectRoot = '';
+    await provider.openCatalogProject(dirC);
+    const openedNoWs = ctrl.executedCommands.find(c => c.command === 'vscode.openFolder');
+    check('openCatalogProject (no workspace open): opens the folder directly, no dialog needed', Boolean(openedNoWs));
+    check('openCatalogProject (no workspace open): never showed a choice dialog', ctrl.shown.info.length === 0);
+
+    // ── openCatalogProject: a path that no longer exists ────────────────────
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    const missingPath = path.join(homeDir, 'never-existed-xyz');
+    await provider.openCatalogProject(missingPath);
+    check('openCatalogProject (missing path): reports the error, does not crash', ctrl.shown.error.some(m => /no longer exists/i.test(m)));
+    check('openCatalogProject (missing path): projectRoot left unchanged', provider.projectRoot === dirA);
+
+    // ── openCatalogProject: refuses mid-turn, same as every other project switch ─
+    ctrl.reset();
+    vscode.workspace.workspaceFolders = [{ uri: uriOf(dirA) }];
+    provider.projectRoot = dirA;
+    provider.isBusy = true;
+    await provider.openCatalogProject(dirC);
+    provider.isBusy = false;
+    check('openCatalogProject: refuses to switch mid-turn', provider.projectRoot === dirA);
+    check('openCatalogProject: warns why', ctrl.shown.warning.some(m => /stop the current task/i.test(m)));
+
+    // ── _activateProjectRoot also keeps the catalog fresh (covers restore/startup, not just explicit picks) ─
+    await provider._writeGlobalProjects([]);
+    await provider._activateProjectRoot(dirA);
+    await new Promise(r => setTimeout(r, 50)); // same fire-and-forget settle as above
+    list = await provider._readGlobalProjects();
+    check('_activateProjectRoot records the project too (covers startup restore, not just dropdown picks)',
+      list.some(p => p.path === dirA));
+  } catch (e) {
+    check('global project catalog suite ran', false, e.stack || e.message);
+  } finally {
+    vscode.workspace.workspaceFolders = undefined;
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); }
+    for (const d of [homeDir, dirA, dirB, dirC]) { try { if (d) fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  }
+}
+
+// ── 8z. Code-review regressions ──────────────────────────────────────────────
+// Each check below pins a bug found in review that had no coverage. Grouped in
+// one suite because they share nothing but their origin.
+async function reviewRegressionSuite() {
+  console.log('\ncode-review regressions:');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+  let provider, tmp, tmp2;
+  try {
+    const { NavyCoderViewProvider, sessionContext } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-review-'));
+    tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-review2-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // ── A queued message must run in the session it was queued IN ──────────
+    // askNavy re-entered from the queue drain used to read activeSessionId,
+    // which by then names whichever tab is VISIBLE — so tab A's queued prompt
+    // ran against tab B's messages/checkpoints/projectRoot.
+    {
+      const queuedTab = provider.activeSessionId;
+      await provider.openNewSessionTab();
+      const visibleTab = provider.activeSessionId;
+      check('setup: two distinct tabs exist', queuedTab !== visibleTab);
+
+      let boundTo = null;
+      provider._askNavyTurn = async () => { boundTo = sessionContext.getStore(); };
+      // Exactly how the drain re-enters: inside the finishing turn's context.
+      await sessionContext.run(queuedTab, () => provider.askNavy('queued prompt', false, '', [], []));
+      check('a queued turn stays bound to the tab it was queued in, not the visible one',
+        boundTo === queuedTab);
+      delete provider._askNavyTurn;
+
+      // Outside any context it must still fall back to the active tab.
+      let boundTo2 = null;
+      provider._askNavyTurn = async () => { boundTo2 = sessionContext.getStore(); };
+      await provider.askNavy('direct prompt', false, '', [], []);
+      check('a turn started from the UI still binds to the visible tab', boundTo2 === visibleTab);
+      delete provider._askNavyTurn;
+    }
+
+    // ── The tab strip always describes the VISIBLE project ─────────────────
+    // _sessionSummaries read this.projectRoot through the session proxy, so a
+    // background turn ending in project A rebuilt the strip from A's chats
+    // while the user was looking at B ('sessionList' bypasses the webview's
+    // session gate, so it rendered unconditionally).
+    {
+      const visible = provider.activeSessionId;
+      provider.projectRoot = tmp;                       // the visible tab is on tmp
+      const bgId = provider.generateId();
+      provider.sessions.set(bgId, Object.assign(Object.create(Object.getPrototypeOf(provider.sessions.get(visible))), {
+        ...provider.sessions.get(visible), id: bgId, projectRoot: tmp2, messages: [], checkpoints: [],
+      }));
+      const fromBackground = sessionContext.run(bgId, () => provider._sessionSummaries());
+      check('a background turn\'s session list still describes the VISIBLE project',
+        fromBackground.every(s => s.root === tmp) && fromBackground.some(s => s.id === visible));
+      check('it does not leak the background project\'s tabs into the strip',
+        !fromBackground.some(s => s.id === bgId));
+      provider.sessions.delete(bgId);
+    }
+
+    // ── Closing a tab removes its file, so it cannot come back on reload ───
+    {
+      const keep = provider.activeSessionId;
+      await provider.openNewSessionTab();
+      const doomed = provider.activeSessionId;
+      provider.messages = [{ role: 'user', text: 'temporary chat' }];
+      await provider.saveProjectSession();
+      const chatFile = path.join(tmp, '.navy', 'chats', doomed + '.json');
+      check('setup: the chat was persisted to its own file', fs.existsSync(chatFile));
+      await provider.closeSessionTab(doomed);
+      check('closing a tab deletes its persisted chat file', !fs.existsSync(chatFile));
+      check('closing a tab falls back to a sibling', provider.activeSessionId !== doomed);
+      void keep;
+    }
+
+    // ── _projCacheFor must never evict the entry it just created ───────────
+    // Eviction ran before lastTouched was stamped, so a brand-new entry sorted
+    // as the OLDEST and was thrown away first — losing the bgManifestLock the
+    // caller was about to store on it.
+    {
+      const p2 = new NavyCoderViewProvider(makeContext(tmp));
+      for (let i = 0; i < 40; i++) p2._projCacheFor('/no/such/project-' + i);
+      const freshRoot = '/no/such/project-brand-new';
+      const fresh = p2._projCacheFor(freshRoot);
+      check('a just-created project cache survives the eviction it triggers',
+        p2._projectCaches.get(freshRoot) === fresh);
+      check('the returned object is the one still in the map (its lock is not orphaned)',
+        p2._projectCaches.get(freshRoot).writeLock === fresh.writeLock);
+      check('eviction still bounds the map', p2._projectCaches.size <= 21);
+      clearTimeout(p2._cpSaveTimer);
+    }
+
+    // ── _evictStaleSessions must not evict the root it just loaded ─────────
+    // Doing so un-marked that root in _loadedChatRoots — the set the caller
+    // had just added it to — so the next visit re-read the same directory,
+    // re-added the same chats and evicted again, forever.
+    {
+      const p3 = new NavyCoderViewProvider(makeContext(tmp));
+      for (let i = 0; i < 60; i++) {
+        const id = 'sess-' + i;
+        p3.sessions.set(id, Object.assign(Object.create(Object.getPrototypeOf(p3.sessions.get(p3.activeSessionId))), {
+          ...p3.sessions.get(p3.activeSessionId), id, projectRoot: tmp2, messages: [], checkpoints: [],
+          isBusy: false, _updated: new Date(1000 + i).toISOString(),
+        }));
+      }
+      p3._loadedChatRoots.add(tmp2);
+      p3._evictStaleSessions(tmp2);
+      check('the just-loaded root stays marked as loaded (no re-read thrash)', p3._loadedChatRoots.has(tmp2));
+      check('none of the just-loaded root\'s chats were evicted',
+        [...p3.sessions.values()].filter(s => s.projectRoot === tmp2).length === 60);
+      clearTimeout(p3._cpSaveTimer);
+    }
+
+    // ── list_files honours the `folder` argument the repo map advertises ───
+    {
+      fs.writeFileSync(path.join(tmp2, 'sibling-only.txt'), 'x');
+      ctrl.workspaceFolders = [{ uri: { fsPath: tmp } }, { uri: { fsPath: tmp2 } }];
+      vscode.workspace.workspaceFolders = ctrl.workspaceFolders;
+      const listed = await provider.toolListFiles('.', 1, tmp2);
+      check('list_files(folder) lists the SIBLING folder, not the active project',
+        /sibling-only\.txt/.test(listed));
+      const badFolder = await provider.toolListFiles('.', 1, 'no-such-folder');
+      check('list_files(folder) reports an unmatched folder instead of silently using the wrong one',
+        /does not match any open workspace folder/.test(badFolder));
+    }
+
+    // ── Shell argument escaping actually round-trips ───────────────────────
+    // The Windows escape used to wrap the value in quotes and put a caret
+    // AFTER every % — but a caret inside quotes is literal to cmd.exe, so it
+    // suppressed expansion and then stayed in the value (%PATH% arrived as
+    // %^PATH%, 50% as 50%^). And Node's default quoting turns the quotes into
+    // \" , which cmd.exe forwards literally, splitting any argument with a
+    // space. Both are checked here by really running the command.
+    {
+      const isWin = process.platform === 'win32';
+      const spec = provider._shellSpec('echo hi');
+      check('_shellSpec: uses the platform shell', spec.bin === (isWin ? 'cmd' : 'sh'));
+      check('_shellSpec: verbatim argument passing exactly on Windows', spec.verbatim === isWin);
+
+      const printer = path.join(tmp, 'print-argv.js');
+      fs.writeFileSync(printer, 'console.log("ARGV:" + JSON.stringify(process.argv.slice(2)));');
+      ctrl.config.approvalMode = 'auto-approve';
+      provider.projectRoot = tmp;
+
+      const cases = ['%PATH%', '50%', 'foo bar', 'a&echo PWNED', 'it"s here', 'x^y', '$(id)', '!DELAYED!'];
+      for (const value of cases) {
+        const out = await provider.toolRunCommand(
+          'node print-argv.js ' + provider._shellEscapeArg(value), 15000);
+        const m = out.match(/ARGV:(\[.*\])/);
+        let got = null;
+        try { got = m ? JSON.parse(m[1]) : null; } catch {}
+        check(`_shellEscapeArg round-trips ${JSON.stringify(value)} as exactly one literal argument`,
+          Array.isArray(got) && got.length === 1 && got[0] === value);
+      }
+      check('_shellEscapeArg: %VAR% is never expanded into its real value',
+        !(await provider.toolRunCommand('node print-argv.js ' + provider._shellEscapeArg('%PATH%'), 15000))
+          .includes(path.delimiter + 'Windows'));
+    }
+
+    // ── Live cards are re-announced when a tab is switched back to ─────────
+    // Switching tabs clears the view while the work underneath keeps going.
+    // Nothing re-sent the run-project card, and a background task's card is
+    // only created on 'start' — which had already passed — so its later
+    // messages, including its final answer, were dropped on the floor.
+    {
+      const posted3 = [];
+      const savedView3 = provider.view;
+      provider.view = { webview: { postMessage: (m) => posted3.push(m) } };
+      provider.projectRoot = tmp;
+
+      provider.bgProcesses.set('__run_project__', { proc: { pid: 1 }, command: 'npm start', url: 'http://localhost:3000' });
+      provider.bgProcesses.set('devserver', { proc: { pid: 2 }, stdout: 'listening on 4000' });
+      provider.bgWorkers.set('task-1', { ctrl: new AbortController(), prompt: 'audit the routes' });
+
+      provider._sendLiveCardState();
+      const kinds = posted3.map(m => m.type);
+      check('a live dev server is re-announced so its card and Stop button come back',
+        kinds.includes('runProjectStart'));
+      check('…including its URL, so the card is Live rather than stuck Starting',
+        posted3.some(m => m.type === 'runProjectReady' && m.url === 'http://localhost:3000'));
+      check('a running background task is re-announced with its real prompt',
+        posted3.some(m => m.type === 'bgTaskUpdate' && m.status === 'start'
+          && m.taskId === 'task-1' && m.prompt === 'audit the routes'));
+      check('a running background process is replayed with what it has printed',
+        posted3.some(m => m.type === 'bgProcessOutput' && m.id === 'devserver'
+          && m.chunk === 'listening on 4000'));
+      check('the dev server is not also replayed as an ordinary process card',
+        !posted3.some(m => m.type === 'bgProcessOutput' && m.id === '__run_project__'));
+
+      // A finished process must not be resurrected as a running card.
+      posted3.length = 0;
+      provider.bgProcesses.set('devserver', { proc: null, exitCode: 0, stdout: 'done' });
+      provider.bgWorkers.clear();
+      provider.bgProcesses.delete('__run_project__');
+      provider._sendLiveCardState();
+      check('an already-exited process is not re-announced as running',
+        !posted3.some(m => m.type === 'bgProcessOutput'));
+
+      provider.bgProcesses.clear();
+      provider.view = savedView3;
+    }
+
+    // ── Ollama context window: the key is ARCHITECTURE-prefixed ────────────
+    // This looked only for `llm.context_length`, which Ollama never emits — it
+    // reports `llama.context_length`, `qwen2.context_length`, `gptoss.…` etc.
+    // So no value was ever found: the badge stayed blank, the context-fill bar
+    // never moved, and num_ctx was never sent on any request.
+    {
+      const realFetch = global.fetch;
+      const posted = [];
+      const savedView = provider.view;
+      provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+
+      const showResponse = (body) => {
+        global.fetch = async () => ({ ok: true, json: async () => body });
+      };
+      const run = async () => {
+        posted.length = 0;
+        provider.modelContextLength = null;
+        await provider.fetchModelContext('http://localhost:11434', 'm');
+        const msg = posted.find(m => m.type === 'contextWindow');
+        // `max` is what the model reports; `current` is what Navy will use
+        // after navy.contextWindow is applied. With the setting at its default
+        // (0 = Max) these are the same, which is what these cases assert.
+        return msg && msg.max ? { length: msg.current, max: msg.max, options: msg.options } : null;
+      };
+
+      showResponse({ model_info: { 'llama.context_length': 8192 } });
+      let msg = await run();
+      check('context window: architecture-prefixed key is found (llama.*)',
+        msg && msg.length === 8192 && provider.modelContextLength === 8192);
+
+      showResponse({ model_info: { 'gptoss.context_length': 131072 } });
+      msg = await run();
+      check('context window: the model\'s full advertised window is used, uncapped',
+        msg && msg.length === 131072);
+
+      showResponse({ model_info: { 'qwen2.context_length': 131072 }, parameters: 'stop "<|im_end|>"\nnum_ctx 4096' });
+      msg = await run();
+      check('context window: a smaller Modelfile num_ctx does not hold the window down (Navy sets num_ctx itself)',
+        msg && msg.length === 131072);
+
+      showResponse({ model_info: { 'qwen2.context_length': 8192 }, parameters: 'num_ctx 32768' });
+      msg = await run();
+      check('context window: a Modelfile num_ctx ABOVE the architecture value is still honoured',
+        msg && msg.length === 32768);
+
+      showResponse({ model_info: {} });
+      msg = await run();
+      check('context window: unknown stays unknown — no message, so the badge hides rather than guessing',
+        !msg && provider.modelContextLength === null);
+
+      showResponse({ model_info: { 'llm.context_length': 16384 } });
+      msg = await run();
+      check('context window: the legacy llm.* key is still honoured if a build ever emits it',
+        msg && msg.length === 16384);
+
+      global.fetch = realFetch;
+      provider.view = savedView;
+    }
+
+    // ── The user picks a window from a list built for the ACTIVE model ─────
+    {
+      const { contextWindowOptions } = require('../src/extension.js');
+      check('context options: an 8k model is never offered a larger window',
+        JSON.stringify(contextWindowOptions(8192)) === JSON.stringify([8192, 4096]));
+      check('context options: the model maximum is always offered, even when it is not a power of two',
+        contextWindowOptions(200000)[0] === 200000);
+      check('context options: a 1M model offers the whole ladder up to its own maximum',
+        contextWindowOptions(1048576)[0] === 1048576 && contextWindowOptions(1048576).includes(131072));
+      check('context options: descending, so the largest reads first',
+        contextWindowOptions(131072).every((v, i, a) => i === 0 || a[i - 1] > v));
+      check('context options: an unknown maximum offers nothing at all',
+        contextWindowOptions(0).length === 0 && contextWindowOptions(null).length === 0);
+      check('context options: a maximum that IS a listed step is not duplicated',
+        contextWindowOptions(32768).filter(v => v === 32768).length === 1);
+
+      // Selection: 0 tracks the model, an explicit size is clamped to it.
+      const posted2 = [];
+      const savedView2 = provider.view;
+      provider.view = { webview: { postMessage: (m) => posted2.push(m) } };
+      const latest = () => posted2.filter(m => m.type === 'contextWindow').pop();
+
+      await vscode.workspace.getConfiguration().update('contextWindow', 0);
+      provider._applyContextWindow(131072, true);
+      check('context choice: 0 means Max — the effective window follows the model',
+        latest().current === 131072 && provider.modelContextLength === 131072);
+
+      await provider.setContextWindow(16384);
+      check('context choice: an explicit size is what gets used',
+        latest().current === 16384 && provider.modelContextLength === 16384);
+      check('context choice: the choice is persisted, not just held in memory',
+        vscode.workspace.getConfiguration('navy').get('contextWindow') === 16384);
+
+      // Switching to a SMALLER model must not leave a larger stale pick in force.
+      provider._applyContextWindow(8192, true);
+      check('context choice: a pick larger than the new model is clamped to what it supports',
+        latest().current === 8192 && provider.modelContextLength === 8192);
+
+      // …and switching back restores the user's real preference, not the clamp.
+      provider._applyContextWindow(131072, true);
+      check('context choice: the clamp is not sticky — the original pick returns on a bigger model',
+        latest().current === 16384);
+
+      await provider.setContextWindow(0);
+      check('context choice: returning to Max tracks the model again', latest().current === 131072);
+
+      provider._applyContextWindow(null, false);
+      check('context choice: an unknown window offers no options and disables the picker',
+        latest().max === null && latest().options.length === 0 && provider.modelContextLength === null);
+
+      provider.view = savedView2;
+    }
+
+    // ── Non-Ollama providers get a context window too ──────────────────────
+    // Live from the provider's own model list where it reports one (OpenRouter
+    // sends context_length, vLLM sends max_model_len), and from the known-model
+    // table otherwise — previously the badge was Ollama-only and every hosted
+    // provider showed nothing at all.
+    {
+      const { resolveModelContext } = require('../src/extension.js');
+      check('context window: a provider-reported value wins over the table',
+        resolveModelContext('claude-sonnet-5', 500000) === 500000);
+      check('context window: falls back to the known-model table when the provider says nothing',
+        resolveModelContext('claude-sonnet-5', undefined) === 200000);
+      check('context window: an unknown model resolves to null, so the badge hides',
+        resolveModelContext('some-private-finetune-v3', undefined) === null);
+      check('context window: a nonsense provider value is ignored rather than displayed',
+        resolveModelContext('gpt-4o', 0) === 128000 && resolveModelContext('gpt-4o', -5) === 128000);
+      check('context window: more specific model patterns win (gpt-4.1 before gpt-4o)',
+        resolveModelContext('gpt-4.1-mini', undefined) === 1047576);
+
+      // The list fetch must harvest whatever the provider reported, under the
+      // provider's own ids, without disturbing the plain name list.
+      const realFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: true,
+        json: async () => ({ data: [
+          { id: 'vendor/big-model', context_length: 262144 },
+          { id: 'vendor/vllm-model', max_model_len: 65536 },
+          { id: 'vendor/no-context-model' },
+        ] }),
+      });
+      const contexts = new Map();
+      const names = await provider._fetchModelList('http://x/models', {}, contexts);
+      check('context window: model list still returns plain names', names.length === 3 && names[0] === 'vendor/big-model');
+      check('context window: context_length harvested from the provider list', contexts.get('vendor/big-model') === 262144);
+      check('context window: max_model_len (vLLM) harvested too', contexts.get('vendor/vllm-model') === 65536);
+      check('context window: a model reporting no window is simply absent from the map',
+        !contexts.has('vendor/no-context-model'));
+      global.fetch = realFetch;
+
+      // Display: local models are quoted in binary (131072 = "128k"), hosted
+      // APIs in decimal (200000 = "200k"). Dividing everything by 1024 printed
+      // Claude's window as "195k ctx".
+      const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'media', 'main.js'), 'utf8');
+      const formatContextWindow = new Function(
+        extractFunction(mainSrc, 'function formatContextWindow') + '\nreturn formatContextWindow;')();
+      const shown = (n) => formatContextWindow(n);
+      check('context window display: binary windows read as the familiar power of two',
+        shown(131072) === '128k ctx' && shown(8192) === '8k ctx' && shown(262144) === '256k ctx');
+      check('context window display: decimal windows are not mangled into 1024ths',
+        shown(200000) === '200k ctx' && shown(400000) === '400k ctx' && shown(128000) === '128k ctx');
+      check('context window display: an odd value still gets a sensible round number',
+        shown(16385) === '16k ctx' && shown(1047576) === '1M ctx');
+      check('context window display: million-token windows collapse to M',
+        shown(1048576) === '1M ctx' && shown(1000000) === '1M ctx' && shown(2097152) === '2M ctx');
+    }
+
+    // ── readFileTail must not emit a replacement char on a multibyte cut ───
+    {
+      const f = path.join(tmp, 'utf8-tail.log');
+      // 'é' is two bytes; asking for an odd byte count lands mid-character.
+      fs.writeFileSync(f, 'aaaa' + 'é'.repeat(20));
+      const readFileTail = new Function('fs', extractFunction(extSrc, 'function readFileTail') + '\nreturn readFileTail;')(fs);
+      const tail = readFileTail(f, 9); // 9 bytes = 4.5 'é' characters
+      check('readFileTail never starts with a U+FFFD from a split character', !tail.startsWith('�'));
+      check('readFileTail still returns the real tail', tail.endsWith('é'));
+      const whole = readFileTail(f, 10_000);
+      check('readFileTail returns the whole file untouched when it fits', whole === 'aaaa' + 'é'.repeat(20));
+    }
+  } catch (e) {
+    check('review regression suite ran', false, e.stack || e.message);
+  } finally {
+    if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    try { if (tmp2) fs.rmSync(tmp2, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -2060,16 +4964,33 @@ async function approvalCancelSuite() {
 undoRedoSuite()
   .then(retrievalSuite)
   .then(semanticSearchSuite)
+  .then(retrievalUpgradesSuite)
+  .then(sandboxSuite)
+  .then(missingPathHintSuite)
+  .then(persistentBgProcessSuite)
+  .then(multiRootSuite)
+  .then(sessionIsolationSuite)
+  .then(sessionTaggingSuite)
+  .then(projectCacheEvictionSuite)
+  .then(sessionCacheEvictionSuite)
+  .then(projectRulesSuite)
   .then(syntaxCheckSuite)
   .then(robustnessSuite)
   .then(writeLoopGuardSuite)
   .then(hallucinationSuite)
+  .then(toolLedgerSuite)
+  .then(costEstimateSuite)
+  .then(historyDigestSuite)
+  .then(delegateResearchSuite)
+  .then(providerFallbackSuite)
   .then(cachingFallbackSuite)
   .then(adaptiveThinkingFallbackSuite)
   .then(geminiSuite)
   .then(mcpSuite)
   .then(mcpHttpSuite)
   .then(projectFolderSuite)
+  .then(globalProjectCatalogSuite)
+  .then(reviewRegressionSuite)
   .then(approvalCancelSuite)
   .then(() => {
     uninstallVscodeMock();

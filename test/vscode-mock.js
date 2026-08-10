@@ -26,20 +26,28 @@ function createVscodeMock() {
       provider: 'ollama',
       codeLens: true,
       inlineCompletions: false,
+      providerFallbacks: [],
+      persistBackgroundProcesses: false,
     },
     nextWarning: undefined,           // value the next showWarningMessage resolves to
     nextInfo: undefined,              // value the next showInformationMessage resolves to (modal choices)
     nextRename: null,                 // [{ fsPath, newText }] the fake rename provider returns
     nextOpenDialog: null,             // [fsPath] the next showOpenDialog returns, or null for cancel
+    nextWorkspaceSymbols: null,       // [{ name, location: { uri: { fsPath }, range } }] the fake symbol provider returns
+    nextDocumentSymbols: null,        // [{name,kind}] for every file, or a Map<fsPath, [...]> for per-file control
     executedCommands: [],             // [{ command, args }] — lets tests assert vscode.openFolder etc.
     shown: { warning: [], info: [], error: [] },
+    shownInfoCalls: [],               // [{ msg, options, items }] — full showInformationMessage calls, see the mock above
     applyEditFails: false,
     reset() {
       this.nextWarning = undefined; this.nextInfo = undefined; this.nextRename = null;
       this.nextOpenDialog = null; this.applyEditFails = false;
+      this.nextWorkspaceSymbols = null;
+      this.nextDocumentSymbols = null;
       this.executedCommands = [];
       this.scoped = {};
       this.shown = { warning: [], info: [], error: [] };
+      this.shownInfoCalls = [];
     },
   };
 
@@ -69,6 +77,12 @@ function createVscodeMock() {
     async createDirectory(u) {
       fs.mkdirSync(u.fsPath, { recursive: true });
     },
+    async readDirectory(u) {
+      let entries;
+      try { entries = fs.readdirSync(u.fsPath, { withFileTypes: true }); }
+      catch (e) { const err = new Error('ENOENT: ' + u.fsPath); throw err; }
+      return entries.map((e) => [e.name, e.isDirectory() ? FileType.Directory : FileType.File]);
+    },
   };
 
   // Scoped values, so tests can exercise the workspace-vs-global precedence the
@@ -97,7 +111,7 @@ function createVscodeMock() {
     env: { appRoot: require('os').tmpdir() },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
-    Uri: { file: uri, parse: (s) => uri(s) },
+    Uri: { file: uri, parse: (s) => uri(s), joinPath: (base, ...segs) => uri([base.fsPath, ...segs].join('/')) },
     ThemeColor: class { constructor(id) { this.id = id; } },
     EventEmitter: class { constructor() { this.event = () => ({ dispose() {} }); } fire() {} dispose() {} },
     Range: class { constructor(a, b, c, d) { Object.assign(this, { a, b, c, d }); } },
@@ -134,10 +148,19 @@ function createVscodeMock() {
       activeTextEditor: undefined,
       createTextEditorDecorationType: () => ({ dispose() {} }),
       showWarningMessage: async (msg) => { ctrl.shown.warning.push(msg); return ctrl.nextWarning; },
-      showInformationMessage: async (msg) => { ctrl.shown.info.push(msg); return ctrl.nextInfo; },
+      // shownInfoCalls carries the FULL call (options/button labels included) for
+      // tests that need to assert on more than the message text — ctrl.shown.info
+      // stays string-only so every existing `.some(m => regex.test(m))` check
+      // keeps working unmodified.
+      showInformationMessage: async (msg, options, ...items) => {
+        ctrl.shown.info.push(msg);
+        ctrl.shownInfoCalls.push({ msg, options, items });
+        return ctrl.nextInfo;
+      },
       showOpenDialog: async () => (ctrl.nextOpenDialog ? ctrl.nextOpenDialog.map(uri) : undefined),
       showErrorMessage: async (msg) => { ctrl.shown.error.push(msg); return undefined; },
       createStatusBarItem: () => ({ show() {}, dispose() {}, text: '', tooltip: '', command: '', name: '' }),
+      onDidChangeActiveTextEditor: () => ({ dispose() {} }),
     },
     languages: { getDiagnostics: () => [] },
     commands: {
@@ -148,13 +171,32 @@ function createVscodeMock() {
           const files = ctrl.nextRename;
           return { __rename: files, entries: () => files.map(r => [uri(r.fsPath), []]) };
         }
+        if (cmd === 'vscode.executeWorkspaceSymbolProvider') {
+          return ctrl.nextWorkspaceSymbols || undefined; // no language server active
+        }
+        if (cmd === 'vscode.executeDocumentSymbolProvider') {
+          const fp = args[0]?.fsPath;
+          // Map → per-file control (different outline per file); plain array →
+          // same result for every file; unset → no provider for any file.
+          if (ctrl.nextDocumentSymbols instanceof Map) return ctrl.nextDocumentSymbols.get(fp);
+          return ctrl.nextDocumentSymbols || undefined;
+        }
         return undefined;
       },
       registerCommand: () => ({ dispose() {} }),
     },
     StatusBarAlignment: { Left: 1, Right: 2 },
     CodeActionKind: { QuickFix: 'quickfix' },
-    SymbolKind: {},
+    // Real values (not just distinct placeholders) — code under test does
+    // real Set membership checks against these, e.g. "is this kind a
+    // function/class/method worth showing in a repo-map outline".
+    SymbolKind: {
+      File: 0, Module: 1, Namespace: 2, Package: 3, Class: 4, Method: 5,
+      Property: 6, Field: 7, Constructor: 8, Enum: 9, Interface: 10,
+      Function: 11, Variable: 12, Constant: 13, String: 14, Number: 15,
+      Boolean: 16, Array: 17, Object: 18, Key: 19, Null: 20, EnumMember: 21,
+      Struct: 22, Event: 23, Operator: 24, TypeParameter: 25,
+    },
   };
 
   return { vscode, ctrl };

@@ -1,16 +1,32 @@
 const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./providers/llm.js');
 const { openAiCompatBase, providerDisplayName } = require('./providers/endpoints.js');
 const { McpManager } = require('./providers/mcp.js');
-const { formatProviderError } = require('./providers/errors.js');
+const { formatProviderError, classifyProviderError, isTransientProviderError } = require('./providers/errors.js');
 const { getEmbeddings, cosineSimilarity } = require('./providers/embeddings.js');
 const { getWebviewHtml } = require('./webview-html.js');
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 // Deliberately NOT importing execSync: every child process here is launched from
 // the extension host thread, and a synchronous spawn there freezes the editor.
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const dns = require('dns');
+// fetch_url goes through http/https directly rather than global fetch(), which
+// offers no way to control address resolution — see _requestPinned.
+const http = require('http');
+const https = require('https');
+const zlib = require('zlib');
+const { AsyncLocalStorage } = require('async_hooks');
+
+// Tracks WHICH session a long-running operation (a turn, a background task)
+// belongs to, independent of whatever tab the user has since switched to.
+// Without this, a turn running for project A would start reading/writing
+// project B's messages/checkpoints/etc. the instant the user switched tabs,
+// since those are otherwise resolved from the live, shared activeSessionId —
+// see the _session getter below, which prefers this context when present.
+const sessionContext = new AsyncLocalStorage();
 
 // package.json declares untrustedWorkspaces.supported = false, so VS Code should
 // never activate Navy in a restricted window. This is the belt-and-braces check
@@ -50,16 +66,165 @@ const EMBED_INDEX_MAX_BYTES = 24 * 1024 * 1024;
 // all: Navy silently operates on a project the user isn't looking at. Accepts a
 // root that IS a workspace folder or lives inside one (picking a sub-directory
 // as the project root is legitimate). Pure, so it's directly testable.
+// Windows paths are case-insensitive — every path/root-identity comparison
+// in this file needs to fold case there (and nowhere else). `fold` is the
+// bare case-fold; `foldPath` additionally normalizes first (mixed slash
+// styles, redundant `.`/`..` segments, trailing separators), for callers
+// comparing two real filesystem paths rather than an already-known-clean
+// string. One shared pair instead of nine-plus independent inline copies,
+// so a correction to either rule can't be applied to some call sites and
+// missed on others.
+function fold(p) { return process.platform === 'win32' ? p.toLowerCase() : p; }
+function foldPath(p) { return fold(path.normalize(p)); }
+
 function rootBelongsToWorkspace(root, folderPaths) {
   if (!root) return false;
   if (!folderPaths || folderPaths.length === 0) return true; // no workspace to contradict it
-  const fold = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
-  const r = fold(path.normalize(root));
+  const r = foldPath(root);
   return folderPaths.some((f) => {
-    const n = fold(path.normalize(f));
+    const n = foldPath(f);
     return r === n || r.startsWith(n + path.sep);
   });
 }
+
+// Approximate USD list price per 1M tokens, input/output separate — for
+// spend visibility (the running cost estimate next to the token counter),
+// NOT live pricing. Providers change prices without notice, so this is a
+// best-effort snapshot only: `estimateCost` returns null for anything it
+// can't confidently match rather than guessing, and the UI labels every
+// figure it does show as an estimate. First matching pattern wins, ordered
+// most-specific-first so e.g. "gpt-4o-mini" is checked before "gpt-4o".
+const MODEL_PRICING = [
+  { re: /claude-opus/i, in: 15, out: 75 },
+  { re: /claude-(?:\d[\w.-]*-)?sonnet|claude-3-[57]-sonnet/i, in: 3, out: 15 },
+  { re: /claude-haiku/i, in: 0.8, out: 4 },
+  { re: /gpt-4o-mini/i, in: 0.15, out: 0.6 },
+  { re: /gpt-4o/i, in: 2.5, out: 10 },
+  { re: /gpt-4\.1-mini/i, in: 0.4, out: 1.6 },
+  { re: /gpt-4\.1-nano/i, in: 0.1, out: 0.4 },
+  { re: /gpt-4\.1/i, in: 2, out: 8 },
+  { re: /gpt-5-nano/i, in: 0.05, out: 0.4 },
+  { re: /gpt-5-mini/i, in: 0.25, out: 2 },
+  { re: /gpt-5/i, in: 1.25, out: 10 },
+  { re: /^o1-mini|o1-preview/i, in: 3, out: 12 },
+  { re: /^o1\b/i, in: 15, out: 60 },
+  { re: /^o4-mini/i, in: 1.1, out: 4.4 },
+  { re: /^o3-mini/i, in: 1.1, out: 4.4 },
+  { re: /^o3\b/i, in: 2, out: 8 },
+  { re: /gpt-3\.5/i, in: 0.5, out: 1.5 },
+  // Gemini is split by generation on purpose: 2.x is priced very differently
+  // from 1.5, and a single `gemini-.*flash` rule quietly billed a 2.5-flash
+  // turn at 1.5-flash rates. Unversioned//unknown generations fall through to
+  // the last, oldest rule rather than being assumed to be the newest.
+  { re: /gemini-2\.[05].*flash-lite/i, in: 0.1, out: 0.4 },
+  { re: /gemini-2\.[05].*flash/i, in: 0.3, out: 2.5 },
+  { re: /gemini-2\.[05].*pro/i, in: 1.25, out: 10 },
+  { re: /gemini-.*flash/i, in: 0.075, out: 0.3 },
+  { re: /gemini-.*pro/i, in: 1.25, out: 5 },
+  { re: /deepseek-reasoner|deepseek-r1/i, in: 0.55, out: 2.19 },
+  { re: /deepseek-chat|deepseek-v3/i, in: 0.27, out: 1.1 },
+  { re: /grok/i, in: 3, out: 15 },
+  { re: /glm-4/i, in: 0.5, out: 1.5 },
+];
+
+// Pure function (no `this`) so it's directly testable and reusable. Returns
+// null when the cost genuinely can't be estimated (unrecognized model on a
+// hosted provider) — the caller must never substitute a guess for that, since
+// this is the one place in Navy that touches the user's actual money.
+// Local providers are unambiguously free — gated on the PROVIDER, not a
+// model-name guess, since a locally-run model can share a name with a
+// hosted one (e.g. "llama3") without sharing its price.
+function estimateCost(provider, model, promptTokens, completionTokens) {
+  if (provider === 'ollama' || provider === 'lmstudio') return 0;
+  const entry = MODEL_PRICING.find(p => p.re.test(model || ''));
+  if (!entry) return null;
+  return (promptTokens / 1_000_000) * entry.in + (completionTokens / 1_000_000) * entry.out;
+}
+
+// Ceiling for _projectCaches (embedding index, repo-map, relevance, .gitignore
+// caches, keyed per project root — see the _proj getter) before the LEAST
+// recently touched, currently-unopen entries start getting evicted. Generous
+// on purpose: a normal session touching a handful of projects never comes
+// close to this, so eviction only ever engages for the genuinely unusual
+// case of visiting many different repos in one long-lived window — see
+// _evictStaleProjectCaches.
+const PROJECT_CACHE_CAP = 20;
+
+// Ceiling for this.sessions (every chat tab, loaded or created, in this
+// window — see _evictStaleSessions). Higher than PROJECT_CACHE_CAP since an
+// individual chat is usually far smaller than a project's embedding index,
+// but the growth risk is the same shape: visiting many projects over a
+// long-lived window auto-loads every one of their saved chats and never
+// used to free any of them.
+const SESSION_CACHE_CAP = 40;
+
+// Context window per model family, in tokens — the FALLBACK for providers that
+// don't report it themselves. Live values are always preferred: Ollama reports
+// it per model via /api/show, and OpenRouter (plus vLLM and other
+// OpenAI-compatible servers) reports it in the model list — see
+// _fetchModelList/resolveModelContext, which consult this only when the
+// provider said nothing. Like MODEL_PRICING this is a best-effort snapshot, not
+// live data, so anything unrecognized resolves to null and the UI simply hides
+// the badge rather than showing a number that might be wrong. First match wins,
+// ordered most-specific-first.
+const MODEL_CONTEXT = [
+  { re: /claude-/i, ctx: 200000 },
+  { re: /gpt-4\.1/i, ctx: 1047576 },
+  { re: /gpt-5/i, ctx: 400000 },
+  { re: /gpt-4o/i, ctx: 128000 },
+  { re: /gpt-4-turbo/i, ctx: 128000 },
+  { re: /gpt-3\.5/i, ctx: 16385 },
+  { re: /^o1-mini/i, ctx: 128000 },
+  { re: /^o1\b|^o3|^o4-mini/i, ctx: 200000 },
+  { re: /gemini-1\.5-pro/i, ctx: 2097152 },
+  { re: /gemini-/i, ctx: 1048576 },
+  { re: /deepseek/i, ctx: 128000 },
+  { re: /grok-4/i, ctx: 256000 },
+  { re: /grok/i, ctx: 131072 },
+  { re: /glm-4/i, ctx: 128000 },
+  { re: /llama-?3/i, ctx: 131072 },
+  { re: /mistral|mixtral/i, ctx: 32768 },
+];
+
+// Context window for `model`, or null when it genuinely isn't known. `live` is
+// whatever the provider itself reported for that model (see _fetchModelList),
+// and always wins — a real answer from the provider beats a table that can only
+// ever be a snapshot. Pure, so it's directly testable.
+function resolveModelContext(model, live) {
+  const fromProvider = Number(live);
+  if (Number.isFinite(fromProvider) && fromProvider > 0) return fromProvider;
+  const entry = MODEL_CONTEXT.find(e => e.re.test(model || ''));
+  return entry ? entry.ctx : null;
+}
+
+// The selectable window sizes offered for a model whose maximum is `max`:
+// familiar power-of-two steps up to that maximum, plus the maximum itself when
+// it isn't already one of them (200,000 and 1,000,000 are not). Built per model
+// rather than from a fixed list, so an 8k model never offers 128k and a 1M
+// model isn't silently limited to whatever a hardcoded list happened to stop
+// at. Descending, so the largest — the default — reads first. Pure.
+function contextWindowOptions(max) {
+  if (!Number.isFinite(max) || max <= 0) return [];
+  const steps = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+  const offered = steps.filter(s => s < max);
+  offered.push(max);
+  return offered.reverse();
+}
+
+// How many .navy/bg-logs/*.log files a project keeps (see _pruneBgLogs).
+// Generous — these are small unless a dev server is genuinely chatty, and the
+// point is only to stop unbounded growth over a project's whole lifetime, not
+// to be stingy about recent history the user may still want to read back.
+const PERSIST_LOG_KEEP = 20;
+
+// Read-only tools — safe to run in parallel within a turn (see the
+// Promise.all gate in _askNavyTurn) and the full set a delegate_research
+// sub-agent is permitted to call (see toolDelegateResearch). One shared
+// definition so the two notions of "read-only" can't drift apart.
+const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
+  'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
+  'check_syntax','find_symbol','find_references',
+  'web_search','fetch_url','get_terminal_output','read_process_output']);
 
 // Shared by _collectRelevance (keyword search) and _listCodeFiles (embedding
 // index) — both walk the same repo the same way, so a single definition
@@ -158,13 +323,169 @@ function literalReplace(original, search, replace) {
   return null;
 }
 
+// Splits a file's content into embeddable chunks. A file that fits in one
+// window (the common case for most source files) produces a SINGLE chunk
+// spanning the whole file, with the exact embedded text format used before
+// chunking existed (`rel + '\n\n' + content.slice(0, 1500)`) — so ordinary
+// small-file behavior, and every existing test that pins that exact string,
+// is unaffected. Only a file with MORE lines than one window splits into
+// multiple overlapping chunks, each tagged with its own line range — this is
+// what makes a symbol defined past the old 1,500-char cutoff findable by
+// semantic search at all. A per-chunk window is capped at maxCharsPerChunk —
+// deliberately much larger than the single-file 1,500 above: 120 lines of
+// ordinary code easily runs 4,000-6,000+ characters, and reusing the smaller
+// constant here would silently truncate a chunk mid-window, undermining the
+// entire reason chunking exists (a real symbol landing just past that
+// smaller cutoff, inside its own correct chunk, would still be invisible).
+// Capped at maxChunks per file (a giant file just gets its first
+// maxChunks*step lines covered, matching the caps used everywhere else in
+// this file: maxFiles, MAX_READ_LINES, etc.). Pure.
+function chunkFileForEmbedding(rel, content, { windowLines = 120, overlapLines = 20, maxChunks = 8, maxCharsPerChunk = 6000 } = {}) {
+  const lines = content.split('\n');
+  if (lines.length <= windowLines) {
+    return [{ startLine: 1, endLine: Math.max(lines.length, 1), text: rel + '\n\n' + content.slice(0, 1500) }];
+  }
+  const step = windowLines - overlapLines;
+  const chunks = [];
+  for (let start = 0; start < lines.length && chunks.length < maxChunks; start += step) {
+    const end = Math.min(start + windowLines, lines.length);
+    const slice = lines.slice(start, end).join('\n');
+    chunks.push({ startLine: start + 1, endLine: end, text: `${rel}:${start + 1}-${end}\n\n${slice.slice(0, maxCharsPerChunk)}` });
+    if (end >= lines.length) break;
+  }
+  return chunks;
+}
+
+// Strips // and /* */ comments from JSONC (JSON with Comments) — devcontainer.json
+// commonly contains comments despite its .json extension, and JSON.parse rejects
+// them outright. String-literal-aware (tracks quote/escape state) so a comment
+// marker inside a quoted value (e.g. a "https://" URL) is never mistaken for a
+// real comment. Pure.
+function stripJsonComments(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; out += ch; continue; }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      out += '\n';
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i++; // land on the closing '/'
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+// Matches the handful of OS/toolchain error strings that mean "a path in
+// this command doesn't actually exist" (cmd.exe, POSIX shells, and common
+// compiler frontends all phrase this differently) — used by _spawnAndCollect
+// to nudge the model toward verifying the real name instead of guessing a
+// new spelling and retrying, which otherwise repeats indefinitely (a wrong
+// path never becomes right by chance). Deliberately narrow: only genuine
+// "this path/command doesn't exist" signatures, never a generic non-zero
+// exit, so a real compile error or test failure never gets misdiagnosed as
+// a path problem. Pure.
+function looksLikeMissingPathError(output) {
+  // "file not found" is cmd.exe's own wording for `dir`/`type` on a path that
+  // isn't there — and also clang's ("'foo.h' file not found"), which is the
+  // same class of problem. It was missing until _shellEscapeArg was fixed:
+  // before that, quoting corruption meant a not-found path reached cmd
+  // mangled, so it reported a SYNTAX error instead and this pattern never had
+  // to recognise the plain not-found case.
+  return /cannot find the (file|path) specified|the filename, directory name, or volume label syntax is incorrect|is not recognized as an internal or external command|no such file or directory|\bfile not found\b|command not found/i.test(output);
+}
+
+// Wraps a tool's result in whichever wire shape the model expects: a native
+// tool-result message when the model used real provider tool-calling, or an
+// XML-tagged user message for the JSON-fallback path (small/local models).
+// Shared by the main turn loop and delegate_research's own sub-agent loop —
+// this shape has needed provider-specific fixes before (Anthropic
+// cache_control, DeepSeek's required `type` field, …), and a single
+// definition means a future one can't be applied to one caller and
+// forgotten on the other. Pure.
+function makeToolResultMessage(tool, result, isNative) {
+  return isNative
+    ? { role: 'tool', tool_call_id: tool.id || '', content: String(result) }
+    : { role: 'user', content: '<tool_result name="' + tool.name + '">\n' + result + '\n</tool_result>' };
+}
+
+// Reads only the last `maxBytes` of a file via a positional read, instead of
+// loading the whole thing into memory just to throw away everything but the
+// tail — used for persisted background-process logs, which a chatty dev
+// server can grow to multi-MB, and which get read repeatedly (once per
+// read_process_output call, and up to 20 times by run_project's own
+// server-URL poll). A synchronous full-file read on the extension host's
+// single thread scales with how much the process has ever logged, not with
+// maxBytes; this scales with neither the file's total size nor how many
+// times it's read.
+function readFileTail(filePath, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const size = fs.fstatSync(fd).size;
+    const readSize = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(readSize);
+    fs.readSync(fd, buf, 0, readSize, size - readSize);
+    // Cutting at a byte offset lands mid-character whenever the boundary falls
+    // inside a multi-byte UTF-8 sequence, and decoding that yields a leading
+    // U+FFFD — visible junk at the top of every truncated read. A lead byte is
+    // 0b0xxxxxxx (ASCII) or 0b11xxxxxx (sequence start); 0b10xxxxxx is a
+    // continuation, so skipping forward to the first non-continuation byte
+    // drops at most 3 bytes of a character that was already incomplete. Only
+    // applies when the read actually started mid-file — a tail covering the
+    // whole file begins on a real character boundary by definition. Kept
+    // inline rather than factored out: the test suite extracts this function
+    // by name and evaluates it standalone.
+    let from = 0;
+    if (readSize < size) {
+      while (from < 4 && from < buf.length && (buf[from] & 0xc0) === 0x80) from++;
+    }
+    return (from ? buf.subarray(from) : buf).toString('utf8');
+  } catch { return ''; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+
 // Tool definitions — used both for the XML-fallback prompt and for native Ollama tool calling.
 const { TOOLS, TOOLS_API, TOOL_PROMPT } = require('./providers/tools.js');
 
-class NavyCoderViewProvider {
-  constructor(context) {
-    this.context = context;
-    this.view = undefined;
+// Per-project state that used to live as flat NavyCoderViewProvider instance
+// fields (messages, checkpoints, isBusy, bgProcesses, …) — extracted so more
+// than one project's state can be tracked at once without a switch clobbering
+// whatever was live for the previous one. NavyCoderViewProvider exposes every
+// field below as a getter/setter proxying to the ACTIVE session (see the
+// property block right after its constructor), so every existing
+// `this.messages`, `this.isBusy`, `this.checkpoints`, etc. call site
+// elsewhere in this file keeps working completely unchanged — this class
+// only changes WHERE that state physically lives, not how it's used.
+//
+// Identity is a generated `id`, NOT projectRoot — a tab ("New Chat") can
+// exist before any project is assigned to it, and `projectRoot` is a plain
+// mutable field on the session rather than its lookup key. MANY sessions can
+// share the same projectRoot at once — the tab strip shows them as that
+// project's own set of chats (children of the project, selected via the
+// dropdown), each persisted to its OWN file under that project's .navy/
+// directory (.navy/chats/<id>.json — see _ensureProjectChatsLoaded /
+// saveProjectSession), so two chats on the same project never clobber each
+// other's history the way a single shared session.json used to.
+class Session {
+  constructor(id, projectRoot) {
+    this.id = id;
+    this.projectRoot = projectRoot || '';
     this.lastReply = '';
     this.abortController = undefined;
     this.messages = [];
@@ -173,6 +494,47 @@ class NavyCoderViewProvider {
     this.checkpoints = [];
     this.redoStack = []; // entries: { files: [{ filePath, text }] } — text as it was before the undo
     this.activeToolCall = null;
+    this.messageQueue = [];   // queued prompts while a turn is in progress
+    this.isBusy = false;
+    this.currentTurnId = null;     // groups checkpoints for per-turn undo
+    this.bgProcesses = new Map(); // id → { proc, stdout, stderr, exitCode }
+    this.bgWorkers   = new Map(); // taskId → { ctrl: AbortController }
+    this.bgWorkerId  = 0;
+    this.sessionDigest = '';
+    this._updated = ''; // ISO timestamp of the last save to this chat's own file — used to pick the most-recent chat when reactivating a project
+    // Token usage from delegate_research sub-agent calls made DURING the
+    // current turn — reset at the start of each turn, folded into that
+    // turn's meta.tokens at the end (see toolDelegateResearch/_askNavyTurn).
+    // Session-scoped (not a local var in _askNavyTurn) because
+    // toolDelegateResearch is a separate method with no other channel back
+    // into the turn's own token accounting.
+    this.subAgentTokens = { prompt: 0, completion: 0 };
+    // The model the currently-running turn was invoked with (the picker's
+    // choice arrives per-request, so it can differ from navy.model). Read by
+    // tools that make their own model calls — see toolDelegateResearch.
+    this.activeModel = '';
+    // Provider-fallback notices raised during the current turn, folded into
+    // that turn's persisted reply text at the end — see _announceFallback.
+    this.fallbackNotices = [];
+    this._checkpointTurnId = undefined;
+    this._heartbeat = undefined;
+    this._watchdog = undefined;
+    this._cpSaveTimer = undefined;
+    // Write-lock, gutter-decoration ranges, and embeddings/repo-map/
+    // .gitignore/relevance caches all live on the PROVIDER, keyed by
+    // project root (see _projectCaches / the _proj getter) — not here. They
+    // mirror shared on-disk/filesystem state (and, for the write-lock, a
+    // shared invariant — no two writes to the same file at once) that's the
+    // same for every chat on a project, so they must be shared across
+    // sibling sessions, not duplicated per chat.
+  }
+}
+
+class NavyCoderViewProvider {
+  constructor(context) {
+    this.context = context;
+    this.view = undefined;
+    this.sessions = new Map(); // generated id → Session; lets more than one tab's state exist at once
     // Restore the last picked project root (persisted via navy.projectRoot) so the
     // project choice survives window reloads. Scope matters: the workspace-level value
     // always applies, but the global value is only trusted when NO workspace is open —
@@ -186,23 +548,28 @@ class NavyCoderViewProvider {
     // Without the second check, a root left over from a different project makes
     // the chat silently operate on a project that isn't open, forcing the user to
     // fix it by hand in the picker every time they open that folder.
-    this.projectRoot = (savedRoot && fs.existsSync(savedRoot) && rootBelongsToWorkspace(savedRoot, folderPaths))
+    const initialRoot = (savedRoot && fs.existsSync(savedRoot) && rootBelongsToWorkspace(savedRoot, folderPaths))
       ? savedRoot
       : '';
-    this.messageQueue = [];   // queued prompts while a turn is in progress
-    this.isBusy = false;
-    this.modelContextLength = null; // fetched from Ollama /api/show
+    const initialId = this.generateId();
+    this.sessions.set(initialId, new Session(initialId, initialRoot));
+    this.activeSessionId = initialId;
+    this._bootstrapSessionId = initialId; // identifies ONLY this constructor-created placeholder — see _activateProjectRoot's cleanup, which must never sweep up a deliberately-created empty "+" tab
+    this._loadedChatRoots = new Set(); // roots whose .navy/chats/ has been read from disk this window — read once, then trust in-memory state
+    this._orphanCheckedRoots = new Set(); // roots already checked for leftover persisted background processes this window — see _checkOrphanedBgProcesses
+    this._lastActiveByRoot = new Map(); // projectRoot -> sessionId, so re-selecting a project resumes whichever of its chats you were last on
+    this._projectCaches = new Map(); // projectRoot -> { embedIndexCache, embedInFlight, embedUnavailable, embedSaveTimer, repoMapCache, relCache, gitIgnoredCache } — shared across every chat on that project, see the _proj getter
+    // The window Navy actually uses: sent as num_ctx to Ollama, and the
+    // denominator of the context-fill gauge. Derived from modelContextMax and
+    // the user's navy.contextWindow choice — see _applyContextWindow. Tied to
+    // the active model, not a project.
+    this.modelContextLength = null;
+    this.modelContextMax = null; // the largest window the ACTIVE model reports, before the user's choice is applied
     // Restore the persisted thinking level so the choice survives window reloads.
     this.thinkingLevel = vscode.workspace.getConfiguration('navy').get('thinkingLevel', 'medium');
-    this.currentTurnId = null;     // groups checkpoints for per-turn undo
     this.statusBarItem = null; // set by activate() after construction
-    this.bgProcesses = new Map(); // id → { proc, stdout, stderr, exitCode }
-    this._writeLock = Promise.resolve(); // serializes file writes across main turn + background tasks
     this.log = null; // set by activate() → Navy Coder output channel; safe to call before
-    this.mcp = new McpManager((line) => this.log?.(line)); // external MCP tool servers
-    this.bgWorkers   = new Map(); // taskId → { ctrl: AbortController }
-    this.bgWorkerId  = 0;
-    this.editedRanges = new Map(); // filePath -> [{start,end}] for gutter decorations
+    this.mcp = new McpManager((line) => this.log?.(line)); // external MCP tool servers — shared across all sessions, config is global
     this.gutterDecorationType = vscode.window.createTextEditorDecorationType({
       backgroundColor: new vscode.ThemeColor('diffEditor.insertedLineBackground'),
       isWholeLine: true,
@@ -211,8 +578,189 @@ class NavyCoderViewProvider {
     });
   }
 
+  // ── Active-session field proxies ─────────────────────────────────────────
+  // Every getter/setter below reads/writes the ACTIVE Session object instead
+  // of a flat field on `this`. `_session` lazily creates a blank one if
+  // somehow missing (defensive — activeSessionId should always name a real
+  // entry in `this.sessions` once the constructor has run).
+  get _session() {
+    // A turn/background-task running inside sessionContext.run(...) keeps
+    // resolving to the session it STARTED with, even after the user switches
+    // the visible tab to a different one — only code running outside any
+    // such context (webview message handlers reacting to whatever tab is
+    // currently on-screen) falls back to the live activeSessionId.
+    const ctxId = sessionContext.getStore();
+    const key = ctxId !== undefined ? ctxId : this.activeSessionId;
+    let s = this.sessions.get(key);
+    if (!s) { s = new Session(key, ''); this.sessions.set(key, s); }
+    return s;
+  }
+
+  get projectRoot() { return this._session.projectRoot; }
+  set projectRoot(root) {
+    // A plain field mutation on the ACTIVE tab — session identity is a
+    // generated id (see the Session class), independent of which project a
+    // tab is pointed at, so assigning here never switches tabs or creates a
+    // new one. "Switch to a different EXISTING tab" is done by assigning
+    // activeSessionId directly (see switchSessionTab), and "point Navy at a
+    // root, reusing an existing tab for it if one already has it" is
+    // _switchProjectRoot's job, not this setter's.
+    this._session.projectRoot = root || '';
+  }
+
+  get lastReply() { return this._session.lastReply; }
+  set lastReply(v) { this._session.lastReply = v; }
+  get abortController() { return this._session.abortController; }
+  set abortController(v) { this._session.abortController = v; }
+  get messages() { return this._session.messages; }
+  set messages(v) { this._session.messages = v; }
+  get pendingApprovals() { return this._session.pendingApprovals; }
+  set pendingApprovals(v) { this._session.pendingApprovals = v; }
+  get pendingCommandApprovals() { return this._session.pendingCommandApprovals; }
+  set pendingCommandApprovals(v) { this._session.pendingCommandApprovals = v; }
+  get checkpoints() { return this._session.checkpoints; }
+  set checkpoints(v) { this._session.checkpoints = v; }
+  get redoStack() { return this._session.redoStack; }
+  set redoStack(v) { this._session.redoStack = v; }
+  get activeToolCall() { return this._session.activeToolCall; }
+  set activeToolCall(v) { this._session.activeToolCall = v; }
+  get messageQueue() { return this._session.messageQueue; }
+  set messageQueue(v) { this._session.messageQueue = v; }
+  get isBusy() { return this._session.isBusy; }
+  set isBusy(v) { this._session.isBusy = v; }
+  get currentTurnId() { return this._session.currentTurnId; }
+  set currentTurnId(v) { this._session.currentTurnId = v; }
+  get bgProcesses() { return this._session.bgProcesses; }
+  set bgProcesses(v) { this._session.bgProcesses = v; }
+  // Project-scoped, not session-scoped: two sibling chats on the SAME
+  // project can each run a turn/background task at once, and both may
+  // mutate files — the lock has to serialize across ALL of a project's
+  // chats, not just within one, or two chats' writes to the same file can
+  // interleave and corrupt it. See _proj.
+  get _writeLock() { return this._proj.writeLock; }
+  set _writeLock(v) { this._proj.writeLock = v; }
+  get bgWorkers() { return this._session.bgWorkers; }
+  set bgWorkers(v) { this._session.bgWorkers = v; }
+  get bgWorkerId() { return this._session.bgWorkerId; }
+  set bgWorkerId(v) { this._session.bgWorkerId = v; }
+  // Project-scoped, not session-scoped: gutter marks reflect real edits on
+  // disk, which exist regardless of which of a project's chats made them.
+  // Session-scoping this meant a sibling chat writing to a shared file
+  // would call applyGutterDecorations with ITS OWN (mostly empty)
+  // editedRanges map, wiping out the gutter marks another chat had just set
+  // for that same file/editor.
+  get editedRanges() { return this._proj.editedRanges || (this._proj.editedRanges = new Map()); }
+  set editedRanges(v) { this._proj.editedRanges = v; }
+  get sessionDigest() { return this._session.sessionDigest; }
+  set sessionDigest(v) { this._session.sessionDigest = v; }
+  get subAgentTokens() { return this._session.subAgentTokens; }
+  set subAgentTokens(v) { this._session.subAgentTokens = v; }
+  get _checkpointTurnId() { return this._session._checkpointTurnId; }
+  set _checkpointTurnId(v) { this._session._checkpointTurnId = v; }
+  get _heartbeat() { return this._session._heartbeat; }
+  set _heartbeat(v) { this._session._heartbeat = v; }
+  get _watchdog() { return this._session._watchdog; }
+  set _watchdog(v) { this._session._watchdog = v; }
+  get _cpSaveTimer() { return this._session._cpSaveTimer; }
+  set _cpSaveTimer(v) { this._session._cpSaveTimer = v; }
+
+  // Embeddings/repo-map/.gitignore caches are keyed by PROJECT ROOT, not by
+  // chat session — they mirror a single shared on-disk file
+  // (.navy/embeddings.json) and filesystem state that's the same regardless
+  // of which of a project's chats is asking. Session-scoping these (as they
+  // were before) meant two sibling chats on the same project each kept
+  // their OWN copy of the embedding index and their OWN in-flight/
+  // rate-limit guards — so both could kick off redundant embedding calls at
+  // once (exactly what _embedInFlight exists to prevent), and whichever
+  // chat's debounced save fired last would silently overwrite the other's
+  // additions to the shared embeddings.json.
+  get _proj() { return this._projCacheFor(this.projectRoot); }
+
+  // Same lookup as _proj, but for an EXPLICIT root rather than the active
+  // session's — needed by anything that takes `root` as its own parameter
+  // (the bg-process manifest lock below) rather than always meaning "the
+  // currently active tab's project", which may differ or may no longer be
+  // active at all by the time an async continuation (e.g. a persisted
+  // process's exit handler, which can fire long after its own tab closed)
+  // actually runs.
+  _projCacheFor(root) {
+    let p = this._projectCaches.get(root);
+    if (!p) {
+      p = { writeLock: Promise.resolve(), lastTouched: Date.now() };
+      this._projectCaches.set(root, p);
+      // Stamped BEFORE evicting, and the entry is exempted by root below:
+      // eviction sorts on `lastTouched || 0`, so an unstamped brand-new entry
+      // sorted as the OLDEST and became the first thing thrown away — the
+      // exact inverse of the intent. That mattered for real: _withBgManifestLock
+      // asks for the cache of a root with no open session (a persisted
+      // process's exit handler firing after its tab closed), then stores the
+      // lock on the object it got back — which, once evicted, is detached, so
+      // the next writer creates a fresh entry with no lock and manifest writes
+      // stop being serialized at all.
+      this._evictStaleProjectCaches(root);
+    } else {
+      p.lastTouched = Date.now();
+    }
+    return p;
+  }
+
+  // Keeps _projectCaches bounded — without this it grows by one entry for
+  // every distinct project root ever visited in this window, for the rest of
+  // the window's life, holding onto that project's embedding vectors/repo-map/
+  // relevance caches long after the user has moved on. Only ever evicts a
+  // root with NO currently-open chat tab anywhere in this window: that's
+  // exactly the condition under which no turn or background task could be
+  // touching its write lock, so this can never race a real write — a write
+  // already in flight keeps its own reference to the writeLock it captured
+  // regardless of whether the Map entry still exists, and a NEW write can
+  // only start once a session for that root exists again, which is precisely
+  // what "currently-open" rules out. embedSaveTimer is cleared, not flushed,
+  // on eviction — the same tradeoff dispose() already makes on full shutdown.
+  _evictStaleProjectCaches(protectRoot) {
+    if (this._projectCaches.size <= PROJECT_CACHE_CAP) return;
+    const openRoots = new Set([...this.sessions.values()].map(s => s.projectRoot).filter(Boolean));
+    const evictable = [...this._projectCaches.entries()]
+      .filter(([root]) => !openRoots.has(root) && root !== protectRoot)
+      .sort((a, b) => (a[1].lastTouched || 0) - (b[1].lastTouched || 0)); // oldest-touched first
+    let over = this._projectCaches.size - PROJECT_CACHE_CAP;
+    for (const [root, cache] of evictable) {
+      if (over <= 0) break;
+      clearTimeout(cache.embedSaveTimer);
+      this._projectCaches.delete(root);
+      over--;
+    }
+  }
+  get _embedIndexCache() { return this._proj.embedIndexCache; }
+  set _embedIndexCache(v) { this._proj.embedIndexCache = v; }
+  get _embedInFlight() { return this._proj.embedInFlight; }
+  set _embedInFlight(v) { this._proj.embedInFlight = v; }
+  get _embedUnavailable() { return this._proj.embedUnavailable; }
+  set _embedUnavailable(v) { this._proj.embedUnavailable = v; }
+  get _embedSaveTimer() { return this._proj.embedSaveTimer; }
+  set _embedSaveTimer(v) { this._proj.embedSaveTimer = v; }
+  get _repoMapCache() { return this._proj.repoMapCache; }
+  set _repoMapCache(v) { this._proj.repoMapCache = v; }
+  get _relCache() { return this._proj.relCache; }
+  set _relCache(v) { this._proj.relCache = v; }
+  get _gitIgnoredCache() { return this._proj.gitIgnoredCache; }
+  set _gitIgnoredCache(v) { this._proj.gitIgnoredCache = v; }
+
   async resolveWebviewView(webviewView) {
     this.view = webviewView;
+    // Auto-tag every outgoing message with the session it belongs to — reads
+    // sessionContext first (so a background turn's messages stay tagged with
+    // ITS session even after the user switches tabs), falling back to
+    // whichever tab is currently on-screen for everything else (settings,
+    // model list, and other UI-driven messages with no running turn behind
+    // them). Wrapping the ONE postMessage call here, instead of editing every
+    // one of the ~150 `this.view.webview.postMessage(...)` call sites
+    // elsewhere in this file, keeps every existing call site unchanged —
+    // same trick as the Session getter/setter proxies above.
+    const realPostMessage = webviewView.webview.postMessage.bind(webviewView.webview);
+    webviewView.webview.postMessage = (message) => {
+      const sessionId = sessionContext.getStore() ?? this.activeSessionId;
+      return realPostMessage({ sessionId, ...message });
+    };
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -222,7 +770,7 @@ class NavyCoderViewProvider {
     webviewView.webview.html = this.getHtml(webviewView.webview);
 
     // Cancel all pending approvals when the panel is closed so awaiting promises resolve.
-    webviewView.onDidDispose(() => this.cancelPendingApprovals());
+    webviewView.onDidDispose(() => this.cancelAllPendingApprovals());
 
     webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
@@ -233,13 +781,24 @@ class NavyCoderViewProvider {
           this.sendApprovalMode();
           this.sendSettings();
           this.view?.webview.postMessage({ type: 'thinkingLevel', level: this.thinkingLevel });
+          if (this.projectRoot) await this._activateProjectRoot(this.projectRoot);
           await this.sendWorkspaceFolders();
           await this.loadProjectSession();
+          this._sendSessionList();
           // Say plainly when tools are restricted, rather than letting the user
           // discover it by watching every command get refused.
           if (!workspaceIsTrusted()) {
             this.view?.webview.postMessage({ type: 'restrictedMode' });
           }
+          break;
+        case 'newSessionTab':
+          await this.openNewSessionTab();
+          break;
+        case 'switchSessionTab':
+          await this.switchSessionTab(message.sessionId || '');
+          break;
+        case 'closeSessionTab':
+          await this.closeSessionTab(message.sessionId || '');
           break;
         case 'ask':
           await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || []);
@@ -335,15 +894,20 @@ class NavyCoderViewProvider {
         case 'setProjectRoot':
           // Never switch roots while a turn is running — executing tools resolve
           // paths against this.projectRoot live, so edits would land in the wrong project.
-          if (this.isBusy) {
-            vscode.window.showWarningMessage('Navy is working — stop the current task before switching projects.');
+          if (this._refuseIfBusy()) {
             await this.sendWorkspaceFolders(); // re-send current root so the dropdown reverts
             break;
           }
           await this._switchProjectRoot(message.root || '');
           break;
+        case 'openCatalogProject':
+          await this.openCatalogProject(message.root || '');
+          break;
         case 'setThinkingLevel':
           this.setThinkingLevel(message.level);
+          break;
+        case 'setContextWindow':
+          await this.setContextWindow(message.tokens);
           break;
         case 'clearMemory': {
           const pick = await vscode.window.showWarningMessage(
@@ -405,6 +969,25 @@ class NavyCoderViewProvider {
           if (worker) worker.ctrl.abort();
           break;
         }
+        case 'killBgProcess':
+          // The Stop button on a background-process panel. Routed through the
+          // same tool the model uses, so manifest cleanup and the bgProcessDone
+          // notification happen identically either way.
+          if (message.id) await this.toolKillProcess(message.id);
+          break;
+        case 'openDiffFile':
+          // "Open in editor" on a diff card — the card can only ever show a
+          // truncated view of a large change, and it used to say "use the
+          // editor diff view" with no way to get there.
+          if (message.path) {
+            try {
+              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(message.path));
+              await vscode.window.showTextDocument(doc, { preview: false });
+            } catch (e) {
+              vscode.window.showWarningMessage(`Navy: could not open ${path.basename(message.path)} — ${e.message}`);
+            }
+          }
+          break;
         case 'stopRunProject': {
           const entry = this.bgProcesses.get('__run_project__');
           if (entry?.proc) {
@@ -498,12 +1081,38 @@ class NavyCoderViewProvider {
   // the promises directly here (the previous approach) left whatever
   // Approve/Reject card was still pending stuck with visibly-enabled but dead
   // buttons after Stop, since nothing ever told the webview it was resolved.
+  // Active session only — Stop and Clear are per-chat actions (mirroring
+  // the abortController/messageQueue resets right next to their call
+  // sites), so this must not reach into an unrelated background tab and
+  // reject ITS approvals too. For "cancel literally everything, the whole
+  // panel is going away" semantics, see cancelAllPendingApprovals.
   cancelPendingApprovals() {
     for (const id of [...this.pendingApprovals.keys()]) {
       this.resolveApproval(id, false);
     }
     for (const id of [...this.pendingCommandApprovals.keys()]) {
       this.resolveCommandApproval(id, false);
+    }
+  }
+
+  // Every session's pending approvals — used ONLY when the whole webview
+  // panel is being disposed (extension deactivation, view container
+  // removed). A background chat's turn can be sitting on an approval right
+  // then, and nothing will ever resolve that promise once the webview that
+  // would show it is gone, leaving the turn hung forever. Bound via
+  // sessionContext.run so resolveApproval/resolveCommandApproval (which
+  // read/write through the active-session proxies) act on each session's
+  // OWN maps regardless of which one happens to be live.
+  cancelAllPendingApprovals() {
+    for (const session of this.sessions.values()) {
+      sessionContext.run(session.id, () => {
+        for (const id of [...session.pendingApprovals.keys()]) {
+          this.resolveApproval(id, false);
+        }
+        for (const id of [...session.pendingCommandApprovals.keys()]) {
+          this.resolveCommandApproval(id, false);
+        }
+      });
     }
   }
 
@@ -544,7 +1153,9 @@ class NavyCoderViewProvider {
     this.redoStack = [];
     this.view?.webview.postMessage({ type: 'redoState', count: 0 });
     this._persistCheckpoints();
-    this.editedRanges.clear();
+    // Deliberately does NOT clear editedRanges: gutter marks reflect real
+    // edits still sitting on disk (possibly from a sibling chat on the same
+    // project too), so clearing THIS conversation must not erase them.
     this.view?.webview.postMessage({ type: 'cleared' });
     // A run-project dev server is deliberately NOT killed by Clear (Clear resets
     // the conversation, not your running work) — but its card has no lazy
@@ -573,7 +1184,6 @@ class NavyCoderViewProvider {
     if (!this.projectRoot && filePath && !filePath.startsWith('Untitled')) {
       // Containment check must be separator-aware (E:\Proj2 is NOT inside E:\Proj)
       // and case-folded on Windows where paths are case-insensitive.
-      const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
       const fp = fold(filePath);
       const wsFolder = vscode.workspace.workspaceFolders?.find((f) => {
         const base = fold(f.uri.fsPath);
@@ -619,17 +1229,25 @@ class NavyCoderViewProvider {
     const folders = vscode.workspace.workspaceFolders || [];
     const roots = folders.map((f) => f.uri.fsPath).filter(Boolean);
 
-    // Fallback: if no workspace folders, derive root from the active file.
-    if (!this.projectRoot && roots.length === 0) {
-      const editor = vscode.window.activeTextEditor;
-      if (editor && !editor.document.fileName.startsWith('Untitled')) {
-        this.projectRoot = path.dirname(editor.document.fileName);
+    // Auto-derivation only applies while there's a single, still-untouched
+    // tab — a "New Chat" tab deliberately created with openNewSessionTab is a
+    // blank slate on purpose (the user picks its project from the dropdown
+    // themselves), and this runs often enough (every ready/switch/visibility
+    // change) that auto-filling it here would silently defeat that intent
+    // the moment any of those fired.
+    if (this.sessions.size === 1) {
+      // Fallback: if no workspace folders, derive root from the active file.
+      if (!this.projectRoot && roots.length === 0) {
+        const editor = vscode.window.activeTextEditor;
+        if (editor && !editor.document.fileName.startsWith('Untitled')) {
+          this.projectRoot = path.dirname(editor.document.fileName);
+        }
       }
-    }
 
-    // Use the first workspace folder as default root if none set yet.
-    if (!this.projectRoot && roots.length > 0) {
-      this.projectRoot = roots[0];
+      // Use the first workspace folder as default root if none set yet.
+      if (!this.projectRoot && roots.length > 0) {
+        this.projectRoot = roots[0];
+      }
     }
 
     // Ensure the current root appears in the list even when it was auto-derived from an open file.
@@ -637,7 +1255,18 @@ class NavyCoderViewProvider {
       ? [this.projectRoot, ...roots]
       : roots;
 
-    this.view?.webview.postMessage({ type: 'workspaceFolders', roots: displayRoots, current: this.projectRoot });
+    // Global catalog entries NOT already shown above (this window's own
+    // roots) — "other projects Navy remembers", sorted most-recent-first.
+    // Picking one goes through openCatalogProject's open-here/add-to-
+    // workspace choice instead of a direct switch, since it isn't part of
+    // this window's workspace (yet).
+    const shown = new Set(displayRoots.map(fold));
+    const globalProjects = await this._readGlobalProjects();
+    const catalog = globalProjects
+      .filter(p => !shown.has(fold(p.path)))
+      .map(p => ({ path: p.path, name: p.name || path.basename(p.path) }));
+
+    this.view?.webview.postMessage({ type: 'workspaceFolders', roots: displayRoots, current: this.projectRoot, catalog });
   }
 
   // Persist the picked project root so it survives window reloads. Workspace-scoped
@@ -651,13 +1280,155 @@ class NavyCoderViewProvider {
     } catch {}
   }
 
+  // ── Shared small-JSON-file I/O (global catalog + per-project bg-manifest) ──
+  // Both files are read as a whole array, mutated, and written back whole —
+  // same shape, so one pair of low-level helpers backs both instead of two
+  // independent copies of the same read/parse/fallback and
+  // stringify/write/log-on-failure logic.
+  async _readJsonFile(filePath, fallback) {
+    try {
+      const data = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
+      return JSON.parse(Buffer.from(data).toString('utf8'));
+    } catch { return fallback; }
+  }
+
+  async _writeJsonFile(filePath, data, label) {
+    try {
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(filePath)));
+      await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(JSON.stringify(data, null, 2), 'utf8'));
+    } catch (e) { this.log?.((label || filePath) + ' write failed: ' + e.message); }
+  }
+
+  // Read → mutate → write, but re-reads once right before writing and
+  // retries the whole cycle (recomputing `mutate` against the fresh data) if
+  // the file changed underneath it — both the global catalog and the
+  // bg-process manifest can ALSO be written by a completely different VS
+  // Code window's own extension host process, where an in-memory lock is no
+  // help at all (different processes, no shared memory to lock). This isn't
+  // a perfect guarantee — a write from another process can still land in the
+  // gap between this function's own re-read and its write — but it turns the
+  // common case of "another writer finished just before us" into a merge
+  // instead of a silent lost update, which no locking at all would give.
+  // Callers that CAN also serialize in-process (same window) should still do
+  // so on top of this — see _withGlobalProjectsLock / the per-project
+  // bgManifestLock — since that fixes the same-process race completely,
+  // where this can only narrow it.
+  async _rmwJsonFile(filePath, fallback, mutate) {
+    const MAX_RETRIES = 3;
+    let before = await this._readJsonFile(filePath, fallback);
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const next = mutate(before);
+      if (attempt < MAX_RETRIES) {
+        const recheck = await this._readJsonFile(filePath, fallback);
+        if (JSON.stringify(recheck) !== JSON.stringify(before)) { before = recheck; continue; }
+      }
+      await this._writeJsonFile(filePath, next, filePath);
+      return next;
+    }
+  }
+
+  // ── Global project catalog (~/.navy/projects.json) ─────────────────────────
+  // navy.projectRoot and vscode.workspace.workspaceFolders both only ever
+  // describe THIS window — a project used in a window that's since closed had
+  // no way to be picked again except re-browsing for its folder from scratch.
+  // This is a small, user-inspectable catalog (plain JSON under the profile
+  // directory — same spirit as the per-project .navy/ files, just not scoped
+  // to any one project) of every root Navy has ever been pointed at, across
+  // every window, so it can be resumed from the dropdown regardless of what's
+  // open right now. See openFolder/_activateProjectRoot for where it's kept
+  // up to date, and sendWorkspaceFolders for where it reaches the webview.
+
+  _globalProjectsDir() {
+    // Overridable so tests never touch the real user's home directory.
+    return this._globalProjectsDirOverride || path.join(os.homedir(), '.navy');
+  }
+
+  _globalProjectsPath() {
+    return path.join(this._globalProjectsDir(), 'projects.json');
+  }
+
+  async _readGlobalProjects() {
+    const parsed = await this._readJsonFile(this._globalProjectsPath(), []);
+    if (!Array.isArray(parsed)) return [];
+    const entries = parsed.filter(p => p && typeof p.path === 'string');
+    // Drop entries whose folder no longer exists — a moved/deleted project
+    // shouldn't linger in the picker forever offering a dead path. Not
+    // rewritten back to disk here (that would mean a write on every single
+    // read); a stale entry is dropped for real the next time _recordProjectUsage
+    // rewrites the file for an unrelated reason.
+    //
+    // Async and concurrent, deliberately: this runs on every
+    // sendWorkspaceFolders (startup, every project switch, every workspace
+    // folder change), and the catalog holds up to 100 entries. A synchronous
+    // existsSync loop put up to 100 blocking stat calls on the extension host's
+    // single thread each time — and against a path on a disconnected network
+    // share, ONE of those can block for seconds, freezing the whole editor.
+    const alive = await Promise.all(entries.map(async (p) => {
+      try { await fs.promises.access(p.path); return p; } catch { return null; }
+    }));
+    return alive.filter(Boolean);
+  }
+
+  async _writeGlobalProjects(list) {
+    await this._writeJsonFile(this._globalProjectsPath(), list, 'global project catalog');
+  }
+
+  // Serializes writers WITHIN this window — a plain Promise-chain mutex, same
+  // pattern as _withWriteLock, just scoped to the one shared global-catalog
+  // file rather than per-project. Two rapid project switches (or the
+  // startup restore racing an explicit pick) in the SAME window are fully
+  // serialized by this; a DIFFERENT window's writer is handled by
+  // _rmwJsonFile's retry instead, since this lock's Promise chain only
+  // exists in this process's memory.
+  _withGlobalProjectsLock(fn) {
+    const run = (this._globalProjectsLock || Promise.resolve()).then(fn, fn);
+    this._globalProjectsLock = run.catch(() => {});
+    return run;
+  }
+
+  // Upserts `root` into the global catalog with a fresh lastOpened timestamp
+  // (case-folded path match on Windows, same as every other path-identity
+  // check in this file), capped to the most recent 100 entries so the
+  // catalog can't grow without bound over years of use.
+  async _recordProjectUsage(root) {
+    if (!root) return;
+    await this._withGlobalProjectsLock(() => this._rmwJsonFile(this._globalProjectsPath(), [], (list) => {
+      const arr = Array.isArray(list) ? list : [];
+      const next = arr.filter(p => p && typeof p.path === 'string' && fold(p.path) !== fold(root));
+      // Forced strictly ahead of every entry already present, rather than
+      // trusting Date.now() to have moved. Two projects opened in quick
+      // succession can land in the SAME millisecond — the sort then sees a tie,
+      // leaves them in array order, and "most recently used" silently reports
+      // the wrong project first. Rare on Windows (coarse clock, slow I/O
+      // between the calls), routine on Linux, which is exactly the kind of
+      // difference that only shows up once it is someone else's machine.
+      const newest = arr.reduce((max, p) => Math.max(max, p?.lastOpened || 0), 0);
+      const lastOpened = Math.max(Date.now(), newest + 1);
+      next.push({ path: root, name: path.basename(root), lastOpened });
+      next.sort((a, b) => (b.lastOpened || 0) - (a.lastOpened || 0));
+      return next.slice(0, 100);
+    }));
+  }
+
+  // Shared "is Navy busy" guard for every project-switch entry point
+  // (openFolder, openCatalogProject, the setProjectRoot message handler) —
+  // shows the warning and reports true so the caller can bail out. One
+  // definition so the wording/condition can't drift between call sites, or
+  // be updated in some and missed in others.
+  _refuseIfBusy() {
+    if (!this.isBusy) return false;
+    vscode.window.showWarningMessage('Navy is working — stop the current task before switching projects.');
+    return true;
+  }
+
   async openFolder() {
-    // Switching the project root mid-turn would make executing tools resolve
-    // paths against a different project than the one they started in — edits
-    // would land in the wrong repo. setProjectRoot already refuses this; this
-    // path sets projectRoot too, so it has to refuse for the same reason.
-    if (this.isBusy) {
-      vscode.window.showWarningMessage('Navy is working — stop the current task before switching projects.');
+    // "Open Here"/no-workspace-yet below still directly replace this.projectRoot
+    // (they reload the window into a different project entirely) — switching
+    // that mid-turn would make executing tools resolve paths against a
+    // different project than the one they started in, so edits would land
+    // in the wrong repo. setProjectRoot already refuses this for the same
+    // reason.
+    if (this._refuseIfBusy()) {
       return;
     }
 
@@ -665,29 +1436,52 @@ class NavyCoderViewProvider {
       canSelectFiles: false,
       canSelectFolders: true,
       canSelectMany: false,
-      openLabel: 'Open Navy project'
+      openLabel: 'Add Navy project'
     });
     if (!result || result.length === 0) return;
     const picked = result[0].fsPath;
-    const uri = vscode.Uri.file(picked);
     const folders = vscode.workspace.workspaceFolders || [];
     // Case-fold on Windows: the open dialog can return "E:\Proj" for a folder
     // stored as "e:\Proj", and a case-sensitive compare would then offer to
     // "add" a project that is already open.
-    const foldPath = (p) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p));
     const exists = folders.some((f) => foldPath(f.uri.fsPath) === foldPath(picked));
+    const name = path.basename(picked);
 
-    // Already part of this workspace — just point Navy at it.
+    // Catalog it regardless of what happens next — a folder picked here is
+    // "known" to Navy from this point on, independent of whether it ends up
+    // open in THIS window at all (see the global catalog section above).
+    this._recordProjectUsage(picked).catch(() => {});
+
+    // Already part of this workspace — nothing to add. Picking the dialog
+    // option is never itself a "switch to it" action (see below) — it's
+    // already selectable from the list, so just say so.
     if (exists) {
-      await this._switchProjectRoot(picked);
+      vscode.window.showInformationMessage(`"${name}" is already in your project list — select it above.`);
+      await this.sendWorkspaceFolders();
       return;
     }
 
+    await this._offerOpenOrAdd(picked);
+  }
+
+  // The "what do you want to do with this project" choice — shared by
+  // openFolder (a brand-new folder from the file dialog) and
+  // openCatalogProject (a previously-known project from the global catalog
+  // that isn't part of THIS window's workspace right now). Either way the
+  // folder is not currently one of this window's roots, so the same two
+  // legitimate meanings of "open it" apply: replace what's here, or add it
+  // alongside what's already open.
+  async _offerOpenOrAdd(picked) {
+    const uri = vscode.Uri.file(picked);
+    const name = path.basename(picked);
+    const folders = vscode.workspace.workspaceFolders || [];
+
     if (folders.length === 0) {
-      // No workspace open — actually open the folder (Explorer, language servers,
-      // file watching), exactly like File → Open Folder. Persist the root first:
-      // opening a folder reloads the window, and the fresh session derives its
-      // root from the newly opened workspace folder.
+      // No workspace open at all — there's no "list" to add to yet; opening
+      // the folder IS how a workspace comes into being, exactly like File →
+      // Open Folder. Persist the root first: opening a folder reloads the
+      // window, and the fresh session derives its root from the newly
+      // opened workspace folder.
       this.projectRoot = picked;
       await this._persistProjectRoot(picked);
       await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: false });
@@ -698,13 +1492,12 @@ class NavyCoderViewProvider {
     // into an untitled multi-root workspace, which is not what most people mean
     // by "open another project" — they expect the new one to replace the current
     // one. Both are legitimate, so ask rather than guessing.
-    const name = path.basename(picked);
     const choice = await vscode.window.showInformationMessage(
       `Open "${name}"?`,
       {
         modal: true,
         detail: 'Open here replaces the current project in this window (like File → Open Folder).\n\n'
-              + 'Add to workspace keeps the current project open alongside it, so you can switch between them from Navy\'s project selector.',
+              + 'Add to workspace keeps what\'s already open and adds this one alongside it — pick which chat to work in from the tab strip.',
       },
       'Open Here', 'Add to Workspace'
     );
@@ -723,6 +1516,44 @@ class NavyCoderViewProvider {
       return; // window reloads
     }
 
+    await this._addFolderToWorkspace(picked);
+  }
+
+  // Picking a project from the GLOBAL catalog (see the section above) that
+  // isn't part of this window's workspace right now — same "open here or add
+  // to the workspace" choice as a brand-new folder pick, just sourced from
+  // Navy's own memory instead of a fresh file-dialog browse.
+  async openCatalogProject(picked) {
+    if (!picked) return;
+    if (this._refuseIfBusy()) return;
+    if (!fs.existsSync(picked)) {
+      vscode.window.showErrorMessage(`Navy: "${path.basename(picked)}" no longer exists at ${picked} — it will be removed from the list.`);
+      await this.sendWorkspaceFolders(); // re-send so the (now-stale) entry is dropped from what's displayed
+      return;
+    }
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.some((f) => foldPath(f.uri.fsPath) === foldPath(picked))) {
+      // Already part of this window's workspace (e.g. it was added in
+      // another session of this same window) — just switch to it directly,
+      // exactly like picking it from the main part of the dropdown.
+      await this._switchProjectRoot(picked);
+      return;
+    }
+    await this._offerOpenOrAdd(picked);
+  }
+
+  // Adds `picked` to the REAL VS Code workspace (Explorer, file watching, and
+  // language servers all need this — not just Navy's own state), WITHOUT
+  // switching Navy to it. Adding a project to the list and making it the
+  // active one are deliberately two separate steps: the dialog only ever
+  // registers the folder; the user then explicitly picks it from the
+  // dropdown (case 'setProjectRoot' → _switchProjectRoot), which is the one
+  // and only action that actually changes what Navy — and the rest of the
+  // editor — is pointed at.
+  async _addFolderToWorkspace(picked) {
+    const uri = vscode.Uri.file(picked);
+    const name = path.basename(picked);
+    const folders = vscode.workspace.workspaceFolders || [];
     // updateWorkspaceFolders takes { uri } objects, NOT bare Uris — passing a
     // bare Uri leaves `.uri` undefined, so VS Code rejects the call and returns
     // false. That was the original bug: the folder was never added, but Navy set
@@ -731,23 +1562,323 @@ class NavyCoderViewProvider {
     const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri });
     if (!added) {
       vscode.window.showErrorMessage(`Navy could not add "${name}" to this workspace. Try File → Add Folder to Workspace.`);
-      return; // do NOT move projectRoot to a folder that isn't actually open
+      return false;
     }
-    try { await vscode.commands.executeCommand('revealInExplorer', uri); } catch {}
-
     // onDidChangeWorkspaceFolders re-sends the folder list once VS Code has
-    // applied the change, so the dropdown picks the new folder up on its own.
-    await this._switchProjectRoot(picked);
+    // applied the change, so the dropdown picks the new folder up.
+    await this.sendWorkspaceFolders();
+    return true;
   }
 
-  // Point Navy at an already-available root: persist it, refresh the picker, and
-  // load that project's session. Shared by openFolder and the picker so both
-  // paths can't drift.
+  // Reads `root`'s persisted chats (.navy/chats/*.json) into `this.sessions`
+  // the first time this window visits that root — a no-op on every later
+  // call, so re-selecting a project you've already opened this session never
+  // re-hits disk or clobbers whatever's accumulated in memory since. Falls
+  // back to the legacy single-file .navy/session.json (+ checkpoints.json)
+  // format for projects that predate per-chat files; the next save for that
+  // chat writes it out in the new format, so migration is automatic and
+  // requires no separate step.
+  async _ensureProjectChatsLoaded(root) {
+    if (!root || this._loadedChatRoots.has(root)) return;
+    this._loadedChatRoots.add(root);
+    const chatsDir = path.join(root, '.navy', 'chats');
+    let entries = [];
+    try { entries = await vscode.workspace.fs.readDirectory(vscode.Uri.file(chatsDir)); } catch { entries = []; }
+    const chatFiles = entries.filter(([name, type]) => type === vscode.FileType.File && name.endsWith('.json'));
+    if (chatFiles.length) {
+      // Independent reads — no ordering dependency between them, and each
+      // writes a distinct `id` into this.sessions, so firing them all at
+      // once instead of one at a time doesn't change the outcome, just how
+      // long a project with many saved chats takes to become usable.
+      await Promise.all(chatFiles.map(async ([name]) => {
+        const id = name.slice(0, -'.json'.length);
+        if (this.sessions.has(id)) return;
+        try {
+          const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(chatsDir, name)));
+          const parsed = JSON.parse(Buffer.from(data).toString('utf8'));
+          const s = new Session(id, root);
+          s.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+          s.sessionDigest = typeof parsed.digest === 'string' ? parsed.digest : '';
+          s.checkpoints = Array.isArray(parsed.checkpoints) ? parsed.checkpoints : [];
+          s._updated = typeof parsed.updated === 'string' ? parsed.updated : '';
+          this.sessions.set(id, s);
+        } catch {}
+      }));
+    } else {
+      try {
+        const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, '.navy', 'session.json')));
+        const parsed = JSON.parse(Buffer.from(data).toString('utf8'));
+        const id = this.generateId();
+        const s = new Session(id, root);
+        s.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+        s.sessionDigest = typeof parsed.digest === 'string' ? parsed.digest : '';
+        try {
+          const cpData = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, '.navy', 'checkpoints.json')));
+          const cpParsed = JSON.parse(Buffer.from(cpData).toString('utf8'));
+          if (Array.isArray(cpParsed.checkpoints)) s.checkpoints = cpParsed.checkpoints;
+        } catch {}
+        this.sessions.set(id, s);
+      } catch { /* brand-new project — nothing to load */ }
+    }
+    // Loading a project's chats is the dominant way `this.sessions` grows in
+    // bulk (a whole project's history at once) — the natural point to check
+    // whether it's grown past the cap, mirroring _proj's eviction check on
+    // every new _projectCaches entry.
+    this._evictStaleSessions(root);
+  }
+
+  // Keeps `this.sessions` bounded, mirroring _evictStaleProjectCaches for
+  // _projectCaches — without this, every chat ever created or loaded from
+  // disk in this window stays in memory (full messages array + undo
+  // checkpoints with pre-edit file text) for the rest of the window's life.
+  // Deliberately conservative about which sessions are eligible: unlike the
+  // project cache (freely-recomputable data), a session holds real chat
+  // content, and losing any of it would be far worse than the memory growth
+  // this fixes. Only evicts a session that is: not the active tab, not busy
+  // (a turn/background task could be appending to it right now — messages
+  // only ever change while isBusy is true), already fully saved to disk (a
+  // real _updated timestamp, together with !isBusy, guarantees nothing in
+  // memory is unsaved), and not its project's LAST remaining chat
+  // (closeSessionTab already refuses to let the UI close that one; eviction
+  // honors the same invariant, or reactivating that project would wrongly
+  // look like it has no chats yet). Also un-marks the session's project root
+  // in _loadedChatRoots, so a later visit re-reads it from disk — cheap
+  // (skips every sibling chat already in memory) and is what makes the
+  // evicted chat resumable again instead of gone for the rest of the window.
+  //
+  // `justLoadedRoot` (the root _ensureProjectChatsLoaded has this moment
+  // hydrated) is held back from eviction entirely. Evicting one of its chats
+  // would un-mark it in _loadedChatRoots — the very set that call just added
+  // it to — so the next visit re-reads the same directory, re-adds the same
+  // chats, exceeds the cap again and evicts again: a loop that re-hits disk
+  // on every project switch forever while freeing nothing durably. The cap is
+  // a ceiling on growth, not a hard limit, so deferring to the next load of a
+  // DIFFERENT project costs nothing.
+  _evictStaleSessions(justLoadedRoot) {
+    if (this.sessions.size <= SESSION_CACHE_CAP) return;
+    const countByRoot = new Map();
+    for (const s of this.sessions.values()) {
+      if (s.projectRoot) countByRoot.set(s.projectRoot, (countByRoot.get(s.projectRoot) || 0) + 1);
+    }
+    const evictable = [...this.sessions.entries()]
+      .filter(([id, s]) => id !== this.activeSessionId && !s.isBusy && s._updated
+        && !(justLoadedRoot && s.projectRoot === justLoadedRoot)
+        && (!s.projectRoot || (countByRoot.get(s.projectRoot) || 0) > 1))
+      .sort((a, b) => a[1]._updated.localeCompare(b[1]._updated)); // oldest-saved first
+    let over = this.sessions.size - SESSION_CACHE_CAP;
+    for (const [id, s] of evictable) {
+      if (over <= 0) break;
+      this.sessions.delete(id);
+      if (s.projectRoot) {
+        this._loadedChatRoots.delete(s.projectRoot);
+        if (this._lastActiveByRoot.get(s.projectRoot) === id) this._lastActiveByRoot.delete(s.projectRoot);
+        countByRoot.set(s.projectRoot, (countByRoot.get(s.projectRoot) || 1) - 1);
+      }
+      over--;
+    }
+  }
+
+  // Makes `root` the active project: hydrates its chats (once — see above),
+  // then activates whichever chat was last active for it, or the most
+  // recently saved one, or creates a fresh chat if it has none yet. Shared
+  // by the startup handshake and _switchProjectRoot so both hydrate/activate
+  // identically.
+  async _activateProjectRoot(root) {
+    if (!root) return;
+    // Fire-and-forget: bookkeeping for the global catalog must never block
+    // or fail activation itself (covers explicit switches, the startup
+    // restore, and landing back here after openFolder's window reload).
+    this._recordProjectUsage(root).catch(() => {});
+    await this._ensureProjectChatsLoaded(root);
+    const forRoot = [...this.sessions.values()].filter(s => s.projectRoot === root);
+    if (!forRoot.length) {
+      // No chats exist yet for this project — reuse the active tab if it's
+      // still a genuinely blank, untouched one, otherwise start a fresh
+      // chat under it rather than repurposing an unrelated one.
+      if (!this.projectRoot && this.messages.length === 0) {
+        this.projectRoot = root;
+      } else {
+        const id = this.generateId();
+        this.sessions.set(id, new Session(id, root));
+        this.activeSessionId = id;
+      }
+    } else {
+      const remembered = this._lastActiveByRoot.get(root);
+      const target = forRoot.find(s => s.id === remembered)
+        || forRoot.slice().sort((a, b) => (b._updated || '').localeCompare(a._updated || ''))[0];
+      this.activeSessionId = target.id;
+      // The constructor's bootstrap placeholder tab, specifically, can be
+      // left dangling once a real persisted chat for its root is found —
+      // clean up ONLY that exact tab (matched by id, not just "any blank
+      // tab happens to be lying around"), so a deliberately-created empty
+      // "+" tab the user is keeping open is never swept up by this.
+      const bootstrap = this.sessions.get(this._bootstrapSessionId);
+      if (bootstrap && bootstrap.id !== this.activeSessionId && bootstrap.projectRoot === root
+        && bootstrap.messages.length === 0 && bootstrap.checkpoints.length === 0) {
+        this.sessions.delete(bootstrap.id);
+      }
+    }
+    this._lastActiveByRoot.set(root, this.activeSessionId);
+    // Fire-and-forget: a leftover-process prompt must never block/delay
+    // activating the project itself, and this runs unattended off the
+    // normal turn/tool error paths, so a failure here needs its own catch.
+    this._checkOrphanedBgProcesses(root).catch(() => {});
+  }
+
+  // Points Navy at `root` — the ONE action that actually changes the active
+  // project (case 'setProjectRoot', the dropdown). Activates that project's
+  // own chats (see _activateProjectRoot) — tabs are children of a project,
+  // so switching projects switches which set of tabs is visible, same as
+  // reopening a document. Also reveals the folder in VS Code's own Explorer
+  // — picking a project here is a deliberate "make THIS the project I'm
+  // working on" action, so the rest of the editor (not just Navy's chat)
+  // should reflect it. Adding a folder to the list (openFolder /
+  // _addFolderToWorkspace) is deliberately a SEPARATE step that never calls
+  // this — see openFolder's comment for why.
   async _switchProjectRoot(root) {
-    this.projectRoot = root;
+    if (root && root !== this.projectRoot) {
+      await this._activateProjectRoot(root);
+    }
     await this._persistProjectRoot(root);
+    if (root) { try { await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(root)); } catch {} }
     await this.sendWorkspaceFolders();
     await this.loadProjectSession();
+    this._sendSessionList();
+  }
+
+  // ── Session tabs ──────────────────────────────────────────────────────────
+  // A tab is a Session identified by a generated id (see the Session class).
+  // Tabs are children of a project — the tab strip only ever shows the
+  // chats belonging to the CURRENTLY selected project (see
+  // _sessionSummaries), and switching project (the dropdown) switches which
+  // set of tabs is visible, the same way reopening a document resumes it.
+
+  // Creates a brand-new chat tab UNDER THE CURRENT PROJECT and switches to
+  // it — never prompts for a project folder; a new tab is always a sibling
+  // of whatever tab it was opened from. If no project is selected yet, it's
+  // a genuinely blank/unbound "New Chat" instead, exactly like the very
+  // first tab before any project has ever been picked.
+  async openNewSessionTab() {
+    const root = this.projectRoot;
+    const id = this.generateId();
+    this.sessions.set(id, new Session(id, root));
+    this.activeSessionId = id;
+    if (root) this._lastActiveByRoot.set(root, id);
+    // 'sessionList' first: it's exempt from the webview's per-message
+    // sessionId gate and is what teaches the frontend the active session
+    // just changed. Sending 'restore'/'sessionLoaded' (both gated) before it
+    // would have them silently dropped, since the frontend's local
+    // activeSessionId is still the OLD tab's until it sees an exempt
+    // message — see resolveWebviewView's postMessage wrapper.
+    this._sendSessionList();
+    this.restoreMessages();
+    const memory = root ? await this.loadProjectMemory() : '';
+    // A brand-new chat has no usage yet — 0/null, same shape loadProjectSession
+    // sends, so the frontend never has to special-case "just-created" vs.
+    // "restored with nothing spent".
+    this.view?.webview.postMessage({
+      type: 'sessionLoaded', count: 0, memory, projectRoot: root,
+      sessionPrompt: 0, sessionCompletion: 0, sessionTotal: 0, estimatedCost: null, costKnown: true,
+    });
+  }
+
+  // Switches the ACTIVE tab to the session `sessionId` — used by tab clicks.
+  // Unlike the dropdown's webview-message handler (case 'setProjectRoot',
+  // which itself refuses while isBusy before ever calling _switchProjectRoot),
+  // tab clicks never refuse — with per-session state, and sessionContext
+  // binding a running turn to the session it started in, letting a turn keep
+  // running in the background while the user switches away is the entire
+  // point of tabs. Never touches the real VS Code workspace/Explorer or
+  // navy.projectRoot — switching between a project's own chats isn't a
+  // change of project at all.
+  async switchSessionTab(sessionId) {
+    if (!sessionId || !this.sessions.has(sessionId) || sessionId === this.activeSessionId) return;
+    this.activeSessionId = sessionId;
+    if (this.projectRoot) this._lastActiveByRoot.set(this.projectRoot, sessionId);
+    // 'sessionList' first — see openNewSessionTab's comment. A direct tab
+    // click already updated the frontend's activeSessionId optimistically
+    // before this ever runs, so this is a no-op for that caller — but
+    // closeSessionTab also calls this to fall back to a sibling the
+    // frontend had NO advance notice of, and without 'sessionList' arriving
+    // first, that sibling's 'restore'/'sessionLoaded' would be silently
+    // dropped by the gate, leaving the chat showing blank/welcome instead
+    // of that sibling's real history.
+    this._sendSessionList();
+    await this.loadProjectSession();
+  }
+
+  // Closes a tab. A running turn is aborted first (same as pressing Stop)
+  // rather than left orphaned, writing to a session nobody can see anymore.
+  // Refuses to close a project's very last remaining chat — there must
+  // always be at least one per project that has any open at all (other
+  // projects' chat counts are irrelevant here, tabs only compete with their
+  // own siblings).
+  async closeSessionTab(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const siblings = [...this.sessions.values()].filter(s => s.projectRoot === session.projectRoot);
+    if (siblings.length <= 1) return;
+    session.abortController?.abort();
+    for (const [, approval] of session.pendingApprovals) approval.resolve(false);
+    for (const [, approval] of session.pendingCommandApprovals) approval.resolve(false);
+    this._disposeSession(session);
+    this.sessions.delete(sessionId);
+    // Closing is permanent, so the chat's own file goes with it. Dropping the
+    // session from memory alone left .navy/chats/<id>.json on disk, and
+    // _ensureProjectChatsLoaded resurrected the tab on the next window reload
+    // — a closed tab that keeps coming back is indistinguishable from a bug.
+    // Deliberately AFTER the in-memory delete: a failed unlink (file already
+    // gone, read-only checkout) must not keep the tab open.
+    await this._deleteChatFile(session);
+    if (this.activeSessionId === sessionId) {
+      const sibling = siblings.find(s => s.id !== sessionId);
+      await this.switchSessionTab(sibling.id);
+    } else {
+      this._sendSessionList();
+    }
+  }
+
+  // Removes a chat's persisted file. Also cancels its pending debounced save,
+  // which would otherwise fire a few hundred ms later and write the file
+  // straight back — the one ordering mistake that would silently undo this.
+  async _deleteChatFile(session) {
+    clearTimeout(session._cpSaveTimer);
+    session._cpSaveTimer = undefined;
+    if (!session.projectRoot || !session.id) return;
+    const file = path.join(session.projectRoot, '.navy', 'chats', session.id + '.json');
+    try { await vscode.workspace.fs.delete(vscode.Uri.file(file)); }
+    catch { /* never written (unsaved/blank chat), or already gone — nothing to do */ }
+  }
+
+  // Summary for the tab strip: id, display name, and whether a turn is
+  // currently running in it (drives the per-tab busy spinner). Only the
+  // CURRENTLY ACTIVE project's own chats are included — tabs are children
+  // of a project, not a flat list spanning every project ever opened. The
+  // name is drawn from the chat's first user message (like a browser tab
+  // titling itself from the page), not the project name — the project is
+  // already shown once, above, in the dropdown.
+  // The tab strip always describes what is ON SCREEN, so the root is read
+  // from the VISIBLE session directly — deliberately NOT `this.projectRoot`,
+  // which goes through the active-session proxy and therefore resolves to the
+  // *turn's* project whenever this runs inside sessionContext.run. A
+  // background tab's turn ending calls _sendSessionList from its own context
+  // (see _askNavyTurn's finally block), and 'sessionList' is exempt from the
+  // webview's per-message session gate, so using the proxy here would replace
+  // the visible project's tab strip with a different project's tabs.
+  _sessionSummaries() {
+    const root = this.sessions.get(this.activeSessionId)?.projectRoot ?? '';
+    return [...this.sessions.entries()]
+      .filter(([, s]) => s.projectRoot === root)
+      .map(([id, s]) => {
+        const first = s.messages.find(m => m.role === 'user' && typeof m.text === 'string' && m.text.trim());
+        const text = first?.text.trim() || '';
+        const name = text ? (text.length > 40 ? text.slice(0, 40) + '…' : text) : 'New Chat';
+        return { id, name, root: s.projectRoot, busy: s.isBusy, active: id === this.activeSessionId };
+      });
+  }
+
+  _sendSessionList() {
+    this.view?.webview.postMessage({ type: 'sessionList', sessions: this._sessionSummaries() });
   }
 
   async setModel(model) {
@@ -774,7 +1905,14 @@ class NavyCoderViewProvider {
   // GET a provider's /models list. Returns an array of model ids, or null on any
   // failure (caller falls back). Handles OpenAI ({data:[{id}]}) and bare-array
   // shapes, and follows Anthropic-style has_more/last_id pagination (≤3 pages).
-  async _fetchModelList(url, headers) {
+  // `contextsOut`, when given, is a Map filled with modelId → context window for
+  // any provider that reports one in its own model list. OpenRouter does
+  // (`context_length`), as do vLLM (`max_model_len`) and several other
+  // OpenAI-compatible servers — reading it here costs nothing extra, since the
+  // list is already being fetched, and a live answer from the provider is
+  // always better than the MODEL_CONTEXT snapshot. Optional so the existing
+  // two-argument callers (and tests) are unaffected.
+  async _fetchModelList(url, headers, contextsOut) {
     try {
       const all = [];
       let pageUrl = url;
@@ -786,6 +1924,14 @@ class NavyCoderViewProvider {
         if (!res.ok) return all.length ? all : null;
         const data = await res.json();
         const raw = data.data || data.models || (Array.isArray(data) ? data : []);
+        if (contextsOut) {
+          for (const m of raw) {
+            if (!m || typeof m === 'string') continue;
+            const id = m.id || m.name;
+            const ctx = Number(m.context_length ?? m.max_context_length ?? m.max_model_len ?? m.context_window);
+            if (id && Number.isFinite(ctx) && ctx > 0) contextsOut.set(id, ctx);
+          }
+        }
         all.push(...raw.map(m => (typeof m === 'string' ? m : (m && (m.id || m.name)))).filter(Boolean));
         pageUrl = (data.has_more && data.last_id)
           ? url + (url.includes('?') ? '&' : '?') + 'after_id=' + encodeURIComponent(data.last_id)
@@ -835,9 +1981,14 @@ class NavyCoderViewProvider {
                 || await this.context.secrets.get('navy.apiKey') || '';
     const currentModel = config.get('model', '');
 
-    // Context length is only fetchable from Ollama (/api/show) — clear it for other
-    // providers so the context gauge never shows a stale value from a previous provider.
-    if (provider !== 'ollama') this.modelContextLength = null;
+    // Cleared up front so a provider switch can never leave the previous
+    // provider's window on screen: whichever branch below resolves one will set
+    // it again, and if none does the picker stays hidden rather than offering
+    // sizes for a model that isn't loaded. Telling the webview matters as much
+    // as clearing the field — clearing only the field left the control
+    // displaying the old model's sizes indefinitely, since nothing ever sent a
+    // follow-up message to blank it.
+    this._applyContextWindow(null, false);
 
     // Ollama — native tags endpoint (+ context length).
     if (provider === 'ollama') {
@@ -874,11 +2025,18 @@ class NavyCoderViewProvider {
     // whether a key is present, so a provider/base/key change re-fetches.
     const cacheKey = provider + '|' + url + '|' + (apiKey ? 'k' : '');
     let fetched;
+    // Windows the provider itself reported, keyed by its own model ids — cached
+    // alongside the list so a cache hit doesn't lose them and silently drop the
+    // badge back to the MODEL_CONTEXT snapshot.
+    let liveContexts = new Map();
     if (!force && this._modelListCache?.key === cacheKey && Date.now() - this._modelListCache.time < 300_000) {
       fetched = this._modelListCache.models;
+      liveContexts = this._modelListCache.contexts || liveContexts;
     } else {
-      fetched = this._sanitizeModelList(provider, await this._fetchModelList(url, headers));
-      if (fetched && fetched.length) this._modelListCache = { key: cacheKey, time: Date.now(), models: fetched };
+      const contexts = new Map();
+      fetched = this._sanitizeModelList(provider, await this._fetchModelList(url, headers, contexts));
+      liveContexts = contexts;
+      if (fetched && fetched.length) this._modelListCache = { key: cacheKey, time: Date.now(), models: fetched, contexts };
     }
 
     let activeModel = config.get('model', currentModel);
@@ -893,6 +2051,14 @@ class NavyCoderViewProvider {
     }
     const { models, error } = this._mergeModelList(fetched, NavyCoderViewProvider.MODEL_FALLBACKS[provider], activeModel);
     this.view?.webview.postMessage({ type: 'models', models, currentModel: activeModel, ...(error ? { error } : {}) });
+
+    // _sanitizeModelList can rewrite an id for display (Gemini's "models/" prefix
+    // is stripped), so look the live value up under both the displayed name and
+    // the provider's own raw id before falling back to the snapshot table.
+    const rawId = [...liveContexts.keys()].find(k => k === activeModel || k.endsWith('/' + activeModel) || k.split('/').pop() === activeModel);
+    const reported = liveContexts.get(activeModel) ?? (rawId ? liveContexts.get(rawId) : undefined);
+    const ctx = resolveModelContext(activeModel, reported);
+    if (ctx) this._applyContextWindow(ctx, reported !== undefined);
   }
 
   async fetchModelContext(host, model) {
@@ -904,16 +2070,80 @@ class NavyCoderViewProvider {
       });
       if (!res.ok) return;
       const data = await res.json();
-      // context_length can be nested under model_info or at the top level.
-      const ctx = data.model_info?.['llm.context_length']
-        || data.context_length
-        || data.parameters?.context_length
-        || null;
-      if (ctx) {
-        this.modelContextLength = Number(ctx);
-        this.view?.webview.postMessage({ type: 'contextLength', length: this.modelContextLength });
-      }
+      const modelInfo = (data && typeof data.model_info === 'object' && data.model_info) || {};
+
+      // Ollama reports the window under an ARCHITECTURE-prefixed key —
+      // `llama.context_length`, `qwen2.context_length`, `gptoss.context_length`,
+      // `deepseek4.context_length`, … — never a fixed `llm.` prefix. Looking
+      // only for `llm.context_length` (and for `parameters.context_length`,
+      // where `parameters` is actually a newline-delimited STRING, not an
+      // object) meant this never once found a value: the context badge stayed
+      // permanently blank, the context-fill bar never moved, and — because
+      // this same field is what sets `num_ctx` on every Ollama request — Navy
+      // never asked for a context window at all, silently leaving long
+      // conversations to be truncated at Ollama's own small default.
+      const archKey = Object.keys(modelInfo).find(k => k.endsWith('.context_length'));
+      const archMax = Number(modelInfo[archKey] ?? modelInfo['llm.context_length'] ?? data.context_length ?? 0);
+      // A Modelfile may pin num_ctx. Take whichever is LARGER: Navy sets num_ctx
+      // explicitly on every request, so a Modelfile default doesn't constrain
+      // what can be asked for — but a Modelfile that pins something ABOVE what
+      // the architecture reports is still a real, usable window.
+      const pinned = Number(/^\s*num_ctx\s+(\d+)/mi.exec(String(data.parameters || ''))?.[1] || 0);
+      const detected = Math.max(
+        Number.isFinite(archMax) ? archMax : 0,
+        Number.isFinite(pinned) ? pinned : 0);
+      if (detected <= 0) return; // unknown — leave the badge hidden rather than guess
+
+      this._applyContextWindow(detected, true);
     } catch (_) {}
+  }
+
+  // Single place where "what window did the provider report" (`max`) becomes
+  // "what window is Navy actually using" (`modelContextLength`) — every source
+  // of a window routes through here so the clamp, the persisted user choice,
+  // and the message to the webview can never be applied by one caller and
+  // forgotten by another.
+  //
+  // navy.contextWindow of 0 means Max: the effective window then tracks the
+  // model, so switching from an 8k model to a 1M one just works instead of
+  // staying pinned to whatever number was right for the previous model. An
+  // explicit choice is always clamped to what the model really supports, so a
+  // stale larger pick can never ask for a window that doesn't exist.
+  //
+  // `live` records whether `max` came from the provider itself or from the
+  // MODEL_CONTEXT snapshot, purely so the UI can say which.
+  _applyContextWindow(max, live) {
+    this.modelContextMax = Number.isFinite(max) && max > 0 ? max : null;
+    // Remembered so setContextWindow can re-post without having to re-derive
+    // where the maximum originally came from.
+    this._contextWindowWasLive = Boolean(live);
+    if (!this.modelContextMax) {
+      this.modelContextLength = null;
+      this.view?.webview.postMessage({ type: 'contextWindow', max: null, current: null, options: [] });
+      return;
+    }
+    const chosen = Number(vscode.workspace.getConfiguration('navy').get('contextWindow', 0)) || 0;
+    this.modelContextLength = chosen > 0 ? Math.min(chosen, this.modelContextMax) : this.modelContextMax;
+    this.view?.webview.postMessage({
+      type: 'contextWindow',
+      max: this.modelContextMax,
+      current: this.modelContextLength,
+      options: contextWindowOptions(this.modelContextMax),
+      // Only Ollama takes num_ctx from this; elsewhere the window is fixed by
+      // the API and the choice only affects when Navy treats the chat as full.
+      adjustable: vscode.workspace.getConfiguration('navy').get('provider', 'ollama') === 'ollama',
+      live: Boolean(live),
+    });
+  }
+
+  // The user picking a size from the dropdown. Persisted globally (it's a
+  // property of the machine's memory and the model, not of one project), then
+  // re-resolved through the same path everything else uses.
+  async setContextWindow(tokens) {
+    const value = Number(tokens);
+    const normalized = Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+    await vscode.workspace.getConfiguration('navy').update('contextWindow', normalized, vscode.ConfigurationTarget.Global);
+    this._applyContextWindow(this.modelContextMax, this._contextWindowWasLive);
   }
 
   setThinkingLevel(level) {
@@ -927,15 +2157,21 @@ class NavyCoderViewProvider {
 
   // ── Project session & memory ─────────────────────────────────────────────
 
-  getNavyDir() {
-    return this.projectRoot ? path.join(this.projectRoot, '.navy') : null;
+  // Both accept an optional root override (defaulting to the active
+  // project) so callers that need to write into a project's .navy/ dir
+  // BEFORE it's necessarily the active one — e.g. persisted background
+  // processes, which are keyed by whichever root spawned them, not
+  // whichever one happens to be on-screen — don't have to fake-switch
+  // projectRoot just to reuse this helper.
+  getNavyDir(root = this.projectRoot) {
+    return root ? path.join(root, '.navy') : null;
   }
 
-  async ensureNavyDir() {
-    const dir = this.getNavyDir();
+  async ensureNavyDir(root = this.projectRoot) {
+    const dir = this.getNavyDir(root);
     if (!dir) return null;
     try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir)); } catch {}
-    // Self-ignoring directory: session.json contains the full conversation text,
+    // Self-ignoring directory: chat files contain the full conversation text,
     // which must never end up committed to the user's repo.
     const gi = vscode.Uri.file(path.join(dir, '.gitignore'));
     try { await vscode.workspace.fs.stat(gi); }
@@ -943,48 +2179,104 @@ class NavyCoderViewProvider {
     return dir;
   }
 
+  // Refreshes the webview from the ACTIVE session's already-in-memory state.
+  // Does NOT read chat history from disk — that only ever happens once, in
+  // _ensureProjectChatsLoaded, when a project is first activated this
+  // window — so calling this repeatedly (every tab switch, every project
+  // switch) can't re-import stale disk content over newer in-memory state.
   async loadProjectSession() {
-    // Undo/redo history is per-project: checkpoints are reloaded below, and the
-    // redo stack must not survive a switch (it holds the OTHER project's files).
+    // Undo/redo history is per-chat: the redo stack must not survive a
+    // switch (it holds the OTHER chat's files).
     if (this.redoStack.length) {
       this.redoStack = [];
       this.view?.webview.postMessage({ type: 'redoState', count: 0 });
     }
-    const dir = this.getNavyDir();
-    if (!dir) return;
-    try {
-      const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'session.json')));
-      const session = JSON.parse(Buffer.from(data).toString('utf8'));
-      this.messages = Array.isArray(session.messages) ? session.messages : [];
-      this.sessionDigest = typeof session.digest === 'string' ? session.digest : '';
-      this.restoreMessages();
-      const memory = await this.loadProjectMemory();
-      this.view?.webview.postMessage({
-        type: 'sessionLoaded',
-        count: this.messages.length,
-        memory,
-        projectRoot: this.projectRoot
-      });
-    } catch {
-      this.messages = [];
-      this.sessionDigest = '';
-      this.view?.webview.postMessage({ type: 'sessionLoaded', count: 0, memory: '', projectRoot: this.projectRoot });
-    }
-    const rules = await this.loadProjectRules();
+    this.restoreMessages();
+    const memory = this.projectRoot ? await this.loadProjectMemory() : '';
+    // Usage travels with 'sessionLoaded' too — restoring a chat or switching
+    // to a sibling should show ITS accumulated cost immediately, not stay
+    // blank until you happen to send another message in it.
+    const usage = this._sessionUsage();
+    this.view?.webview.postMessage({
+      type: 'sessionLoaded',
+      count: this.messages.length,
+      memory,
+      projectRoot: this.projectRoot,
+      sessionPrompt: usage.prompt,
+      sessionCompletion: usage.completion,
+      sessionTotal: usage.prompt + usage.completion,
+      estimatedCost: usage.prompt + usage.completion > 0 ? usage.cost : null,
+      costKnown: usage.costKnown,
+    });
+    const rules = this.projectRoot ? await this.loadProjectRules() : '';
     this.view?.webview.postMessage({ type: 'rulesStatus', active: Boolean(rules) });
-    await this._loadCheckpoints();
+    this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
+    this._sendLiveCardState();
+  }
+
+  // Re-announces anything still RUNNING in this chat, because switching tabs
+  // clears the view entirely while the work underneath carries on.
+  //
+  // Without this, leaving a tab and coming back left a dev server with no card
+  // and no Stop button, and a running background task whose every later
+  // message the frontend then discarded (its card is only created on 'start',
+  // which had already been and gone) — so the task's final answer was lost
+  // outright. Clear Chat already re-sent the run-project card for exactly this
+  // reason; a tab switch needs the same treatment, for all three card kinds.
+  _sendLiveCardState() {
+    const post = (m) => this.view?.webview.postMessage(m);
+
+    const runProject = this.bgProcesses.get('__run_project__');
+    if (runProject?.proc) {
+      const projectName = path.basename(this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '');
+      post({ type: 'runProjectStart', projectName, command: runProject.command });
+      if (runProject.url) post({ type: 'runProjectReady', url: runProject.url });
+    }
+
+    for (const [taskId, worker] of this.bgWorkers) {
+      post({ type: 'bgTaskUpdate', taskId, status: 'start', prompt: worker.prompt || '' });
+    }
+
+    for (const [id, entry] of this.bgProcesses) {
+      if (id === '__run_project__' || !entry?.proc) continue;
+      // Replays what has been captured so far, which also recreates the panel
+      // (appendBgProcessOutput builds it on demand). A persisted process has no
+      // in-memory buffer — an empty chunk still restores its panel and its
+      // Stop control.
+      post({ type: 'bgProcessOutput', id, chunk: entry.stdout || '' });
+    }
+  }
+
+  // Persists the ACTIVE chat to its OWN file (.navy/chats/<id>.json) — never
+  // a file shared with any other chat, so two chats on the same project can
+  // never clobber each other's history. See _persistCheckpoints, which
+  // writes the same file (also carrying checkpoints) on its own debounce.
+  async _writeChatFile() {
+    const dir = await this.ensureNavyDir();
+    if (!dir) return;
+    const chatsDir = path.join(dir, 'chats');
+    try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(chatsDir)); } catch {}
+    const s = this._session;
+    let bytes = 0;
+    const keepCps = [];
+    for (let i = s.checkpoints.length - 1; i >= 0; i--) {
+      bytes += (s.checkpoints[i].originalText || '').length;
+      if (bytes > 8_000_000) break;
+      keepCps.unshift(s.checkpoints[i]);
+    }
+    s._updated = new Date().toISOString();
+    try {
+      const payload = { id: s.id, updated: s._updated, messages: s.messages, digest: s.sessionDigest || '', checkpoints: keepCps };
+      await vscode.workspace.fs.writeFile(
+        vscode.Uri.file(path.join(chatsDir, s.id + '.json')),
+        Buffer.from(JSON.stringify(payload), 'utf8')
+      );
+    } catch (e) { this.log?.('chat persist failed: ' + e.message); }
   }
 
   async saveProjectSession() {
-    const dir = await this.ensureNavyDir();
-    if (!dir) return;
-    try {
-      const session = { updated: new Date().toISOString(), projectRoot: this.projectRoot, messages: this.messages, digest: this.sessionDigest || '' };
-      await vscode.workspace.fs.writeFile(
-        vscode.Uri.file(path.join(dir, 'session.json')),
-        Buffer.from(JSON.stringify(session, null, 2), 'utf8')
-      );
-    } catch {}
+    if (!this.projectRoot) return;
+    await this._writeChatFile();
   }
 
   async loadProjectMemory() {
@@ -997,18 +2289,31 @@ class NavyCoderViewProvider {
   }
 
   async loadProjectRules() {
-    // Check well-known per-project rule files in the workspace root first.
+    // Merge EVERY well-known rule file found, not just the first — a project
+    // commonly has a tool-agnostic AGENTS.md for shared team conventions AND
+    // a small tool-specific file (.cursorrules, .navyrules) layering a
+    // targeted tweak on top. "First file wins" meant adding either one
+    // silently discarded ALL of the other: a repo that already had AGENTS.md
+    // and then dropped in a two-line .navyrules note would lose the entire
+    // rest of its conventions the moment Navy read rules at all. Ordered
+    // broadest-first so a more Navy-specific file reads as a refinement of
+    // (and, on conflict, an override for) the general ones before it —
+    // matching the "later = can override earlier" convention already used
+    // for navy.systemPrompt vs. the built-in tool-use rules.
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const sections = [];
     if (root) {
-      for (const name of ['.navyrules', '.cursorrules', 'AGENTS.md', '.github/copilot-instructions.md']) {
+      for (const name of ['AGENTS.md', '.github/copilot-instructions.md', '.cursorrules', '.navyrules']) {
         try {
           const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, name)));
           const text = Buffer.from(data).toString('utf8').trim();
-          if (text) return text;
+          if (text) sections.push(`### From ${name}\n${text}`);
         } catch {}
       }
     }
-    // Fall back to the Navy-managed rules.md in .navy/
+    if (sections.length) return sections.join('\n\n');
+    // Fall back to the Navy-managed rules.md in .navy/ only when NONE of the
+    // well-known files above exist at all.
     const dir = this.getNavyDir();
     if (!dir) return '';
     try {
@@ -1075,7 +2380,92 @@ class NavyCoderViewProvider {
       return;
     }
 
+    // Captured once, at invocation — everything below runs bound to THIS
+    // session regardless of which tab the user switches to while it's
+    // running (see the _session getter and sessionContext at the top of this
+    // file). Without this, a background turn would start reading and writing
+    // a DIFFERENT project's messages/checkpoints the instant the user
+    // switched tabs, since those otherwise resolve from the live, shared
+    // activeSessionId.
+    //
+    // Prefers an ALREADY-ESTABLISHED context over activeSessionId, same as
+    // the postMessage wrapper and _persistCheckpoints: the queue drain in
+    // _askNavyTurn's finally block re-enters here from inside the finishing
+    // turn's own context (AsyncLocalStorage propagates through the
+    // setImmediate it uses), so reading activeSessionId unconditionally
+    // would re-bind a queued prompt to whichever tab is VISIBLE by then —
+    // running tab A's queued message against tab B's messages, checkpoints
+    // and projectRoot, landing its file writes in the wrong project.
+    const boundSession = sessionContext.getStore() ?? this.activeSessionId;
+    return sessionContext.run(boundSession, () => this._askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images));
+  }
+
+  // Tries the configured primary provider first, exactly like a plain
+  // streamAssistant call — and ONLY for a genuinely transient failure
+  // (isTransientProviderError: rate limit, server outage, or network error;
+  // NEVER auth/quota/context-length/model-not-found, which need YOU to fix
+  // something rather than a different account to silently pay for) falls
+  // through navy.providerFallbacks in order, each entry using its OWN
+  // already-saved API key. Empty by default (opt-in only) — with nothing
+  // configured this behaves identically to calling streamAssistant directly.
+  // Every fallback attempt is announced in the chat BEFORE it runs and
+  // whether it succeeded — real money can land on a different account, so
+  // that must never happen invisibly. Returns the normal streamAssistant
+  // result plus { usedProvider, usedModel } so the caller can tag rawBlocks/
+  // cost/meta with whichever provider ACTUALLY served this call, not
+  // whatever's configured as primary.
+  async _streamWithFallback(host, model, messages, temperature) {
+    const config = vscode.workspace.getConfiguration('navy');
+    const primaryProvider = config.get('provider', 'ollama');
+    try {
+      const result = await streamAssistant(this, host, model, messages, temperature, this.abortController?.signal);
+      return { ...result, usedProvider: primaryProvider, usedModel: model };
+    } catch (primaryError) {
+      if (this.abortController?.signal.aborted) throw primaryError; // never fall back from an intentional Stop
+      if (!isTransientProviderError(primaryError.message)) throw primaryError;
+      const fallbacks = config.get('providerFallbacks', []);
+      if (!Array.isArray(fallbacks) || !fallbacks.length) throw primaryError;
+
+      const primaryLabel = providerDisplayName(primaryProvider);
+      let lastError = primaryError;
+      for (const fb of fallbacks) {
+        if (!fb || !fb.provider || !fb.model) continue; // malformed entry — skip rather than crash the turn over a settings typo
+        if (this.abortController?.signal.aborted) throw lastError;
+        const fbLabel = providerDisplayName(fb.provider);
+        const reason = classifyProviderError(primaryLabel, lastError.message)?.title || `${primaryLabel} error: ${lastError.message}`;
+        this._announceFallback(`${reason} — trying fallback: ${fbLabel} (${fb.model})…`);
+        try {
+          const fbHost = (fb.provider === 'ollama' || fb.provider === 'lmstudio') ? (fb.host || host) : host;
+          const result = await streamAssistant(this, fbHost, fb.model, messages, temperature, this.abortController?.signal, null,
+            { aiProvider: fb.provider, apiBase: fb.apiBase });
+          this._announceFallback(`Fallback succeeded: ${fbLabel}`);
+          return { ...result, usedProvider: fb.provider, usedModel: fb.model };
+        } catch (fbError) {
+          // No separate "also failed" message here — the next iteration's own
+          // "trying fallback: …" line (or, if none remain, the final thrown
+          // error's normal formatted display) already makes that clear.
+          lastError = fbError;
+        }
+      }
+      throw lastError;
+    }
+  }
+
+  // Streams a fallback notice into the live reply AND records it on the
+  // session, so it survives into persisted history. Posting a bare 'chunk' was
+  // display-only: the notice appeared while the turn ran, then vanished on the
+  // next reload, because only the model's own responseText is persisted. That
+  // is exactly the wrong thing to lose — it is the record of which account got
+  // billed for the turn.
+  _announceFallback(text) {
+    this.view?.webview.postMessage({ type: 'chunk', text: `\n\n_[${text}]_\n\n` });
+    this._session.fallbackNotices.push(text);
+  }
+
+  async _askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images) {
     this.isBusy = true;
+    this._session.fallbackNotices = []; // per-turn; folded into the persisted reply below
+    this._sendSessionList(); // tab strip's busy spinner reflects this session's turn starting
     if (this.statusBarItem) this.statusBarItem.text = '$(sync~spin) Navy';
     this.currentTurnId = this.generateId();
     // Liveness beacon: the webview only declares Navy dead after 4 minutes of
@@ -1088,9 +2478,21 @@ class NavyCoderViewProvider {
 
     const config = vscode.workspace.getConfiguration('navy');
     const configuredModel = config.get('model', '');
-    const model = selectedModel || configuredModel;
+    const model = selectedModel || configuredModel; // the configured PRIMARY — always what _streamWithFallback tries first, every iteration; never reassigned
+    // Published on the session so tools that make their OWN model calls run on
+    // the same model as the turn that invoked them — see toolDelegateResearch.
+    // The picker's choice arrives as `selectedModel` and only reaches
+    // navy.model via setModel, so reading config directly can lag by a turn.
+    this._session.activeModel = model;
     const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
-    const aiProviderForTag = config.get('provider', 'ollama'); // tags _rawBlocks with its origin provider
+    const aiProviderForTag = config.get('provider', 'ollama'); // ditto: the configured primary, immutable
+    // Whichever provider/model actually served the MOST RECENT model call —
+    // equals the primary above unless navy.providerFallbacks kicked in for
+    // that call. Used (instead of the immutable pair above) anywhere a call's
+    // OWN result needs tagging: rawBlocks replay safety, cost estimation, and
+    // the turn's persisted meta.provider/meta.model.
+    let lastUsedProvider = aiProviderForTag;
+    let lastUsedModel = model;
 
     // Map thinking level to temperature.
     const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7 };
@@ -1145,8 +2547,6 @@ class NavyCoderViewProvider {
             + diags.slice(0, 20).map(d => {
                 const sev = ['Error', 'Warning', 'Info', 'Hint'][d.severity] || '?';
                 return `[${sev}] line ${d.range.start.line + 1}: ${d.message}`;
-
-
               }).join('\n');
           if (errors.length > 0 || warnings.length > 0) {
             this.view?.webview.postMessage({ type: 'diagnostics', errors: errors.length, warnings: warnings.length });
@@ -1220,7 +2620,7 @@ class NavyCoderViewProvider {
       systemContent += '\n\n## User preferences (does not override the tool-use rules above):\n' + cap(customSystemPrompt.trim(), 2000);
     }
     if (projectRules) {
-      systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults):\n' + cap(projectRules, 8000);
+      systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults; where multiple sources below conflict, the LATER one wins):\n' + cap(projectRules, 8000);
     }
     if (projectMemory) {
       systemContent += '\n\n## Project Memory (facts you learned in previous sessions — treat as ground truth unless you discover otherwise):\n' + cap(projectMemory, 6000);
@@ -1269,41 +2669,76 @@ class NavyCoderViewProvider {
 
     // Long sessions: condense the oldest turns into a digest instead of silently
     // forgetting them — Navy keeps knowing what was discussed and changed early on.
-    if (this.messages.length > 80) {
-      const dropped = this.messages.slice(0, this.messages.length - 60);
-      this.messages = this.messages.slice(-60);
-      // Mechanical digest — always available, zero latency, used as the fallback.
-      const lines = dropped.map(m => {
-        const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
-        if (!head) return '';
-        if (m.role === 'user') return '- User: ' + head;
-        const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
-        return '- Navy: ' + head + files;
-      }).filter(Boolean);
-      let digestAddition = lines.join('\n');
-      // Preferred: let the model write a REAL summary of what's being forgotten
-      // (decisions, files changed, unresolved threads) — the way Claude Code
-      // compacts. Rare (once per ~20 turns), so the extra call is acceptable;
-      // any failure falls back to the mechanical digest above.
-      try {
-        this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
-        const excerpt = dropped
-          .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
-          .join('\n').slice(0, 12000);
-        const summary = await this._completeOnce(host, model, [
-          { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
-          { role: 'user', content: excerpt },
-        ]);
-        if (summary && summary.trim().length > 40) digestAddition = summary.trim();
-      } catch (e) { this.log?.('history summarization failed (using mechanical digest): ' + e.message); }
-      this.sessionDigest = ((this.sessionDigest || '') + '\n' + digestAddition).trim();
-      if (this.sessionDigest.length > 6000) {
-        this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
+    // Two independent triggers, not just message COUNT: a handful of verbose
+    // turns (long files quoted back, big search/read results folded into the
+    // reply) can already be hundreds of thousands of characters — replayed on
+    // EVERY iteration of EVERY future turn — while staying nowhere near 80
+    // messages. _compactMessages (below, in the tool loop) only ever prunes
+    // THIS turn's own fresh tool churn; nothing else bounds the size of past
+    // turns being replayed, so that's this trigger's job.
+    const HISTORY_CHAR_CAP = 200000; // ≈50k tokens — kept under _compactMessages' own 240k ceiling, which still has this turn's OWN growth to add on top
+    const messagesCharSize = this.messages.reduce((sum, m) => sum + (m.text || '').length, 0);
+    if (this.messages.length > 80 || messagesCharSize > HISTORY_CHAR_CAP) {
+      // Keep at least the most recent MIN_KEEP messages no matter what (never
+      // gut near-term continuity in one shot), otherwise keep growing the
+      // kept window from the end until either MAX_KEEP messages are kept (the
+      // original count-based target) or adding the next one would push the
+      // KEPT portion itself back over the cap — whichever comes first, so a
+      // handful of oversized messages gets trimmed even when there aren't 80+.
+      const MIN_KEEP = 10, MAX_KEEP = 60;
+      let keepCount = 0, keptSize = 0;
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        const size = (this.messages[i].text || '').length;
+        if (keepCount >= MIN_KEEP && (keepCount >= MAX_KEEP || keptSize + size > HISTORY_CHAR_CAP)) break;
+        keptSize += size;
+        keepCount++;
+      }
+      const dropped = this.messages.slice(0, this.messages.length - keepCount);
+      // A size-triggered check on a session with FEWER than MIN_KEEP messages
+      // has nothing it's willing to drop (the recency floor protects all of
+      // them) — bail out before spending a whole extra model call summarizing
+      // zero messages, which would waste tokens instead of saving them.
+      if (dropped.length) {
+        this.messages = this.messages.slice(-keepCount);
+        // Mechanical digest — always available, zero latency, used as the fallback.
+        const lines = dropped.map(m => {
+          const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
+          if (!head) return '';
+          if (m.role === 'user') return '- User: ' + head;
+          const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
+          const reads = m.meta?.reads?.length ? ` [read: ${m.meta.reads.join(', ')}]` : '';
+          return '- Navy: ' + head + files + reads;
+        }).filter(Boolean);
+        let digestAddition = lines.join('\n');
+        // Preferred: let the model write a REAL summary of what's being forgotten
+        // (decisions, files changed, unresolved threads) — the way Claude Code
+        // compacts. Rare (once per ~20 turns), so the extra call is acceptable;
+        // any failure falls back to the mechanical digest above.
+        try {
+          this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
+          const excerpt = dropped
+            .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
+            .join('\n').slice(0, 12000);
+          const summary = await this._completeOnce(host, model, [
+            { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
+            { role: 'user', content: excerpt },
+          ]);
+          if (summary && summary.trim().length > 40) digestAddition = summary.trim();
+        } catch (e) { this.log?.('history summarization failed (using mechanical digest): ' + e.message); }
+        this.sessionDigest = ((this.sessionDigest || '') + '\n' + digestAddition).trim();
+        if (this.sessionDigest.length > 6000) {
+          this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
+        }
       }
     }
 
     for (const item of this.messages) {
-      messages.push({ role: item.role, content: item.text });
+      // Append a compact record of what the turn actually DID (files read/
+      // written, commands run) to the model-facing copy of its text — see
+      // _renderTurnLedger. item.text itself is left untouched, since it's
+      // also what the webview displays and what the digest below excerpts.
+      const ledger = item.role === 'assistant' ? this._renderTurnLedger(item.meta) : '';
+      messages.push({ role: item.role, content: item.text + ledger });
     }
 
     const userText = userParts.join('\n\n---\n\n');
@@ -1317,7 +2752,25 @@ class NavyCoderViewProvider {
     } else {
       messages.push({ role: 'user', content: userText });
     }
-    this.messages.push({ role: 'user', text: prompt });
+    // Attachment names and the image count are persisted with the message so a
+    // restored chat still shows its 📎/🖼 badges. They were rendered live and
+    // then dropped, so reopening a chat made a question that hinged on an
+    // attached file look like it was asked with no context at all.
+    const attachedNames = (attachedFiles || [])
+      .map(f => (typeof f === 'string' ? f : (f?.path || f?.name || '')))
+      .filter(Boolean)
+      .map(p => String(p).replace(/^.*[\\/]/, ''));
+    this.messages.push({
+      role: 'user',
+      text: prompt,
+      ...(attachedNames.length ? { attachments: attachedNames } : {}),
+      ...(images?.length ? { images: images.length } : {}),
+    });
+    // Tab titles are drawn from the first user message (see
+    // _sessionSummaries) — refresh now so a "New Chat" tab picks up its
+    // real title the moment you send the first prompt, not only once the
+    // whole turn finishes (the next _sendSessionList after this one).
+    this._sendSessionList();
 
     this.lastReply = '';
 
@@ -1347,9 +2800,13 @@ class NavyCoderViewProvider {
       const FILE_EDIT_SOFT_CAP = 5;  // stop feeding fresh diagnostics + nudge to wrap up
       const FILE_EDIT_HARD_CAP = 10; // refuse further writes to this file for the rest of the turn
 
-      // Change tracker: accumulates what the model touched so we can append a report footer.
-      const taskChanges = { touched: new Map(), deleted: [], commands: [] };
-      // touched: Map<inputPath, 'created'|'modified'>; commands: { cmd, exit }[]
+      // Change tracker: accumulates what the model touched so we can append a report footer,
+      // AND (via reads/commands persisted into meta below) so a LATER turn can see what THIS
+      // turn actually verified/ran instead of only what its final reply claimed.
+      const taskChanges = { touched: new Map(), deleted: [], commands: [], reads: [] };
+      // touched: Map<inputPath, 'created'|'modified'>; commands/reads: capped arrays, see below
+      const turnTokens = { prompt: 0, completion: 0 }; // accumulated across every model call this turn — see meta.tokens below
+      this.subAgentTokens = { prompt: 0, completion: 0 }; // reset — any delegate_research calls this turn accumulate into this fresh object
 
       let lastAssistantText = ''; // final assistant text, persisted to history after the loop
       let hallucinationNudged = false; // false-completion-claim correction sent once
@@ -1369,7 +2826,9 @@ class NavyCoderViewProvider {
         resetWatchdog();
         // Keep the request within the context window on long multi-step tasks.
         if (iteration > 0) this._compactMessages(messages);
-        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks } = await streamAssistant(this, host, model, messages, temperature);
+        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = await this._streamWithFallback(host, model, messages, temperature);
+        lastUsedProvider = usedProvider;
+        lastUsedModel = usedModel;
         // Model call finished — stop the watchdog so it can't fire while tools run or
         // while the user takes their time reviewing a pending edit approval.
         clearTimeout(this._watchdog);
@@ -1377,7 +2836,34 @@ class NavyCoderViewProvider {
         // Send token usage and context fill level after each model call.
         const totalTokens = tokenCounts.prompt + tokenCounts.completion;
         if (totalTokens > 0) {
-          this.view?.webview.postMessage({ type: 'tokenCount', prompt: tokenCounts.prompt, completion: tokenCounts.completion, total: totalTokens });
+          turnTokens.prompt += tokenCounts.prompt;
+          turnTokens.completion += tokenCounts.completion;
+          // Running session total = every already-PERSISTED turn's usage
+          // (this._sessionUsage) plus however much of the CURRENT turn has
+          // run so far — so the counter climbs live during a long multi-step
+          // turn instead of jumping only once the turn finally finishes.
+          const persisted = this._sessionUsage();
+          // Includes any delegate_research sub-agent calls made so far this
+          // turn — they ran through the SAME provider/model, so pricing the
+          // combined total at that rate is exact, not an approximation.
+          const turnPromptSoFar = turnTokens.prompt + this.subAgentTokens.prompt;
+          const turnCompletionSoFar = turnTokens.completion + this.subAgentTokens.completion;
+          const sessionPrompt = persisted.prompt + turnPromptSoFar;
+          const sessionCompletion = persisted.completion + turnCompletionSoFar;
+          // Prices the WHOLE turn's accumulated tokens at whichever provider
+          // served the MOST RECENT call — a known simplification if a
+          // fallback engaged partway through a multi-iteration turn (an
+          // already-existing one-provider-per-turn assumption predating
+          // navy.providerFallbacks, not something this feature makes worse
+          // in a new way).
+          const liveCost = estimateCost(lastUsedProvider, lastUsedModel, turnPromptSoFar, turnCompletionSoFar);
+          const estimatedCost = liveCost === null ? null : persisted.cost + liveCost;
+          const costKnown = persisted.costKnown && liveCost !== null;
+          this.view?.webview.postMessage({
+            type: 'tokenCount', prompt: tokenCounts.prompt, completion: tokenCounts.completion, total: totalTokens,
+            sessionPrompt, sessionCompletion, sessionTotal: sessionPrompt + sessionCompletion,
+            estimatedCost, costKnown,
+          });
           if (this.modelContextLength) {
             this.view?.webview.postMessage({ type: 'contextUsage', used: tokenCounts.prompt, max: this.modelContextLength });
           }
@@ -1399,7 +2885,7 @@ class NavyCoderViewProvider {
           // only trusts rawBlocks it recognizes as its own and safely falls back
           // to reconstructing from the generic tool_calls array otherwise.
           messages.push({ role: 'assistant', content: responseText || '', tool_calls: nativeToolCalls,
-            ...(rawBlocks?.length ? { _rawBlocks: rawBlocks, _rawBlocksProvider: aiProviderForTag } : {}) });
+            ...(rawBlocks?.length ? { _rawBlocks: rawBlocks, _rawBlocksProvider: lastUsedProvider } : {}) });
         } else {
           messages.push({ role: 'assistant', content: responseText });
         }
@@ -1501,15 +2987,7 @@ class NavyCoderViewProvider {
         const toolResults = [];
         const nonFinish = toolCalls.filter(t => t.name !== 'finish');
 
-        const makeToolResult = (tool, result) => nativeToolCalls.length > 0
-          ? { role: 'tool', tool_call_id: tool.id || '', content: String(result) }
-          : { role: 'user', content: '<tool_result name="' + tool.name + '">\n' + result + '\n</tool_result>' };
-
-        // Read-only tools are safe to run in parallel; writes must be sequential.
-        const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
-          'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
-          'check_syntax','find_symbol','find_references',
-          'web_search','fetch_url','get_terminal_output','read_process_output']);
+        const makeToolResult = (tool, result) => makeToolResultMessage(tool, result, nativeToolCalls.length > 0);
 
         // Tools whose results are stable — dedup prevents re-reading the same file in a loop.
         // web_search included so a weak model can't spin on the same query repeatedly.
@@ -1548,6 +3026,12 @@ class NavyCoderViewProvider {
               continue;
             }
             seenReadCalls.add(key);
+            // Record what was actually looked at (capped) so a LATER turn can be told
+            // this turn already read/searched it — see _renderTurnLedger.
+            if (taskChanges.reads.length < 12) {
+              const d = this._describeReadCall(tool);
+              if (d) taskChanges.reads.push(d);
+            }
           }
           // Block retrying a persistently-failing command (≥2 consecutive failures with same args).
           if (COMMAND_TOOLS.has(tool.name)) {
@@ -1625,9 +3109,11 @@ class NavyCoderViewProvider {
               } else if (typeof result === 'string' && result.startsWith('Exit code: 0')) {
                 failedCommands.delete(cmdKey);
               }
-              // Record for the change-report footer.
+              // Record for the change-report footer (and, capped, for the turn ledger).
               const exitMatch = String(result).match(/^Exit code: (\d+)/);
-              if (exitMatch) taskChanges.commands.push({ cmd: tool.args?.command || tool.args?.filter || '', exit: parseInt(exitMatch[1]) });
+              if (exitMatch && taskChanges.commands.length < 8) {
+                taskChanges.commands.push({ cmd: tool.args?.command || tool.args?.filter || '', exit: parseInt(exitMatch[1]) });
+              }
             }
             // Record successful file writes + auto-verify with fresh diagnostics.
             if (WRITE_TOOLS.has(tool.name) && typeof result === 'string' && result.startsWith('Applied to')) {
@@ -1685,8 +3171,36 @@ class NavyCoderViewProvider {
         const meta = {};
         if (taskChanges.touched.size)   meta.files   = [...taskChanges.touched.keys()].map(p => path.basename(p));
         if (taskChanges.deleted.length) meta.deleted = taskChanges.deleted.filter(Boolean).map(p => path.basename(p));
-        if (taskChanges.commands.length) meta.commands = taskChanges.commands.length;
-        this.messages.push({ role: 'assistant', text: lastAssistantText, ...(Object.keys(meta).length ? { meta } : {}) });
+        if (taskChanges.commands.length) {
+          meta.commands = taskChanges.commands.length; // display only — media/main.js renders this as a count
+          meta.commandLog = taskChanges.commands;       // model-facing only — see _renderTurnLedger
+        }
+        // reads: model-facing only — the webview has no use for it and ignores unknown meta keys.
+        if (taskChanges.reads.length) meta.reads = taskChanges.reads;
+        // provider/model travel WITH the tokens they priced — _sessionUsage prices
+        // each turn at what actually ran it, not whatever's currently configured.
+        // lastUsedProvider/lastUsedModel (not the immutable primary aiProviderForTag/
+        // model) so a turn where navy.providerFallbacks actually engaged is priced
+        // at the provider that really ran it, not the one that failed.
+        // Includes any delegate_research sub-agent usage from this turn — it's
+        // real spend against the same provider/model, so it belongs in the total.
+        const finalTokens = {
+          prompt: turnTokens.prompt + this.subAgentTokens.prompt,
+          completion: turnTokens.completion + this.subAgentTokens.completion,
+        };
+        if (finalTokens.prompt + finalTokens.completion > 0) {
+          meta.tokens = finalTokens;
+          meta.provider = lastUsedProvider;
+          meta.model = lastUsedModel;
+        }
+        // Fallback notices ride along in the persisted text so a reloaded
+        // session still shows that a different provider (and a different
+        // account) served this turn — see _announceFallback.
+        const notices = this._session.fallbackNotices;
+        const persistedText = notices.length
+          ? notices.map(n => `_[${n}]_`).join('\n') + '\n\n' + lastAssistantText
+          : lastAssistantText;
+        this.messages.push({ role: 'assistant', text: persistedText, ...(Object.keys(meta).length ? { meta } : {}) });
       }
 
       // Only auto-apply code fences in pure-chat mode (no tool use), to prevent double-applies.
@@ -1715,6 +3229,7 @@ class NavyCoderViewProvider {
       this._watchdog = undefined;
       this.abortController = undefined;
       this.isBusy = false;
+      this._sendSessionList(); // tab strip's busy spinner reflects this session's turn ending
       if (this.statusBarItem) this.statusBarItem.text = '☸ Navy';
       this.view?.webview.postMessage({ type: 'done' });
       if (hitCap) this.view?.webview.postMessage({ type: 'capReached', steps: maxIterations });
@@ -1735,6 +3250,80 @@ class NavyCoderViewProvider {
         });
       }
     }
+  }
+
+  // Short human-readable label for a read-type tool call, for the turn ledger
+  // (see _renderTurnLedger) — never shown in the chat UI, just fed back to the
+  // model so it knows what a PAST turn actually looked at, not just what that
+  // turn's reply claimed.
+  _describeReadCall(tool) {
+    const a = tool.args || {};
+    switch (tool.name) {
+      case 'read_file': return a.path ? 'read_file(' + a.path + ')' : '';
+      case 'read_lines': return a.path ? `read_lines(${a.path}:${a.start ?? '?'}-${a.end ?? '?'})` : '';
+      case 'list_files': return 'list_files(' + (a.path || '.') + ')';
+      case 'search_files': return a.query ? `search_files("${a.query.slice(0, 40)}")` : '';
+      case 'search_codebase': return a.query ? `search_codebase("${a.query.slice(0, 40)}")` : '';
+      case 'find_relevant_files': return a.query ? `find_relevant_files("${a.query.slice(0, 40)}")` : '';
+      case 'search_docs': return a.query ? `search_docs("${a.query.slice(0, 40)}")` : '';
+      case 'web_search': return a.query ? `web_search("${a.query.slice(0, 40)}")` : '';
+      case 'find_symbol': return a.name ? 'find_symbol(' + a.name + ')' : '';
+      case 'find_references': return a.name ? 'find_references(' + a.name + ')' : '';
+      case 'git_blame': return a.path ? 'git_blame(' + a.path + ')' : '';
+      case 'git_status': return 'git_status()';
+      case 'git_diff': return 'git_diff()';
+      case 'git_log': return 'git_log()';
+      default: return tool.name + '()';
+    }
+  }
+
+  // Renders a past turn's tool activity (see the taskChanges tracker in
+  // _askNavyTurn / the `meta` attached to each persisted assistant message)
+  // as a short, model-facing note — NEVER shown in the chat UI (main.js only
+  // reads meta.files/deleted/commands for its own display, and ignores
+  // reads/commandLog entirely). Without this, replaying history for a new
+  // turn only carries each past turn's final reply TEXT (see the "for (const
+  // item of this.messages)" loop in askNavy) — so the model has no way to
+  // know it already read a file or ran a command two turns ago unless it
+  // happened to mention that in prose, and routinely re-did work it had
+  // already done. This gives it a compact, verifiable record instead.
+  _renderTurnLedger(meta) {
+    if (!meta) return '';
+    const parts = [];
+    if (meta.reads?.length) parts.push('read ' + meta.reads.join(', '));
+    if (meta.files?.length) parts.push('wrote ' + meta.files.join(', '));
+    if (meta.deleted?.length) parts.push('deleted ' + meta.deleted.join(', '));
+    if (meta.commandLog?.length) {
+      parts.push('ran ' + meta.commandLog.map(c => '"' + c.cmd + '"' + (c.exit === 0 ? ' (exit 0)' : ' (exit ' + c.exit + ')')).join(', '));
+    }
+    if (!parts.length) return '';
+    return '\n\n[Tool activity that turn, for your own reference — do not repeat unnecessarily: ' + parts.join('; ') + ']';
+  }
+
+  // Sums token usage (and estimated cost) across every PERSISTED turn of the
+  // active chat — not a separately-maintained running counter, so it's
+  // automatically correct after Clear (this.messages is empty → 0), after
+  // restoring an old chat (recomputed straight from its saved meta.tokens),
+  // and after switching tabs (each session's own messages, never mixed with
+  // a sibling's). Cost is computed PER TURN using that turn's OWN provider
+  // and model (meta.provider/meta.model) — a session can span a provider or
+  // model switch, and pricing an earlier turn at whatever's CURRENTLY
+  // configured would silently misreport it (e.g. an old paid-API turn
+  // reading as free just because you've since switched to local Ollama).
+  // costKnown is false whenever at least one priced turn's model isn't in
+  // MODEL_PRICING, so the caller can show "≈$X+" instead of a number that
+  // looks exact but is actually missing part of the total.
+  _sessionUsage() {
+    let prompt = 0, completion = 0, cost = 0, costKnown = true;
+    for (const m of this.messages) {
+      const t = m.meta?.tokens;
+      if (!t) continue;
+      prompt += t.prompt || 0;
+      completion += t.completion || 0;
+      const c = estimateCost(m.meta.provider, m.meta.model, t.prompt || 0, t.completion || 0);
+      if (c === null) costKnown = false; else cost += c;
+    }
+    return { prompt, completion, cost, costKnown };
   }
 
   // Mid-turn context compaction: when the accumulated conversation gets too large,
@@ -1971,13 +3560,13 @@ class NavyCoderViewProvider {
         case 'delete_file': return await this.toolDeleteFile(tool.args.path);
         case 'rename_file': return await this.toolRenameFile(tool.args.from, tool.args.to);
         case 'rename_symbol': return await this.toolRenameSymbol(tool.args.path, tool.args.line, tool.args.name, tool.args.newName);
-        case 'list_files': return await this.toolListFiles(tool.args.path, tool.args.maxDepth);
-        case 'search_files': return await this.toolSearchFiles(tool.args.query);
+        case 'list_files': return await this.toolListFiles(tool.args.path, tool.args.maxDepth, tool.args.folder);
+        case 'search_files': return await this.toolSearchFiles(tool.args.query, tool.args.folder);
         case 'apply_edit': return await this.toolApplyEdit(tool.args.path, tool.args.search, tool.args.replace);
         case 'edit_line': return await this.toolEditLine(tool.args.path, tool.args.line, tool.args.content);
         case 'delete_line': return await this.toolDeleteLine(tool.args.path, tool.args.line);
         case 'insert_after_line': return await this.toolInsertAfterLine(tool.args.path, tool.args.line, tool.args.content);
-        case 'run_command': return await this.toolRunCommand(tool.args.command, tool.args.timeout);
+        case 'run_command': return await this.toolRunCommand(tool.args.command, tool.args.timeout, tool.id);
         case 'run_project': return await this.toolRunProject(tool.args.command);
         case 'start_process': return await this.toolStartProcess(tool.args.id, tool.args.command);
         case 'read_process_output': return await this.toolReadProcessOutput(tool.args.id, tool.args.clear);
@@ -1986,6 +3575,7 @@ class NavyCoderViewProvider {
         case 'find_symbol': return await this.toolFindSymbol(tool.args.name);
         case 'find_references': return await this.toolFindReferences(tool.args.name);
         case 'web_search': return await this.toolWebSearch(tool.args.query, tool.args.maxResults);
+        case 'delegate_research': return await this.toolDelegateResearch(tool.args.task, tool.args.maxSteps);
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
@@ -1993,10 +3583,10 @@ class NavyCoderViewProvider {
         case 'check_syntax': return await this.toolCheckSyntax(tool.args.path);
         case 'fetch_url': return await this.toolFetchUrl(tool.args.url);
         case 'get_terminal_output': return await this.toolGetTerminalOutput(tool.args.lines);
-        case 'run_tests': return await this.toolRunTests(tool.args.filter);
-        case 'search_codebase': return await this.toolSearchCodebase(tool.args.query, tool.args.filePattern, tool.args.contextLines);
+        case 'run_tests': return await this.toolRunTests(tool.args.filter, tool.id);
+        case 'search_codebase': return await this.toolSearchCodebase(tool.args.query, tool.args.filePattern, tool.args.contextLines, tool.args.folder);
         case 'search_docs': return await this.toolSearchDocs(tool.args.query, tool.args.maxResults);
-        case 'find_relevant_files': return await this.toolFindRelevantFiles(tool.args.query, tool.args.maxResults);
+        case 'find_relevant_files': return await this.toolFindRelevantFiles(tool.args.query, tool.args.maxResults, tool.args.folder);
         case '__parse_error__':
           return 'Tool call JSON was invalid and could not be parsed. Tool attempted: ' + tool.args.tool + '. Error: ' + tool.args.error + '. Please re-emit the tool block with valid JSON.';
         default: return 'Unknown tool: ' + tool.name;
@@ -2069,6 +3659,12 @@ class NavyCoderViewProvider {
 
   // Resolves paths to absolute and enforces workspace containment to prevent
   // prompt-injection attacks that try to read/write files outside the project.
+  // Multi-root aware: VS Code natively supports several folders open in one
+  // workspace at once, so a tool call targeting an absolute path inside a
+  // SIBLING open folder (not just the active projectRoot) is legitimate, not
+  // a traversal attempt. Only projectRoot resolves a RELATIVE path (one
+  // unambiguous base is still required for that), but containment is checked
+  // against every currently-open folder.
   resolveWorkspacePath(inputPath) {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) throw new Error('No project root — open a folder before using file tools');
@@ -2076,25 +3672,47 @@ class NavyCoderViewProvider {
     const candidate = path.isAbsolute(inputPath) ? inputPath : path.join(root, inputPath);
     // Windows paths are case-insensitive — compare case-folded there so "c:\my project\…"
     // isn't falsely rejected against a root of "C:\My Project". Containment is unaffected.
-    const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
-    const normalRoot = fold(path.normalize(root));
-    const normalCandidate = fold(path.normalize(candidate));
-    if (normalCandidate !== normalRoot && !normalCandidate.startsWith(normalRoot + path.sep)) {
-      throw new Error('Path is outside the workspace root: ' + inputPath);
+    const allRoots = [root, ...((vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath))].filter(Boolean);
+    const normalRoots = [...new Set(allRoots.map(foldPath))];
+    const normalCandidate = foldPath(candidate);
+    const isUnder = (r) => normalCandidate === r || normalCandidate.startsWith(r + path.sep);
+    if (!normalRoots.some(isUnder)) {
+      throw new Error('Path is outside every open workspace folder: ' + inputPath);
     }
 
     // Resolve symlinks to prevent traversal through symlinks inside the workspace
     try {
       const real = fold(fs.realpathSync(candidate));
-      const realRoot = fold(fs.realpathSync(root));
-      if (real !== realRoot && !real.startsWith(realRoot + path.sep)) {
-        throw new Error('Path resolves outside workspace root via symlink: ' + inputPath);
+      const realRoots = normalRoots.map(r => { try { return fold(fs.realpathSync(r)); } catch { return r; } });
+      if (!realRoots.some(r => real === r || real.startsWith(r + path.sep))) {
+        throw new Error('Path resolves outside every open workspace folder via symlink: ' + inputPath);
       }
     } catch (e) {
       if (e.code !== 'ENOENT') throw e; // file not yet created — lexical check above is sufficient
     }
 
     return candidate;
+  }
+
+  // Resolves an optional `folder` argument (search_codebase/search_files/
+  // find_relevant_files) against the currently open workspace folders — lets
+  // a multi-root workspace target a SIBLING folder explicitly instead of
+  // only ever searching the active projectRoot. Matches by exact path or by
+  // folder name (case-insensitive on Windows), since the model may have only
+  // seen the short name via buildRepoMap's sibling-folder hint. Returns
+  // { root } on success, or { error } naming what didn't match so the caller
+  // can report a clear message instead of silently using the wrong folder.
+  _resolveTargetFolder(folder) {
+    const fallback = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!folder) return { root: fallback };
+    const wanted = fold(folder.trim());
+    const folders = vscode.workspace.workspaceFolders || [];
+    const match = folders.find(f => fold(f.uri.fsPath) === wanted || fold(path.basename(f.uri.fsPath)) === wanted);
+    if (!match) {
+      const available = folders.map(f => f.uri.fsPath).join(', ') || '(none open)';
+      return { error: `"${folder}" does not match any open workspace folder. Open folders: ${available}` };
+    }
+    return { root: match.uri.fsPath };
   }
 
   async toolReadFile(inputPath) {
@@ -2166,8 +3784,18 @@ class NavyCoderViewProvider {
     return text;
   }
 
-  async toolListFiles(inputPath, maxDepth = 1) {
-    const dirPath = this.resolveWorkspacePath(inputPath);
+  async toolListFiles(inputPath, maxDepth = 1, folder) {
+    const target = this._resolveTargetFolder(folder);
+    if (target.error) return target.error;
+    if (!target.root) return 'No workspace open.';
+    // `folder` only chooses which root a RELATIVE path is resolved against —
+    // the result still goes through resolveWorkspacePath, so containment is
+    // checked against every open folder exactly as before and this can never
+    // widen what's reachable. An absolute path is passed through untouched,
+    // since it already names its own root.
+    const requested = inputPath || '.';
+    const base = path.isAbsolute(requested) ? requested : path.join(target.root, requested);
+    const dirPath = this.resolveWorkspacePath(base);
     try {
       const lines = [];
       await this._listDir(dirPath, '', maxDepth, 0, lines);
@@ -2243,8 +3871,10 @@ class NavyCoderViewProvider {
     });
   }
 
-  async toolSearchFiles(query) {
-    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  async toolSearchFiles(query, folder) {
+    const resolved = this._resolveTargetFolder(folder);
+    if (resolved.error) return resolved.error;
+    const root = resolved.root;
     if (!root) return 'No workspace open';
     try {
       // Fast path: bundled ripgrep — respects .gitignore, searches the whole tree.
@@ -2410,11 +4040,10 @@ class NavyCoderViewProvider {
       // refuse the whole rename — never partially apply or edit outside the project.
       const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       if (root) {
-        const fold = (p) => process.platform === 'win32' ? p.toLowerCase() : p;
-        const nRoot = fold(path.normalize(root));
+        const nRoot = foldPath(root);
         const outside = entries
           .map(([u]) => u.fsPath)
-          .filter(fp => { const n = fold(path.normalize(fp)); return n !== nRoot && !n.startsWith(nRoot + path.sep); });
+          .filter(fp => { const n = foldPath(fp); return n !== nRoot && !n.startsWith(nRoot + path.sep); });
         if (outside.length) {
           return `Refused: renaming "${name}" would also modify ${outside.length} file(s) OUTSIDE the workspace (e.g. ${path.basename(outside[0])}). Navy only edits files inside the project. Use apply_edit for an in-project-only change if that's what you intended.`;
         }
@@ -2589,6 +4218,424 @@ class NavyCoderViewProvider {
     });
   }
 
+  // ── Command-execution sandboxing (opt-in via navy.sandboxMode) ──────────
+  // Off by default — zero behavior change unless the user turns it on. When
+  // 'docker', every spawn site routes through _maybeWrapForSandbox below, so
+  // enabling it protects run_command, run_tests, run_project, and background
+  // processes uniformly rather than needing separate wiring in each tool.
+
+  // Is Docker actually usable right now? Checks `docker info`, not just that
+  // the binary is on PATH — Docker Desktop can be installed but not running,
+  // and _commandAvailable alone would report "available" in that state.
+  // Deliberately NOT cached across calls (unlike _commandAvailable, which
+  // guards a hot per-edit path): Docker starting/stopping mid-session is
+  // common here specifically (a user starting Docker Desktop to try this
+  // feature), and this check only runs once per command execution — not a
+  // path where a ~1s `docker info` call meaningfully adds latency.
+  async _dockerAvailable() {
+    const result = await this._runChecker('docker', ['info'], CHECKER_CWD, 5000);
+    return result.ok;
+  }
+
+  // Resolves (building if needed) the Docker image to run sandboxed commands
+  // in — cached per project root, since a `docker build` invocation (even
+  // one that resolves instantly off Docker's OWN layer cache) is still a
+  // real daemon round-trip, and otherwise repeats before EVERY single
+  // sandboxed command in a turn even though the resolved image essentially
+  // never changes within a session. Invalidated by re-checking the mtime of
+  // whichever config file (devcontainer.json / Dockerfile) actually exists —
+  // cheap (one or two stat calls) — so editing either takes effect on the
+  // very next command rather than needing a reload.
+  async _resolveSandboxImage(root) {
+    const cache = this._projCacheFor(root);
+    const statMtime = async (p) => { try { return (await fs.promises.stat(p)).mtimeMs; } catch { return null; } };
+    const [dcMtime, dfMtime] = await Promise.all([
+      statMtime(path.join(root, '.devcontainer', 'devcontainer.json')),
+      statMtime(path.join(root, 'Dockerfile')),
+    ]);
+    const cached = cache.sandboxImageCache;
+    if (cached && cached.dcMtime === dcMtime && cached.dfMtime === dfMtime) return cached.result;
+
+    const result = await this._resolveSandboxImageUncached(root);
+    cache.sandboxImageCache = { dcMtime, dfMtime, result };
+    return result;
+  }
+
+  // Only trusts config the PROJECT ITSELF already declares — a
+  // .devcontainer/devcontainer.json (the exact file VS Code's own Dev
+  // Containers feature reads) or a plain Dockerfile at the project root —
+  // and never guesses at a generic multi-language image: a container that
+  // doesn't actually have the project's real toolchain is a false sense of
+  // safety, worse than no sandbox at all. Returns { image }, or null if
+  // there's nothing to build from (caller refuses sandboxed execution with
+  // an actionable message rather than silently running unsandboxed).
+  async _resolveSandboxImageUncached(root) {
+    let dockerfilePath = null;
+    let context = root;
+    let directImage = null;
+
+    const devcontainerPath = path.join(root, '.devcontainer', 'devcontainer.json');
+    try {
+      const raw = await fs.promises.readFile(devcontainerPath, 'utf8');
+      const config = JSON.parse(stripJsonComments(raw));
+      if (typeof config.image === 'string' && config.image.trim()) {
+        directImage = config.image.trim();
+      } else {
+        const df = config.build?.dockerfile || config.dockerFile;
+        if (df) {
+          dockerfilePath = path.resolve(path.dirname(devcontainerPath), df);
+          context = path.resolve(path.dirname(devcontainerPath), config.build?.context || '.');
+        }
+      }
+    } catch {}
+
+    if (!directImage && !dockerfilePath) {
+      // No usable devcontainer config — fall back to a plain root Dockerfile,
+      // same as VS Code's own Dev Containers feature does in that case.
+      const plainDockerfile = path.join(root, 'Dockerfile');
+      try { await fs.promises.access(plainDockerfile); dockerfilePath = plainDockerfile; context = root; } catch {}
+    }
+
+    if (directImage) return { image: directImage };
+    if (!dockerfilePath) return null;
+
+    // Stable tag derived from the project root — repeated runs reuse Docker's
+    // own layer cache (a rebuild with nothing changed is near-instant)
+    // instead of accumulating a fresh anonymous image every time.
+    const tag = 'navy-sandbox-' + crypto.createHash('md5').update(root).digest('hex').slice(0, 12);
+    const build = await this._runChecker('docker', ['build', '-t', tag, '-f', dockerfilePath, context], CHECKER_CWD, 300000);
+    if (!build.ok) return null;
+    return { image: tag };
+  }
+
+  // Central sandboxing decision point — called by every process-spawning
+  // tool (_spawnAndCollect, toolRunProject, toolStartProcess) so enabling
+  // navy.sandboxMode protects all of them uniformly. When 'off' (default),
+  // returns the { bin, args, cwd, verbatim } spec completely unchanged. When
+  // 'docker', resolves an image from the project's own devcontainer/Dockerfile
+  // and rewrites the spawn target to run inside it with ONLY the project
+  // folder mounted. Never silently falls back to unsandboxed execution if
+  // sandboxing was requested but can't proceed — that would be a false sense
+  // of safety; returns { refused: true, message } for the caller to surface
+  // directly as the tool's result instead.
+  async _maybeWrapForSandbox(spec) {
+    const { bin, args, cwd } = spec;
+    const mode = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off');
+    if (mode !== 'docker') return { ...spec };
+
+    if (!(await this._dockerAvailable())) {
+      return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "docker") but Docker is not installed or not running — refusing to run unsandboxed. Start Docker Desktop, or set navy.sandboxMode to "off".' };
+    }
+    const resolved = await this._resolveSandboxImage(cwd);
+    if (!resolved) {
+      return { refused: true, message: `Sandboxed execution requested (navy.sandboxMode is "docker") but no .devcontainer/devcontainer.json or Dockerfile was found in ${path.basename(cwd)} — Navy will not guess at a generic image that might not match this project's real toolchain. Add a devcontainer config or Dockerfile, or set navy.sandboxMode to "off".` };
+    }
+    const dockerArgs = [
+      'run', '--rm', '--memory', '2g', '--cpus', '2',
+      '-v', `${cwd}:/workspace`, '-w', '/workspace',
+      resolved.image, bin, ...args,
+    ];
+    // verbatim is deliberately cleared: this is now a direct argv spawn of
+    // docker.exe, where Node's own CRT-rule quoting is exactly right and
+    // verbatim (which would concatenate the args with bare spaces) would
+    // mangle any argument containing one.
+    return { bin: 'docker', args: dockerArgs, cwd, verbatim: false };
+  }
+
+  // Shown appended to every command-approval card so the user knows which
+  // mode is about to run — computed from the raw setting rather than the
+  // resolution outcome, since resolution (Docker running? config present?)
+  // only happens after approval; a refusal still surfaces plainly as the
+  // tool's result if sandboxing was requested but couldn't proceed.
+  _sandboxLabelSuffix() {
+    return vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off') === 'docker' ? ' (sandboxed)' : '';
+  }
+
+  // ── Persistent background processes (opt-in via navy.persistBackgroundProcesses) ─
+  // Off by default — zero behavior change unless the user turns it on. Today,
+  // run_project/start_process children are killed outright whenever this
+  // window reloads or the extension deactivates (see _disposeSession) — fine
+  // for a one-off command, but it means a long dev server has to be
+  // restarted after every single reload. When this setting is on, those
+  // children are spawned fully detached (unref'd, and — Windows too, which
+  // previously never detached at all) and simply left running instead of
+  // killed. Per Node's own documented behavior, a detached child only
+  // actually survives its parent exiting if its stdio is NOT an inherited
+  // pipe (the pipe's read end is owned by the parent and disappears with
+  // it) — so persisted output goes to a real log file under .navy/bg-logs/
+  // instead of the in-memory buffer/live webview streaming a normal
+  // (non-persisted) process gets. A small manifest (.navy/bg-processes.json)
+  // records what's still out there so a later window can find it and offer
+  // to stop it — the alternative is a leaked process nobody but Task
+  // Manager/`ps` would ever notice.
+
+  _persistBgEnabled() {
+    return vscode.workspace.getConfiguration('navy').get('persistBackgroundProcesses', false) === true;
+  }
+
+  _bgManifestPath(root) { return path.join(root, '.navy', 'bg-processes.json'); }
+
+  async _readBgManifest(root) {
+    const parsed = await this._readJsonFile(this._bgManifestPath(root), []);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+
+  async _writeBgManifest(root, list) {
+    await this.ensureNavyDir(root); // also seeds .navy/.gitignore — this must never end up committed
+    await this._writeJsonFile(this._bgManifestPath(root), list, 'bg-process manifest');
+  }
+
+  // Serializes writers to ONE project's manifest WITHIN this window — same
+  // pattern as _withGlobalProjectsLock, just per-project (via _projCacheFor,
+  // so it works for whatever root a persisted process's OWN exit handler
+  // captured, not necessarily whatever's currently active) instead of one
+  // global lock, and deliberately its own field rather than reusing
+  // _writeLock — a slow unrelated file edit must never delay a sibling tab's
+  // background-process bookkeeping, or vice versa. Sibling chat tabs on the
+  // same project can genuinely run persisted start_process/run_project calls
+  // (or their exit handlers) concurrently, which is exactly the race this
+  // closes; _rmwJsonFile's retry underneath is the remaining cross-WINDOW
+  // defense, for the narrower case of the same project open in two windows.
+  _withBgManifestLock(root, fn) {
+    const cache = this._projCacheFor(root);
+    const run = (cache.bgManifestLock || Promise.resolve()).then(fn, fn);
+    cache.bgManifestLock = run.catch(() => {});
+    return run;
+  }
+
+  async _addToBgManifest(root, record) {
+    return this._withBgManifestLock(root, async () => {
+      await this.ensureNavyDir(root);
+      return this._rmwJsonFile(this._bgManifestPath(root), [], (list) => [...(Array.isArray(list) ? list : []), record]);
+    });
+  }
+
+  async _removeFromBgManifest(root, pid) {
+    return this._withBgManifestLock(root, async () => {
+      await this.ensureNavyDir(root);
+      return this._rmwJsonFile(this._bgManifestPath(root), [], (list) => (Array.isArray(list) ? list : []).filter(r => r.pid !== pid));
+    });
+  }
+
+  // Opens the real log file a persisted child's stdout/stderr get wired to.
+  // Must be a genuine fd (dup'd into the child at spawn time), not a pipe —
+  // see the section comment above for why that's what actually makes
+  // survival past this process exiting work.
+  async _openPersistLog(root, id) {
+    await this.ensureNavyDir(root);
+    const dir = path.join(root, '.navy', 'bg-logs');
+    await fs.promises.mkdir(dir, { recursive: true });
+    const safe = String(id).replace(/[^a-z0-9_-]/gi, '_');
+    const logPath = path.join(dir, `${safe}-${Date.now()}.log`);
+    const fd = fs.openSync(logPath, 'a'); // a real fd, dup'd into the child — see above
+    // Opening a new log is the natural moment to retire old ones; nothing else
+    // ever revisits this directory, so without it every launch adds a file that
+    // stays for the life of the project (a chatty dev server's logs are MBs
+    // each). Fire-and-forget: log housekeeping must never delay or fail
+    // starting the process the user actually asked for.
+    this._pruneBgLogs(dir, logPath).catch(() => {});
+    return { fd, logPath };
+  }
+
+  // Keeps .navy/bg-logs/ to the most recent PERSIST_LOG_KEEP files. Never
+  // touches the log just opened, nor one still named by a live manifest entry —
+  // read_process_output reads these back from disk, so deleting one out from
+  // under a running process would silently blank its output.
+  async _pruneBgLogs(dir, currentLogPath) {
+    let names;
+    try { names = await fs.promises.readdir(dir); } catch { return; }
+    const logs = names.filter(n => n.endsWith('.log'));
+    if (logs.length <= PERSIST_LOG_KEEP) return;
+
+    const root = path.dirname(path.dirname(dir)); // .../<root>/.navy/bg-logs → <root>
+    const inUse = new Set([currentLogPath]);
+    for (const rec of await this._readBgManifest(root)) { if (rec.logPath) inUse.add(rec.logPath); }
+
+    const stated = await Promise.all(logs.map(async (name) => {
+      const full = path.join(dir, name);
+      try { return { full, mtime: (await fs.promises.stat(full)).mtimeMs }; }
+      catch { return null; }
+    }));
+    const candidates = stated
+      .filter(e => e && !inUse.has(e.full))
+      .sort((a, b) => b.mtime - a.mtime)          // newest first
+      .slice(Math.max(0, PERSIST_LOG_KEEP - inUse.size)); // everything past the keep window
+    for (const entry of candidates) {
+      try { await fs.promises.unlink(entry.full); } catch {}
+    }
+  }
+
+  // Kills by bare pid — the manifest-driven orphan cleanup below only ever
+  // has a pid from a previous window, never a live ChildProcess object to
+  // hand _killProcessTree.
+  _killPidTree(pid) {
+    if (!pid) return;
+    try {
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true, detached: false });
+        killer.on('error', () => {});
+      } else {
+        try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch {} }
+      }
+    } catch {}
+  }
+
+  // Existence check, not an actual signal — sending signal 0 is the
+  // standard cross-platform way to ask "is this pid still alive" without
+  // affecting it. EPERM (rather than ESRCH) still means a real process is
+  // there, just not one this user owns.
+  _pidAlive(pid) {
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  }
+
+  // Wall-clock start time of `pid` in epoch ms, or null when it can't be
+  // determined (process already gone, query tool unavailable, output not what
+  // was expected). Only ever used to prove a pid is still the process we
+  // recorded — see _classifyBgRecord.
+  // Captures a command's STDOUT ONLY, as its own trimmed lines. Deliberately
+  // not _runChecker, which merges stdout and stderr into one string: that is
+  // right for a syntax checker (where the diagnostic IS the point) but wrong
+  // for parsing a value, since any unrelated warning on stderr lands in front
+  // of the answer and corrupts it. Observed for real — under WSL, `ps` prints
+  // "your 131072x1 screen size is bogus" to stderr and exits 0, which made
+  // every start-time lookup unparseable and so every live process
+  // "unverified".
+  _runForStdoutLines(bin, args, timeout = 8000) {
+    return new Promise((resolve) => {
+      let out = '';
+      let done = false;
+      let timer = null;
+      const finish = (lines) => {
+        if (done) return;
+        done = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        resolve(lines);
+      };
+      try {
+        const child = spawn(bin, args, { cwd: CHECKER_CWD, windowsHide: true });
+        child.stdout?.on('data', (d) => { out += d.toString(); });
+        child.on('close', () => finish(out.split('\n').map(l => l.trim()).filter(Boolean)));
+        child.on('error', () => finish([]));
+        timer = setTimeout(() => {
+          if (done) return;
+          this._killProcessTree(child);
+          finish([]);
+        }, timeout);
+      } catch { finish([]); }
+    });
+  }
+
+  async _pidStartTimeMs(pid) {
+    // Both branches scan the captured lines for the first that parses, rather
+    // than assuming the value is the whole output — cheap insurance against a
+    // banner or notice slipping onto stdout too.
+    if (process.platform === 'win32') {
+      // Get-Process is the only dependable route on current Windows: wmic is
+      // gone from Windows 11 24H2 onward, and tasklist reports no start time.
+      const script = `try { [int64]((Get-Process -Id ${Number(pid)} -ErrorAction Stop).StartTime.ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds } catch { '' }`;
+      const lines = await this._runForStdoutLines('powershell',
+        ['-NoProfile', '-NonInteractive', '-Command', script]);
+      for (const line of lines) {
+        const ms = Number(line);
+        if (Number.isFinite(ms) && ms > 0) return ms;
+      }
+      return null;
+    }
+    // POSIX: `lstart` is supported by both Linux (procps) and macOS ps, and is
+    // an absolute ctime(3) timestamp ("Sun Aug  9 21:01:12 2026") rather than
+    // an elapsed duration — so interpreting it needs no second "and what time
+    // is it now" round trip, and Date.parse handles the format directly.
+    const lines = await this._runForStdoutLines('ps', ['-o', 'lstart=', '-p', String(Number(pid))]);
+    for (const line of lines) {
+      const parsed = Date.parse(line);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  }
+
+  // Is `record.pid` still the process this record was written for, or has an
+  // unrelated process since inherited that number?
+  //
+  // This gate stands directly in front of `taskkill /F /T` / `kill(-pid)`, so
+  // getting it wrong destroys a stranger's whole process TREE because an
+  // integer happened to match. PIDs recycle aggressively — a busy machine can
+  // wrap the space within hours, and these records routinely outlive a
+  // reboot — so liveness alone proves nothing. Start time is the cheap
+  // discriminator: our record knows when we spawned it, and a recycled pid's
+  // process necessarily started later.
+  //
+  // Three outcomes, deliberately not two:
+  //   'ours'       — alive and start time matches; safe to offer to stop.
+  //   'gone'       — not running, or running with a different start time
+  //                  (i.e. recycled); the record is stale, prune it.
+  //   'unverified' — alive, but identity could not be established (a manifest
+  //                  entry from before startedAt was recorded, or the query
+  //                  tool is missing/slow). NEVER killed, and NOT pruned
+  //                  either: silently dropping it would leave a real orphan
+  //                  running with nothing left pointing at it.
+  async _classifyBgRecord(record) {
+    if (!this._pidAlive(record.pid)) return 'gone';
+    if (!record.startedAt) return 'unverified';
+    const started = await this._pidStartTimeMs(record.pid);
+    if (started === null) return 'unverified';
+    // `ps -o lstart` has one-second resolution, and startedAt is stamped in
+    // the parent a moment either side of the child actually starting — so an
+    // exact match isn't available. A recycled pid is separated by far more
+    // than this tolerance.
+    return Math.abs(started - record.startedAt) <= 15000 ? 'ours' : 'gone';
+  }
+
+  // Called once per project root per window (see _activateProjectRoot) —
+  // prunes manifest entries that are no longer running (so a stale record
+  // can't keep re-prompting about a long-dead process), then, if anything
+  // genuinely survived, asks whether to stop it. Fire-and-forget from the
+  // caller's perspective (never blocks project activation on a modal-less
+  // dialog) and always resolves rather than throwing, since it runs unattended
+  // off the main activation path.
+  async _checkOrphanedBgProcesses(root) {
+    if (!root || this._orphanCheckedRoots.has(root)) return;
+    this._orphanCheckedRoots.add(root);
+    const list = await this._readBgManifest(root);
+    if (!list.length) return;
+
+    const classified = await Promise.all(list.map(async (r) => ({ record: r, state: await this._classifyBgRecord(r) })));
+    const ours = classified.filter(c => c.state === 'ours').map(c => c.record);
+    const unverified = classified.filter(c => c.state === 'unverified').map(c => c.record);
+
+    // Keep everything still running — including what couldn't be identified —
+    // and drop only what is provably finished or recycled.
+    const keep = [...ours, ...unverified];
+    if (keep.length !== list.length) await this._withBgManifestLock(root, () => this._writeBgManifest(root, keep));
+    if (!keep.length) return;
+
+    const describe = (r) => `${r.id === '__run_project__' ? 'project' : r.id} (${r.command})`;
+    if (!ours.length) {
+      // Nothing confirmed ours, but something is still holding those pids.
+      // Report rather than act: killing on an unconfirmed match is exactly
+      // what this whole path exists to avoid.
+      vscode.window.showWarningMessage(
+        `Navy has ${unverified.length} background process record(s) from a previous session it could not verify are still the same processes `
+        + `(pid ${unverified.map(r => r.pid).join(', ')}: ${unverified.map(describe).join(', ')}). `
+        + `They were left alone — stop them yourself if they are still wanted gone.`);
+      return;
+    }
+
+    const label = ours.length === 1 ? '1 background process' : `${ours.length} background processes`;
+    const names = ours.map(describe).join(', ');
+    const unverifiedNote = unverified.length
+      ? ` (${unverified.length} further record(s) could not be verified and will be left alone.)`
+      : '';
+    const choice = await vscode.window.showWarningMessage(
+      `Navy left ${label} running from a previous session: ${names}. Stop them, or leave them running?${unverifiedNote}`,
+      { modal: false }, 'Stop All', 'Leave Running'
+    );
+    if (choice === 'Stop All') {
+      for (const rec of ours) this._killPidTree(rec.pid);
+      await this._withBgManifestLock(root, () => this._writeBgManifest(root, unverified));
+    }
+  }
+
   // Pin down WHERE a JSON parse failed. V8's message format varies: sometimes it
   // already carries "(line N column M)", sometimes only a character offset, and
   // sometimes neither (just a truncated context snippet). The last case is
@@ -2731,14 +4778,179 @@ class NavyCoderViewProvider {
     return `SYNTAX ERROR in ${base} (reported by ${bin}):\n${(res.output || 'check failed with no output').slice(0, 1500)}`;
   }
 
-  // Block private/local addresses: loopback, RFC-1918, link-local, IPv6 loopback,
-  // decimal-encoded IPs (e.g. 2130706433 = 127.0.0.1), cloud metadata endpoints.
+  // Parses inet_aton-style numeric IPv4 literals — decimal (2130706433), hex
+  // (0x7f000001), octal (017700000001), or partial forms (a.b, a.b.c) — that
+  // attackers use to smuggle a loopback/private address past a naive string
+  // check. A normal "a.b.c.d" hostname also matches (four decimal parts) and
+  // normalizes right back to itself, so this is safe to run on every hostname.
+  // Returns a dotted-quad string, or null if `h` isn't a numeric form at all
+  // (an ordinary hostname is left to DNS resolution instead).
+  _parseNumericIPv4(h) {
+    const NUM = '(?:0x[0-9a-f]+|0[0-7]+|[1-9][0-9]*|0)';
+    if (!new RegExp(`^${NUM}(?:\\.${NUM}){0,3}$`, 'i').test(h)) return null;
+    const nums = h.split('.').map((p) =>
+      /^0x/i.test(p) ? parseInt(p, 16) : /^0[0-7]+$/.test(p) ? parseInt(p, 8) : parseInt(p, 10));
+    const n = nums.length;
+    const remainingBits = 32 - 8 * (n - 1); // inet_aton: the LAST part absorbs whatever bits remain
+    if (nums.slice(0, n - 1).some((x) => x > 255) || nums[n - 1] >= Math.pow(2, remainingBits)) return null;
+    let value = 0;
+    for (let i = 0; i < n - 1; i++) value = value * 256 + nums[i];
+    value = value * Math.pow(2, remainingBits) + nums[n - 1];
+    return [
+      Math.floor(value / 16777216) % 256, Math.floor(value / 65536) % 256,
+      Math.floor(value / 256) % 256, value % 256,
+    ].join('.');
+  }
+
+  // IPv4 ranges fetch_url must never reach: loopback, RFC-1918 private space,
+  // link-local, CGNAT, IETF/test/benchmark assignments, and
+  // multicast/reserved/broadcast (224.0.0.0 and above).
+  _isPrivateOrReservedIPv4(ip) {
+    const b = ip.split('.').map(Number);
+    if (b.length !== 4 || b.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return true; // malformed → refuse
+    const [a, b1, c] = b;
+    return a === 0 || a === 10 || a === 127
+      || (a === 100 && b1 >= 64 && b1 <= 127)   // 100.64.0.0/10 CGNAT
+      || (a === 169 && b1 === 254)              // 169.254.0.0/16 link-local
+      || (a === 172 && b1 >= 16 && b1 <= 31)     // 172.16.0.0/12
+      || (a === 192 && b1 === 168)               // 192.168.0.0/16
+      || (a === 192 && b1 === 0 && (c === 0 || c === 2)) // 192.0.0.0/24, 192.0.2.0/24 (TEST-NET-1)
+      || (a === 198 && (b1 === 18 || b1 === 19)) // 198.18.0.0/15 benchmarking
+      || (a === 198 && b1 === 51 && c === 100)   // 198.51.100.0/24 (TEST-NET-2)
+      || (a === 203 && b1 === 0 && c === 113)    // 203.0.113.0/24 (TEST-NET-3)
+      || a >= 224;                                // multicast (224-239) + reserved/broadcast (240-255)
+  }
+
+  // IPv6 ranges fetch_url must never reach: loopback, unspecified,
+  // link-local (fe80::/10), unique-local (fc00::/7), multicast (ff00::/8),
+  // and IPv4-mapped addresses (checked via the embedded IPv4 address).
+  _isPrivateOrReservedIPv6(ip) {
+    const norm = ip.toLowerCase();
+    if (norm === '::1' || norm === '::') return true;
+    const mapped = norm.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return this._isPrivateOrReservedIPv4(mapped[1]);
+    const firstSeg = (norm.startsWith('::') ? '0' + norm.slice(1) : norm).split(':')[0];
+    const first = parseInt(firstSeg || '0', 16) || 0;
+    return (first >= 0xfe80 && first <= 0xfebf)   // fe80::/10 link-local
+        || (first >= 0xfc00 && first <= 0xfdff)   // fc00::/7 unique-local
+        || (first >= 0xff00 && first <= 0xffff);  // ff00::/8 multicast
+  }
+
+  // Fast, string-only pre-filter: catches localhost/internal-looking hostnames
+  // and numeric IP literals (in any base) without paying for a DNS round trip.
+  // NOT sufficient on its own — see _hostnameResolvesToPrivateAddress below.
   _isBlockedHost(h) {
-    return /^(localhost|127\.|0\.0\.0\.0|::1|::ffff:|0:0:0:0:0:0:0:1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(h)
-      || /^[0-9]+$/.test(h)   // decimal IP like 2130706433
-      || h === 'metadata.google.internal'
-      || h.endsWith('.internal')
-      || h.endsWith('.local');
+    if (h === 'localhost' || h === 'metadata.google.internal') return true;
+    if (h.endsWith('.internal') || h.endsWith('.local')) return true;
+    const v4 = this._parseNumericIPv4(h);
+    if (v4) return this._isPrivateOrReservedIPv4(v4);
+    if (h.includes(':')) return this._isPrivateOrReservedIPv6(h);
+    return false;
+  }
+
+  // Authoritative check: resolves the hostname and inspects the ACTUAL
+  // address(es) the request will connect to. A hostname-only string check
+  // (_isBlockedHost above) is defeated by DNS rebinding — a public-looking or
+  // attacker-controlled domain that resolves to 127.0.0.1 or an internal
+  // address sails straight through a blocklist that never looks past the name.
+  // Runs on every redirect hop too, since a hop can resolve differently than
+  // the URL the user actually gave.
+  //
+  // Returns the ONE address the caller must then pin the connection to, and
+  // that is the whole point: validating the name and then letting the HTTP
+  // client resolve it again independently leaves a window where a low-TTL
+  // record answers public for the check and private for the connect. Handing
+  // _requestPinned this exact address makes the address that was validated
+  // provably the address that gets dialled, which closes the race rather than
+  // just narrowing it.
+  //
+  // EVERY resolved address must pass, not merely the one that gets used — a
+  // name answering with a mix of public and private addresses has no
+  // legitimate reason to be followed at all.
+  async _resolveSafeAddress(hostname) {
+    let addresses;
+    try {
+      addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    } catch {
+      // Can't resolve — the request would fail on its own with the same error;
+      // there is nothing to block and nowhere it could connect to anyway.
+      return { unresolvable: true };
+    }
+    if (!addresses.length) return { unresolvable: true };
+    const blocked = addresses.some(({ address, family }) =>
+      family === 6 ? this._isPrivateOrReservedIPv6(address) : this._isPrivateOrReservedIPv4(address));
+    if (blocked) return { blocked: true };
+    return { address: addresses[0].address, family: addresses[0].family };
+  }
+
+  // Performs ONE http/https GET with the TCP connection pinned to `pinned`
+  // (from _resolveSafeAddress) through the `lookup` hook net.connect calls.
+  // The hostname still travels in the Host header and in TLS SNI/certificate
+  // validation, so pinning changes only WHICH address is dialled — never who
+  // the server has to prove itself to be.
+  //
+  // This is why fetch() isn't used here: it exposes no way to control address
+  // resolution, so its connect could always disagree with our check. Every
+  // behaviour fetch() was providing is reproduced — manual redirect handling
+  // (the caller's loop), a hard overall timeout, response decompression, and
+  // a cap on how much body is retained.
+  _requestPinned(parsed, pinned, timeoutMs, maxBytes) {
+    const mod = parsed.protocol === 'https:' ? https : http;
+    return new Promise((resolve, reject) => {
+      const req = mod.request({
+        protocol: parsed.protocol,
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: (parsed.pathname || '/') + (parsed.search || ''),
+        method: 'GET',
+        headers: {
+          'User-Agent': 'NavyCoder/1.0',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Accept': '*/*',
+          Host: parsed.host,
+        },
+        // Both callback shapes: since Node 20, net.connect defaults to
+        // autoSelectFamily (Happy Eyeballs), which calls lookup with
+        // { all: true } and expects an ARRAY back. Answering only the older
+        // (address, family) form there hands it `undefined` and every request
+        // dies with "Invalid IP address: undefined".
+        lookup: (_hostname, options, cb) => (options && options.all)
+          ? cb(null, [{ address: pinned.address, family: pinned.family }])
+          : cb(null, pinned.address, pinned.family),
+      }, (res) => {
+        const encoding = String(res.headers['content-encoding'] || '').toLowerCase();
+        let stream = res;
+        if (encoding === 'gzip' || encoding === 'x-gzip') stream = res.pipe(zlib.createGunzip());
+        else if (encoding === 'deflate') stream = res.pipe(zlib.createInflate());
+        else if (encoding === 'br') stream = res.pipe(zlib.createBrotliDecompress());
+        const chunks = [];
+        let total = 0;
+        stream.on('data', (c) => {
+          // Keep draining once the cap is hit (so the socket closes cleanly)
+          // but stop retaining — a hostile or merely enormous page must not be
+          // able to grow this process's memory without bound.
+          if (total >= maxBytes) return;
+          total += c.length;
+          chunks.push(c);
+        });
+        stream.on('end', () => {
+          clearTimeout(hardTimer);
+          resolve({
+            status: res.statusCode,
+            statusText: res.statusMessage || '',
+            location: res.headers.location || '',
+            contentType: String(res.headers['content-type'] || ''),
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+        stream.on('error', (e) => { clearTimeout(hardTimer); reject(e); });
+      });
+      // Overall deadline, not just socket inactivity: a server dribbling one
+      // byte a second would reset an idle timeout forever.
+      const hardTimer = setTimeout(() => req.destroy(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+      req.on('error', (e) => { clearTimeout(hardTimer); reject(e); });
+      req.end();
+    });
   }
 
   async toolFetchUrl(url) {
@@ -2752,20 +4964,21 @@ class NavyCoderViewProvider {
         if (!/^https?:$/i.test(parsed.protocol)) return 'Fetch error: only http/https URLs are allowed';
         const h = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
         if (this._isBlockedHost(h)) return 'Fetch error: fetching private or local addresses is not allowed';
-        const res = await fetch(current, {
-          signal: AbortSignal.timeout(15000),
-          headers: { 'User-Agent': 'NavyCoder/1.0' },
-          redirect: 'manual',
-        });
+        const pinned = await this._resolveSafeAddress(h);
+        if (pinned.blocked) {
+          return 'Fetch error: this hostname resolves to a private or local address — fetching it is not allowed';
+        }
+        if (pinned.unresolvable) return `Fetch error: could not resolve ${h}`;
+        // The connection goes to `pinned` and nowhere else — see _requestPinned.
+        const res = await this._requestPinned(parsed, pinned, 15000, 2_000_000);
         if (res.status >= 300 && res.status < 400) {
-          const loc = res.headers.get('location');
-          if (!loc) return `HTTP ${res.status}: redirect with no Location header`;
-          current = new URL(loc, current).href; // re-validated at top of loop
+          if (!res.location) return `HTTP ${res.status}: redirect with no Location header`;
+          current = new URL(res.location, current).href; // re-validated at top of loop
           continue;
         }
-        if (!res.ok) return `HTTP ${res.status}: ${res.statusText}`;
-        const ct = res.headers.get('content-type') || '';
-        let text = await res.text();
+        if (res.status < 200 || res.status >= 300) return `HTTP ${res.status}: ${res.statusText}`;
+        const ct = res.contentType;
+        let text = res.body;
         if (ct.includes('html')) {
           text = text
             .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -2789,22 +5002,85 @@ class NavyCoderViewProvider {
     return `Open terminals:\n${names}\n\nVS Code does not expose terminal buffer contents to extensions. To capture output, re-run the command yourself via run_command, or use start_process + read_process_output for long-running processes.`;
   }
 
+  // Characters cmd.exe itself acts on when they appear UNQUOTED on a command
+  // line. Each one gets a caret prefix in stage 2 of _shellEscapeArg below.
+  // `%` is here because expansion happens before operator parsing, so an
+  // unescaped %VAR% both leaks environment contents and can smuggle an & or |
+  // in through the variable's VALUE; `!` because delayed expansion may be on.
+  static get WIN_CMD_METACHARS() { return /[()%!^"<>&|]/g; }
+
   _shellEscapeArg(s) {
     if (process.platform === 'win32') {
-      // cmd /c: % must be doubled (%%) to suppress variable expansion — ^% does NOT work
-      // because cmd.exe expands %VAR% before processing ^ escapes.
-      // Other shell metacharacters are escaped with caret inside double quotes.
-      return '"' + s.replace(/%/g, '%%').replace(/([&|<>^"!])/g, '^$1') + '"';
+      // The same string is parsed TWICE on Windows, by two parsers with
+      // different rules, so escaping has to happen in two ordered stages:
+      //
+      //  1. CommandLineToArgvW quoting, for the CHILD program's own argv
+      //     split: wrap in quotes, double any backslash run that precedes a
+      //     quote (and any trailing run, which precedes the closing quote),
+      //     and escape embedded quotes as \".
+      //  2. Caret-escape every cmd.exe metacharacter — INCLUDING the quotes
+      //     stage 1 just added — so cmd.exe hands the whole thing through
+      //     untouched, stripping only the carets.
+      //
+      // Stage 2 must cover the quotes, and that is the crux: a caret inside a
+      // quoted region is LITERAL to cmd.exe, which only honours carets
+      // outside quotes. The previous `"…%^…"` form relied on a caret that was
+      // always inside quotes, so it did suppress expansion but never got
+      // removed — a filter of `%PATH%` reached the child as the literal
+      // `%^PATH%`, and `50%` as `50%^`. With no unescaped quote anywhere in
+      // the result, every caret does its job and disappears.
+      //
+      // This only survives the trip to cmd.exe when the spawn asks for
+      // verbatim argument passing — see _shellSpec, which is the only
+      // supported way to run a string escaped by this function.
+      const crt = '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"';
+      return crt.replace(NavyCoderViewProvider.WIN_CMD_METACHARS, '^$&');
     }
     // POSIX sh: single-quote wrap — fully safe against all meta-characters
     return "'" + s.replace(/'/g, "'\\''") + "'";
   }
 
-  async toolRunTests(filter) {
+  // The platform shell invocation for a command STRING, plus whether Node must
+  // pass the arguments to CreateProcess verbatim.
+  //
+  // On Windows it must. Node's default quoting applies CRT rules to each arg,
+  // so the command string gets wrapped in quotes and any quote inside it
+  // becomes \" — but cmd.exe does not understand \" and forwards it literally,
+  // so `-t "foo bar"` arrives at the child as two argv entries, `"foo` and
+  // `bar"`. Verbatim hands cmd.exe exactly the line built here, which is what
+  // makes _shellEscapeArg's quoting (and a raw command whose own program path
+  // is quoted, e.g. `"C:\Program Files\x\y.exe" arg`) work at all.
+  //
+  // Only ever for a real shell invocation: a direct argv spawn (_runTestBinary)
+  // or a docker-wrapped one needs Node's normal quoting, and verbatim would
+  // break it — see _maybeWrapForSandbox, which clears the flag when it rewrites
+  // the spawn target.
+  _shellSpec(command) {
+    return process.platform === 'win32'
+      ? { bin: 'cmd', args: ['/c', command], verbatim: true }
+      : { bin: 'sh', args: ['-c', command], verbatim: false };
+  }
+
+  // Spawn options shared by every process-launching site here, so the verbatim
+  // decision can never be applied at some of them and forgotten at others.
+  _spawnOptions(resolved, extra = {}) {
+    return {
+      cwd: resolved.cwd,
+      ...(resolved.verbatim ? { windowsVerbatimArguments: true } : {}),
+      ...extra,
+    };
+  }
+
+  async toolRunTests(filter, streamId) {
     if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('run tests');
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return 'No workspace open.';
 
+    // npm/npx are .cmd shims on Windows — they need the shell to resolve at
+    // all, so these still build a command string. `filter` used to go through
+    // JSON.stringify(), which provides NO shell protection at all (a POSIX
+    // double-quoted string still runs $(...) as real command substitution) —
+    // routed through the hardened _shellEscapeArg instead, same as cargo/go below.
     let cmd = null;
     try {
       const pkg = JSON.parse(await fs.promises.readFile(path.join(root, 'package.json'), 'utf8'));
@@ -2814,30 +5090,36 @@ class NavyCoderViewProvider {
         // them when jest is actually in play.
         const isJest = /\bjest\b/.test(scripts.test) || Boolean(pkg.devDependencies?.jest || pkg.dependencies?.jest);
         cmd = isJest
-          ? 'npm test -- --watchAll=false' + (filter ? ' --testNamePattern=' + JSON.stringify(filter) : '')
+          ? 'npm test -- --watchAll=false' + (filter ? ' --testNamePattern=' + this._shellEscapeArg(filter) : '')
           : 'npm test';
       } else if (scripts['test:unit']) cmd = 'npm run test:unit';
       else if (scripts.vitest || pkg.devDependencies?.vitest || pkg.dependencies?.vitest) {
-        cmd = 'npx vitest run' + (filter ? ' -t ' + JSON.stringify(filter) : '');
+        cmd = 'npx vitest run' + (filter ? ' -t ' + this._shellEscapeArg(filter) : '');
       }
     } catch {}
 
-    if (!cmd) {
-      const checks = [
-        [path.join(root, 'pytest.ini'), 'python -m pytest' + (filter ? ' -k ' + JSON.stringify(filter) : '') + ' -v'],
-        [path.join(root, 'setup.py'), 'python -m pytest' + (filter ? ' -k ' + JSON.stringify(filter) : '') + ' -v'],
-        [path.join(root, 'pyproject.toml'), 'python -m pytest' + (filter ? ' -k ' + JSON.stringify(filter) : '') + ' -v'],
-        [path.join(root, 'Cargo.toml'), 'cargo test' + (filter ? ' -- ' + this._shellEscapeArg(filter) : '')],
-        [path.join(root, 'go.mod'), 'go test ./...' + (filter ? ' -run ' + this._shellEscapeArg(filter) : '')],
-      ];
-      for (const [file, testCmd] of checks) {
-        try { await fs.promises.access(file); cmd = testCmd; break; } catch {}
-      }
+    if (cmd) {
+      const result = await this.toolRunCommand(cmd, 60000, streamId);
+      return result.slice(0, 8000);
     }
 
-    if (!cmd) return 'Could not detect test framework. Tried npm test, pytest, cargo test, go test.';
+    // pytest/cargo/go are real executables — run via a direct argv spawn, no
+    // shell involved at all, so `filter` needs no escaping and can't be
+    // reinterpreted as anything other than one literal argument.
+    const binaryChecks = [
+      [path.join(root, 'pytest.ini'),     'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
+      [path.join(root, 'setup.py'),       'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
+      [path.join(root, 'pyproject.toml'), 'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
+      [path.join(root, 'Cargo.toml'),     'cargo',  ['test', ...(filter ? ['--', filter] : [])]],
+      [path.join(root, 'go.mod'),         'go',     ['test', './...', ...(filter ? ['-run', filter] : [])]],
+    ];
+    let matched = null;
+    for (const [file, bin, args] of binaryChecks) {
+      try { await fs.promises.access(file); matched = { bin, args }; break; } catch {}
+    }
+    if (!matched) return 'Could not detect test framework. Tried npm test, pytest, cargo test, go test.';
 
-    const result = await this.toolRunCommand(cmd, 60000);
+    const result = await this._runTestBinary(matched.bin, matched.args, root, 60000, streamId);
     return result.slice(0, 8000);
   }
 
@@ -2905,8 +5187,10 @@ class NavyCoderViewProvider {
     return results.join('\n\n---\n\n');
   }
 
-  async toolSearchCodebase(query, filePattern, contextLines = 2) {
-    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  async toolSearchCodebase(query, filePattern, contextLines = 2, folder) {
+    const resolved = this._resolveTargetFolder(folder);
+    if (resolved.error) return resolved.error;
+    const root = resolved.root;
     if (!root) return 'No workspace open.';
 
     // Fast path: bundled ripgrep — .gitignore-aware, full-tree, regex-capable.
@@ -3257,43 +5541,18 @@ class NavyCoderViewProvider {
     this._pushCheckpoint({ kind: 'edit', filePath, originalText, ...(newHash ? { newHash } : {}) });
   }
 
-  // Persist checkpoints to .navy/checkpoints.json (debounced) so Undo survives a
-  // window reload. Only the newest ~8 MB is written — undo history, not a backup.
+  // Persist checkpoints into the active chat's own file (debounced) so Undo
+  // survives a window reload. Only the newest ~8 MB is written — undo
+  // history, not a backup.
   _persistCheckpoints() {
     clearTimeout(this._cpSaveTimer);
-    this._cpSaveTimer = setTimeout(async () => {
-      const dir = await this.ensureNavyDir();
-      if (!dir) return;
-      try {
-        let bytes = 0;
-        const keep = [];
-        for (let i = this.checkpoints.length - 1; i >= 0; i--) {
-          bytes += (this.checkpoints[i].originalText || '').length;
-          if (bytes > 8_000_000) break;
-          keep.unshift(this.checkpoints[i]);
-        }
-        await vscode.workspace.fs.writeFile(
-          vscode.Uri.file(path.join(dir, 'checkpoints.json')),
-          Buffer.from(JSON.stringify({ checkpoints: keep }), 'utf8')
-        );
-      } catch (e) { this.log?.('checkpoint persist failed: ' + e.message); }
+    const ctxId = sessionContext.getStore() ?? this.activeSessionId;
+    this._cpSaveTimer = setTimeout(() => {
+      // Re-bind to the session this checkpoint belonged to when scheduled —
+      // the debounce timer fires later, possibly after the user has
+      // switched tabs, and _writeChatFile must write THAT chat's file.
+      sessionContext.run(ctxId, () => this._writeChatFile());
     }, 500);
-  }
-
-  async _loadCheckpoints() {
-    const dir = this.getNavyDir();
-    if (!dir) return;
-    try {
-      const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'checkpoints.json')));
-      const parsed = JSON.parse(Buffer.from(data).toString('utf8'));
-      if (Array.isArray(parsed.checkpoints)) {
-        this.checkpoints = parsed.checkpoints.filter(c => c && (
-          (c.kind === 'rename' && c.from && c.to) ||
-          (c.filePath && typeof c.originalText === 'string')
-        ));
-        this.view?.webview.postMessage({ type: 'checkpoints', count: this.checkpoints.length });
-      }
-    } catch { /* no saved checkpoints — fine */ }
   }
 
   // Undo a single checkpoint entry (kind-aware). Returns the redo operation.
@@ -3496,32 +5755,43 @@ class NavyCoderViewProvider {
     return this._wslCache;
   }
 
-  async toolRunCommand(command, timeout = 30000) {
-    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('run shell commands');
-    const config = vscode.workspace.getConfiguration('navy');
-    const approvalMode = config.get('approvalMode', 'ask-always');
+  // Approval gate shared by every command-executing tool. `displayCommand` is
+  // shown verbatim in the approval card — the user sees the same thing
+  // whether the actual execution ends up going through a shell string or a
+  // direct argv spawn. Returns whether the caller may proceed.
+  async _approveCommand(displayCommand) {
+    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
+    if (approvalMode === 'auto-approve') return true;
+    const id = this.generateId();
+    this.view?.webview.postMessage({ type: 'pendingCommand', id, command: displayCommand });
+    return await new Promise((resolve) => {
+      this.pendingCommandApprovals.set(id, { resolve });
+    });
+  }
 
-    if (approvalMode !== 'auto-approve') {
-      const id = this.generateId();
-      this.view?.webview.postMessage({ type: 'pendingCommand', id, command });
-      const approved = await new Promise((resolve) => {
-        this.pendingCommandApprovals.set(id, { resolve });
-      });
-      if (!approved) return 'Command rejected by user';
-    }
-
-    const root = this.projectRoot
-      || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-      || (vscode.window.activeTextEditor ? path.dirname(vscode.window.activeTextEditor.document.fileName) : process.cwd());
-    const isWin = process.platform === 'win32';
-    const shellBin = isWin ? 'cmd' : 'sh';
-    const shellArgs = isWin ? ['/c', command] : ['-c', command];
-
+  // Spawns the given { bin, args, cwd, verbatim } spec and streams stdout/
+  // stderr to the webview, with the same timeout/kill and output-capping
+  // behavior for every caller. Shared by toolRunCommand (a _shellSpec — the
+  // platform shell plus a command STRING) and _runTestBinary (a real
+  // executable plus a real argv array, no shell involved at all). Routes
+  // through _maybeWrapForSandbox first so navy.sandboxMode protects every
+  // caller uniformly.
+  // `streamId` tags the live output with the tool call it belongs to. Without
+  // it every command's output was broadcast untagged and the webview appended
+  // it to whichever terminal card happened to be current — so a background
+  // task's command (background tasks run their own agent loop, concurrently
+  // with the main turn) wrote into the main turn's card. Untagged output now
+  // falls through to the shell panel instead of contaminating a card that
+  // belongs to something else.
+  async _spawnAndCollect(spec, timeout, streamId) {
+    const resolved = await this._maybeWrapForSandbox(spec);
+    if (resolved.refused) return resolved.message;
+    const { bin, args } = resolved;
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
       const MAX_BUF = 200000; // cap accumulation — a chatty command must not eat memory
-      const child = spawn(shellBin, shellArgs, { cwd: root, detached: !isWin });
+      const child = spawn(bin, args, this._spawnOptions(resolved, { detached: process.platform !== 'win32' }));
       const timer = setTimeout(() => {
         this._killProcessTree(child);
         resolve('Command timed out after ' + timeout + 'ms\nstdout: ' + stdout.slice(-8000) + '\nstderr: ' + stderr.slice(-8000));
@@ -3531,13 +5801,13 @@ class NavyCoderViewProvider {
         const chunk = data.toString();
         stdout += chunk;
         if (stdout.length > MAX_BUF) stdout = stdout.slice(-MAX_BUF);
-        this.view?.webview.postMessage({ type: 'shellChunk', chunk });
+        this.view?.webview.postMessage({ type: 'shellChunk', chunk, streamId });
       });
       child.stderr.on('data', (data) => {
         const chunk = data.toString();
         stderr += chunk;
         if (stderr.length > MAX_BUF) stderr = stderr.slice(-MAX_BUF);
-        this.view?.webview.postMessage({ type: 'shellChunk', chunk, isStderr: true });
+        this.view?.webview.postMessage({ type: 'shellChunk', chunk, isStderr: true, streamId });
       });
       child.on('close', (code) => {
         clearTimeout(timer);
@@ -3549,6 +5819,15 @@ class NavyCoderViewProvider {
               + `\n\n[... output truncated — ${out.length.toLocaleString()} chars total, showing head and tail ...]\n\n`
               + out.slice(-13000);
         }
+        // A failed command whose own output says a path/command doesn't
+        // exist is a signal worth surfacing explicitly — left alone, a model
+        // that guessed wrong just guesses again with a slightly different
+        // spelling and repeats the same failure, since a wrong path never
+        // becomes right by chance. Appended AFTER truncation so it's never
+        // the part that gets cut.
+        if (code !== 0 && looksLikeMissingPathError(out)) {
+          out += '\n\n[Navy: this looks like a path/file/command that does not exist, not a code or logic error. Before retrying with a different guessed spelling, list the actual parent directory (e.g. `dir`/`ls` on it, or list_files if it is inside the workspace) and use the exact name it reports — do not guess again.]';
+        }
         resolve(out);
       });
       child.on('error', (error) => {
@@ -3556,6 +5835,32 @@ class NavyCoderViewProvider {
         resolve('Command error: ' + error.message);
       });
     });
+  }
+
+  async toolRunCommand(command, timeout = 30000, streamId) {
+    if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('run shell commands');
+    if (!(await this._approveCommand(command + this._sandboxLabelSuffix()))) return 'Command rejected by user';
+
+    const root = this.projectRoot
+      || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+      || (vscode.window.activeTextEditor ? path.dirname(vscode.window.activeTextEditor.document.fileName) : process.cwd());
+    return this._spawnAndCollect({ ...this._shellSpec(command), cwd: root }, timeout, streamId);
+  }
+
+  // Runs a test binary directly with a real argv array — no shell, so a
+  // filter containing shell metacharacters (&, |, %, $(...), backticks,
+  // quotes) is delivered to the process byte-for-byte with zero
+  // reinterpretation, instead of being concatenated into a shell command
+  // string. Only for real executables (pytest/cargo/go) that never need
+  // shell resolution the way npm/npx (.cmd shims on Windows) do — verified
+  // empirically that a plain (non-shell) spawn delivers each arg unmodified
+  // with no injection, no %-expansion, and no operator-splitting.
+  async _runTestBinary(bin, args, root, timeout, streamId) {
+    const display = [bin, ...args].map(a => /[\s"&|<>^%!$`']/.test(a) ? JSON.stringify(a) : a).join(' ');
+    if (!(await this._approveCommand(display + this._sandboxLabelSuffix()))) return 'Command rejected by user';
+    // verbatim: false — a real argv spawn, where Node's own per-argument
+    // quoting is exactly what's wanted (see _shellSpec for the contrast).
+    return this._spawnAndCollect({ bin, args, cwd: root, verbatim: false }, timeout, streamId);
   }
 
   detectRunCommand() {
@@ -3607,7 +5912,7 @@ class NavyCoderViewProvider {
     const config2 = vscode.workspace.getConfiguration('navy');
     if (config2.get('approvalMode', 'ask-always') !== 'auto-approve') {
       const choice = await vscode.window.showInformationMessage(
-        `Navy wants to run: ${cmd}`, { modal: false }, 'Allow', 'Deny'
+        `Navy wants to run: ${cmd}${this._sandboxLabelSuffix()}`, { modal: false }, 'Allow', 'Deny'
       );
       if (choice !== 'Allow') return 'Command rejected by user.';
     }
@@ -3621,18 +5926,81 @@ class NavyCoderViewProvider {
     // Previous run exited — clean up its entry before starting fresh.
     if (existing) this.bgProcesses.delete('__run_project__');
 
+    const isWin = process.platform === 'win32';
+    // Resolved BEFORE posting runProjectStart — a sandboxing refusal should
+    // never leave the webview showing a "starting..." state for a project
+    // that was never actually launched.
+    const resolved = await this._maybeWrapForSandbox({ ...this._shellSpec(cmd), cwd: root });
+    if (resolved.refused) return resolved.message;
+
     const projectName = path.basename(root);
     this.view?.webview.postMessage({ type: 'runProjectStart', projectName, command: cmd });
 
-    const isWin = process.platform === 'win32';
     const entry = { proc: null, stdout: '', stderr: '', exitCode: null, command: cmd, url: null };
-    // detached: true on Unix creates a new process group so _killProcessTree can kill it cleanly.
-    const proc = spawn(isWin ? 'cmd' : 'sh', isWin ? ['/c', cmd] : ['-c', cmd], { cwd: root, detached: !isWin });
-    entry.proc = proc;
-    this.bgProcesses.set('__run_project__', entry);
-
     const URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)\S*/;
     let urlFound = false;
+
+    if (this._persistBgEnabled()) {
+      // A real log-file fd, not a pipe — see the section comment above
+      // _persistBgEnabled for why that's what actually lets this process
+      // outlive a reload. There is then no live stream to read, so this
+      // branch can't wire the usual onData/webview streaming or synchronous
+      // URL detection — instead it polls the log file itself, capped,
+      // self-clearing, same style as every other bounded timer in this file.
+      //
+      // detached is Unix-only here (`!isWin`), verified empirically rather
+      // than assumed: on Windows, `detached: true` on the cmd.exe wrapper
+      // reliably breaks the grandchild's (node/npm/etc.) I/O ever reaching
+      // the redirected fd at all — cmd.exe runs it and exits 0, but the log
+      // file stays empty, with no error anywhere. This reproduced across
+      // both a raw fd AND cmd's own `>` redirection, and both with and
+      // without shell:true, so it isn't specific to one mechanism — plain
+      // (non-detached) + unref() reliably captures output and (unlike
+      // detached, which mainly governs console/signal-group inheritance,
+      // irrelevant to a window reload) is what this actually needs: nothing
+      // here calls _killProcessTree on a persist:true entry (see
+      // _disposeSession), so the process is simply never told to stop.
+      const { fd, logPath } = await this._openPersistLog(root, '__run_project__');
+      const proc = spawn(resolved.bin, resolved.args, this._spawnOptions(resolved, { detached: !isWin, stdio: ['ignore', fd, fd] }));
+      try { fs.closeSync(fd); } catch {} // child already has its own dup'd handle
+      proc.unref();
+      Object.assign(entry, { proc, persist: true, root, pid: proc.pid, logPath });
+      this.bgProcesses.set('__run_project__', entry);
+      await this._addToBgManifest(root, { id: '__run_project__', pid: proc.pid, command: cmd, startedAt: Date.now(), logPath, kind: 'run_project' });
+
+      let tries = 0;
+      const poll = setInterval(() => {
+        tries++;
+        if (urlFound || tries > 20 || this.bgProcesses.get('__run_project__') !== entry) { clearInterval(poll); return; }
+        const tail = readFileTail(logPath, 4000);
+        const m = tail.match(URL_RE);
+        if (m) {
+          urlFound = true;
+          entry.url = m[0].replace(/0\.0\.0\.0/, 'localhost');
+          this.view?.webview.postMessage({ type: 'runProjectReady', url: entry.url });
+          clearInterval(poll);
+        }
+      }, 500);
+
+      proc.on('exit', (code) => {
+        entry.exitCode = code ?? 0;
+        entry.proc = null;
+        this.bgProcesses.delete('__run_project__');
+        this._removeFromBgManifest(root, proc.pid).catch(() => {});
+        this.view?.webview.postMessage({ type: 'runProjectStopped', exitCode: entry.exitCode });
+      });
+      proc.on('error', () => {
+        this.view?.webview.postMessage({ type: 'runProjectStopped', exitCode: -1 });
+        this.bgProcesses.delete('__run_project__');
+      });
+
+      return `Starting "${projectName}" with: ${cmd}\nRunning detached (navy.persistBackgroundProcesses is on) — output logged to ${logPath}, and it will survive a window reload. Watching the log for the server URL...`;
+    }
+
+    // detached: true on Unix creates a new process group so _killProcessTree can kill it cleanly.
+    const proc = spawn(resolved.bin, resolved.args, this._spawnOptions(resolved, { detached: !isWin }));
+    entry.proc = proc;
+    this.bgProcesses.set('__run_project__', entry);
 
     const onData = (chunk) => {
       const text = chunk.toString();
@@ -3676,17 +6044,49 @@ class NavyCoderViewProvider {
     const config = vscode.workspace.getConfiguration('navy');
     if (config.get('approvalMode', 'ask-always') !== 'auto-approve') {
       const choice = await vscode.window.showInformationMessage(
-        `Navy wants to start a background process:\n${command}`,
+        `Navy wants to start a background process:\n${command}${this._sandboxLabelSuffix()}`,
         { modal: false }, 'Allow', 'Deny'
       );
       if (choice !== 'Allow') return 'Process rejected by user.';
     }
 
-    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+    // Distinct from `root` below: persisting needs somewhere real to anchor
+    // the manifest/log to, so it's never enabled off the process.cwd()
+    // fallback (no actual open project to write .navy/ under).
+    const persistRoot = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null;
+    const root = persistRoot || process.cwd();
     const isWin = process.platform === 'win32';
+    const resolved = await this._maybeWrapForSandbox({ ...this._shellSpec(command), cwd: root });
+    if (resolved.refused) return resolved.message;
+
     const entry = { proc: null, stdout: '', stderr: '', exitCode: null, startedAt: Date.now() };
 
-    const proc = spawn(isWin ? 'cmd' : 'sh', isWin ? ['/c', command] : ['-c', command], { cwd: root, detached: !isWin });
+    if (persistRoot && this._persistBgEnabled()) {
+      // See the persist branch of toolRunProject for why this needs a real
+      // fd (not the usual pipe), can't wire live webview streaming, and why
+      // `detached` is Unix-only (empirically verified: on Windows it breaks
+      // the grandchild's I/O ever reaching the redirected fd through the
+      // cmd.exe wrapper).
+      const { fd, logPath } = await this._openPersistLog(persistRoot, id);
+      const proc = spawn(resolved.bin, resolved.args, this._spawnOptions(resolved, { detached: !isWin, stdio: ['ignore', fd, fd] }));
+      try { fs.closeSync(fd); } catch {}
+      proc.unref();
+      Object.assign(entry, { proc, persist: true, root: persistRoot, pid: proc.pid, logPath });
+      this.bgProcesses.set(id, entry);
+      await this._addToBgManifest(persistRoot, { id, pid: proc.pid, command, startedAt: entry.startedAt, logPath, kind: 'start_process' });
+
+      proc.on('exit', code => {
+        entry.exitCode = code ?? 0;
+        entry.proc = null;
+        this._removeFromBgManifest(persistRoot, proc.pid).catch(() => {});
+        this.view?.webview.postMessage({ type: 'bgProcessDone', id, exitCode: entry.exitCode });
+      });
+      proc.on('error', () => { entry.exitCode = -1; });
+
+      return `Process "${id}" started (PID ${proc.pid}), detached — it will survive a window reload (navy.persistBackgroundProcesses is on). Output is logged to ${logPath}; use read_process_output("${id}") to read it.`;
+    }
+
+    const proc = spawn(resolved.bin, resolved.args, this._spawnOptions(resolved, { detached: !isWin }));
     entry.proc = proc;
     this.bgProcesses.set(id, entry);
 
@@ -3724,6 +6124,15 @@ class NavyCoderViewProvider {
         : `No process "${id}". No background processes running.`;
     }
     const status = entry.exitCode !== null ? `exited (code ${entry.exitCode})` : 'running';
+    // Persisted (navy.persistBackgroundProcesses) processes have no live
+    // in-memory buffer to read — their stdio is a real file, not a pipe
+    // this process ever sees (see _openPersistLog) — so read its current
+    // tail from disk instead. `clear` intentionally has no effect on a real
+    // log file rather than silently discarding it.
+    if (entry.logPath) {
+      const tail = readFileTail(entry.logPath, 100000);
+      return `[${id}] ${status} (persisted — logged to ${entry.logPath})\n${tail.trim() || '(no output yet)'}`;
+    }
     const combined = (entry.stdout + (entry.stderr ? '\n[stderr]\n' + entry.stderr : '')).trim();
     if (clear && entry.exitCode === null) { entry.stdout = ''; entry.stderr = ''; }
     return `[${id}] ${status}\n${combined || '(no output yet)'}`;
@@ -3731,23 +6140,16 @@ class NavyCoderViewProvider {
 
   // Kill a spawned process AND its entire child tree (npm → node, etc.).
   // On Windows uses taskkill /F /T; on Unix kills the process group (requires detached: true on spawn).
+  // Delegates to _killPidTree (spawn, NOT execSync — this is called from
+  // stream handlers, timers, and the tool loop, all on the extension host
+  // thread, and a synchronous kill would freeze the whole editor for as
+  // long as the child takes to die) so the same by-pid kill logic serves
+  // both a live ChildProcess here and a bare pid recovered from a previous
+  // window's manifest (see _checkOrphanedBgProcesses, which has no
+  // ChildProcess object to hand this).
   _killProcessTree(proc) {
     if (!proc?.pid || proc.killed) return;
-    try {
-      if (process.platform === 'win32') {
-        // spawn, NOT execSync. This is called from stream handlers, timers, and
-        // the tool loop — all on the extension host thread. A synchronous
-        // taskkill blocks that thread for as long as the child takes to die
-        // (up to the 5s timeout), which freezes the whole editor. Killing is
-        // fire-and-forget: nothing here needs to wait for it to complete.
-        const killer = spawn('taskkill', ['/F', '/T', '/PID', String(proc.pid)], {
-          stdio: 'ignore', windowsHide: true, detached: false,
-        });
-        killer.on('error', () => {}); // taskkill missing/denied — nothing to do
-      } else {
-        try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill(); } catch {} }
-      }
-    } catch {}
+    this._killPidTree(proc.pid);
   }
 
   async toolKillProcess(id) {
@@ -3756,24 +6158,57 @@ class NavyCoderViewProvider {
     if (!entry.proc) return `Process "${id}" has already exited (code ${entry.exitCode}).`;
     this._killProcessTree(entry.proc);
     this.bgProcesses.delete(id);
+    if (entry.persist && entry.root) await this._removeFromBgManifest(entry.root, entry.pid);
     this.view?.webview.postMessage({ type: 'bgProcessDone', id, exitCode: -1 });
     return `Process "${id}" killed.`;
   }
 
-  dispose() {
-    this.mcp?.stop();
-    clearInterval(this._heartbeat);
-    clearTimeout(this._cpSaveTimer);
-    // Kill all background processes when the extension is deactivated or reloaded.
-    for (const [, entry] of this.bgProcesses) {
-      if (entry?.proc) { try { this._killProcessTree(entry.proc); } catch {} }
+  // Stops every process/timer a session owns — used when closing a tab, and
+  // (iterating every session) when the extension itself deactivates. Kept as
+  // one shared helper so a tab's cleanup and full-shutdown cleanup can never
+  // drift apart from each other.
+  _disposeSession(session) {
+    clearInterval(session._heartbeat);
+    clearTimeout(session._watchdog);
+    clearTimeout(session._cpSaveTimer);
+    for (const [, entry] of session.bgProcesses) {
+      // navy.persistBackgroundProcesses processes are deliberately left
+      // running — killing them here would defeat the entire point of the
+      // setting. They're already detached/unref'd and recorded in the
+      // project's manifest, so nothing further is needed to let them go.
+      if (entry?.proc && !entry.persist) { try { this._killProcessTree(entry.proc); } catch {} }
     }
-    this.bgProcesses.clear();
+    for (const [, worker] of session.bgWorkers) { try { worker.ctrl.abort(); } catch {} }
   }
 
-  async runBackgroundTask(taskId, prompt) {
+  dispose() {
+    this.mcp?.stop();
+    // Every open tab's processes/timers, not just the currently active one —
+    // a background dev server or task in a non-visible tab must still be
+    // stopped when the extension deactivates or the window reloads.
+    for (const session of this.sessions.values()) this._disposeSession(session);
+    // Project-level caches (see _proj) are shared across a project's chats,
+    // not owned by any one session — their debounce timer is cleared here.
+    for (const p of this._projectCaches.values()) clearTimeout(p.embedSaveTimer);
+  }
+
+  // Captured once, at invocation — everything the background task does stays
+  // bound to the session that was active when it was started, even after the
+  // user switches tabs (see the _session getter and sessionContext note above).
+  // Prefers an already-established context over activeSessionId for the same
+  // reason askNavy does: if this is ever reached from inside a running turn,
+  // the task belongs to THAT turn's session, not to whichever tab happens to
+  // be on screen by then.
+  runBackgroundTask(taskId, prompt) {
+    const boundSession = sessionContext.getStore() ?? this.activeSessionId;
+    return sessionContext.run(boundSession, () => this._runBackgroundTaskBody(taskId, prompt));
+  }
+
+  async _runBackgroundTaskBody(taskId, prompt) {
     const ctrl = new AbortController();
-    this.bgWorkers.set(taskId, { ctrl });
+    // `prompt` is kept so _sendLiveCardState can rebuild this task's card with
+    // its real label after a tab switch wiped the view.
+    this.bgWorkers.set(taskId, { ctrl, prompt });
     // Distinct turnId so this task's file edits form their own Undo Last Turn group,
     // never merging into whatever main-chat turn happens to be active.
     const bgTurnId = 'bg-' + this.generateId();
@@ -3946,6 +6381,107 @@ class NavyCoderViewProvider {
     } catch (e) {
       return 'find_references failed: ' + e.message + '. Try search_codebase as a fallback.';
     }
+  }
+
+  // Runs an isolated, READ-ONLY sub-agent to investigate `task` and returns
+  // only its written conclusion — not the raw tool trace it took to get
+  // there, keeping the DELEGATING turn's own context clean. Reuses the exact
+  // model-call and native/text tool-call dispatch machinery _askNavyTurn
+  // itself uses (streamAssistant, _normalizeToolCallIds, the same
+  // native-vs-parseToolCalls fallback), so it behaves identically across
+  // providers — deliberately does NOT thread through _rawBlocks
+  // (Anthropic/Gemini extended-thinking continuity) since a short, focused
+  // investigation doesn't need multi-turn deliberation carried between its
+  // OWN steps the way a long primary conversation does.
+  //
+  // Every tool call is checked against READ_ONLY before running — the model
+  // sees no restricted schema (still the same TOOLS_API everyone gets), so
+  // enforcement happens at DISPATCH, not by hiding tools it might still try:
+  // a write/command/delegate attempt is refused with an explanation instead
+  // of silently no-oping or (worse) actually running.
+  async toolDelegateResearch(task, maxSteps) {
+    if (!task || !task.trim()) return 'Error: task is required — describe what to investigate.';
+    // NOT `parseInt(maxSteps, 10) || 12` — 0 is falsy, so that would silently
+    // replace an explicit maxSteps: 0 with the default (12) instead of
+    // clamping it to the minimum (1). Only a genuinely non-numeric/absent
+    // value should fall back to the default.
+    const parsedSteps = parseInt(maxSteps, 10);
+    const steps = Math.min(Math.max(Number.isFinite(parsedSteps) ? parsedSteps : 12, 1), 20);
+    const config = vscode.workspace.getConfiguration('navy');
+    // The model the DELEGATING turn is actually running on, not whatever
+    // navy.model happens to say: the model picker sends its choice with the
+    // request itself, so config can still hold the previous one and the
+    // sub-agent would silently run on a different (possibly much weaker or
+    // more expensive) model than its parent — while its tokens get billed
+    // into that parent's usage total. Falls back to config for a call made
+    // outside any turn.
+    const model = this._session.activeModel || config.get('model', '');
+    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'none';
+
+    const systemContent = `You are a focused research sub-agent inside the Navy Coder VS Code extension, delegated ONE investigation by another agent. You have NO memory of any earlier conversation — the task below is everything you know.
+
+Project root: ${root}
+
+You may call READ-ONLY tools to investigate: read_file, read_lines, list_files, search_files, search_codebase, find_relevant_files, find_symbol, find_references, search_docs, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, web_search, fetch_url. You CANNOT write, delete, rename files, run commands, or delegate further — any such attempt will be refused. When you have enough to answer, respond in PLAIN TEXT with a clear, well-organized report the delegating agent can act on directly — do not call finish(), just stop calling tools once you're done.
+
+Investigation task:
+${task.trim()}`;
+
+    const messages = [{ role: 'system', content: systemContent }];
+    let finalText = '';
+    let filesLookedAt = 0;
+
+    for (let i = 0; i < steps; i++) {
+      if (this.abortController?.signal.aborted) { finalText = finalText || '[Interrupted by Stop.]'; break; }
+      let streamed;
+      try {
+        streamed = await streamAssistant(this, host, model, messages, 0.2, this.abortController?.signal, () => {});
+      } catch (e) {
+        return `Sub-agent research failed: ${e.message}` + (finalText ? `\n\nPartial findings before the failure:\n${finalText}` : '');
+      }
+      const { text, nativeToolCalls, tokenCounts } = streamed;
+      this.subAgentTokens.prompt += tokenCounts.prompt;
+      this.subAgentTokens.completion += tokenCounts.completion;
+      this._normalizeToolCallIds(nativeToolCalls);
+      messages.push(nativeToolCalls.length > 0
+        ? { role: 'assistant', content: text || '', tool_calls: nativeToolCalls }
+        : { role: 'assistant', content: text });
+      if (text?.trim()) finalText = text;
+
+      const toolCalls = nativeToolCalls.length > 0
+        ? nativeToolCalls.map(tc => {
+            let args = {};
+            try { args = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : (tc.function.arguments || {}); }
+            catch (e) { args = { __parseError: e.message, tool: tc.function.name }; }
+            return { name: tc.function.name, args, id: tc.id || '' };
+          })
+        : parseToolCalls(text);
+
+      const nonFinish = toolCalls.filter(t => t.name !== 'finish');
+      if (!nonFinish.length) break; // no tool calls (or only finish) — finalText above is the answer
+
+      const makeResult = (tool, result) => makeToolResultMessage(tool, result, nativeToolCalls.length > 0);
+
+      for (const tool of nonFinish) {
+        let result;
+        if (!READ_ONLY.has(tool.name)) {
+          result = `[Refused: delegate_research sub-agents are read-only — "${tool.name}" is not permitted. State your findings as text; the delegating agent will make any actual changes.]`;
+        } else {
+          try { result = await this.executeTool(tool); }
+          catch (e) { result = 'Error: ' + e.message; }
+          filesLookedAt++;
+        }
+        messages.push(makeResult(tool, result));
+      }
+    }
+
+    if (!finalText.trim()) {
+      finalText = filesLookedAt
+        ? `Sub-agent investigated but did not produce a written conclusion within its step budget (${steps}). Consider raising maxSteps or narrowing the task.`
+        : 'Sub-agent produced no findings.';
+    }
+    return finalText.trim();
   }
 
   async toolWebSearch(query, maxResults = 5) {
@@ -4219,7 +6755,14 @@ class NavyCoderViewProvider {
       try {
         const buf = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(dir, 'embeddings.json')));
         const parsed = JSON.parse(Buffer.from(buf).toString('utf8'));
-        if (parsed && typeof parsed === 'object') stored = { model: parsed.model || '', provider: parsed.provider || '', files: parsed.files || {} };
+        // Pre-chunking caches stored one `vector` per file, not a `chunks`
+        // array — reading one of those as the new shape would throw on the
+        // first similarity call (`chunk.vector` on an object with no
+        // `.chunks`). Treat a cache with no `chunked` marker as stale and
+        // rebuild from scratch, same as an outright model/provider change.
+        if (parsed && typeof parsed === 'object' && parsed.chunked === true) {
+          stored = { model: parsed.model || '', provider: parsed.provider || '', files: parsed.files || {} };
+        }
       } catch {}
     }
     this._embedIndexCache = { root, ...stored };
@@ -4241,9 +6784,12 @@ class NavyCoderViewProvider {
         // update, and the same again parsing it back on the next session.
         const compact = {};
         for (const [rel, f] of Object.entries(files)) {
-          compact[rel] = { mtimeMs: f.mtimeMs, size: f.size, vector: f.vector.map(n => Math.round(n * 1e5) / 1e5) };
+          compact[rel] = {
+            mtimeMs: f.mtimeMs, size: f.size,
+            chunks: f.chunks.map(c => ({ startLine: c.startLine, endLine: c.endLine, vector: c.vector.map(n => Math.round(n * 1e5) / 1e5) })),
+          };
         }
-        const json = JSON.stringify({ model, provider, files: compact });
+        const json = JSON.stringify({ model, provider, chunked: true, files: compact });
         if (json.length > EMBED_INDEX_MAX_BYTES) {
           this.log?.(`semantic index not persisted: ${(json.length / 1048576).toFixed(1)} MB exceeds the ${EMBED_INDEX_MAX_BYTES / 1048576} MB cache limit (search still works this session, it just re-indexes next time)`);
           return;
@@ -4369,19 +6915,30 @@ class NavyCoderViewProvider {
     const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
     const apiKey = await this.context.secrets.get('navy.apiKey.' + provider) || await this.context.secrets.get('navy.apiKey') || '';
 
+    // Chunk every file needing (re-)embedding, then flatten into one text
+    // list — a large file contributes several chunks, an ordinary small one
+    // contributes exactly one (see chunkFileForEmbedding). Batching by
+    // flattened TEXT count (not file count) keeps each embeddings API call
+    // bounded the same way it always was, even though one file can now
+    // expand into several inputs.
+    const fileChunks = new Map(); // rel -> chunk[] (vector filled in below)
+    const flatTexts = [];
+    const flatOwners = []; // parallel: which (rel, chunk index) each flatText belongs to
+    for (const f of toEmbed) {
+      let content = '';
+      try { content = await fs.promises.readFile(f.full, 'utf8'); } catch {}
+      const chunks = chunkFileForEmbedding(f.rel, content);
+      fileChunks.set(f.rel, chunks);
+      chunks.forEach((c, idx) => { flatTexts.push(c.text); flatOwners.push({ rel: f.rel, idx }); });
+    }
+
     const BATCH = 32;
-    for (let i = 0; i < toEmbed.length; i += BATCH) {
-      const batch = toEmbed.slice(i, i + BATCH);
-      const texts = await Promise.all(batch.map(async f => {
-        let content = '';
-        try { content = await fs.promises.readFile(f.full, 'utf8'); } catch {}
-        // Path + a leading slice — enough to capture imports/signature/purpose
-        // without embedding whole large files (cost and token-limit reasons).
-        return f.rel + '\n\n' + content.slice(0, 1500);
-      }));
+    for (let i = 0; i < flatTexts.length; i += BATCH) {
+      const textBatch = flatTexts.slice(i, i + BATCH);
+      const ownerBatch = flatOwners.slice(i, i + BATCH);
       let vectors;
       try {
-        vectors = await getEmbeddings(provider, model, texts, { apiBase, host, apiKey });
+        vectors = await getEmbeddings(provider, model, textBatch, { apiBase, host, apiKey });
       } catch (e) {
         this.log?.('semantic search disabled — embeddings request failed: ' + e.message);
         this._embedUnavailable = provider + ':' + model;
@@ -4390,16 +6947,27 @@ class NavyCoderViewProvider {
       // Only cache a vector that is actually usable. Caching a malformed one
       // alongside a valid mtime/size would poison the index permanently: the
       // change check would never re-embed it, and every later similarity call
-      // would throw on it.
-      batch.forEach((f, j) => {
+      // would throw on it. A partial failure (some chunks of a file got a
+      // vector, others didn't) still keeps the chunks that succeeded — no
+      // reason to discard a whole large file's good data over one bad chunk.
+      ownerBatch.forEach((owner, j) => {
         const v = vectors[j];
-        if (Array.isArray(v) && v.length) {
-          index.files[f.rel] = { mtimeMs: f.mtimeMs, size: f.size, vector: v };
-        } else {
-          delete index.files[f.rel];
-          this.log?.(`semantic index: provider returned no usable vector for ${f.rel} — skipped`);
-        }
+        if (Array.isArray(v) && v.length) fileChunks.get(owner.rel)[owner.idx].vector = v;
       });
+    }
+
+    for (const f of toEmbed) {
+      const chunks = fileChunks.get(f.rel);
+      const usable = chunks.filter(c => Array.isArray(c.vector) && c.vector.length);
+      if (usable.length === 0) {
+        delete index.files[f.rel];
+        this.log?.(`semantic index: provider returned no usable vector for ${f.rel} — skipped`);
+        continue;
+      }
+      index.files[f.rel] = {
+        mtimeMs: f.mtimeMs, size: f.size,
+        chunks: usable.map(c => ({ startLine: c.startLine, endLine: c.endLine, vector: c.vector })),
+      };
     }
     this._saveEmbeddingIndex();
     return index.files;
@@ -4422,10 +6990,26 @@ class NavyCoderViewProvider {
       [queryVec] = await getEmbeddings(provider, model, [query], { apiBase, host, apiKey });
     } catch { return null; }
     if (!queryVec) return null;
-    return Object.entries(files)
-      .map(([rel, f]) => ({ rel, similarity: cosineSimilarity(queryVec, f.vector) }))
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 15);
+    // cosineSimilarity throws on a dimension mismatch rather than silently
+    // comparing a truncated prefix — filter those out here so one stale/
+    // corrupted cache entry (e.g. left over from a since-changed embedding
+    // model) can't take down semantic ranking for every OTHER file too.
+    let mismatched = 0;
+    const scored = [];
+    for (const [rel, f] of Object.entries(files)) {
+      // Score every chunk, keep the file's BEST-matching one — a hit reports
+      // that chunk's line range so the model can jump straight to it with
+      // read_lines instead of re-reading (or guessing at) the whole file.
+      let best = null;
+      for (const chunk of f.chunks) {
+        if (chunk.vector.length !== queryVec.length) { mismatched++; continue; }
+        const similarity = cosineSimilarity(queryVec, chunk.vector);
+        if (!best || similarity > best.similarity) best = { similarity, startLine: chunk.startLine, endLine: chunk.endLine };
+      }
+      if (best) scored.push({ rel, similarity: best.similarity, startLine: best.startLine, endLine: best.endLine });
+    }
+    if (mismatched) this.log?.(`semantic search: skipped ${mismatched} chunk(s) with a mismatched vector dimension`);
+    return scored.sort((a, b) => b.similarity - a.similarity).slice(0, 15);
   }
 
   // Pure merge: keyword-ranked hits + semantic candidates → one combined,
@@ -4435,40 +7019,130 @@ class NavyCoderViewProvider {
   // similarity floor so weakly-related files don't pollute the results just
   // because they ranked highest among a bad match set.
   _blendSemanticRanking(ranked, semantic, threshold = 0.45) {
-    const bySemantic = new Map(semantic.map(s => [s.rel, s.similarity]));
+    const bySemantic = new Map(semantic.map(s => [s.rel, s]));
     const seen = new Set(ranked.map(h => h.rel));
     const merged = ranked.map(h => {
-      const sim = bySemantic.get(h.rel);
-      if (sim === undefined) return h;
-      return { ...h, score: h.score + Math.round(sim * 20), semantic: true };
+      const s = bySemantic.get(h.rel);
+      if (!s) return h;
+      return { ...h, score: h.score + Math.round(s.similarity * 20), semantic: true, semanticRange: { startLine: s.startLine, endLine: s.endLine } };
     });
     for (const s of semantic) {
       if (seen.has(s.rel) || s.similarity < threshold) continue;
-      merged.push({ rel: s.rel, count: 0, matched: [], inName: false, defs: false, semantic: true, score: Math.round(s.similarity * 20) });
+      merged.push({
+        rel: s.rel, count: 0, matched: [], inName: false, defs: false, semantic: true,
+        semanticRange: { startLine: s.startLine, endLine: s.endLine }, score: Math.round(s.similarity * 20),
+      });
     }
     return merged.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
   }
 
-  async toolFindRelevantFiles(query, maxResults = 8) {
-    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  // Blends real language-server symbol matches into the ranking — an actual
+  // LSP definition is a much stronger "this file defines what you asked
+  // about" signal than _collectRelevance's DEF_KW regex guess, and it's
+  // available for free wherever the user already has a language extension
+  // installed (the common case). Only queries the single highest-weighted
+  // term — one workspace-symbol call per request keeps this cheap; the model
+  // can always call find_symbol itself for a specific name. Returns []
+  // (never throws) when no language server answers, so keyword-only ranking
+  // is completely unaffected when this has nothing to add.
+  async _lspSymbolCandidates(root, terms) {
+    if (!terms.length) return [];
+    const query = terms[0].term;
+    try {
+      const symbols = await vscode.commands.executeCommand('vscode.executeWorkspaceSymbolProvider', query);
+      if (!symbols || !symbols.length) return [];
+      const best = new Map(); // rel -> best score seen
+      for (const sym of symbols.slice(0, 20)) {
+        const fp = sym.location?.uri?.fsPath;
+        if (!fp) continue;
+        const rel = path.relative(root, fp).replace(/\\/g, '/');
+        if (rel.startsWith('..')) continue; // symbol lives outside this project root
+        // An exact name match to the query term is a much stronger signal
+        // than a fuzzy/substring match the symbol provider may also return.
+        const score = sym.name.toLowerCase() === query.toLowerCase() ? 15 : 8;
+        if (!best.has(rel) || best.get(rel) < score) best.set(rel, score);
+      }
+      return [...best.entries()].map(([rel, score]) => ({ rel, score }));
+    } catch { return []; }
+  }
+
+  // Per-file symbol outline (top-level function/class/method names) for
+  // buildRepoMap — the SAME real language-server infrastructure
+  // _lspSymbolCandidates/find_symbol already use, not a new parser. A bare
+  // file tree tells the model NOTHING about what's inside a file; this gives
+  // it real signatures to reason about before deciding what to read, at zero
+  // cost when no language server is active for that file type (returns ''
+  // and buildRepoMap shows the plain filename, exactly as before). Bounded
+  // to a short timeout so one slow/hung provider can't stall building the
+  // map for the whole turn — buildRepoMap calls this across many files in
+  // parallel, so the bound is per-call, not cumulative.
+  async _fileSymbolOutline(uri) {
+    const INTERESTING = new Set([
+      vscode.SymbolKind.Class, vscode.SymbolKind.Interface, vscode.SymbolKind.Function,
+      vscode.SymbolKind.Method, vscode.SymbolKind.Constructor, vscode.SymbolKind.Enum,
+      vscode.SymbolKind.Struct,
+    ]);
+    try {
+      const symbols = await Promise.race([
+        vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', uri),
+        new Promise(resolve => setTimeout(() => resolve(undefined), 400)),
+      ]);
+      if (!symbols || !symbols.length) return '';
+      const names = [];
+      for (const s of symbols) {
+        if (names.length >= 8) break;
+        if (!INTERESTING.has(s.kind)) continue;
+        if (s.name) names.push(s.name);
+      }
+      return names.length ? ' — ' + names.join(', ') : '';
+    } catch { return ''; }
+  }
+
+  async toolFindRelevantFiles(query, maxResults = 8, folder) {
+    const resolved = this._resolveTargetFolder(folder);
+    if (resolved.error) return resolved.error;
+    const root = resolved.root;
     if (!root) return 'No workspace open.';
     const terms = this._tokenizeQuery(query);
     if (!terms.length) return 'Give a more specific query — identifiers, symbol names, or distinctive keywords.';
     const hits = await this._collectRelevance(root, terms);
     let ranked = this._rankRelevance(hits, terms);
 
-    let usedSemantic = false;
+    // Real LSP symbol matches are a stronger "this file defines something
+    // you asked about" signal than the regex-based `defs` guess above —
+    // blend them in before semantic search, so a file can earn both bonuses.
     try {
-      const semantic = await this._semanticCandidates(root, query);
-      if (semantic && semantic.length) { ranked = this._blendSemanticRanking(ranked, semantic); usedSemantic = true; }
-    } catch (e) { this.log?.('semantic search failed, using keyword results only: ' + e.message); }
+      const lspHits = await this._lspSymbolCandidates(root, terms);
+      for (const lsp of lspHits) {
+        const existing = ranked.find(h => h.rel === lsp.rel);
+        if (existing) { existing.score += lsp.score; existing.lspMatch = true; }
+        else ranked.push({ rel: lsp.rel, count: 0, matched: [], inName: false, defs: false, lspMatch: true, score: lsp.score });
+      }
+      ranked.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+    } catch (e) { this.log?.('LSP symbol blend failed, using keyword results only: ' + e.message); }
+
+    // Semantic search is scoped to the ACTIVE project only, even when `folder`
+    // targets a sibling: the embeddings cache (.navy/embeddings.json) is
+    // persisted via getNavyDir(), which is anchored to this.projectRoot, not
+    // to whichever root is being searched — running it against a sibling
+    // folder would read/write the wrong project's cache file. Keyword and LSP
+    // search above have no such per-root persistence and work across any
+    // open folder already.
+    let usedSemantic = false;
+    if (root === (this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath)) {
+      try {
+        const semantic = await this._semanticCandidates(root, query);
+        if (semantic && semantic.length) { ranked = this._blendSemanticRanking(ranked, semantic); usedSemantic = true; }
+      } catch (e) { this.log?.('semantic search failed, using keyword results only: ' + e.message); }
+    }
 
     ranked = ranked.slice(0, Math.max(1, Math.min(maxResults || 8, 25)));
     if (!ranked.length) return `No files matched: ${terms.map(t => t.term).join(', ')}`;
     const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}${usedSemantic ? ' (keyword + semantic)' : ''}\n`;
-    return header + ranked.map(h =>
-      `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}${h.semantic ? ', semantic-match' : ''}; matched: ${h.matched.join(', ') || '—'}]`
-    ).join('\n');
+    return header + ranked.map(h => {
+      const semanticNote = h.semantic ? ', semantic-match' + (h.semanticRange ? ` at lines ${h.semanticRange.startLine}-${h.semanticRange.endLine}` : '') : '';
+      return `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}${h.lspMatch ? ', LSP-defines' : ''}${semanticNote}; matched: ${h.matched.join(', ') || '—'}]`;
+    }).join('\n');
   }
 
   async buildRepoMap() {
@@ -4483,6 +7157,11 @@ class NavyCoderViewProvider {
 
     const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt', '__pycache__', '.venv', 'venv', 'coverage', '.cache']);
     const lines = [];
+    // Symbol outlines (see _fileSymbolOutline) are fetched for at most this
+    // many files per build, across the whole tree — bounds total LSP calls
+    // regardless of repo size. { idx: position in `lines` to enrich, uri }.
+    const SYMBOL_CALL_CAP = 30;
+    const symbolTargets = [];
 
     const walk = async (dir, prefix, depth) => {
       let entries;
@@ -4490,7 +7169,13 @@ class NavyCoderViewProvider {
       catch { return; }
       const dirs = entries.filter(e => e.isDirectory() && !SKIP_DIRS.has(e.name) && !e.name.startsWith('.'));
       const files = entries.filter(e => e.isFile());
-      for (const f of files.slice(0, 40)) lines.push(prefix + f.name);
+      for (const f of files.slice(0, 40)) {
+        const idx = lines.length;
+        lines.push(prefix + f.name); // enriched with a symbol outline below, if this file gets a slot
+        if (symbolTargets.length < SYMBOL_CALL_CAP && RELEVANCE_CODE_EXTS.has(path.extname(f.name).toLowerCase())) {
+          symbolTargets.push({ idx, uri: vscode.Uri.file(path.join(dir, f.name)) });
+        }
+      }
       if (files.length > 40) lines.push(prefix + `… (${files.length - 40} more files)`);
       if (depth < 2) {
         for (const d of dirs.slice(0, 15)) {
@@ -4504,6 +7189,19 @@ class NavyCoderViewProvider {
 
     try {
       await walk(root, '', 0);
+
+      // Fetch every file's symbol outline IN PARALLEL — each call is
+      // individually time-boxed (_fileSymbolOutline), so running them
+      // concurrently bounds the total wall-clock cost to about one timeout
+      // window, not a multiple of the file count. Must happen before any
+      // further pushes/unshifts below, since symbolTargets recorded exact
+      // `lines` indices during the walk.
+      if (symbolTargets.length) {
+        await Promise.all(symbolTargets.map(async (t) => {
+          const outline = await this._fileSymbolOutline(t.uri);
+          if (outline) lines[t.idx] += outline;
+        }));
+      }
 
       // Try common project manifest files to get real project name.
       let projectMeta = '';
@@ -4520,6 +7218,19 @@ class NavyCoderViewProvider {
         } catch { /* not this type */ }
       }
       if (projectMeta) lines.unshift('Project: ' + projectMeta);
+
+      // Multi-root hint: note sibling open folders exist without walking or
+      // fully mapping them (that would double prompt size on every message
+      // by default) — the model can target one explicitly via the `folder`
+      // argument on search_codebase/search_files/list_files/find_relevant_files,
+      // or resolveWorkspacePath already accepts an absolute path inside any
+      // of them regardless.
+      const siblings = (vscode.workspace.workspaceFolders || [])
+        .map(f => f.uri.fsPath)
+        .filter(fp => foldPath(fp) !== foldPath(root));
+      if (siblings.length) {
+        lines.push(`\nOther open folders (pass folder: "<path>" to search_codebase/search_files/list_files/find_relevant_files to target one): ${siblings.join(', ')}`);
+      }
 
       const map = lines.join('\n') || 'Empty project directory';
       this._repoMapCache = { root, time: Date.now(), map };
@@ -5083,4 +7794,7 @@ function deactivate() {}
 
 // NavyCoderViewProvider is exported for the test suite (test/run.js drives its
 // undo/redo/checkpoint logic against a mock vscode + real temp filesystem).
-module.exports = { activate, deactivate, NavyCoderViewProvider };
+// sessionContext is exported so tests can directly verify that code running
+// inside it stays bound to the session it started with, independent of
+// mocking a full turn's model/tool call chain.
+module.exports = { activate, deactivate, NavyCoderViewProvider, sessionContext, estimateCost, resolveModelContext, contextWindowOptions };

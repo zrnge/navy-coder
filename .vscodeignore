@@ -17,3 +17,5 @@ eval/**
 *.vsix
 .gitignore
 **/*.map
+# CI config — repository tooling, of no use inside an installed extension.
+.github/**

@@ -1,0 +1,42 @@
+name: CI
+
+# Runs the full test suite + build on every push and PR against main, on
+# BOTH Linux and Windows — Navy has genuinely platform-conditional logic
+# (cmd.exe vs sh command construction, taskkill vs process groups, the
+# Windows-specific detached+cmd.exe quirk worked around in persisted
+# background processes, WSL detection, …) that a Linux-only runner would
+# give zero regression coverage for. Nothing here calls a real AI provider —
+# every test mocks the model, so this needs no API keys/secrets and costs
+# nothing to run on every commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false # a failure on one OS shouldn't hide a real one on the other
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build (bundle extension.js)
+        run: npm run build

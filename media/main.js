@@ -15,10 +15,15 @@ const stopButton  = document.querySelector('#stopButton');
 const undoButton = document.querySelector('#undoButton');
 const redoButton = document.querySelector('#redoButton');
 const projectSelect = document.querySelector('#projectSelect');
+// Prefix marking a <option> value as a global-catalog entry (a project Navy
+// remembers but that isn't part of THIS window's workspace right now) rather
+// than one of this window's own roots — see populateProjects/the change
+// handler below and openCatalogProject on the extension side.
+const CATALOG_OPTION_PREFIX = '__catalog__:';
 const approvalQueue = document.querySelector('#approvalQueue');
 const approvalModeSelect = document.querySelector('#approvalModeSelect');
 const thinkingLevelSelect = document.querySelector('#thinkingLevelSelect');
-const contextLengthEl = document.querySelector('#contextLength');
+const contextSelect = document.querySelector('#contextSelect');
 const queuedBadge = document.querySelector('#queuedBadge');
 const statusText = document.querySelector('#statusText');
 const memoryButton = document.querySelector('#memoryButton');
@@ -61,6 +66,12 @@ const searchClose = document.querySelector('#searchClose');
 const shellPanel = document.querySelector('#shellPanel');
 const shellOutput = document.querySelector('#shellOutput');
 const shellPanelClose = document.querySelector('#shellPanelClose');
+const sessionTabsEl = document.querySelector('#sessionTabs');
+
+// Which session (project) this webview is currently displaying — null until
+// the first tagged message arrives. See the multi-session gate at the top of
+// the message listener below for how this is used and kept in sync.
+let activeSessionId = null;
 
 let activeAssistantMessage = null;
 let activeAssistantBubble = null;
@@ -263,6 +274,20 @@ projectSelect?.addEventListener('change', () => {
     }, 500);
     return;
   }
+  if (projectSelect.value.startsWith(CATALOG_OPTION_PREFIX)) {
+    const picked = projectSelect.value.slice(CATALOG_OPTION_PREFIX.length);
+    vscode.postMessage({ type: 'openCatalogProject', root: picked });
+    // Picking a catalog entry is never itself a direct switch — it opens a
+    // dialog (open here / add to workspace) that can be dismissed, or
+    // reloads the window — so revert the visible selection until a real
+    // workspaceFolders update confirms what actually happened.
+    setTimeout(() => {
+      if (projectSelect.value.startsWith(CATALOG_OPTION_PREFIX)) {
+        projectSelect.value = projectSelect.dataset.lastValue || '';
+      }
+    }, 500);
+    return;
+  }
   projectSelect.dataset.lastValue = projectSelect.value;
   vscode.postMessage({ type: 'setProjectRoot', root: projectSelect.value });
 });
@@ -302,6 +327,10 @@ welcomeEl?.addEventListener('click', (e) => {
   promptInput.selectionStart = promptInput.selectionEnd = p.length;
   autoResize();
   updateSendButton();
+});
+
+contextSelect?.addEventListener('change', () => {
+  vscode.postMessage({ type: 'setContextWindow', tokens: Number(contextSelect.value) || 0 });
 });
 
 thinkingLevelSelect?.addEventListener('change', () => {
@@ -549,6 +578,37 @@ window.addEventListener('message', (event) => {
   const message = event.data;
   _wdLastActivity = message && message.type ? message.type : 'unknown';
 
+  // Multi-session gating: every message from the extension is tagged with
+  // the session (an opaque generated id, in `message.sessionId`) it belongs
+  // to. 'sessionList' and 'workspaceFolders' always pass through.
+  // 'workspaceFolders' is what teaches this webview the CORRECT active
+  // session no matter which UI element triggered a switch — the legacy
+  // dropdown and openFolder never optimistically update activeSessionId
+  // themselves (only the tab strip's own click handler does, see
+  // switchToSessionTab), and EVERY project-switch path sends this message,
+  // so adopting `message.sessionId` here (NOT `message.current`, which is
+  // just the project ROOT path for populating the dropdown, a completely
+  // different value from the session id) is what keeps activeSessionId
+  // correct regardless of which control was used. Without this, switching
+  // via the dropdown would leave activeSessionId stale, and every resulting
+  // state-sync message (chat restore, even the dropdown's own update) would
+  // then be wrongly gated out below as "belongs to a different tab". The
+  // very first tagged message ever seen establishes the baseline with no
+  // gating — nothing has been rendered yet, so there's nothing to protect.
+  // After that, anything tagged for a DIFFERENT session than the one
+  // currently displayed belongs to a background tab's turn and must not
+  // touch this tab's visible thread — its state still accumulates
+  // server-side; switching to that tab later requests a fresh snapshot
+  // instead.
+  if (activeSessionId === null && message.sessionId !== undefined) activeSessionId = message.sessionId;
+  if (message.type === 'workspaceFolders' && message.sessionId !== undefined && message.sessionId !== activeSessionId) {
+    adoptActiveSession(message.sessionId);
+  }
+  const sessionGateExempt = message.type === 'sessionList' || message.type === 'workspaceFolders';
+  if (!sessionGateExempt && message.sessionId !== undefined && message.sessionId !== activeSessionId) {
+    return;
+  }
+
   // Any message from the extension proves it's alive — push the dead-backend
   // watchdog out. Includes the 30s 'heartbeat' sent during long turns.
   if (isBusy) armBusyWatchdog();
@@ -573,6 +633,12 @@ window.addEventListener('message', (event) => {
     activeTermCard = null;
     if (shellOutput) shellOutput.textContent = '';
     if (shellPanel) shellPanel.style.display = 'none';
+    // Defensive: a prior turn normally clears these via collapseToolProgress,
+    // but a fresh turn must never inherit leftover activity-log state either way.
+    allActivityLogEls = [];
+    _needNewActivityLog = false;
+    currentActivityRowEl = null;
+    activityRowsById.clear();
     // Show an initial "Thinking" row — replaced by real tool rows as they arrive.
     addToolCallCard('__thinking__', {});
     const thinkingRow = currentActivityRowEl;
@@ -581,11 +647,14 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'chunk') {
     // First chunk means the model is responding directly — discard the Thinking placeholder.
-    if (activityLogEl) {
-      const placeholder = activityLogEl.querySelector('.thinking-row');
-      if (placeholder) placeholder.remove();
-      // If the log is now empty, remove it entirely so it doesn't show a ghost border.
-      if (!activityLogEl.children.length) { activityLogEl.remove(); activityLogEl = null; }
+    {
+      const log = currentActivityLog();
+      if (log) {
+        const placeholder = log.querySelector('.thinking-row');
+        if (placeholder) placeholder.remove();
+        // If the log is now empty, remove it entirely so it doesn't show a ghost border.
+        if (!log.children.length) removeCurrentActivityLog();
+      }
     }
     appendAssistantText(message.text);
   }
@@ -597,6 +666,9 @@ window.addEventListener('message', (event) => {
     // aborted turn may have only completed some of them.
     if (message.type === 'done') updatePlanProgress(0, true);
     // A command still streaming when the turn ends (Stop pressed) — close its card.
+    // Every card still in flight, not just the most recent one — Stop ends
+    // all of them, and a keyed card left out would spin at 'running…' forever.
+    for (const id of [...termCardsById.keys()]) finalizeTermCard('__stopped__', id);
     if (activeTermCard) finalizeTermCard('__stopped__');
     // Drop bubbles that render to nothing (e.g. a reply that was purely tool-call
     // JSON from a small model, or a trailing bubble opened for text that never
@@ -656,6 +728,9 @@ window.addEventListener('message', (event) => {
   if (message.type === 'error') {
     flushAssistantText();
     setBusy(false);
+    // Every card still in flight, not just the most recent one — Stop ends
+    // all of them, and a keyed card left out would spin at 'running…' forever.
+    for (const id of [...termCardsById.keys()]) finalizeTermCard('__stopped__', id);
     if (activeTermCard) finalizeTermCard('__stopped__');
     activeAssistantMessage = null;
     activeAssistantBubble = null;
@@ -675,33 +750,38 @@ window.addEventListener('message', (event) => {
     updateWelcome();
   }
 
+  if (message.type === 'sessionList') {
+    // The backend's own `active` flag is authoritative — must be checked
+    // FIRST, not merely as a fallback for when the old id is missing from
+    // the list entirely. Opening a new tab (or closeSessionTab falling back
+    // to a sibling) leaves the OLD session right there in the list, just
+    // with active:false now — matching it by id alone found it and treated
+    // that as "nothing changed", so the switch was never adopted (the
+    // "blue active tab doesn't move until you click away and back" bug).
+    const active = message.sessions.find(s => s.active) || message.sessions.find(s => s.id === activeSessionId);
+    // Only touch busy/focus state on an ACTUAL switch, not every routine
+    // refresh of this list (sent on every turn start/end too) — calling
+    // setBusy(false) unconditionally would steal focus into the prompt input
+    // on every single one of those, not just when the user actually switches.
+    if (active && active.id !== activeSessionId) {
+      // The backend's active session can change without a direct tab click
+      // (e.g. opening a new tab, or closing the tab you were viewing which
+      // auto-switches to another) — adopt it BEFORE rendering the tab strip
+      // below, or the strip highlights the OLD tab for one more render.
+      // renderSessionTabs marks a tab active by comparing against
+      // activeSessionId, so it has to see the corrected value, not the
+      // stale one. Also soft-clear so stale content doesn't linger, and
+      // sync busy state since 'start'/'done' for that tab's own turn may
+      // have already fired while it was in the background and gated out.
+      adoptActiveSession(active.id, { busy: active.busy });
+    }
+    renderSessionTabs(message.sessions);
+  }
+
   if (message.type === 'cleared') {
     // Unlock the UI first — clearing mid-turn must not leave the input locked.
     setBusy(false);
-    activeAssistantMessage = null;
-    activeAssistantBubble = null;
-    activeAssistantContent = '';
-    activityLogEl = null;
-    currentActivityRowEl = null;
-    activityRowsById.clear();
-    activeTermCard = null;
-    lastAssistantMessage = null;
-    // A run-project server or background task/process can still be running
-    // server-side after Clear (Clear only resets the conversation, not those).
-    // Drop the now-stale DOM references so their next update doesn't write
-    // into a detached node — bgTaskEls/bgProcessPanels lazily recreate their
-    // card on the next message; the extension host re-sends runProjectStart
-    // right after 'cleared' if a project is still running, since that card
-    // has no such lazy-recreate path.
-    runProjectCardEl = null;
-    bgTaskEls.clear();
-    bgProcessPanels.clear();
-    if (tokenCounterEl) { tokenCounterEl.textContent = ''; tokenCounterEl.classList.remove('visible'); }
-    if (contextBarFill) { contextBarFill.style.width = '0%'; contextBarFill.className = 'context-bar-fill'; }
-    resetPlanCard();
-    messagesEl.innerHTML = '';
-    messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
-    welcomeEl.classList.remove('hidden');
+    resetThreadDisplay();
     attachedFiles = [];
     attachedTexts = [];
     pastedImages = [];
@@ -758,7 +838,7 @@ window.addEventListener('message', (event) => {
     if (message.tool === 'run_command' || message.tool === 'run_tests') {
       const cmdText = message.args?.command
         || ('run_tests' + (message.args?.filter ? ' — ' + message.args.filter : ' (auto-detected)'));
-      createTermCard(message.tool, cmdText);
+      createTermCard(message.tool, cmdText, message.callId);
     } else {
       addToolCallCard(message.tool, message.args, message.callId);
     }
@@ -767,8 +847,8 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'toolResult') {
-    if ((message.tool === 'run_command' || message.tool === 'run_tests') && activeTermCard) {
-      finalizeTermCard(message.result);
+    if ((message.tool === 'run_command' || message.tool === 'run_tests') && termCardFor(message.callId)) {
+      finalizeTermCard(message.result, message.callId);
     } else {
       addToolResultCard(message.tool, message.result, message.callId);
     }
@@ -846,7 +926,7 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'workspaceFolders') {
-    populateProjects(message.roots, message.current);
+    populateProjects(message.roots, message.current, message.catalog);
     if (projectSelect && message.current) {
       projectSelect.dataset.lastValue = message.current;
       projectSelect.value = message.current;
@@ -879,12 +959,8 @@ window.addEventListener('message', (event) => {
     if (thinkingLevelSelect) thinkingLevelSelect.value = message.level;
   }
 
-  if (message.type === 'contextLength') {
-    if (contextLengthEl) {
-      const k = Math.round(message.length / 1024);
-      contextLengthEl.textContent = k + 'k ctx';
-      contextLengthEl.title = 'Model context window: ' + message.length.toLocaleString() + ' tokens';
-    }
+  if (message.type === 'contextWindow') {
+    renderContextWindowSelect(message);
   }
 
   if (message.type === 'statusText') {
@@ -930,6 +1006,9 @@ window.addEventListener('message', (event) => {
     if (message.count > 0) {
       addSystemMessage('Session restored — ' + message.count + ' messages from previous session.');
     }
+    // Restoring a chat (or switching to a sibling tab) shows ITS accumulated
+    // usage immediately, not blank until the next new message.
+    renderTokenCounter(message.sessionTotal, message.sessionPrompt, message.sessionCompletion, message.estimatedCost, message.costKnown);
   }
 
   if (message.type === 'memoryUpdated') {
@@ -938,11 +1017,14 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'tokenCount') {
-    if (tokenCounterEl) {
-      tokenCounterEl.textContent = message.total.toLocaleString() + ' tok';
-      tokenCounterEl.title = `Prompt: ${message.prompt.toLocaleString()} + Completion: ${message.completion.toLocaleString()} tokens`;
-      tokenCounterEl.classList.add('visible');
-    }
+    // sessionTotal/etc. are only absent from an older extension host talking
+    // to a newer webview — fall back to the single-turn figures rather than
+    // showing nothing.
+    renderTokenCounter(
+      message.sessionTotal ?? message.total,
+      message.sessionPrompt ?? message.prompt,
+      message.sessionCompletion ?? message.completion,
+      message.estimatedCost, message.costKnown);
   }
 
   if (message.type === 'contextUsage') {
@@ -996,7 +1078,7 @@ window.addEventListener('message', (event) => {
   if (message.type === 'shellChunk') {
     // Route into the active IN/OUT terminal card when one exists; the top shell
     // panel remains as a fallback for commands run outside the tool loop (PR review).
-    if (appendTermOutput(message.chunk, message.isStderr)) return;
+    if (appendTermOutput(message.chunk, message.isStderr, message.streamId)) return;
     const panel = document.getElementById('shellPanel');
     const output = document.getElementById('shellOutput');
     if (panel && output) {
@@ -1103,9 +1185,18 @@ function getOrCreateBgTaskEl(taskId, promptText) {
 }
 
 function handleBgTaskUpdate(msg) {
-  const refs = msg.status === 'start'
-    ? getOrCreateBgTaskEl(msg.taskId, msg.prompt || '')
-    : bgTaskEls.get(msg.taskId);
+  // Created on demand for ANY status, not just 'start'. Switching tabs clears
+  // bgTaskEls while the task keeps running, and the 'start' that would have
+  // rebuilt the card is long past — so every later chunk, tool line and the
+  // final answer were dropped and the task's result never appeared at all.
+  // The extension also re-announces live tasks on tab switch
+  // (_sendLiveCardState), which restores the real prompt label; this is the
+  // belt-and-braces path for anything that arrives before it.
+  const refs = bgTaskEls.get(msg.taskId)
+    || (msg.status === 'done' || msg.status === 'aborted' || msg.status === 'error' || msg.status === 'start'
+        || msg.status === 'chunk' || msg.status === 'tool'
+      ? getOrCreateBgTaskEl(msg.taskId, msg.prompt || '(background task)')
+      : null);
   if (!refs) return;
 
   const { textEl, logEl, statusEl } = refs;
@@ -1173,8 +1264,15 @@ function appendBgProcessOutput(id, chunk, isStderr) {
         <span class="bg-task-badge">⬡ PROC</span>
         <span class="bg-task-prompt">${escapeHtml(String(id))}</span>
         <span class="bg-task-status running">● running</span>
+        <button class="bg-task-abort bg-proc-stop" title="Stop process">✕</button>
       </div>
       <pre class="bg-process-output"></pre>`;
+    // Background TASKS had an abort button; background PROCESSES did not, even
+    // though kill_process exists — a stray dev server started by start_process
+    // could only be stopped by asking the model to do it.
+    el.querySelector('.bg-proc-stop').addEventListener('click', () => {
+      vscode.postMessage({ type: 'killBgProcess', id });
+    });
     messagesEl.appendChild(el);
     if (welcomeEl) welcomeEl.style.display = 'none';
     refs = { el, outputEl: el.querySelector('.bg-process-output'), statusEl: el.querySelector('.bg-task-status') };
@@ -1190,10 +1288,15 @@ function appendBgProcessOutput(id, chunk, isStderr) {
 }
 
 function markBgProcessDone(id, exitCode) {
-  const refs = bgProcessPanels.get(id);
+  // Built on demand if the panel isn't there (a tab switch cleared it): the
+  // exit status is the one thing you most need to see, and returning early
+  // meant a process that finished while you were on another tab reported
+  // nothing at all — or worse, reappeared as "running" on its next output.
+  const refs = bgProcessPanels.get(id) || (appendBgProcessOutput(id, ''), bgProcessPanels.get(id));
   if (!refs) return;
   refs.statusEl.className = exitCode === 0 ? 'bg-task-status done' : 'bg-task-status error';
   refs.statusEl.textContent = exitCode === 0 ? `✓ exited (0)` : `✕ exited (${exitCode})`;
+  refs.el.querySelector('.bg-proc-stop')?.remove();
   bgProcessPanels.delete(id);
 }
 
@@ -1202,7 +1305,11 @@ function markBgProcessDone(id, exitCode) {
 let runProjectCardEl = null;
 
 function showRunProjectCard(projectName, command) {
-  // Remove any existing card first.
+  // Supersede ANY previous run-project card, live or already stopped. Only the
+  // tracked (live) one used to be removed, and setRunProjectStopped had already
+  // dropped that reference — so every stopped server left its card behind and
+  // they piled up, one per run, for the life of the conversation.
+  for (const old of messagesEl.querySelectorAll('.run-project-card')) old.remove();
   runProjectCardEl?.remove();
 
   const card = document.createElement('div');
@@ -1234,7 +1341,7 @@ function showRunProjectCard(projectName, command) {
     vscode.postMessage({ type: 'stopRunProject' });
   });
 
-  messagesEl.appendChild(card);
+  appendTurnCard(card);
   runProjectCardEl = card;
   if (welcomeEl) welcomeEl.style.display = 'none';
   scrollToBottom();
@@ -1272,7 +1379,12 @@ function appendRunProjectOutput(chunk) {
 }
 
 function setRunProjectStopped(exitCode) {
-  if (!runProjectCardEl) return;
+  // Idempotent, and the card reference is KEPT: output can still arrive after
+  // the process is reported dead (a final flush, a crash trace), and nulling
+  // the reference here silently discarded exactly the lines that explain why
+  // it stopped. showRunProjectCard is what clears the card, when a new server
+  // supersedes it.
+  if (!runProjectCardEl || runProjectCardEl.classList.contains('stopped')) return;
   const statusEl  = runProjectCardEl.querySelector('.rp-status');
   const wheelWrap = runProjectCardEl.querySelector('.rp-wheel-wrap');
   const stopBtn   = runProjectCardEl.querySelector('.rp-stop-btn');
@@ -1284,7 +1396,6 @@ function setRunProjectStopped(exitCode) {
   if (wheelWrap) wheelWrap.innerHTML = `<span class="rp-stopped-icon">■</span>`;
   if (stopBtn)   stopBtn.remove();
   if (dotEl)     dotEl.classList.add('offline');
-  runProjectCardEl = null;
 }
 
 function autoResize() {
@@ -1706,6 +1817,30 @@ function updateWelcome() {
   welcomeEl.classList.toggle('hidden', hasMessages);
 }
 
+// How many messages a restore renders up front. A long chat previously built
+// every message into the DOM at once, and the chat has no virtualisation — so
+// reopening a project with hundreds of turns paid the full parse and layout
+// cost before the panel became usable. The rest stay one click away.
+const HISTORY_RENDER_LIMIT = 60;
+
+function renderHistoryItem(item) {
+  if (item.role === 'user') {
+    // Attachment/image badges are part of what the question WAS — replayed
+    // from the persisted message rather than dropped on restore.
+    addMessage('user', item.text, item.attachments || [], item.images || 0);
+  } else if (item.role === 'assistant') {
+    addMessage('assistant', item.text);
+    // Restore the change summary for this turn (live footer isn't persisted).
+    if (item.meta) {
+      const bits = [];
+      if (item.meta.files?.length)   bits.push('changed ' + item.meta.files.join(', '));
+      if (item.meta.deleted?.length) bits.push('deleted ' + item.meta.deleted.join(', '));
+      if (item.meta.commands)        bits.push(item.meta.commands + ' command' + (item.meta.commands > 1 ? 's' : '') + ' run');
+      if (bits.length) addSystemMessage('This turn: ' + bits.join(' · '));
+    }
+  }
+}
+
 function renderHistory(history) {
   messagesEl.innerHTML = '';
   messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — keep it in the DOM
@@ -1716,25 +1851,33 @@ function renderHistory(history) {
   note.className = 'restore-note';
   note.textContent = 'Session restored — earlier tool activity and diffs are not shown.';
   messagesEl.appendChild(note);
-  for (const item of history) {
-    if (!item.text?.trim()) continue; // skip empty tool-only iterations
-    if (item.role === 'user') {
-      addMessage('user', item.text);
-    } else if (item.role === 'assistant') {
-      addMessage('assistant', item.text);
-      // Restore the change summary for this turn (live footer isn't persisted).
-      if (item.meta) {
-        const bits = [];
-        if (item.meta.files?.length)   bits.push('changed ' + item.meta.files.join(', '));
-        if (item.meta.deleted?.length) bits.push('deleted ' + item.meta.deleted.join(', '));
-        if (item.meta.commands)        bits.push(item.meta.commands + ' command' + (item.meta.commands > 1 ? 's' : '') + ' run');
-        if (bits.length) addSystemMessage('This turn: ' + bits.join(' · '));
-      }
-    }
+
+  const renderable = history.filter(i => i.text?.trim()); // skip empty tool-only iterations
+  const hidden = Math.max(0, renderable.length - HISTORY_RENDER_LIMIT);
+  if (hidden) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'history-more-btn';
+    more.textContent = `Show ${hidden} earlier message${hidden === 1 ? '' : 's'} ↑`;
+    more.addEventListener('click', () => {
+      // renderHistoryItem appends to the end, so the earlier messages are
+      // rendered there and then moved, as a block, to just above this button —
+      // which sits above the recent ones. Order within the block is preserved
+      // (a fragment keeps insertion order), so the transcript still reads
+      // oldest-first rather than coming back reversed or interleaved.
+      const mark = messagesEl.childNodes.length;
+      for (const item of renderable.slice(0, hidden)) renderHistoryItem(item);
+      const frag = document.createDocumentFragment();
+      for (const node of [...messagesEl.childNodes].slice(mark)) frag.appendChild(node);
+      messagesEl.insertBefore(frag, more);
+      more.remove();
+    });
+    messagesEl.appendChild(more);
   }
+  for (const item of renderable.slice(hidden)) renderHistoryItem(item);
 }
 
-function populateProjects(roots, current) {
+function populateProjects(roots, current, catalog) {
   if (!projectSelect) return;
   projectSelect.innerHTML = '';
 
@@ -1744,6 +1887,15 @@ function populateProjects(roots, current) {
     option.textContent = 'No workspace';
     projectSelect.appendChild(option);
   } else {
+    // A blank "New Chat" tab (current === '') has no project bound yet — show
+    // an explicit placeholder instead of letting the browser silently
+    // default to pre-selecting the first real folder in the list below.
+    if (!current) {
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '(select a project)';
+      projectSelect.appendChild(placeholder);
+    }
     for (const root of roots) {
       const option = document.createElement('option');
       option.value = root;
@@ -1752,6 +1904,24 @@ function populateProjects(roots, current) {
       if (root === current) option.selected = true;
       projectSelect.appendChild(option);
     }
+  }
+
+  // Other projects Navy remembers (the global ~/.navy/projects.json catalog)
+  // that aren't part of THIS window's workspace right now — picking one
+  // opens the same "open here or add to workspace" choice a brand-new
+  // folder pick gets, rather than switching directly (see the change
+  // handler above and openCatalogProject on the extension side).
+  if (catalog && catalog.length) {
+    const group = document.createElement('optgroup');
+    group.label = 'Other projects';
+    for (const proj of catalog) {
+      const option = document.createElement('option');
+      option.value = CATALOG_OPTION_PREFIX + proj.path;
+      option.textContent = proj.name;
+      option.title = proj.path;
+      group.appendChild(option);
+    }
+    projectSelect.appendChild(group);
   }
 
   const addOption = document.createElement('option');
@@ -1783,7 +1953,19 @@ function renderApprovalQueue(approvals) {
     const item = document.createElement('div');
     item.className = 'approval-item';
     item.textContent = a.path.replace(/^.*[\/]/, '');
-    item.title = a.path;
+    item.title = a.path + ' — click to jump to its card';
+    // Now that adding a diff card no longer hijacks the scroll position, this
+    // queue is how you get back to a card you have scrolled past. Clicking an
+    // entry has to actually take you there for that to hold.
+    item.addEventListener('click', () => {
+      const card = a.id
+        ? [...messagesEl.querySelectorAll('.diff-card')].find(c => c.dataset.diffId === String(a.id))
+        : null;
+      if (card) {
+        userScrolledUp = true; // an explicit jump, not a follow-the-stream scroll
+        card.scrollIntoView({ block: 'center' });
+      }
+    });
     list.appendChild(item);
   }
   approvalQueue.appendChild(badge);
@@ -2033,7 +2215,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     copyBtn.addEventListener('click', () => {
       // Prefer the article: a reply split across several bubbles by tool activity
       // records its full markdown there, so copy still yields the whole reply.
-      vscode.postMessage({ type: 'copy', text: article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '' });
+      vscode.postMessage({ type: 'copy', text: copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '') });
       copyBtn.textContent = '✓';
       setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
     });
@@ -2119,6 +2301,135 @@ function resetPlanCard() {
   planStepCount = 0;
 }
 
+// Resets everything tied to the currently-displayed conversation THREAD —
+// shared by the 'cleared' message handler and by switching session tabs
+// (soft-clearing before the target tab's sessionLoaded/restore repopulates
+// it). Deliberately leaves composer/draft state (attachedFiles, pastedImages,
+// the prompt textarea) untouched — that's what the user is about to send,
+// not part of which project's history is on screen, and losing it on an
+// accidental tab click would be a bad surprise.
+function resetThreadDisplay() {
+  activeAssistantMessage = null;
+  activeAssistantBubble = null;
+  activeAssistantContent = '';
+  allActivityLogEls = [];
+  currentActivityRowEl = null;
+  activityRowsById.clear();
+  activeTermCard = null;
+  termCardsById.clear();
+  lastAssistantMessage = null;
+  // A run-project server or background task/process can still be running
+  // server-side after Clear/a tab switch (those aren't reset here). Drop the
+  // now-stale DOM references so their next update doesn't write into a
+  // detached node — bgTaskEls/bgProcessPanels lazily recreate their card on
+  // the next message; the extension host re-sends runProjectStart right
+  // after 'cleared' if a project is still running, since that card has no
+  // such lazy-recreate path.
+  runProjectCardEl = null;
+  bgTaskEls.clear();
+  bgProcessPanels.clear();
+  if (tokenCounterEl) { tokenCounterEl.textContent = ''; tokenCounterEl.classList.remove('visible'); }
+  if (contextBarFill) { contextBarFill.style.width = '0%'; contextBarFill.className = 'context-bar-fill'; }
+  resetPlanCard();
+  messagesEl.innerHTML = '';
+  messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — re-attach or it never shows again
+  welcomeEl.classList.remove('hidden');
+}
+
+// Latest session list, kept so switchToSessionTab can read a target tab's
+// busy flag immediately at click time rather than waiting for another
+// message — see the comment there for why that timing matters.
+let lastSessionSummaries = [];
+
+// Renders the tab strip from the extension's session list. Rebuilt from
+// scratch on every update (the list is small — a handful of open projects at
+// most — so there's no need for incremental diffing here).
+function renderSessionTabs(sessions) {
+  lastSessionSummaries = sessions;
+  if (!sessionTabsEl) return;
+  sessionTabsEl.innerHTML = '';
+  const multiple = sessions.length > 1;
+  for (const s of sessions) {
+    const tab = document.createElement('div');
+    tab.className = 'session-tab' + (s.id === activeSessionId ? ' active' : '') + (s.busy ? ' busy' : '');
+    tab.setAttribute('role', 'tab');
+    // s.id is an opaque generated identifier, not meaningful to show. Every
+    // visible tab already belongs to the SAME project (shown once, in the
+    // dropdown above) — so the tooltip is just the chat's own name.
+    tab.title = s.name;
+    tab.addEventListener('click', () => switchToSessionTab(s.id));
+
+    const label = document.createElement('span');
+    label.className = 'session-tab-label';
+    label.textContent = s.name;
+    tab.appendChild(label);
+
+    if (s.busy) {
+      const spinner = document.createElement('span');
+      spinner.className = 'session-tab-spinner';
+      spinner.title = 'A turn is running in this tab';
+      tab.appendChild(spinner);
+    }
+
+    if (multiple) {
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'session-tab-close';
+      closeBtn.textContent = '✕';
+      closeBtn.title = 'Close tab';
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); // must not also trigger the tab's own switch-click
+        vscode.postMessage({ type: 'closeSessionTab', sessionId: s.id });
+      });
+      tab.appendChild(closeBtn);
+    }
+    sessionTabsEl.appendChild(tab);
+  }
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'session-tab-add';
+  addBtn.title = 'Start a new chat in this project';
+  addBtn.textContent = '+';
+  addBtn.addEventListener('click', () => vscode.postMessage({ type: 'newSessionTab' }));
+  sessionTabsEl.appendChild(addBtn);
+}
+
+// Single funnel for "the active tab changed" — every site that mutates
+// activeSessionId calls this instead of setting the variable directly, so
+// the accompanying side effects (soft-clearing the old tab's display,
+// syncing busy state) can't be applied inconsistently between call sites
+// the way three independent copies of "set it, then remember to also do X
+// and Y" otherwise drift. `busy` is deliberately optional, not defaulted —
+// whether a caller has a real busy value to sync (and whether it should)
+// genuinely differs per site (see switchToSessionTab's own comment on why
+// double-firing setBusy from two different paths is itself a bug to avoid),
+// so omitting it is a real, intentional per-caller choice, not an oversight.
+function adoptActiveSession(id, { busy } = {}) {
+  activeSessionId = id;
+  resetThreadDisplay();
+  if (busy !== undefined) setBusy(busy);
+}
+
+// Switches the displayed tab. Adopts the target session id IMMEDIATELY, before
+// the extension even responds — any message still in flight tagged with the
+// OLD session is then correctly treated as background from this instant on
+// (see the multi-session gate at the top of the message listener). Soft-clears
+// the visible thread since the incoming sessionLoaded/restore for the new tab
+// is about to fully repopulate it — this just avoids a flash of the old tab's
+// content in between. Busy state is synced from the tab strip's OWN data
+// (already known, from the last sessionList) right here, rather than waiting
+// for a fresh sessionList to arrive — the sessionList handler only re-syncs
+// busy state when the active id changes WITHOUT this function having run
+// (e.g. the tab you were viewing got closed out from under you), so relying
+// on it here too would double-fire setBusy on every ordinary click.
+function switchToSessionTab(sessionId) {
+  if (!sessionId || sessionId === activeSessionId) return;
+  const target = lastSessionSummaries.find(s => s.id === sessionId);
+  adoptActiveSession(sessionId, { busy: Boolean(target?.busy) });
+  vscode.postMessage({ type: 'switchSessionTab', sessionId });
+}
+
 // Streaming render state. Formatted markdown is rendered live, but the parse +
 // DOM write is throttled to at most once per MD_RENDER_THROTTLE_MS regardless
 // of how many chunks arrive in between — a growing response otherwise means
@@ -2165,10 +2476,18 @@ function nextRenderDelay() {
 function sealCurrentBubble() {
   if (!activeAssistantBubble || _needNewBubble) return;
   const segment = activeAssistantContent.slice(_segmentStart);
-  if (!segment.trim()) return;   // nothing written yet — keep using this bubble
-  const html = renderMarkdown(segment);
-  activeAssistantBubble.innerHTML = html;
-  if (html) attachCodeBlockActions(activeAssistantBubble);
+  if (segment.trim()) {
+    const html = renderMarkdown(segment);
+    activeAssistantBubble.innerHTML = html;
+    if (html) attachCodeBlockActions(activeAssistantBubble);
+  }
+  // Marked even when this bubble is still EMPTY. Whatever the caller is about
+  // to append lands after it, so text arriving later has to start a new bubble
+  // BELOW that — otherwise it flows back into this one, which sits above, and
+  // a turn whose very first action was a tool call renders its explanation
+  // above the work it is explaining. Returning early on an empty segment (the
+  // previous behaviour) is exactly how that happened. A leftover empty bubble
+  // is invisible: see `.message-bubble:empty` in styles.css.
   _needNewBubble = true;
   _streamPre = null;
 }
@@ -2196,6 +2515,10 @@ function appendAssistantText(text) {
     _segmentStart = activeAssistantContent.length;   // before this text is added
     _needNewBubble = false;
     _streamPre = null;
+    // If MORE tool activity starts after this, it needs a fresh log of its
+    // own (positioned after THIS bubble) rather than resuming the old one —
+    // see getOrCreateActivityLog/allActivityLogEls.
+    _needNewActivityLog = true;
   }
 
   activeAssistantContent += text;
@@ -2322,6 +2645,97 @@ function addSystemMessage(text) {
   el.textContent = text;
   messagesEl.appendChild(el);
   scrollToBottom();
+}
+
+// Renders the running session-cumulative token count (and $ cost estimate,
+// when the model/provider is recognized) into the token counter — shared by
+// the 'tokenCount' (live, during a turn) and 'sessionLoaded' (restoring a
+// chat or switching tabs) handlers so both paths render identically.
+// estimatedCost is null when the model isn't in Navy's pricing table (never
+// shown as $0 — that would misreport an unknown cost as a known free one);
+// costKnown is false when SOME but not all of the session's turns priced
+// successfully, so the total is a floor, not the full picture.
+// Context windows are quoted in two different conventions: binary for local
+// models (131,072 is universally written "128k") and decimal for hosted APIs
+// (Claude's 200,000 is written "200k", not "195k"). A round DECIMAL value is
+// the reliable signal, so it's tested first — testing divisibility by 1024
+// first gets 128,000 wrong, since that is exactly 125 × 1024 and would print
+// as "125k" despite being quoted everywhere as 128K.
+function formatContextWindow(n) {
+  if (n >= 1000000) {
+    return (n % 1000000 === 0 ? n / 1000000 : +(n / 1048576).toFixed(1)) + 'M ctx';
+  }
+  return (n % 1000 === 0 ? n / 1000 : Math.round(n / 1024)) + 'k ctx';
+}
+
+// Rebuilds the context-window picker for whichever model is now active. The
+// options come from the extension (derived from what that model actually
+// reports), never from a list hardcoded here — an 8k model must not be offered
+// 128k, and a 1M model must not be capped at whatever a frontend constant
+// happened to stop at.
+//
+// The first entry is "Max", value 0, which is deliberately NOT the same as
+// picking the maximum explicitly: 0 means "track the model", so switching
+// models moves with it, whereas an explicit size stays put until changed.
+function renderContextWindowSelect(info) {
+  if (!contextSelect) return;
+  if (!info.max) {
+    // Unknown for this model — hide rather than offer sizes that may not exist.
+    contextSelect.innerHTML = '';
+    contextSelect.style.display = 'none';
+    return;
+  }
+  contextSelect.style.display = '';
+  contextSelect.innerHTML = '';
+
+  const maxOption = document.createElement('option');
+  maxOption.value = '0';
+  maxOption.textContent = 'Max · ' + formatContextWindow(info.max);
+  contextSelect.appendChild(maxOption);
+
+  for (const size of info.options || []) {
+    if (size >= info.max) continue; // already covered by "Max" above
+    const option = document.createElement('option');
+    option.value = String(size);
+    option.textContent = formatContextWindow(size);
+    contextSelect.appendChild(option);
+  }
+
+  // `current` equals max both when "Max" is selected and when the largest size
+  // was picked explicitly — so the stored preference decides which is shown,
+  // not the resolved number.
+  contextSelect.value = (info.current && info.current < info.max) ? String(info.current) : '0';
+
+  contextSelect.title = 'Context window: ' + info.current.toLocaleString() + ' tokens'
+    + (info.live
+      ? '\nMaximum reported by the provider for this model.'
+      : '\nMaximum is approximate — this provider does not report it, so it comes from Navy\'s known-model list.')
+    + (info.adjustable
+      ? '\nSent to Ollama as num_ctx — a smaller window reserves less memory.'
+      : '\nFixed by the provider; a smaller value here only makes Navy treat the chat as full sooner.');
+}
+
+function renderTokenCounter(sessionTotal, sessionPrompt, sessionCompletion, estimatedCost, costKnown) {
+  if (!tokenCounterEl) return;
+  if (!sessionTotal) {
+    tokenCounterEl.textContent = '';
+    tokenCounterEl.classList.remove('visible');
+    return;
+  }
+  let text = sessionTotal.toLocaleString() + ' tok';
+  let title = `Session total: ${(sessionPrompt || 0).toLocaleString()} prompt + ${(sessionCompletion || 0).toLocaleString()} completion tokens`;
+  if (typeof estimatedCost === 'number') {
+    const shown = estimatedCost > 0 && estimatedCost < 0.01 ? estimatedCost.toFixed(4) : estimatedCost.toFixed(2);
+    text += ' · ≈$' + shown + (costKnown ? '' : '+');
+    title += `\nEstimated cost: ≈$${estimatedCost.toFixed(4)}`
+      + (costKnown ? '' : ' or more — part of this session used a model with no known pricing')
+      + '\nBased on published list pricing, not a live rate — verify against your provider for exact billing.';
+  } else {
+    title += '\nCost estimate unavailable for this model.';
+  }
+  tokenCounterEl.textContent = text;
+  tokenCounterEl.title = title;
+  tokenCounterEl.classList.add('visible');
 }
 
 function updateMemoryBadge(memoryContent) {
@@ -2710,6 +3124,19 @@ function renderCodeBlock(language, path, code) {
   </div>`;
 }
 
+// What the copy button should actually put on the clipboard. rawMd is the
+// model's untouched output, which still contains its <think> blocks — the UI
+// goes to some trouble to keep reasoning behind a collapsed dropdown, and then
+// copying handed you the raw tags and everything in them. Exported reasoning
+// belongs to the export/expand paths, not to "copy this reply". Pure.
+function copyableReply(raw) {
+  return String(raw || '')
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
+    .replace(/<think(?:ing)?>[\s\S]*$/i, '') // an unterminated block (stopped mid-reasoning)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function escapeHtml(text) {
   return text
     .replace(/&/g, '&amp;')
@@ -2784,7 +3211,41 @@ const WHEEL_SVG = `<svg class="spin-wheel" viewBox="0 0 24 24" width="14" height
   </g>
 </svg>`;
 
-let activityLogEl = null;
+// EVERY activity-log segment created so far this turn, in order — a turn
+// with tool calls in more than one place (text → tools → text → tools →
+// text, not just a single text/tools/text split) needs each batch of tool
+// activity in its OWN log positioned right where it actually happened, not
+// all merged into whichever one was created first. The CURRENT (most
+// recent) one is always derived via currentActivityLog() below rather than
+// tracked in a second variable — a past version kept both an
+// `activityLogEl` variable AND this array in sync by hand at every read/
+// write site, which is exactly the kind of thing a future edit forgets one
+// half of (this file's own resetThreadDisplay() had already drifted that
+// way once). collapseToolProgress/removeToolProgress finalize/remove every
+// segment, not just the current one.
+let allActivityLogEls = [];
+
+function currentActivityLog() {
+  return allActivityLogEls.length ? allActivityLogEls[allActivityLogEls.length - 1] : null;
+}
+
+// Removes the CURRENT (most recent) segment entirely — used when it turns
+// out to be empty (only ever held the "Thinking" placeholder, which just
+// got removed) so it doesn't sit there as an empty bordered box.
+function removeCurrentActivityLog() {
+  const log = currentActivityLog();
+  if (!log) return;
+  log.remove();
+  allActivityLogEls.pop();
+}
+// Set whenever a fresh text bubble opens after a batch of tool activity
+// (see appendAssistantText) — tells the NEXT tool call to start a fresh log
+// of its own instead of silently resuming the old one, which would leave it
+// stuck at its original DOM position while everything after piles into a
+// single bubble whose <think> blocks then render out of chronological order
+// (the exact bug this exists to prevent: a second round of reasoning midway
+// through a turn rendering as if it happened at the very start).
+let _needNewActivityLog = false;
 let currentActivityRowEl = null;
 // Rows keyed by the extension host's per-call id — needed because a toolResult
 // doesn't always arrive right after its own toolCall: parallel read-only calls
@@ -2793,40 +3254,63 @@ let currentActivityRowEl = null;
 // tell those results apart from whatever OTHER call happened to run last.
 const activityRowsById = new Map();
 
+// Places a card produced BY THE CURRENT TURN — a terminal card, a diff, a
+// command approval, the run-project card — at the point in the transcript where
+// it actually happened.
+//
+// Every one of these used to be appended straight to `messagesEl`, i.e. as a
+// SIBLING after the assistant message. Text and activity logs, meanwhile, are
+// appended INTO that message. Since the message element was created first,
+// anything the model wrote or did after a card rendered ABOVE it: run a
+// command, explain the result, and the explanation appeared over the terminal
+// card. This is the same ordering fault sealCurrentBubble/allActivityLogEls
+// were introduced to fix for activity logs — it just never got applied to the
+// cards, which is why one shared helper does it for all of them now.
+//
+// Sealing has two effects, both required: the current bubble is finalised so
+// following prose opens a NEW bubble below the card, and the next batch of tool
+// activity is forced into a fresh log below it as well.
+function appendTurnCard(el) {
+  sealCurrentBubble();
+  _needNewActivityLog = true;
+  (activeAssistantMessage || messagesEl).appendChild(el);
+  updateWelcome();
+  return el;
+}
+
 function getOrCreateActivityLog() {
-  if (!activityLogEl) {
+  if (!currentActivityLog() || _needNewActivityLog) {
     // Close off whatever the model has said so far, so this activity lands
     // BELOW it and anything written afterwards lands below the activity.
     sealCurrentBubble();
-    activityLogEl = document.createElement('div');
-    activityLogEl.className = 'activity-log';
+    const log = document.createElement('div');
+    log.className = 'activity-log';
     // Attach inside the active assistant message so it's visually grouped with
     // the response it belongs to, not floating between turns in the stream.
     const parent = activeAssistantMessage || messagesEl;
-    parent.appendChild(activityLogEl);
+    parent.appendChild(log);
+    allActivityLogEls.push(log);
+    currentActivityRowEl = null;
+    _needNewActivityLog = false;
   }
-  return activityLogEl;
+  return currentActivityLog();
 }
 
 function removeToolProgress() {
-  if (activityLogEl) { activityLogEl.remove(); activityLogEl = null; }
+  for (const el of allActivityLogEls) el.remove();
+  allActivityLogEls = [];
   currentActivityRowEl = null;
   activityRowsById.clear();
 }
 
-function collapseToolProgress() {
-  if (!activityLogEl) { currentActivityRowEl = null; activityRowsById.clear(); return; }
-  // Remove any leftover "Thinking" placeholder
-  activityLogEl.querySelector('.thinking-row')?.remove();
-  const rows = activityLogEl.querySelectorAll('.activity-row');
-  if (rows.length === 0) {
-    activityLogEl.remove();
-    activityLogEl = null;
-    currentActivityRowEl = null;
-    activityRowsById.clear();
-    return;
-  }
-  const errors = activityLogEl.querySelectorAll('.is-error').length;
+// Collapses ONE activity-log segment's rows into a "✓ N steps — verb, verb…"
+// summary, in place. Shared by collapseToolProgress across however many
+// segments the turn actually produced (see allActivityLogEls above).
+function collapseOneActivityLog(log) {
+  log.querySelector('.thinking-row')?.remove(); // leftover "Thinking" placeholder, if any
+  const rows = log.querySelectorAll('.activity-row');
+  if (rows.length === 0) { log.remove(); return; }
+  const errors = log.querySelectorAll('.is-error').length;
   const count = rows.length;
   const verbs = [...rows].slice(0, 4).map(r => r.querySelector('.act-verb')?.textContent || '').filter(Boolean);
   const verbStr = verbs.join(', ') + (count > 4 ? ` +${count - 4}` : '');
@@ -2840,9 +3324,16 @@ function collapseToolProgress() {
     (verbStr ? ` — ${escapeHtml(verbStr)}` : '');
   details.appendChild(summary);
   [...rows].forEach(r => details.appendChild(r));
-  activityLogEl.innerHTML = '';
-  activityLogEl.appendChild(details);
-  activityLogEl = null;
+  log.innerHTML = '';
+  log.appendChild(details);
+}
+
+function collapseToolProgress() {
+  // Every segment the turn produced — not just the current/latest one — so a
+  // turn with tool activity in more than one place ends with each batch
+  // collapsed in place, not just the last.
+  for (const log of allActivityLogEls) collapseOneActivityLog(log);
+  allActivityLogEls = [];
   currentActivityRowEl = null;
   activityRowsById.clear();
 }
@@ -2917,8 +3408,8 @@ function buildResultPreview(tool, result) {
 
 function addToolCallCard(tool, args, callId) {
   // Remove the "Thinking" placeholder row when a real tool call arrives.
-  if (tool !== '__thinking__' && activityLogEl) {
-    const placeholder = activityLogEl.querySelector('.thinking-row');
+  if (tool !== '__thinking__') {
+    const placeholder = currentActivityLog()?.querySelector('.thinking-row');
     if (placeholder) placeholder.remove();
   }
 
@@ -2945,6 +3436,7 @@ function addToolCallCard(tool, args, callId) {
       : '') +
     `<span class="act-result"></span>`;
 
+  row.dataset.tool = tool; // lets a result with no id find its own row — see below
   log.appendChild(row);
   currentActivityRowEl = row;
   if (callId) activityRowsById.set(callId, row);
@@ -2952,7 +3444,22 @@ function addToolCallCard(tool, args, callId) {
 }
 
 function addToolResultCard(tool, result, callId) {
-  const row = (callId && activityRowsById.get(callId)) || currentActivityRowEl;
+  // With an id this is exact. Without one (the XML fallback path small models
+  // use), falling straight back to currentActivityRowEl picked whichever row
+  // was created LAST — wrong whenever read-only tools ran in parallel, since
+  // several are in flight and they finish out of order. Preferring the oldest
+  // STILL-RUNNING row for the same tool matches results to calls correctly for
+  // the common case of several different tools running at once.
+  let row = callId ? activityRowsById.get(callId) : null;
+  if (!row) {
+    // Matched by walking the rows rather than with a selector: a tool name goes
+    // into the attribute unescaped, and CSS.escape is not available in every
+    // environment this file runs in.
+    const log = currentActivityLog();
+    row = [...(log?.querySelectorAll('.activity-row.running') || [])].find(r => r.dataset.tool === tool)
+      || (currentActivityRowEl?.classList.contains('running') ? currentActivityRowEl : null)
+      || currentActivityRowEl;
+  }
   if (!row) return;
   if (callId) activityRowsById.delete(callId);
 
@@ -2975,14 +3482,32 @@ function addToolResultCard(tool, result, callId) {
 // One card per run_command / run_tests call: IN = the command, OUT = live output.
 // Long output collapses behind a "Click to expand" toggle when the command ends.
 
+// Terminal cards keyed by the tool call that owns them, so two commands in
+// flight at once (a background task runs its own agent loop alongside the main
+// turn) can't write into each other's card. `activeTermCard` remains as the
+// fallback for output that arrives with no id at all.
+const termCardsById = new Map();
 let activeTermCard = null;
 
-function createTermCard(tool, commandText) {
+function termCardFor(streamId) {
+  if (streamId && termCardsById.has(streamId)) return termCardsById.get(streamId);
+  // A KNOWN id that matches no card belongs to something this view isn't
+  // showing (a background task's command) — deliberately NOT routed to
+  // whatever card is current, which is exactly the mix-up this fixes. The
+  // caller falls back to the shell panel.
+  if (streamId) return null;
+  return activeTermCard;
+}
+
+function createTermCard(tool, commandText, streamId) {
   // Terminal cards bypass addToolCallCard, which normally clears the "Thinking"
   // placeholder — clear it here too or it spins forever above the card.
-  if (activityLogEl) {
-    activityLogEl.querySelector('.thinking-row')?.remove();
-    if (!activityLogEl.children.length) { activityLogEl.remove(); activityLogEl = null; }
+  {
+    const log = currentActivityLog();
+    if (log) {
+      log.querySelector('.thinking-row')?.remove();
+      if (!log.children.length) removeCurrentActivityLog();
+    }
   }
   const card = document.createElement('div');
   card.className = 'term-card';
@@ -2997,20 +3522,39 @@ function createTermCard(tool, commandText) {
       <pre class="term-out"></pre>
     </div>`;
   card.querySelector('.term-in').textContent = commandText;
-  messagesEl.appendChild(card);
-  activeTermCard = {
+  appendTurnCard(card);
+  const refs = {
     el: card,
     outEl: card.querySelector('.term-out'),
     outRow: card.querySelector('.term-out-row'),
     statusEl: card.querySelector('.term-status'),
     tool,
+    streamId,
   };
+  activeTermCard = refs;
+  if (streamId) termCardsById.set(streamId, refs);
+
+  // Command output is frequently the thing you most want to paste into an
+  // issue, and it was the one block in the transcript with no way to copy it.
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'term-copy-btn';
+  copyBtn.title = 'Copy command and output';
+  copyBtn.textContent = '⧉';
+  copyBtn.addEventListener('click', () => {
+    const body = refs.outEl.textContent || '';
+    vscode.postMessage({ type: 'copy', text: '$ ' + commandText + (body ? '\n' + body : '') });
+    copyBtn.textContent = '✓';
+    setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
+  });
+  card.querySelector('.term-in-row').appendChild(copyBtn);
+
   updateWelcome();
   scrollToBottom();
 }
 
-function appendTermOutput(chunk, isStderr) {
-  const t = activeTermCard;
+function appendTermOutput(chunk, isStderr, streamId) {
+  const t = termCardFor(streamId);
   if (!t) return false;
   t.outRow.style.display = '';
   if (isStderr) {
@@ -3021,17 +3565,24 @@ function appendTermOutput(chunk, isStderr) {
   } else {
     t.outEl.appendChild(document.createTextNode(chunk));
   }
-  if (t.outEl.textContent.length > 30000) {
-    t.outEl.textContent = t.outEl.textContent.slice(-30000);
+  // Drop whole leading nodes rather than reassigning textContent. Reassigning
+  // flattens the element to a single text node, which silently destroyed the
+  // .term-stderr spans — every previously-red line turned into ordinary output
+  // the moment a command crossed the cap.
+  let total = t.outEl.textContent.length;
+  while (total > 30000 && t.outEl.firstChild) {
+    total -= (t.outEl.firstChild.textContent || '').length;
+    t.outEl.removeChild(t.outEl.firstChild);
   }
   t.outEl.scrollTop = t.outEl.scrollHeight;
   return true;
 }
 
-function finalizeTermCard(result) {
-  const t = activeTermCard;
+function finalizeTermCard(result, streamId) {
+  const t = termCardFor(streamId);
   if (!t) return;
-  activeTermCard = null;
+  if (t.streamId) termCardsById.delete(t.streamId);
+  if (activeTermCard === t) activeTermCard = null;
   const r = String(result || '');
   let label = 'done', cls = 'ok';
   const exitM = r.match(/^Exit code: (\d+)/);
@@ -3090,12 +3641,18 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
 
   header.innerHTML = `
     <div class="diff-file-info">
-      <span class="diff-filename" title="${escapeHtml(filePath)}">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px;margin-right:5px;opacity:0.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>${escapeHtml(fname)}</span>
+      <button type="button" class="diff-filename diff-open-btn" title="Open ${escapeHtml(filePath)} in the editor">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px;margin-right:5px;opacity:0.8"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>${escapeHtml(fname)}</button>
       ${fdir ? `<span class="diff-filepath">${escapeHtml(fdir)}</span>` : ''}
       ${badgeHtml}
     </div>
     <span class="diff-status">Review required</span>`;
+  // The card renders at most MAX_ROWS and then tells you to use the editor —
+  // advice that was previously unreachable, since nothing in the card opened
+  // anything. The filename is now the way there.
+  header.querySelector('.diff-open-btn')?.addEventListener('click', () => {
+    vscode.postMessage({ type: 'openDiffFile', path: filePath });
+  });
   card.appendChild(header);
 
   // Action buttons come BEFORE the diff body so they are always visible at the top.
@@ -3134,10 +3691,15 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   // body, so a genuine edit showed a card with no changes in it.
   card.dataset.changeCount = String(added + removed);
 
-  messagesEl.appendChild(card);
+  appendTurnCard(card);
   // No smooth scrollIntoView here — it fights the instant streaming scroll and
   // causes visible rubber-banding. One rAF-pinned scroll keeps motion consistent.
-  userScrolledUp = false;
+  //
+  // Deliberately does NOT reset userScrolledUp: this was the only place that
+  // overrode a deliberate scroll, yanking you to the bottom while you were
+  // reading back through the very context you needed in order to judge the
+  // edit. The pending-approval count in the approval queue is what surfaces a
+  // card you scrolled past.
   scrollToBottom();
 }
 
@@ -3181,37 +3743,94 @@ function addPendingCommandCard(id, command) {
   body.textContent = command;
   card.appendChild(body);
 
-  messagesEl.appendChild(card);
+  appendTurnCard(card);
   userScrolledUp = false;
   scrollToBottom();
 }
 
-// ── LCS-based unified diff ────────────────────────────────────────────────────
+// ── Myers-diff-based unified diff ─────────────────────────────────────────────
 
-function computeLCS(a, b) {
-  const m = a.length, n = b.length;
-  // For large files, cap context to avoid O(mn) freeze.
-  if (m * n > 400000) return null;
-  const dp = new Uint32Array((m + 1) * (n + 1));
-  const W = n + 1;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i * W + j] = a[i-1] === b[j-1]
-        ? dp[(i-1) * W + (j-1)] + 1
-        : Math.max(dp[(i-1) * W + j], dp[i * W + (j-1)]);
+// Myers' O(ND) diff algorithm: finds the shortest edit script (SES) between
+// two line arrays. Replaces an O(n*m) DP table that had to bail out above a
+// hard product cap (~633 lines either side) REGARDLESS of how similar the
+// two versions actually were — so any edit to a larger file, even a single
+// changed line, fell back to a cruder view. Cost here scales with D — the
+// number of ACTUAL differences — not with file size: a 5000-line file with
+// one changed line stays fast and exact, because the search terminates the
+// moment it finds the (tiny) shortest edit script, never touching most of
+// the file. D_LIMIT is scaled inversely with file size so the worst-case
+// total work (size × D_LIMIT) — the pathological case of a huge file that's
+// also almost entirely rewritten, where line alignment stops being useful
+// context anyway — stays bounded regardless of input size, matching (and
+// improving on) the old implementation's bounded-but-fixed cost. Same
+// contract as its predecessor: returns null when it bails, and the caller's
+// existing context-window fallback handles that rare case unchanged.
+// The furthest-reaching path per diagonal k lives in ONE Int32Array indexed by
+// k + OFF, rather than a plain object keyed by a (frequently negative) integer.
+// Objects with negative-integer keys deoptimise straight to dictionary mode, so
+// the hot inner loop was doing hash lookups; and the per-round `{ ...v }` copy
+// the previous version needed made the whole search O(D²) in object
+// allocations. The array is written in place instead: within round d only
+// diagonals of parity d are written, while every read is of parity d-1, so
+// nothing read this round can have been clobbered this round — the copy was
+// never load-bearing.
+//
+// `trace[d]` still snapshots the state entering round d, since backtracking
+// needs it, but stores only the live band (k ∈ [-d-1, d+1]) as a compact
+// Int32Array — D² ints in total rather than D² object properties.
+function computeMyersDiff(a, b) {
+  const n = a.length, m = b.length;
+  if (n === 0 && m === 0) return [];
+  const total = n + m;
+  const D_LIMIT = Math.min(total, Math.max(200, Math.floor(2000000 / Math.max(total, 1))));
+
+  const OFF = D_LIMIT + 2;                     // k = -D_LIMIT-1 … D_LIMIT+1 all land in bounds
+  const v = new Int32Array(2 * D_LIMIT + 5);
+  v[OFF + 1] = 0;                              // seed: the virtual k=1 predecessor of round 0
+  const trace = [];
+  const bandAt = (d, k) => trace[d][k + d + 1]; // trace[d] covers k ∈ [-d-1, d+1]
+
+  let foundD = -1;
+  for (let d = 0; d <= D_LIMIT; d++) {
+    trace.push(v.slice(OFF - d - 1, OFF + d + 2));
+    for (let k = -d; k <= d; k += 2) {
+      let x;
+      if (k === -d || (k !== d && v[OFF + k - 1] < v[OFF + k + 1])) {
+        x = v[OFF + k + 1];
+      } else {
+        x = v[OFF + k - 1] + 1;
+      }
+      let y = x - k;
+      while (x < n && y < m && a[x] === b[y]) { x++; y++; }
+      v[OFF + k] = x;
+      if (x >= n && y >= m) { foundD = d; break; }
     }
+    if (foundD !== -1) break;
   }
-  // Backtrack
+  if (foundD === -1) return null; // genuinely very different — caller falls back
+
+  // Backtrack through the trace to reconstruct the edit script.
   const ops = [];
-  let i = m, j = n;
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && a[i-1] === b[j-1]) {
-      ops.push({ t: '=', line: a[i-1], ol: i, nl: j }); i--; j--;
-    } else if (j > 0 && (i === 0 || dp[i * W + (j-1)] >= dp[(i-1) * W + j])) {
-      ops.push({ t: '+', line: b[j-1], nl: j }); j--;
-    } else {
-      ops.push({ t: '-', line: a[i-1], ol: i }); i--;
+  let x = n, y = m;
+  for (let d = foundD; d > 0; d--) {
+    const k = x - y;
+    const prevK = (k === -d || (k !== d && bandAt(d, k - 1) < bandAt(d, k + 1))) ? k + 1 : k - 1;
+    const prevX = bandAt(d, prevK);
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) {
+      ops.push({ t: '=', line: a[x - 1], ol: x, nl: y });
+      x--; y--;
     }
+    if (x === prevX) {
+      ops.push({ t: '+', line: b[y - 1], nl: y });
+    } else {
+      ops.push({ t: '-', line: a[x - 1], ol: x });
+    }
+    x = prevX; y = prevY;
+  }
+  while (x > 0 && y > 0) {
+    ops.push({ t: '=', line: a[x - 1], ol: x, nl: y });
+    x--; y--;
   }
   return ops.reverse();
 }
@@ -3221,10 +3840,11 @@ function renderDiff(oldText, newText) {
   const MAX_ROWS = 400; // cap DOM rows so huge files can't freeze the sidebar
   const oldLines = oldText.split('\n');
   const newLines = newText.split('\n');
-  const ops = computeLCS(oldLines, newLines);
+  const ops = computeMyersDiff(oldLines, newLines);
 
-  // Fall back to simple sequential diff for very large files (computeLCS bails
-  // above ~633 lines, so this path is common, not exotic).
+  // Fall back to simple sequential diff only for the rare case of two huge,
+  // almost entirely rewritten files (see computeMyersDiff's D_LIMIT) — no
+  // longer common, since file size alone no longer forces this path.
   if (!ops) {
     const max = Math.max(oldLines.length, newLines.length);
     // Mark changed lines first, then show only those ± CONTEXT — same as the LCS

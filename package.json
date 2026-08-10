@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -199,6 +199,25 @@
           "default": true,
           "description": "Show 'Ask Navy' code lens buttons above functions in the editor."
         },
+        "navy.sandboxMode": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "off",
+            "docker"
+          ],
+          "enumDescriptions": [
+            "Commands run directly on your machine (current behavior)",
+            "Commands run inside a Docker container built from the project's own .devcontainer/Dockerfile, with only the project folder mounted"
+          ],
+          "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a Docker container instead of running them directly on your machine. Requires Docker to be installed and running, and the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` — Navy refuses to guess at a generic image, since a container that doesn't actually match the project's real toolchain would be a false sense of safety. This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\n**macOS and Linux hosts only in this release.** On a Windows host, Navy builds commands in cmd.exe dialect and runs them through `cmd /c`, which does not exist inside a Linux container — so sandboxed commands fail. Leave this `off` on Windows."
+        },
+        "navy.contextWindow": {
+          "type": "number",
+          "default": 0,
+          "markdownDescription": "Context window to use, in tokens. `0` (the default) means **Max** — whatever the current model actually reports, so it follows the model automatically instead of being pinned to a number that stops being right the moment you switch. Pick a smaller size from the dropdown next to the model picker when the maximum is more than you want: for Ollama this is sent as `num_ctx` and directly controls how much memory the KV cache reserves, so lowering it is the fix if a large-window local model loads slowly or offloads to CPU. For hosted providers the window is fixed by the API and can't be changed from here — a smaller value there only tells Navy to treat the conversation as full sooner. Always clamped to what the model actually supports.",
+          "minimum": 0
+        },
         "navy.mcpServers": {
           "type": "object",
           "default": {},
@@ -206,13 +225,66 @@
           "additionalProperties": {
             "type": "object",
             "properties": {
-              "command": { "type": "string", "description": "Executable to launch a local (stdio) MCP server." },
-              "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for a local server." },
-              "env": { "type": "object", "description": "Extra environment variables for a local server." },
-              "url": { "type": "string", "description": "Endpoint URL for a remote (streamable HTTP) MCP server. Use this instead of command/args/env." },
-              "headers": { "type": "object", "description": "Extra HTTP headers for a remote server (e.g. Authorization)." }
+              "command": {
+                "type": "string",
+                "description": "Executable to launch a local (stdio) MCP server."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for a local server."
+              },
+              "env": {
+                "type": "object",
+                "description": "Extra environment variables for a local server."
+              },
+              "url": {
+                "type": "string",
+                "description": "Endpoint URL for a remote (streamable HTTP) MCP server. Use this instead of command/args/env."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Extra HTTP headers for a remote server (e.g. Authorization)."
+              }
             }
           }
+        },
+        "navy.providerFallbacks": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Backup providers to try, in order, if the primary provider (`navy.provider`/`navy.model`) fails with a rate limit, a server outage, or a network error — never for an API-key/auth problem, a quota/billing limit, or a conversation too large for the model, since those need YOU to fix something rather than a different account to silently pay for. Empty by default — opt-in only. Each entry needs its own API key already saved (the key icon next to the model picker) for its provider; Navy always says plainly in the chat when a fallback actually runs, including which provider handled the request, so you're never surprised by what ran or which account it billed. Example: `[{ \"provider\": \"anthropic\", \"model\": \"claude-sonnet-5\" }, { \"provider\": \"ollama\", \"model\": \"llama3\", \"host\": \"http://localhost:11434\" }]`.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string",
+                "description": "Provider id — same values as navy.provider (ollama, anthropic, openai, gemini, deepseek, xai, zai, groq, openrouter, lmstudio, custom)."
+              },
+              "model": {
+                "type": "string",
+                "description": "Model to use with this fallback provider."
+              },
+              "apiBase": {
+                "type": "string",
+                "description": "Optional API base override for this fallback (same meaning as navy.apiBase)."
+              },
+              "host": {
+                "type": "string",
+                "description": "Optional inference server URL, only used when provider is \"ollama\" or \"lmstudio\" (same meaning as navy.host)."
+              }
+            },
+            "required": [
+              "provider",
+              "model"
+            ]
+          }
+        },
+        "navy.persistBackgroundProcesses": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Let `run_project`/`start_process` background processes survive closing or reloading this window instead of being stopped when it does. Off by default — with this off, nothing changes. When on, those processes are simply never told to stop, and their output is written to a log file under `.navy/bg-logs/` instead of streamed live to the chat, since there is no longer anything on this end reading it once the window that started them is gone (`read_process_output` reads the log file's current contents either way). Reopening a project that still has one of these running offers to stop it, so a background process you forgot about doesn't run forever unnoticed."
         }
       }
     },
@@ -358,7 +430,7 @@
     "check": "node --check src/extension.js",
     "vscode:prepublish": "npm run build",
     "package": "vsce package",
-    "test": "node test/run.js",
+    "test": "node test/run.js && node test/webview-run.js",
     "eval": "node eval/run.js",
     "eval:selftest": "node eval/selftest.js"
   },

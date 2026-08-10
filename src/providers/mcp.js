@@ -9,6 +9,10 @@
 //   { "windbg": { "command": "pwsh.exe", "args": ["-File", "server.ps1"], "env": {} } }
 
 const { spawn } = require('child_process');
+// Single source of truth for the MCP clientInfo version — previously hardcoded
+// separately in each transport's initialize() call, and both copies had
+// drifted from the actual extension version (and from each other).
+const { version: EXTENSION_VERSION } = require('../../package.json');
 
 const PROTOCOL_VERSION = '2024-11-05';
 const CALL_TIMEOUT_MS = 60_000;
@@ -69,7 +73,7 @@ class McpServerConnection {
     await this._request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'navy-coder', version: '0.2.3' },
+      clientInfo: { name: 'navy-coder', version: EXTENSION_VERSION },
     }, INIT_TIMEOUT_MS);
     this._notify('notifications/initialized', {});
     const res = await this._request('tools/list', {}, INIT_TIMEOUT_MS);
@@ -155,7 +159,7 @@ class McpHttpConnection {
   async start() {
     if (!this.url) throw new Error('mcpServers.' + this.name + ' is missing "url"');
     await this._send({ jsonrpc: '2.0', id: this._nextId++, method: 'initialize',
-      params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'navy-coder', version: '0.2.4' } } },
+      params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'navy-coder', version: EXTENSION_VERSION } } },
       INIT_TIMEOUT_MS, true);
     await this._send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, INIT_TIMEOUT_MS, false);
     const listResult = await this._send({ jsonrpc: '2.0', id: this._nextId++, method: 'tools/list', params: {} }, INIT_TIMEOUT_MS, true);

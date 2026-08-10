@@ -52,12 +52,21 @@ async function fetchWithRetry(url, init) {
   // { function: { name, arguments } } objects from the model's native tool-calling API.
   // If the model does not support native tool calling, nativeToolCalls is empty and the
   // caller should fall back to parseToolCalls(text).
-  async function streamAssistant(provider, host, model, messages, temperature, signal = null, onChunk = null) {
+  // `override`, when given, is { aiProvider, apiBase } — used by
+  // _streamWithFallback to run this call against a DIFFERENT configured
+  // provider than navy.provider/navy.apiBase, without ever touching those
+  // global settings (which would leak into every other concurrent turn/tab
+  // reading the same config while the override was "in effect"). `model`
+  // stays a normal top-level argument — the caller already passes the
+  // fallback's own model there, same as any other call.
+  async function streamAssistant(provider, host, model, messages, temperature, signal = null, onChunk = null, override = null) {
     const config = vscode.workspace.getConfiguration('navy');
-    const aiProvider = config.get('provider', 'ollama');
+    // aiProvider drives the secrets lookup key below, so overriding it here
+    // is sufficient — no separate branch needed for the apiKey fetch itself.
+    const aiProvider = override?.aiProvider || config.get('provider', 'ollama');
     const apiKey = await provider.context.secrets.get('navy.apiKey.' + aiProvider)
                 || await provider.context.secrets.get('navy.apiKey') || '';
-    const apiBase = config.get('apiBase', '');
+    const apiBase = override ? (override.apiBase || '') : config.get('apiBase', '');
 
     // Built-in tools plus any live MCP server tools (dynamic per request, so
     // connecting/disconnecting a server needs no reload).
