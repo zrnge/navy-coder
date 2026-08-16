@@ -7,7 +7,7 @@
 // (Groq, xAI, …) just fails the fetch — callers must treat that as "semantic
 // search unavailable" and fall back to keyword search, never as a hard error.
 
-const { openAiCompatBase } = require('./endpoints.js');
+const { openAiCompatBase, ollamaAuthHeaders } = require('./endpoints.js');
 
 // texts → vectors, same order as input. Throws on any failure; callers decide
 // the fallback (this module never silently returns wrong/partial data).
@@ -15,10 +15,13 @@ async function getEmbeddings(provider, model, texts, { apiBase, host, apiKey, si
   if (!texts.length) return [];
 
   if (provider === 'ollama') {
+    // `host` is already resolved by the caller (ollama.com in cloud mode —
+    // see _ollamaBase), so this only normalizes a trailing slash. The bearer
+    // token is what cloud needs; a local server ignores it.
     const base = (host || 'http://localhost:11434').replace(/\/$/, '');
     const res = await fetch(base + '/api/embed', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...ollamaAuthHeaders(apiKey) },
       body: JSON.stringify({ model, input: texts }),
       signal,
     });

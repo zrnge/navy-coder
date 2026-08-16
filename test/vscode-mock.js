@@ -89,6 +89,7 @@ function createVscodeMock() {
   // real settings system has (a root saved in one project must not leak into
   // another). ctrl.scoped[key] = { workspaceValue, globalValue }.
   ctrl.scoped = {};
+  ctrl.watchers = []; // every createFileSystemWatcher call, for the cache-invalidation tests
   const configApi = {
     get: (k, d) => (k in ctrl.config ? ctrl.config[k] : d),
     update: async (k, v, target) => {
@@ -133,6 +134,21 @@ function createVscodeMock() {
         return true;
       },
       onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+      // Records the handlers so a test can fire a file event the way the editor
+      // would, and records disposal so the leak is testable too.
+      createFileSystemWatcher: (pattern) => {
+        const w = {
+          pattern, disposed: false,
+          onDidCreate: (fn) => { w._create = fn; return { dispose() {} }; },
+          onDidChange: (fn) => { w._change = fn; return { dispose() {} }; },
+          onDidDelete: (fn) => { w._delete = fn; return { dispose() {} }; },
+          dispose: () => { w.disposed = true; },
+          // Test helpers — drive the callbacks the editor would fire.
+          fire: (kind, fsPath) => w['_' + kind]?.({ fsPath }),
+        };
+        ctrl.watchers.push(w);
+        return w;
+      },
       asRelativePath: (p) => (p && p.fsPath) || p,
       openTextDocument: async () => ({ getText: () => '' }),
       // Applies a fake structural-rename WorkspaceEdit to the temp filesystem.
@@ -214,10 +230,23 @@ function installVscodeMock(vscode) {
 function uninstallVscodeMock() { if (_restore) { _restore(); _restore = null; } }
 
 function makeContext(tmp) {
+  // workspaceState is backed by a real Map, not a stub: it is now where the
+  // remembered project root lives (previously a workspace-scoped setting, which
+  // wrote .vscode/settings.json into the user's repo), so tests that exercise
+  // "reopen and remember" need it to actually retain values.
+  const ws = new Map();
   return {
     secrets: { get: async () => '', store: async () => {} },
     subscriptions: [],
     globalState: { get: () => undefined, update: async () => {} },
+    workspaceState: {
+      get: (k, d) => (ws.has(k) ? ws.get(k) : d),
+      update: async (k, v) => { ws.set(k, v); },
+    },
+    // VS Code's per-extension, per-profile global storage directory — where the
+    // project catalog belongs. Pointed at the temp dir so no test can reach the
+    // developer's real profile storage.
+    globalStorageUri: { fsPath: require('path').join(tmp, 'globalStorage'), scheme: 'file' },
     extensionUri: { fsPath: tmp, path: tmp, scheme: 'file' },
     extension: { packageJSON: { version: 'test' } },
   };

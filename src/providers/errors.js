@@ -25,11 +25,30 @@ function classifyProviderError(providerLabel, rawMessage) {
     return {
       kind: 'auth',
       title: `${providerLabel}: API key rejected`,
+      // The region tip is here because a good key aimed at the wrong regional
+      // host fails as a plain "invalid api key" — indistinguishable from a bad
+      // key, and re-pasting a perfectly good one forever is the natural response.
+      // Moonshot, Qwen and MiniMax all run split China/international endpoints.
       tips: ['Open Settings (gear icon) and re-paste your API key for this provider.',
-             'Make sure the key belongs to this provider and has not been revoked.'],
+             'Make sure the key belongs to this provider and has not been revoked.',
+             'If this provider has separate regional endpoints (Moonshot, Qwen, MiniMax), '
+             + 'check the API Base URL matches the region your key was issued in — a valid key '
+             + 'aimed at the other region is rejected exactly like an invalid one.'],
     };
   }
-  if (has(/RESOURCE_EXHAUSTED|exceeded your current quota|limit:\s*0|billing/i)) {
+  // Every term here has to mean "out of quota" on its own, because this branch
+  // runs before the rate-limit one and swallows anything it matches. A bare
+  // `billing` used to be in this list and matched Groq's upsell link —
+  // "Upgrade to Dev Tier today at https://console.groq.com/settings/billing" —
+  // appended to an ordinary per-minute rate limit. That cost more than a wrong
+  // message: `quota` is deliberately non-transient, so classifying a rate limit
+  // as one also suppressed the cross-provider failover that exists for exactly
+  // this case. Provider marketing copy is not a diagnosis.
+  //
+  // insufficient_balance is MiniMax's (402) wording, credit-balance Anthropic's;
+  // without them a prepaid account that has simply run dry falls through to the
+  // generic error, which suggests nothing the user can act on.
+  if (has(/RESOURCE_EXHAUSTED|exceeded your current quota|insufficient[_ ]?quota|limit:\s*0|insufficient[_ ](balance|credit|funds)|credit balance is too low|enable billing|billing (?:is )?not enabled|billing details/i)) {
     return {
       kind: 'quota',
       title: `${providerLabel}: your account has no quota for this model`,
@@ -41,12 +60,21 @@ function classifyProviderError(providerLabel, rawMessage) {
   if (has(/tokens per minute|TPM|request too large|rate[_ ]?limit|429|too many requests|temporarily rate-limited/i)) {
     const nums = m.match(/Limit\s*:?\s*(\d+).*?Requested\s*:?\s*(\d+)/is);
     const detail = nums ? ` (limit ${nums[1]}, this request needed ${nums[2]})` : '';
+    // One request bigger than the whole per-minute budget is a different
+    // problem wearing the same error: it cannot succeed at any time, so the
+    // usual "wait a minute" is advice that can only fail. Say what will work.
+    const oversized = nums && Number(nums[2]) > Number(nums[1]);
     return {
       kind: 'rate_limit',
       title: `${providerLabel}: rate limit hit${detail}`,
-      tips: ['Wait ~60 seconds and try again — per-minute budgets reset.',
-             'Click "New chat" to shrink the conversation history Navy sends.',
-             'Free tiers are small for agentic tools; a paid tier or local Ollama avoids this.'],
+      tips: oversized
+        ? [`This single request (${nums[2]} tokens) is larger than your entire per-minute `
+           + `budget (${nums[1]}), so waiting will not help — it would fail again identically.`,
+           'Send less: click "New chat", attach fewer/smaller files, or turn off "Context".',
+           'Or raise the ceiling: a paid tier, a model with a higher limit, or local Ollama.']
+        : ['Wait ~60 seconds and try again — per-minute budgets reset.',
+           'Click "New chat" to shrink the conversation history Navy sends.',
+           'Free tiers are small for agentic tools; a paid tier or local Ollama avoids this.'],
     };
   }
   if (has(/maximum context length|context[_ ]length[_ ]exceeded|too many tokens|context window|input is too long|prompt is too long/i)) {

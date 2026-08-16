@@ -40,3 +40,43 @@ jobs:
 
       - name: Build (bundle extension.js)
         run: npm run build
+
+  # Launches a REAL VS Code with Navy loaded. Separate from `test` because it
+  # downloads ~325 MB of editor and needs a display, so it is much slower than
+  # the mocked suites and must not gate them — but it is the only thing that can
+  # catch the class of bug those suites are structurally blind to: an extension
+  # that fails to activate, a command in package.json with no handler behind it,
+  # a setting whose id was typed one way in the manifest and another in code.
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # The downloaded editor is keyed by version, so a cache hit turns a
+      # 325 MB download into nothing on most runs.
+      - name: Cache the downloaded VS Code
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test
+          key: vscode-test-${{ runner.os }}
+
+      # Linux runners are headless; VS Code still needs an X server to start.
+      - name: In-editor tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:vscode
+
+      - name: In-editor tests (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:vscode

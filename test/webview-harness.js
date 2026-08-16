@@ -11,7 +11,7 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 const { getWebviewHtml } = require('../src/webview-html.js');
 
-function createWebview() {
+function createWebview(options = {}) {
   const html = getWebviewHtml({
     scriptUri: 'main.js', styleUri: 'styles.css',
     cspSource: '', nonce: 'test', version: '0.0.0-test',
@@ -22,6 +22,62 @@ function createWebview() {
 
   const dom = new JSDOM(doc, { runScripts: 'outside-only', pretendToBeVisual: true });
   const { window } = dom;
+
+  // jsdom implements neither Web Speech API, and main.js feature-detects both
+  // at load time — so a test for read-aloud or dictation has to install the
+  // stubs BEFORE the script runs. Opting in per test keeps the default
+  // environment honest: with `speech` off, the code must behave exactly as it
+  // does in a renderer that lacks these APIs.
+  // A Windows 11 machine's real list, in the order Chromium reports it — the
+  // old SAPI5 voices first, which is exactly why taking getVoices()[0] sounded
+  // the way it did, and a natural voice further down that ranking should find.
+  // Tests may pass their own list (or an empty one) via `options.voices`.
+  const DEFAULT_VOICES = [
+    { name: 'Microsoft David Desktop - English (United States)', lang: 'en-US', localService: true, default: true },
+    { name: 'Microsoft Zira Desktop - English (United States)', lang: 'en-US', localService: true },
+    { name: 'Microsoft Hazel - English (United Kingdom)', lang: 'en-GB', localService: true },
+    { name: 'Microsoft Ava Online (Natural) - English (United States)', lang: 'en-US', localService: false },
+    { name: 'Microsoft Denise - French (France)', lang: 'fr-FR', localService: true },
+  ];
+  const speech = { spoken: [], cancelled: 0, recognizers: [], utterances: [] };
+  if (options.speech) {
+    window.SpeechSynthesisUtterance = class {
+      constructor(text) { this.text = text; }
+    };
+    speech.voices = options.voices || DEFAULT_VOICES;
+    window.speechSynthesis = {
+      speak: (u) => { speech.spoken.push(u.text); speech.utterances.push(u); speech.lastUtterance = u; },
+      cancel: () => { speech.cancelled++; },
+      getVoices: () => speech.voices,
+      addEventListener: () => {},
+    };
+    window.SpeechRecognition = class {
+      constructor() {
+        this.started = 0; this.stopped = 0;
+        speech.recognizers.push(this);
+        speech.recognition = this;
+      }
+      start() { this.started++; }
+      stop() { this.stopped++; }
+      // Test helpers — drive the callbacks the real engine would fire.
+      say(transcript, isFinal = true) {
+        this.onresult?.({ resultIndex: 0, results: [Object.assign([{ transcript }], { 0: { transcript }, isFinal, length: 1 })] });
+      }
+      fail(error) { this.onerror?.({ error }); }
+      end() { this.onend?.(); }
+    };
+  }
+
+  // Permissions Policy. jsdom has no `document.featurePolicy`, which stands in
+  // for the "can't tell" case; passing `micPolicy: false` reproduces the real
+  // VS Code webview, whose iframe is built without `microphone` in its `allow`
+  // list. Set before eval because main.js pre-flights the policy at load.
+  if (options.micPolicy !== undefined) {
+    Object.defineProperty(window.document, 'featurePolicy', {
+      configurable: true,
+      value: { allowsFeature: (feature) => feature !== 'microphone' || options.micPolicy },
+    });
+  }
 
   // Messages the webview sends BACK to the extension — what the tests assert on
   // for user actions (approve, stop, copy, …).
@@ -43,6 +99,7 @@ function createWebview() {
   return {
     dom,
     window,
+    speech,
     document: window.document,
     sent,
     // Deliver a message exactly as the extension host does. `sessionId` is

@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -79,6 +79,24 @@
           "default": "",
           "description": "Optional custom instructions appended to every conversation (e.g. coding style preferences). Does not replace or override Navy's built-in tool-use rules."
         },
+        "navy.skills": {
+          "type": ["string", "array"],
+          "default": "auto",
+          "items": { "type": "string" },
+          "description": "Agent Skills: folders with a SKILL.md, read from .navy/skills/ and .claude/skills/ in the project and from Navy's global storage. \"auto\" offers every installed skill to the model; \"off\" loads none; an array of names offers only those. Every offered skill's name and description sits in EVERY request, so this is a real cost on a small local model — Navy caps the total against the model's own context window and says in the output channel which skills it left out. A skill never grants permission: its `allowed-tools` is shown but never honoured, and anything it runs or changes still goes through the approval gate."
+        },
+        "navy.speechVoice": {
+          "type": "string",
+          "default": "",
+          "description": "Exact name of the system voice used for Read Aloud. Empty picks the best voice installed for your language — on Windows that means preferring a natural/neural voice over the old SAPI5 ones. Pick from the dropdown in Navy's Settings panel, which lists what this machine actually has; a name that isn't installed is ignored and the automatic choice is used instead."
+        },
+        "navy.speechRate": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.5,
+          "maximum": 2,
+          "description": "Read Aloud playback speed. Above about 1.3 most voices start clipping consonants, which costs comprehension rather than saving time."
+        },
         "navy.maxContextChars": {
           "type": "number",
           "default": 12000,
@@ -113,15 +131,29 @@
         },
         "navy.maxToolIterations": {
           "type": "number",
-          "default": 50,
+          "default": 100,
           "minimum": 1,
           "maximum": 200,
           "description": "Maximum number of tool-use iterations Navy Coder can perform in one turn."
         },
+        "navy.fileEditSoftCap": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Writes to the SAME file in one turn before Navy stops feeding fresh diagnostics back and nudges the model to wrap up. Raising it lets a genuine single-file refactor keep going, at the cost of letting a model that is thrashing on one file burn more tokens before anything intervenes."
+        },
+        "navy.fileEditHardCap": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Writes to the SAME file in one turn after which Navy refuses further writes to it for the rest of the turn. This is the backstop against an edit loop, so raising it trades that protection for room to work — a model stuck rewriting one file will make that many attempts before being stopped. Values below the soft cap are raised to match it."
+        },
         "navy.projectRoot": {
           "type": "string",
           "default": "",
-          "description": "Active project directory for Navy Coder to use. Defaults to the first workspace folder."
+          "markdownDescription": "Pin Navy to a specific project directory. Leave empty for the normal behaviour — Navy remembers the project you last chose per window and defaults to the first workspace folder otherwise, without writing anything to your repository. Set this only to override that; editing it switches Navy immediately."
         },
         "navy.inlineCompletions": {
           "type": "boolean",
@@ -136,7 +168,7 @@
         "navy.embeddingModel": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Embedding model for semantic codebase search (used by `find_relevant_files` in addition to keyword search). Leave empty to disable — keyword-only search is the default.\n\n**⚠️ Privacy:** enabling this sends the first ~1500 characters of each source file in your project to the embedding provider you have configured. If `navy.provider` is a hosted service (OpenAI, Gemini, …), your code leaves your machine. Files whose names look credential-bearing (`.env*`, `*secret*`, `*credentials*`, `*.pem`, `serviceAccount*`, `docker-compose*`, …) and anything your repo gitignores are excluded, but review the setting before enabling it on a private codebase. Use a local Ollama embedding model (e.g. `nomic-embed-text`) to keep everything on-device.\n\nMust be an embeddings-capable model for the active `navy.provider` (e.g. `nomic-embed-text` or `mxbai-embed-large` for Ollama, `text-embedding-3-small` for OpenAI, `text-embedding-004` for Gemini). The index is built incrementally and cached in `.navy/embeddings.json`, which is gitignored automatically."
+          "markdownDescription": "Embedding model for semantic codebase search (used by `find_relevant_files` in addition to keyword search). Leave empty to disable — keyword-only search is the default.\n\n**⚠️ Privacy:** enabling this sends the first ~1500 characters of each source file in your project to the embedding provider you have configured. If `navy.provider` is a hosted service (OpenAI, Gemini, …), your code leaves your machine. Files whose names look credential-bearing (`.env*`, `*secret*`, `*credentials*`, `*.pem`, `serviceAccount*`, `docker-compose*`, …) and anything your repo gitignores are excluded, but review the setting before enabling it on a private codebase. Use a local Ollama embedding model (e.g. `nomic-embed-text`) to keep everything on-device.\n\nMust be an embeddings-capable model for the active `navy.provider` (e.g. `nomic-embed-text` or `mxbai-embed-large` for Ollama, `text-embedding-3-small` for OpenAI, `text-embedding-004` for Gemini). The index is built incrementally and cached in `.navy/embeddings/`, which is gitignored automatically; re-indexing a changed file rewrites only the shard it belongs to."
         },
         "navy.provider": {
           "type": "string",
@@ -152,6 +184,10 @@
             "zai",
             "groq",
             "openrouter",
+            "moonshot",
+            "qwen",
+            "minimax",
+            "mimo",
             "custom"
           ],
           "enumDescriptions": [
@@ -162,12 +198,30 @@
             "DeepSeek (api.deepseek.com)",
             "Google Gemini (via OpenAI-compatible endpoint)",
             "xAI Grok (api.x.ai)",
-            "z.ai (api.z.ai)",
+            "z.ai / GLM (api.z.ai/api/paas/v4 — set navy.apiBase to https://api.z.ai/api/coding/paas/v4 for a GLM Coding Plan subscription, or https://open.bigmodel.cn/api/paas/v4 for a mainland-China account)",
             "Groq (api.groq.com)",
             "OpenRouter — multi-provider gateway (openrouter.ai)",
+            "Moonshot AI / Kimi (api.moonshot.ai — set navy.apiBase to api.moonshot.cn for the mainland-China endpoint)",
+            "Alibaba Qwen via Model Studio / DashScope (dashscope-intl.aliyuncs.com/compatible-mode/v1 — set navy.apiBase to https://dashscope.aliyuncs.com/compatible-mode/v1 for the mainland-China endpoint; a key issued in one region is not valid in the other)",
+            "MiniMax (api.minimax.io — set navy.apiBase to https://api.minimax.chat/v1 for the mainland-China endpoint; the older api.minimaxi.com host is still live but rejects current international keys)",
+            "Xiaomi MiMo (api.xiaomimimo.com)",
             "Custom OpenAI-compatible endpoint (set navy.apiBase)"
           ],
           "description": "AI provider to use."
+        },
+        "navy.ollamaMode": {
+          "type": "string",
+          "default": "local",
+          "enum": [
+            "local",
+            "cloud"
+          ],
+          "enumDescriptions": [
+            "Local Ollama running on your own machine (navy.host, default http://localhost:11434)",
+            "Ollama Cloud (ollama.com) — no local install needed, requires an API key"
+          ],
+          "markdownDescription": "Which Ollama to talk to when `navy.provider` is `ollama`.\n\n`local` uses the server at `navy.host` and needs Ollama installed.\n\n`cloud` talks to **https://ollama.com** instead, so nothing has to be installed locally — you only need an API key from your Ollama account, saved with the key icon next to the model picker (stored in the OS keychain, never in settings). Ollama Cloud runs large models that would not fit on most machines.",
+          "order": 1
         },
         "navy.apiBase": {
           "type": "string",
@@ -210,7 +264,7 @@
             "Commands run directly on your machine (current behavior)",
             "Commands run inside a Docker container built from the project's own .devcontainer/Dockerfile, with only the project folder mounted"
           ],
-          "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a Docker container instead of running them directly on your machine. Requires Docker to be installed and running, and the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` — Navy refuses to guess at a generic image, since a container that doesn't actually match the project's real toolchain would be a false sense of safety. This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\n**macOS and Linux hosts only in this release.** On a Windows host, Navy builds commands in cmd.exe dialect and runs them through `cmd /c`, which does not exist inside a Linux container — so sandboxed commands fail. Leave this `off` on Windows."
+          "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a Docker container instead of running them directly on your machine. Requires Docker to be installed and running, and the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` — Navy refuses to guess at a generic image, since a container that doesn't actually match the project's real toolchain would be a false sense of safety. This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\nWorks on Windows, macOS and Linux. With sandboxing on, Navy targets the container rather than the host: commands are written for and run through POSIX `sh` even from a Windows host, since that is what the container actually provides."
         },
         "navy.contextWindow": {
           "type": "number",
@@ -260,7 +314,7 @@
             "properties": {
               "provider": {
                 "type": "string",
-                "description": "Provider id — same values as navy.provider (ollama, anthropic, openai, gemini, deepseek, xai, zai, groq, openrouter, lmstudio, custom)."
+                "description": "Provider id — same values as navy.provider (ollama, anthropic, openai, gemini, deepseek, xai, zai, groq, openrouter, moonshot, qwen, minimax, mimo, lmstudio, custom)."
               },
               "model": {
                 "type": "string",
@@ -348,6 +402,18 @@
       {
         "command": "navy.reviewPR",
         "title": "Navy Coder: Review Pull Request"
+      },
+      {
+        "command": "navy.testProvider",
+        "title": "Navy Coder: Test Provider Connection"
+      },
+      {
+        "command": "navy.newSlashCommand",
+        "title": "Navy Coder: New Slash Command"
+      },
+      {
+        "command": "navy.openSlashCommands",
+        "title": "Navy Coder: Open Slash Commands Folder"
       }
     ],
     "viewsContainers": {
@@ -431,11 +497,14 @@
     "vscode:prepublish": "npm run build",
     "package": "vsce package",
     "test": "node test/run.js && node test/webview-run.js",
+    "test:vscode": "npm run build && node test/integration/run-in-vscode.js",
+    "test:endpoints": "node test/check-provider-endpoints.js",
     "eval": "node eval/run.js",
     "eval:selftest": "node eval/selftest.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.6.0",

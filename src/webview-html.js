@@ -192,8 +192,25 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
               <option value="zai">z.ai</option>
               <option value="groq">Groq</option>
               <option value="openrouter">OpenRouter</option>
+              <option value="moonshot">Moonshot / Kimi</option>
+              <option value="qwen">Qwen (DashScope)</option>
+              <option value="minimax">MiniMax</option>
+              <option value="mimo">Xiaomi MiMo</option>
               <option value="custom">Custom Endpoint</option>
             </select>
+          </div>
+
+          <!-- Ollama only: local install vs Ollama Cloud. Cloud needs no local
+               install at all, just an API key, so the Host field below is
+               hidden for it — navy.host describes a machine-local server and
+               is deliberately ignored in cloud mode. -->
+          <div class="setting-group" id="settingOllamaModeGroup" style="display:none">
+            <label class="setting-label">Ollama</label>
+            <select id="settingOllamaMode" class="setting-input">
+              <option value="local">Local (installed on this machine)</option>
+              <option value="cloud">Ollama Cloud (ollama.com — no install needed)</option>
+            </select>
+            <span class="setting-hint" id="settingOllamaModeHint">Local talks to the server below. Cloud runs large models on ollama.com and only needs an API key.</span>
           </div>
 
           <div class="setting-group" id="settingHostGroup">
@@ -237,6 +254,23 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
               <option value="search-replace">Search / Replace (surgical edits)</option>
               <option value="whole-file">Whole file (full rewrite)</option>
             </select>
+          </div>
+
+          <!-- Read-aloud. The list is filled in by the webview from the
+               voices this renderer actually has (populateVoiceOptions) —
+               the extension host cannot see them, and they differ per
+               machine, so there is nothing to declare in package.json. -->
+          <div class="setting-row">
+            <div class="setting-group setting-half">
+              <label class="setting-label">Read-aloud Voice</label>
+              <select id="settingSpeechVoice" class="setting-select">
+                <option value="">Automatic</option>
+              </select>
+            </div>
+            <div class="setting-group setting-half">
+              <label class="setting-label">Reading Speed</label>
+              <input id="settingSpeechRate" type="number" class="setting-input" min="0.5" max="2" step="0.05" placeholder="1" />
+            </div>
           </div>
 
           <div class="setting-group">
@@ -331,6 +365,22 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                 </svg>
               </button>
+              <!-- Dictation. Unhidden by the script, which is also the only
+                   place that knows what pressing it does — recognition happens
+                   in the user's browser (src/dictation-bridge.js), so nothing
+                   about this renderer decides whether it can work. Recognised
+                   text goes into the box above for review; it is never sent
+                   automatically. There is deliberately no pause control: the
+                   browser's recogniser has none, and faking it by restarting
+                   the engine lost whatever was said across the gap. -->
+              <button type="button" id="micButton" class="attach-button mic-button" title="Dictate a message" aria-label="Dictate a message" hidden>
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" y1="19" x2="12" y2="23"/>
+                </svg>
+              </button>
+              <span id="micStatus" class="mic-status" hidden></span>
               <div id="approvalQueue" class="approval-queue" title="Pending approvals"></div>
               <button id="sendButton" type="submit" class="send-button" title="Send" aria-label="Send message" disabled>
                 <svg id="sendIcon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">

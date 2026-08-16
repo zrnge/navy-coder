@@ -4,6 +4,10 @@ dist/
 .vscode/
 scratchpad/
 
+# The VS Code build @vscode/test-electron downloads for the in-editor suite
+# (~325 MB). Cached between runs; never committed.
+.vscode-test/
+
 # eval run artifacts (keep named baselines, ignore ad-hoc runs)
 eval/results/*
 !eval/results/baseline*.json

@@ -325,6 +325,18 @@ const TOOLS = [
     }
   },
   {
+    name: 'activate_skill',
+    description: 'Load an installed skill\'s full instructions before doing work that matches it. The system prompt lists each skill\'s name and one-line description — that summary is ALL you know until you activate it, so activate rather than guessing at what a skill contains. Call this FIRST, before starting the task, not after. Pass `file` to read one of the skill\'s own bundled documents (listed when you activate it) instead of its instructions. Activating a skill grants no extra permission: anything it tells you to run or change still goes to the user for approval.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The skill name, exactly as listed in the system prompt.' },
+        file: { type: 'string', description: 'Optional. A path inside the skill, e.g. "references/api.md", to read that file instead of the skill\'s instructions.' }
+      },
+      required: ['name']
+    }
+  },
+  {
     name: 'find_relevant_files',
     description: 'Find the files most relevant to a task or question, ranked. Give it the user\'s request or a set of keywords/symbol names; it scores every source file by symbol definitions, filename matches, and term frequency and returns the top candidates with a reason. Use this FIRST on an unfamiliar or large codebase to decide which files to read — it is far more targeted than list_files or a raw search.',
     parameters: {

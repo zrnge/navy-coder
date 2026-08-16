@@ -1,5 +1,5 @@
 const { TOOLS_API, TOOLS } = require('./tools.js');
-const { openAiCompatBase } = require('./endpoints.js');
+const { openAiCompatBase, ollamaHost, ollamaAuthHeaders } = require('./endpoints.js');
 const vscode = require('vscode');
 const https = require('https');
 
@@ -126,9 +126,15 @@ async function fetchWithRetry(url, init) {
       else if (level === 'fast') ollamaBody.think = false;
     }
 
-    const response = await fetchWithRetry(host + '/api/chat', {
+    // Ollama Cloud serves this exact endpoint at ollama.com with a bearer
+    // token, so 'cloud' is a host swap plus auth — no separate code path. A
+    // local server ignores the Authorization header, so it is sent whenever a
+    // key exists rather than being branched on the mode.
+    const ollamaMode = override ? 'local' : config.get('ollamaMode', 'local');
+    const ollamaBase = ollamaHost(ollamaMode, host);
+    const response = await fetchWithRetry(ollamaBase + '/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...ollamaAuthHeaders(apiKey) },
       body: JSON.stringify(ollamaBody),
       signal: signal || provider.abortController.signal
     });

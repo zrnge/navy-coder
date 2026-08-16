@@ -1,0 +1,34 @@
+name: Provider endpoints
+
+# Are the shipped provider base URLs still live?
+#
+# Deliberately NOT part of ci.yml. This is the only thing in the repo that makes
+# real network calls, and a vendor being briefly down must never fail a pull
+# request — but a vendor MOVING must not go unnoticed either. Three providers
+# shipped with base URLs that had never worked for anyone, and each was found
+# only when a user tried that provider by hand.
+#
+# Needs no secrets: the probe sends a deliberately invalid key and treats
+# "rejected the key" as proof the API root is alive. See the script's header for
+# why an invalid key beats no key.
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays, 06:17 UTC — early enough to fix before the week
+  workflow_dispatch:      # and on demand, e.g. right before cutting a release
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # No `npm ci`: the check imports one dependency-free module from src/ and
+      # uses global fetch, so installing devDependencies would only add a way
+      # for this to fail for reasons unrelated to the endpoints.
+      - name: Probe every shipped provider endpoint
+        run: node test/check-provider-endpoints.js

@@ -49,7 +49,11 @@ const settingTemperature = document.querySelector('#settingTemperature');
 const settingMaxIter = document.querySelector('#settingMaxIter');
 const settingEditFormat = document.querySelector('#settingEditFormat');
 const settingSystemPrompt = document.querySelector('#settingSystemPrompt');
+const settingSpeechVoice = document.querySelector('#settingSpeechVoice');
+const settingSpeechRate = document.querySelector('#settingSpeechRate');
 const settingHostGroup = document.querySelector('#settingHostGroup');
+const settingOllamaMode = document.querySelector('#settingOllamaMode');
+const settingOllamaModeGroup = document.querySelector('#settingOllamaModeGroup');
 const settingApiBaseGroup = document.querySelector('#settingApiBaseGroup');
 const settingApiKeyGroup = document.querySelector('#settingApiKeyGroup');
 const attachButton = document.querySelector('#attachButton');
@@ -72,6 +76,31 @@ const sessionTabsEl = document.querySelector('#sessionTabs');
 // the first tagged message arrives. See the multi-session gate at the top of
 // the message listener below for how this is used and kept in sync.
 let activeSessionId = null;
+
+// Declared up here, with the other module-level state, because the dictation
+// controls are wired near the top of the file — a const declared further down
+// is in the temporal dead zone at that point and throws, taking the whole
+// webview script with it.
+const SPEECH_AVAILABLE = typeof window !== 'undefined'
+  && typeof window.speechSynthesis !== 'undefined'
+  && typeof window.SpeechSynthesisUtterance !== 'undefined';
+
+// There is deliberately no SpeechRecognition here. Chromium defines
+// webkitSpeechRecognition in every build, Electron included, and it then fails
+// at start() — twice over:
+//
+//   * Permissions Policy. VS Code builds its webview iframe with
+//     allow="cross-origin-isolated; autoplay; local-network-access;
+//     clipboard-read; clipboard-write;" — no `microphone`. The mic is barred at
+//     the document level, so every attempt ends in 'not-allowed'. Only VS Code
+//     can change that attribute (microsoft/vscode#250568, still open).
+//   * The recognition backend. Chromium's engine is a thin client for a Google
+//     service keyed to Chrome itself; Electron ships without that key, so even
+//     a permitted microphone ends in 'network'.
+//
+// Neither is reachable from a webview, so dictation happens in the user's own
+// browser instead — see src/dictation-bridge.js. Speech synthesis (above) is
+// unaffected: it needs no permission and works here fine.
 
 let activeAssistantMessage = null;
 let activeAssistantBubble = null;
@@ -108,6 +137,10 @@ function updateAddButton() {
 
 form.addEventListener('submit', (event) => {
   event.preventDefault();
+  // Sending ends dictation. Leaving the microphone live would append the next
+  // thing said to a box the user has just emptied, which reads as Navy typing
+  // by itself.
+  if (dictation.active) dictationStop();
   sendPrompt();
 });
 
@@ -474,9 +507,13 @@ const PROVIDER_DEFAULTS = {
   deepseek:   { base: 'https://api.deepseek.com/v1',                   needsKey: true,  baseHint: 'DeepSeek endpoint. Edit only for a proxy/gateway.' },
   gemini:     { base: 'https://generativelanguage.googleapis.com/v1beta/openai', needsKey: true, baseHint: "Google's OpenAI-compatible endpoint. Edit only for a proxy/gateway." },
   xai:        { base: 'https://api.x.ai/v1',                           needsKey: true,  baseHint: 'xAI Grok endpoint. Edit only for a proxy/gateway.' },
-  zai:        { base: 'https://api.z.ai/v1',                           needsKey: true,  baseHint: 'z.ai endpoint. Edit only for a proxy/gateway.' },
+  zai:        { base: 'https://api.z.ai/api/paas/v4',                  needsKey: true,  baseHint: 'z.ai (GLM) endpoint. Use https://api.z.ai/api/coding/paas/v4 for a GLM Coding Plan subscription, or https://open.bigmodel.cn/api/paas/v4 for a mainland-China account.' },
   groq:       { base: 'https://api.groq.com/openai/v1',                needsKey: true,  baseHint: 'Groq endpoint. Edit only for a proxy/gateway.' },
   openrouter: { base: 'https://openrouter.ai/api/v1',                  needsKey: true,  baseHint: 'OpenRouter endpoint. Edit only for a proxy/gateway.' },
+  moonshot:   { base: 'https://api.moonshot.ai/v1',                    needsKey: true,  baseHint: 'Moonshot (Kimi) international endpoint. Use https://api.moonshot.cn/v1 for a mainland-China account.' },
+  qwen:       { base: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', needsKey: true, baseHint: 'Alibaba DashScope international endpoint. Use https://dashscope.aliyuncs.com/compatible-mode/v1 for a mainland-China account.' },
+  minimax:    { base: 'https://api.minimax.io/v1',                     needsKey: true,  baseHint: 'MiniMax international endpoint. Use https://api.minimax.chat/v1 for a mainland-China account. (api.minimaxi.com is the older host and rejects current keys.)' },
+  mimo:       { base: 'https://api.xiaomimimo.com/v1',                 needsKey: true,  baseHint: 'Xiaomi MiMo endpoint. Edit only for a proxy/gateway.' },
   custom:     { base: '',                                              needsKey: false, baseHint: 'Full base URL of your OpenAI-compatible API endpoint.' },
 };
 
@@ -484,9 +521,15 @@ function updateSettingsFieldVisibility(isProviderChange) {
   const p = settingProvider?.value || 'ollama';
   const info = PROVIDER_DEFAULTS[p] || PROVIDER_DEFAULTS.custom;
 
-  if (settingHostGroup) settingHostGroup.style.display = p === 'ollama' ? '' : 'none';
-  if (settingApiBaseGroup) settingApiBaseGroup.style.display = p !== 'ollama' ? '' : 'none';
-  if (settingApiKeyGroup)  settingApiKeyGroup.style.display  = info.needsKey  ? '' : 'none';
+  // Ollama can be a local install or Ollama Cloud. Cloud needs an API key and
+  // no host at all, so the two fields swap over based on the mode rather than
+  // on the provider alone.
+  const isOllama = p === 'ollama';
+  const ollamaCloud = isOllama && settingOllamaMode?.value === 'cloud';
+  if (settingOllamaModeGroup) settingOllamaModeGroup.style.display = isOllama ? '' : 'none';
+  if (settingHostGroup) settingHostGroup.style.display = (isOllama && !ollamaCloud) ? '' : 'none';
+  if (settingApiBaseGroup) settingApiBaseGroup.style.display = !isOllama ? '' : 'none';
+  if (settingApiKeyGroup)  settingApiKeyGroup.style.display  = (info.needsKey || ollamaCloud) ? '' : 'none';
 
   if (settingApiBase) settingApiBase.placeholder = info.base || 'https://your-server.example.com/v1';
   const hintEl = document.querySelector('#settingApiBaseHint');
@@ -510,7 +553,22 @@ closeSettingsButton?.addEventListener('click', () => {
   if (settingsPanel) settingsPanel.style.display = 'none';
 });
 
+// The mic is always shown: dictation does not run in here, so nothing this
+// renderer can or cannot do decides whether it works. Pressing it opens the
+// browser page that does the listening.
+{
+  const mic = document.querySelector('#micButton');
+  if (mic) {
+    mic.hidden = false;
+    mic.title = micIdleTitle();
+    mic.addEventListener('click', () => toggleDictation());
+  }
+}
+
 settingProvider?.addEventListener('change', () => updateSettingsFieldVisibility(true));
+// Switching between local and cloud swaps which fields are relevant (Host vs
+// API Key), so the panel has to re-evaluate immediately, not only on save.
+settingOllamaMode?.addEventListener('change', () => updateSettingsFieldVisibility(false));
 
 settingsForm?.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -523,11 +581,14 @@ settingsForm?.addEventListener('submit', (e) => {
   const settings = {
     provider:     provVal,
     host:         settingHost?.value         || 'http://localhost:11434',
+    ollamaMode:   settingOllamaMode?.value    || 'local',
     apiBase:      rawBase === provDefault ? '' : rawBase,
     temperature:  settingTemperature?.value  ?? 0.2,
     maxIter:      settingMaxIter?.value      ?? 15,
     editFormat:   settingEditFormat?.value   || 'search-replace',
     systemPrompt: settingSystemPrompt?.value || '',
+    speechVoice:  settingSpeechVoice?.value  || '',
+    speechRate:   settingSpeechRate?.value   ?? 1,
   };
   // Key fields display a masked placeholder (ab12••••cd34) after load. Only send
   // them when the user actually typed a new value — sending the mask back would
@@ -945,6 +1006,7 @@ window.addEventListener('message', (event) => {
     const s = message.settings || {};
     if (settingProvider)     settingProvider.value     = s.provider     || 'ollama';
     if (settingHost)         settingHost.value         = s.host         || 'http://localhost:11434';
+    if (settingOllamaMode)   settingOllamaMode.value   = s.ollamaMode   || 'local';
     if (settingApiKey)       settingApiKey.value       = s.apiKey       || '';
     if (settingSearchApiKey) settingSearchApiKey.value = s.searchApiKey || '';
     if (settingApiBase)      settingApiBase.value      = s.apiBase      || '';
@@ -952,7 +1014,18 @@ window.addEventListener('message', (event) => {
     if (settingMaxIter)      settingMaxIter.value      = s.maxIter      ?? 15;
     if (settingEditFormat)   settingEditFormat.value   = s.editFormat   || 'search-replace';
     if (settingSystemPrompt) settingSystemPrompt.value = s.systemPrompt || '';
+    // Clamped here as well as in the manifest: this multiplies playback speed,
+    // and a value of 0 or 12 from a hand-edited settings.json is either silence
+    // or noise.
+    _voiceChoice = s.speechVoice || '';
+    _speechRate = Math.min(2, Math.max(0.5, Number(s.speechRate) || 1));
+    if (settingSpeechRate) settingSpeechRate.value = _speechRate;
+    populateVoiceOptions();
     updateSettingsFieldVisibility(false);
+  }
+
+  if (message.type === 'slashCommands') {
+    setCustomCommands(message.commands);
   }
 
   if (message.type === 'thinkingLevel') {
@@ -1134,6 +1207,13 @@ window.addEventListener('message', (event) => {
   }
   if (message.type === 'runProjectStopped') {
     setRunProjectStopped(message.exitCode);
+  }
+  if (message.type === 'dictationText') {
+    dictationText(message.text, message.done);
+  }
+  if (message.type === 'dictationState') {
+    if (message.state === 'ended') dictationEnd(DICTATION_END_STATUS[message.reason] || '');
+    else dictationState(message.state);
   }
   } catch (err) {
     console.error('[Navy] message handler error:', err);
@@ -1424,14 +1504,65 @@ const SLASH_COMMANDS = [
   { cmd: '/bg',              label: 'Background',    icon: '⚙️', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
 ];
 
+// Commands loaded from markdown files by the extension — see
+// src/slash-commands.js. Kept separate from the built-ins rather than merged
+// into them so a reload of the file list can never lose the shipped set, and so
+// the dropdown can say which is which.
+let CUSTOM_COMMANDS = [];
+
+// One list, custom first: a project's own definition SHADOWS a built-in of the
+// same name. A team whose `/test` means something specific should get that —
+// the alternative is that they name it `/test2` and nobody remembers which is
+// which. The dropdown labels the winner with where it came from.
+function allSlashCommands() {
+  const seen = new Set(CUSTOM_COMMANDS.map(c => c.cmd));
+  return [...CUSTOM_COMMANDS, ...SLASH_COMMANDS.filter(c => !seen.has(c.cmd))];
+}
+
+function setCustomCommands(list) {
+  CUSTOM_COMMANDS = (Array.isArray(list) ? list : [])
+    .filter(c => c && typeof c.cmd === 'string' && c.cmd.startsWith('/') && typeof c.prompt === 'string');
+  // The dropdown may be open on a stale list — rebuild it against the new one
+  // rather than leaving an entry that no longer exists selectable.
+  if (slashDropdownVisible) handleSlashCommand();
+}
+
 function getSlashState() {
   const val = promptInput.value;
   const pos = promptInput.selectionStart;
   const before = val.slice(0, pos);
-  // Match a '/' at the start or after a newline, possibly followed by letters
-  const m = before.match(/(^|\n)(\/\w*)$/);
+  // Match a '/' at the start or after a newline, followed by the characters a
+  // command name may contain. `\w*` was too narrow even for the built-ins: it
+  // stops at the hyphen, so typing `/pr-` closed the menu on `/pr-review`, and
+  // custom names are commonly hyphenated or namespaced (`db:migrate`).
+  const m = before.match(/(^|\n)(\/[\w:-]*)$/);
   if (!m) return null;
   return { query: m[2], index: before.lastIndexOf(m[2]), end: pos };
+}
+
+// `/deploy staging` → the command's prompt with `staging` substituted in.
+//
+// Two flows reach a command and both have to work: picking it from the menu
+// (which inserts the prompt into the box for editing, unchanged from before)
+// and typing the whole thing and pressing Enter, which previously sent the
+// literal text `/deploy staging` to the model. Expanding here, in the composer,
+// keeps what is sent, what is shown in the transcript and what is persisted as
+// one and the same text.
+//
+// A template with no `$ARGUMENTS` gets them appended instead of dropped —
+// `/search cats` must not become "Search the web for: " with the cats gone.
+// Returns the input untouched when the first word isn't a known command, so an
+// ordinary message that happens to start with a slash is left alone. Pure.
+function expandSlashCommand(text, commands) {
+  const m = String(text || '').match(/^\/([\w:-]+)(?:[ \t]+([\s\S]*))?$/);
+  if (!m) return text;
+  const command = (commands || []).find(c => c.cmd === '/' + m[1]);
+  if (!command) return text;
+  const args = (m[2] || '').trim();
+  const template = String(command.prompt || '');
+  if (template.includes('$ARGUMENTS')) return template.split('$ARGUMENTS').join(args);
+  if (!args) return template;
+  return template.trimEnd() + ' ' + args;
 }
 
 function showSlashDropdown(query) {
@@ -1444,22 +1575,69 @@ function showSlashDropdown(query) {
     document.querySelector('.input-area')?.appendChild(dropdown);
   }
   const q = query.slice(1).toLowerCase();
-  const matches = SLASH_COMMANDS.filter(c => c.cmd.slice(1).startsWith(q));
+  const all = allSlashCommands();
+  const matches = all.filter(c => c.cmd.slice(1).toLowerCase().startsWith(q));
   if (matches.length === 0) { hideSlashDropdown(); return; }
+  // Every field here can now come from a file on disk, so all of it is escaped.
+  // The built-ins were safe because they were literals in this file; a command
+  // named by a repository is not, and this is the one place their text reaches
+  // innerHTML.
+  const ORIGIN_LABEL = { project: 'project', shared: 'project', personal: 'personal', skill: 'skill' };
   dropdown.innerHTML = matches.map((c, i) =>
-    `<div class="slash-item" role="option" aria-selected="false" data-idx="${i}" data-cmd="${c.cmd}">
-      <span class="slash-icon">${c.icon}</span>
-      <span class="slash-label">${c.label}</span>
-      <span class="slash-desc">${c.desc}</span>
+    `<div class="slash-item" role="option" aria-selected="false" data-idx="${i}" data-cmd="${escapeHtml(c.cmd)}">
+      <span class="slash-icon">${escapeHtml(c.icon || '')}</span>
+      <span class="slash-label">${escapeHtml(c.label || c.cmd.slice(1))}</span>
+      <span class="slash-desc">${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}</span>
+      ${c.custom ? `<span class="slash-origin">${escapeHtml(ORIGIN_LABEL[c.origin] || 'custom')}</span>` : ''}
+      ${c.removable ? `<button type="button" class="slash-remove" tabindex="-1"
+        title="Remove ${escapeHtml(c.cmd)}" aria-label="Remove the ${escapeHtml(c.cmd)} command">×</button>` : ''}
     </div>`
   ).join('');
   dropdown.querySelectorAll('.slash-item').forEach(item => {
     item.addEventListener('mousedown', (e) => {
       e.preventDefault();
-      const cmd = SLASH_COMMANDS.find(c => c.cmd === item.dataset.cmd);
-      if (cmd) applySlashCommand(cmd);
+      const cmd = all.find(c => c.cmd === item.dataset.cmd);
+      if (!cmd) return;
+      // Alt-click opens a custom command's file instead of running it — the
+      // only way to get from "this prompt is nearly right" to editing it
+      // without hunting for the file by hand.
+      if (e.altKey && cmd.file) { hideSlashDropdown(); vscode.postMessage({ type: 'openSlashCommand', file: cmd.file }); return; }
+      applySlashCommand(cmd);
+    });
+    const owner = all.find(c => c.cmd === item.dataset.cmd);
+    if (!owner?.file) return;
+    item.title = owner.file + '\nAlt-click to edit';
+    // On mousedown for the same reason the row itself is: the composer loses
+    // focus a beat later and takes the menu with it, so a click handler would
+    // fire into a dropdown that is already gone. stopPropagation is what keeps
+    // removing a command from also running it — the row's own handler is the
+    // one this event would otherwise reach next.
+    item.querySelector('.slash-remove')?.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideSlashDropdown();
+      vscode.postMessage({ type: 'deleteSlashCommand', file: owner.file });
     });
   });
+
+  // How anyone finds out they can add their own. Appended only when something
+  // already matched, so it is never the row Enter falls back to — typing a
+  // name that is not a command must still send the message, not open a file
+  // dialog. It is last for the same reason.
+  const add = document.createElement('div');
+  add.className = 'slash-item slash-item-new';
+  add.setAttribute('role', 'option');
+  add.setAttribute('aria-selected', 'false');
+  add.innerHTML = `<span class="slash-icon">＋</span>
+    <span class="slash-label">New command</span>
+    <span class="slash-desc">Write your own prompt as a markdown file</span>`;
+  add.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    hideSlashDropdown();
+    vscode.postMessage({ type: 'newSlashCommand' });
+  });
+  dropdown.appendChild(add);
+
   dropdown.style.display = 'block';
   slashDropdownVisible = true;
 }
@@ -1709,10 +1887,19 @@ function renderSymbolDropdown(symbols) {
 }
 
 function sendPrompt() {
-  const prompt = promptInput.value.trim();
+  // A command typed out in full — `/triage auth` — is expanded here rather
+  // than sent literally. Picking from the menu already put the prompt in the
+  // box, so this is the other half of the same feature, not a second one; a
+  // message that merely starts with a slash and names no command is untouched.
+  // Deliberately BEFORE addMessage and after nothing: the transcript, the
+  // persisted history and what the model receives are then all the same text.
+  const prompt = expandSlashCommand(promptInput.value.trim(), allSlashCommands()).trim();
   if (!prompt && pastedImages.length === 0) return;
 
   // Background task: /bg <task> — non-blocking, runs in parallel with main chat.
+  // Checked after expansion because /bg's own template is the literal `/bg `,
+  // so a custom command may expand INTO a background task, but a custom command
+  // named `bg` cannot take this route away from it.
   if (prompt.startsWith('/bg ')) {
     const taskPrompt = prompt.slice(4).trim();
     if (!taskPrompt) return;
@@ -1823,13 +2010,68 @@ function updateWelcome() {
 // cost before the panel became usable. The rest stay one click away.
 const HISTORY_RENDER_LIMIT = 60;
 
+// Redraws one persisted tool card. Everything it needs was recorded at the
+// time (see makeCardRecord in src/extension.js) and it goes through exactly the
+// same builders the live turn used, so a restored card is the same card — not a
+// summary of one.
+function replayCard(card) {
+  const tool = card?.tool;
+  if (!tool) return;
+  const args = card.args || {};
+  const result = card.result || '';
+  if (tool === 'run_command' || tool === 'run_tests') {
+    const cmdText = args.command
+      || ('run_tests' + (args.filter ? ' — ' + args.filter : ' (auto-detected)'));
+    // No stream id: nothing is still running, so the card is created and
+    // finalized in one go against activeTermCard.
+    createTermCard(tool, cmdText, null);
+    finalizeTermCard(result, null);
+  } else {
+    addToolCallCard(tool, args, null);
+    addToolResultCard(tool, result, null, card.full);
+  }
+}
+
+// Rebuilds ONE assistant turn — its tool activity and then its reply, in that
+// order, inside a single message. Deliberately drives the live streaming path
+// (activeAssistantMessage → cards → appendAssistantText → flush → collapse)
+// rather than reimplementing the layout: the ordering rules that put prose
+// below the work it describes live in those functions, and a second
+// implementation of them would drift.
+function renderAssistantTurn(item) {
+  const cards = Array.isArray(item.cards) ? item.cards : [];
+  if (!cards.length) { addMessage('assistant', item.text); return; }
+
+  activeAssistantMessage = addMessage('assistant', '');
+  activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
+  _primaryBubble = activeAssistantBubble;
+  activeAssistantContent = '';
+  _segmentStart = 0;
+  _needNewBubble = false;
+  _streamPre = null;
+  allActivityLogEls = [];
+  _needNewActivityLog = false;
+  currentActivityRowEl = null;
+  activityRowsById.clear();
+  activeTermCard = null;
+
+  for (const card of cards) replayCard(card);
+  if (item.text) { appendAssistantText(item.text); flushAssistantText(); }
+  collapseToolProgress();
+
+  activeAssistantMessage = null;
+  activeAssistantBubble = null;
+  activeAssistantContent = '';
+  activeTermCard = null;
+}
+
 function renderHistoryItem(item) {
   if (item.role === 'user') {
     // Attachment/image badges are part of what the question WAS — replayed
     // from the persisted message rather than dropped on restore.
     addMessage('user', item.text, item.attachments || [], item.images || 0);
   } else if (item.role === 'assistant') {
-    addMessage('assistant', item.text);
+    renderAssistantTurn(item);
     // Restore the change summary for this turn (live footer isn't persisted).
     if (item.meta) {
       const bits = [];
@@ -1846,13 +2088,21 @@ function renderHistory(history) {
   messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — keep it in the DOM
   if (!Array.isArray(history) || !history.length) { updateWelcome(); return; }
   welcomeEl.classList.add('hidden');
-  // Restored sessions only contain text — tool cards and diffs are not replayed.
-  const note = document.createElement('div');
-  note.className = 'restore-note';
-  note.textContent = 'Session restored — earlier tool activity and diffs are not shown.';
-  messagesEl.appendChild(note);
+  // Tool cards are replayed for every turn that recorded them, which is every
+  // turn saved since 0.2.7. Older chats have no card record at all and still
+  // come back as bare prose, so the note is shown only when that's the case —
+  // a permanent "not shown" banner over a transcript that plainly does show
+  // them was worse than no banner.
+  const anyCards = history.some(i => Array.isArray(i.cards) && i.cards.length);
+  if (!anyCards) {
+    const note = document.createElement('div');
+    note.className = 'restore-note';
+    note.textContent = 'Session restored — tool activity from before this chat was saved is not shown.';
+    messagesEl.appendChild(note);
+  }
 
-  const renderable = history.filter(i => i.text?.trim()); // skip empty tool-only iterations
+  // Skip empty tool-only iterations, but never a turn that has cards to replay.
+  const renderable = history.filter(i => i.text?.trim() || (Array.isArray(i.cards) && i.cards.length));
   const hidden = Math.max(0, renderable.length - HISTORY_RENDER_LIMIT);
   if (hidden) {
     const more = document.createElement('button');
@@ -1866,7 +2116,9 @@ function renderHistory(history) {
       // (a fragment keeps insertion order), so the transcript still reads
       // oldest-first rather than coming back reversed or interleaved.
       const mark = messagesEl.childNodes.length;
-      for (const item of renderable.slice(0, hidden)) renderHistoryItem(item);
+      _restoring = true;
+      try { for (const item of renderable.slice(0, hidden)) renderHistoryItem(item); }
+      finally { _restoring = false; }
       const frag = document.createDocumentFragment();
       for (const node of [...messagesEl.childNodes].slice(mark)) frag.appendChild(node);
       messagesEl.insertBefore(frag, more);
@@ -1874,7 +2126,9 @@ function renderHistory(history) {
     });
     messagesEl.appendChild(more);
   }
-  for (const item of renderable.slice(hidden)) renderHistoryItem(item);
+  _restoring = true;
+  try { for (const item of renderable.slice(hidden)) renderHistoryItem(item); }
+  finally { _restoring = false; }
 }
 
 function populateProjects(roots, current, catalog) {
@@ -2204,22 +2458,51 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     attachCodeBlockActions(bubble);
   }
 
-  // Hover copy button for assistant messages — copies the whole reply as markdown.
-  if (role === 'assistant') {
+  // Hover copy button. Assistant replies copy their markdown source; a user
+  // message copies exactly what was typed — long prompts are collapsed behind
+  // a "Show N more lines" toggle, so the visible text is not the whole thing
+  // and reading it off the DOM would silently truncate. `text` is the original
+  // input, so it is used directly.
+  if (role === 'assistant' || role === 'user') {
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
     copyBtn.className = 'msg-copy-btn';
-    copyBtn.title = 'Copy message';
-    copyBtn.setAttribute('aria-label', 'Copy message');
+    copyBtn.title = role === 'user' ? 'Copy your message' : 'Copy message';
+    copyBtn.setAttribute('aria-label', copyBtn.title);
     copyBtn.textContent = '⧉';
     copyBtn.addEventListener('click', () => {
       // Prefer the article: a reply split across several bubbles by tool activity
       // records its full markdown there, so copy still yields the whole reply.
-      vscode.postMessage({ type: 'copy', text: copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '') });
+      const payload = role === 'user'
+        ? text
+        : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
+      vscode.postMessage({ type: 'copy', text: payload });
       copyBtn.textContent = '✓';
       setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
     });
     article.appendChild(copyBtn);
+
+    // Read aloud. Only offered when the renderer actually provides speech
+    // synthesis — a button that can only fail is worse than no button.
+    if (SPEECH_AVAILABLE) {
+      const speakBtn = document.createElement('button');
+      speakBtn.type = 'button';
+      speakBtn.className = 'msg-speak-btn';
+      speakBtn.title = 'Read aloud';
+      speakBtn.setAttribute('aria-label', 'Read aloud');
+      speakBtn.textContent = '🔊';
+      speakBtn.addEventListener('click', () => {
+        // Clicking the button that is already speaking stops it — the same
+        // control both starts and cancels, so there is never a reading you
+        // cannot stop.
+        if (speakBtn.dataset.speaking === 'true') { stopSpeaking(); return; }
+        const source = role === 'user'
+          ? text
+          : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
+        speakText(speakableText(source), speakBtn);
+      });
+      article.appendChild(speakBtn);
+    }
   }
 
   article.appendChild(bubble);
@@ -2309,6 +2592,9 @@ function resetPlanCard() {
 // not part of which project's history is on screen, and losing it on an
 // accidental tab click would be a bad surprise.
 function resetThreadDisplay() {
+  // A reply being read aloud is about to leave the screen; its audio should go
+  // with it rather than narrating a conversation that is no longer shown.
+  stopSpeaking();
   activeAssistantMessage = null;
   activeAssistantBubble = null;
   activeAssistantContent = '';
@@ -2473,8 +2759,29 @@ function nextRenderDelay() {
 // Fix: when tool activity begins after the model has already written something,
 // seal that bubble. The next text starts a fresh bubble, which lands after the
 // activity log — so the transcript reads in the order things actually happened.
+// True when `text` ends inside an unterminated ``` block. Fence markers only
+// count at the start of a line, matching the parser in renderMarkdown, so a
+// stray triple-backtick mid-line can't throw the count off.
+function hasOpenCodeFence(text) {
+  const fences = String(text).match(/(?:^|\n)`{3,8}/g);
+  return fences ? fences.length % 2 === 1 : false;
+}
+
 function sealCurrentBubble() {
   if (!activeAssistantBubble || _needNewBubble) return;
+  // Never split a bubble in the middle of a code block. Sealing here starts a
+  // new bubble for whatever comes next, which cuts the fence in half: the
+  // sealed half holds an opening ``` with no close, the next half a closing
+  // ``` with no open, and NEITHER parses — so both render as paragraphs, with
+  // the fences shown literally, indentation collapsed, and inline markdown
+  // chewing through the code (re_match_alternation coming out as
+  // re<em>match</em>alternation). A tool call mid-block is enough to trigger it.
+  //
+  // The cost of waiting is that a card raised while the block is still open
+  // lands after the bubble rather than inside the flow, so text that follows
+  // sits above it. That is a far smaller problem than unreadable code, and it
+  // resolves itself as soon as the block closes.
+  if (hasOpenCodeFence(activeAssistantContent.slice(_segmentStart))) return;
   const segment = activeAssistantContent.slice(_segmentStart);
   if (segment.trim()) {
     const html = renderMarkdown(segment);
@@ -2533,10 +2840,17 @@ function appendAssistantText(text) {
   }
 }
 
+// True only while renderHistory is rebuilding a saved chat. A restore drives
+// the streaming path on purpose (see renderAssistantTurn) but nothing is
+// actually streaming: the intermediate render is wasted work, the plan card
+// belongs to the turn that was live when it was parsed, and the slow-render
+// warning would fire once per restored turn on a chat that is merely long.
+let _restoring = false;
+
 function renderStreamingContent() {
   const _renderStart = Date.now();
   _lastMdRenderAt = _renderStart;
-  if (!activeAssistantBubble) return;
+  if (!activeAssistantBubble || _restoring) return;
   maybeBuildPlanCard();
 
   // NEVER show raw <think> reasoning while streaming: drop closed blocks and,
@@ -3105,6 +3419,126 @@ function renderInline(text) {
   return h;
 }
 
+// ── Syntax highlighting ──────────────────────────────────────────────────────
+// Written out longhand rather than pulled in from a library: the webview's CSP
+// is `default-src 'none'` with a script nonce and `connect-src 'none'`, so there
+// is no CDN to load one from, and media/main.js ships verbatim (only
+// src/extension.js goes through esbuild), so a bundled dependency isn't an
+// option either. What follows is a single linear pass per block — no nested
+// quantifiers, no backtracking traps — which matters because this runs on every
+// render tick of a streaming reply.
+//
+// SAFETY: the tokenizer never inserts source text into HTML directly. Every
+// span, and every gap between spans, goes through escapeHtml first, so a code
+// block containing `<script>` is as inert as it was before highlighting existed.
+
+// Blocks past this are left unhighlighted. A very large paste is exactly when
+// the panel can least afford extra per-tick work, and plain text is what it
+// rendered before anyway.
+const HL_MAX_CHARS = 20000;
+
+const HL_CLIKE_KEYWORDS = 'abstract|as|async|await|base|bool|break|byte|case|catch|char|class|const|constexpr|continue|debugger|def|default|defer|delegate|delete|do|double|dynamic|elif|else|enum|event|explicit|export|extends|extern|false|final|finally|float|fn|for|foreach|friend|from|func|function|get|go|goto|if|impl|implements|import|in|inline|instanceof|int|interface|internal|is|let|lock|long|match|mod|module|mut|mutable|namespace|new|nil|noexcept|null|nullptr|object|operator|out|override|package|params|private|protected|pub|public|readonly|ref|register|return|sealed|set|short|signed|sizeof|static|string|struct|super|switch|template|this|throw|throws|trait|true|try|type|typedef|typename|typeof|uint|union|unsafe|unsigned|use|using|var|virtual|void|volatile|when|where|while|with|yield';
+const HL_HASH_KEYWORDS = 'and|as|assert|async|await|break|case|class|continue|def|del|do|done|elif|else|elsif|end|esac|except|exec|export|fi|finally|for|from|function|global|if|import|in|is|lambda|local|module|next|nil|nonlocal|not|or|pass|print|raise|require|rescue|return|select|self|then|throw|true|false|try|unless|until|unset|until|when|while|with|yield';
+const HL_SQL_KEYWORDS = 'ADD|ALL|ALTER|AND|AS|ASC|BEGIN|BETWEEN|BY|CASE|COMMIT|CREATE|CROSS|DEFAULT|DELETE|DESC|DISTINCT|DROP|ELSE|END|EXISTS|FOREIGN|FROM|FULL|GROUP|HAVING|IN|INDEX|INNER|INSERT|INTO|IS|JOIN|KEY|LEFT|LIKE|LIMIT|NOT|NULL|OFFSET|ON|OR|ORDER|OUTER|PRIMARY|REFERENCES|RIGHT|ROLLBACK|SELECT|SET|TABLE|THEN|TRANSACTION|UNION|UNIQUE|UPDATE|VALUES|VIEW|WHEN|WHERE|WITH';
+
+// Language id (from the fence, e.g. ```ts) → tokenizer family. Anything absent
+// is rendered plain, which is the safe default: a wrong guess would mis-colour
+// real code, and nobody benefits from that.
+const HL_FAMILY = {
+  js: 'clike', jsx: 'clike', javascript: 'clike', mjs: 'clike', cjs: 'clike',
+  ts: 'clike', tsx: 'clike', typescript: 'clike',
+  java: 'clike', c: 'clike', h: 'clike', cpp: 'clike', 'c++': 'clike', cc: 'clike', hpp: 'clike',
+  cs: 'clike', 'c#': 'clike', csharp: 'clike', go: 'clike', golang: 'clike',
+  rust: 'clike', rs: 'clike', swift: 'clike', kotlin: 'clike', kt: 'clike',
+  php: 'clike', dart: 'clike', scala: 'clike', groovy: 'clike',
+  py: 'hash', python: 'hash', rb: 'hash', ruby: 'hash',
+  sh: 'hash', bash: 'hash', zsh: 'hash', shell: 'hash', console: 'hash',
+  yaml: 'hash', yml: 'hash', toml: 'hash', ini: 'hash', conf: 'hash',
+  dockerfile: 'hash', makefile: 'hash', make: 'hash', r: 'hash', perl: 'hash', pl: 'hash',
+  json: 'json', jsonc: 'json',
+  html: 'markup', xml: 'markup', svg: 'markup', vue: 'markup', htm: 'markup',
+  css: 'css', scss: 'css', less: 'css', sass: 'css',
+  sql: 'sql',
+};
+
+// One regex per family. Named groups identify the token kind, so a single pass
+// classifies everything without a second lookup. Order inside each alternation
+// is deliberate: comments and strings come first so a keyword inside a string
+// is never coloured as code.
+const HL_RE = {
+  clike: new RegExp(
+    '(?<comment>\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)'
+    + '|(?<string>"(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\'|`(?:\\\\.|[^`\\\\])*`)'
+    + '|(?<number>\\b0[xXbBoO][0-9a-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?\\b)'
+    + '|(?<keyword>\\b(?:' + HL_CLIKE_KEYWORDS + ')\\b)'
+    + '|(?<fn>\\b[A-Za-z_$][\\w$]*(?=\\s*\\())', 'g'),
+  hash: new RegExp(
+    '(?<comment>#[^\\n]*)'
+    + '|(?<string>"""[\\s\\S]*?"""|\'\'\'[\\s\\S]*?\'\'\'|"(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\')'
+    + '|(?<number>\\b\\d[\\d_]*(?:\\.\\d+)?\\b)'
+    + '|(?<keyword>\\b(?:' + HL_HASH_KEYWORDS + ')\\b)'
+    + '|(?<fn>\\b[A-Za-z_][\\w]*(?=\\s*\\())', 'g'),
+  json: new RegExp(
+    '(?<property>"(?:\\\\.|[^"\\\\\\n])*"(?=\\s*:))'
+    + '|(?<string>"(?:\\\\.|[^"\\\\\\n])*")'
+    + '|(?<number>-?\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b)'
+    + '|(?<keyword>\\b(?:true|false|null)\\b)', 'g'),
+  markup: new RegExp(
+    '(?<comment><!--[\\s\\S]*?-->)'
+    + '|(?<string>"(?:[^"\\\\\\n])*"|\'(?:[^\'\\\\\\n])*\')'
+    + '|(?<keyword></?[A-Za-z][\\w:-]*)'
+    + '|(?<property>\\b[A-Za-z_:][\\w:.-]*(?=\\s*=))', 'g'),
+  css: new RegExp(
+    '(?<comment>\\/\\*[\\s\\S]*?\\*\\/)'
+    + '|(?<string>"(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\')'
+    + '|(?<keyword>@[A-Za-z-]+|[.#][A-Za-z_][\\w-]*|:{1,2}[A-Za-z-]+)'
+    + '|(?<property>\\b[a-z-]+(?=\\s*:))'
+    + '|(?<number>-?\\b\\d*\\.?\\d+(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?\\b|#[0-9a-fA-F]{3,8}\\b)', 'g'),
+  sql: new RegExp(
+    '(?<comment>--[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/)'
+    + '|(?<string>\'(?:\\\\.|[^\'\\\\\\n])*\'|"(?:\\\\.|[^"\\\\\\n])*")'
+    + '|(?<number>\\b\\d+(?:\\.\\d+)?\\b)'
+    + '|(?<keyword>\\b(?:' + HL_SQL_KEYWORDS + ')\\b)', 'gi'),
+};
+
+// Which named group matched. Returns '' when a match carried no group, so the
+// caller emits it as plain escaped text rather than an unstyled span.
+function hlTokenClass(match) {
+  const g = match.groups || {};
+  for (const name of ['comment', 'string', 'property', 'number', 'keyword', 'fn']) {
+    if (g[name] !== undefined) return name;
+  }
+  return '';
+}
+
+// Escaped HTML for `code`, with <span class="tok-*"> around recognised tokens.
+// Falls back to plain escaped text for an unknown language or an oversized
+// block — highlighting is a nicety and must never be the reason a block fails
+// to render.
+function highlightCode(code, language) {
+  const family = HL_FAMILY[String(language || '').toLowerCase()];
+  const re = family && HL_RE[family];
+  if (!re || code.length > HL_MAX_CHARS) return escapeHtml(code);
+
+  let out = '';
+  let last = 0;
+  let m;
+  re.lastIndex = 0;
+  while ((m = re.exec(code)) !== null) {
+    // A zero-length match would spin forever; nudge past it. Defensive — none
+    // of the patterns above can match empty — but a future edit might.
+    if (m[0].length === 0) { re.lastIndex++; continue; }
+    out += escapeHtml(code.slice(last, m.index));
+    const cls = hlTokenClass(m);
+    out += cls
+      ? '<span class="tok-' + cls + '">' + escapeHtml(m[0]) + '</span>'
+      : escapeHtml(m[0]);
+    last = m.index + m[0].length;
+  }
+  out += escapeHtml(code.slice(last));
+  return out;
+}
+
 function renderCodeBlock(language, path, code) {
   const pathAttr = path ? ` data-path="${escapeHtml(path)}"` : '';
   const pathLabel = path ? `<span class="code-path" title="${escapeHtml(path)}"${pathAttr}>${escapeHtml(path)}</span>` : '';
@@ -3112,7 +3546,7 @@ function renderCodeBlock(language, path, code) {
   return `<div class="code-block">
     <div class="code-header">
       <div class="code-meta">
-        <span class="code-language">${language || 'code'}</span>
+        <span class="code-language">${escapeHtml(language || 'code')}</span>
         ${pathLabel}
       </div>
       <div class="code-actions">
@@ -3120,9 +3554,377 @@ function renderCodeBlock(language, path, code) {
         ${showApply ? `<button class="apply-button" type="button" title="Apply to file">Apply</button>` : ''}
       </div>
     </div>
-    <pre><code class="language-${language}"${pathAttr}>${escapeHtml(code)}</code></pre>
+    <pre><code class="language-${escapeHtml(language)}"${pathAttr}>${highlightCode(code, language)}</code></pre>
   </div>`;
 }
+
+// ── Speech: reading replies aloud, and dictating a prompt ────────────────────
+// Both use the browser APIs the renderer already provides — no dependency, no
+// network call of Navy's own, nothing to configure. Availability genuinely
+// varies by build (a VS Code webview is Chromium, but speech recognition in
+// particular depends on services not present in every distribution), so every
+// entry point is feature-detected and the controls stay hidden rather than
+// failing when pressed.
+let _speakingButton = null;
+
+// Markdown read aloud verbatim is unpleasant — fences, backticks, list bullets
+// and link syntax all get pronounced. This keeps the prose and drops the
+// punctuation that only exists for the renderer, replacing code blocks with a
+// short spoken marker instead of reading them character by character.
+//
+// Headings and list items end up with a full stop they didn't have. Stripping
+// the marker and nothing else ran every bullet into the next one as a single
+// breathless sentence, which is a large part of what "robotic" actually was:
+// the synthesiser phrases and pauses on punctuation, and there was none to
+// work with.
+function speakableText(md) {
+  const period = (t) => (/[.!?:;,]$/.test(t.trim()) ? t.trim() : t.trim() + '.');
+  return String(md || '')
+    .replace(/```[\s\S]*?```/g, ' … code block … ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/^#{1,6}\s+(.+)$/gm, (_, t) => period(t))
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/gm, (_, t) => period(t))
+    .replace(/\*\*|__|~~|\*/g, '')
+    .replace(/\n{2,}/g, '. ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ── Picking a voice ─────────────────────────────────────────────────────────
+// Nothing chose one before, so every reply was read by whichever voice the
+// platform happens to list first. On Windows that is Microsoft David — SAPI5
+// formant synthesis from the 1990s — which is the robotic sound being
+// complained about. Better voices are usually sitting in the same list; they
+// are simply not first.
+//
+// Ranked by name rather than named outright, because the list differs on every
+// machine and pinning a name that isn't installed drops straight back to the
+// default. Positive entries are the neural/high-quality families; the negative
+// ones are the voices worth actively avoiding when anything else exists.
+const VOICE_RANK = [
+  { re: /natural|neural/i, score: 60 },   // Windows 11 natural voices, Edge/Azure
+  { re: /premium|enhanced/i, score: 50 }, // macOS downloadable Siri-quality voices
+  { re: /\bonline\b/i, score: 45 },       // Microsoft's server-side voices
+  { re: /^google\s/i, score: 40 },        // Chrome's own (absent in Electron, present in a browser)
+  // Already-good voices shipped by default on macOS/iOS.
+  { re: /\b(samantha|ava|allison|serena|zoe|evan|nathan|tom|alex|karen|daniel|moira|fiona)\b/i, score: 30 },
+  { re: /desktop/i, score: -10 },         // "Microsoft Zira Desktop" — the old SAPI5 set
+  { re: /\b(david|mark|hazel|susan|george|zira)\b/i, score: -15 },
+  { re: /espeak|festival|pico|flite/i, score: -60 }, // Linux fallbacks, genuinely unpleasant
+];
+
+function scoreVoice(voice) {
+  let score = 0;
+  const name = String(voice?.name || '');
+  for (const entry of VOICE_RANK) if (entry.re.test(name)) score += entry.score;
+  // A voice served over the network is a neural one — nothing ships a formant
+  // synthesiser remotely.
+  if (voice?.localService === false) score += 8;
+  if (voice?.default) score += 3;
+  return score;
+}
+
+// Language first, quality second: an excellent voice reading the wrong language
+// is unusable, while a merely-adequate one in the right language is not.
+function pickVoice(voices, preferredName) {
+  const list = Array.isArray(voices) ? voices.filter(Boolean) : [];
+  if (!list.length) return null;
+  if (preferredName) {
+    const exact = list.find(v => v.name === preferredName);
+    if (exact) return exact;   // an explicit choice is never second-guessed
+  }
+  const want = String((typeof navigator !== 'undefined' && navigator.language) || 'en-US')
+    .toLowerCase().replace(/_/g, '-');
+  const base = want.split('-')[0];
+  const langOf = (v) => String(v.lang || '').toLowerCase().replace(/_/g, '-');
+  const tiers = [
+    list.filter(v => langOf(v) === want),
+    list.filter(v => langOf(v).split('-')[0] === base),
+    list,
+  ];
+  for (const tier of tiers) {
+    if (tier.length) return tier.slice().sort((a, b) => scoreVoice(b) - scoreVoice(a))[0];
+  }
+  return list[0];
+}
+
+let _voices = [];
+let _voiceChoice = '';   // navy.speechVoice — '' means "pick the best available"
+let _speechRate = 1;
+
+function loadVoices() {
+  try { _voices = window.speechSynthesis.getVoices() || []; } catch { _voices = []; }
+  populateVoiceOptions();
+}
+
+// Fills the Settings dropdown from the voices this renderer actually has.
+// Necessarily done here rather than in package.json: the extension host cannot
+// see the list, it differs per machine, and a free-text setting would happily
+// accept a name that isn't installed and then silently do nothing. Best first,
+// so the automatic choice and its nearest rivals are at the top.
+function populateVoiceOptions() {
+  if (!settingSpeechVoice) return;
+  const auto = pickVoice(_voices, '');
+  settingSpeechVoice.innerHTML = '';
+  const autoOpt = document.createElement('option');
+  autoOpt.value = '';
+  autoOpt.textContent = auto ? `Automatic — ${auto.name}` : 'Automatic';
+  settingSpeechVoice.appendChild(autoOpt);
+  const ordered = _voices.slice().sort((a, b) =>
+    scoreVoice(b) - scoreVoice(a) || String(a.name).localeCompare(String(b.name)));
+  for (const v of ordered) {
+    const opt = document.createElement('option');
+    opt.value = v.name;
+    opt.textContent = v.lang ? `${v.name} — ${v.lang}` : String(v.name);
+    settingSpeechVoice.appendChild(opt);
+  }
+  settingSpeechVoice.value = _voices.some(v => v.name === _voiceChoice) ? _voiceChoice : '';
+}
+
+if (SPEECH_AVAILABLE) {
+  // getVoices() is empty until the engine has finished enumerating, and there
+  // is no promise to await — the event is the only signal that the real list
+  // has arrived, so a voice chosen at load time is usually chosen from nothing.
+  loadVoices();
+  try { window.speechSynthesis.addEventListener?.('voiceschanged', loadVoices); } catch { }
+}
+
+// Reading is done one sentence-sized piece at a time rather than as a single
+// utterance. Two reasons, and the second is the important one: Chromium stops
+// speaking after roughly fifteen seconds of one utterance and never resumes, so
+// long replies were being cut off mid-word; and an engine given a whole essay
+// reads it as one flat run, where the same text split at its sentences is
+// phrased and paced like speech. 160 characters is comfortably inside the
+// cut-off at normal rate.
+const SPEAK_CHUNK_MAX = 160;
+
+function speechChunks(text) {
+  const sentences = String(text || '').match(/[^.!?…]+[.!?…]*\s*/g) || [];
+  const chunks = [];
+  let buf = '';
+  const flush = () => { if (buf.trim()) chunks.push(buf.trim()); buf = ''; };
+  for (const sentence of sentences) {
+    if (sentence.length > SPEAK_CHUNK_MAX) {
+      // One sentence longer than the cap: break it at commas, then, if it is
+      // still too long, at whatever word boundary fits. Never mid-word.
+      flush();
+      let piece = '';
+      for (const part of sentence.split(/(?<=,)\s*/)) {
+        if (piece && (piece + part).length > SPEAK_CHUNK_MAX) { chunks.push(piece.trim()); piece = ''; }
+        if (part.length > SPEAK_CHUNK_MAX) {
+          for (const word of part.split(/\s+/)) {
+            if (piece && (piece + ' ' + word).length > SPEAK_CHUNK_MAX) { chunks.push(piece.trim()); piece = ''; }
+            piece += (piece ? ' ' : '') + word;
+          }
+          continue;
+        }
+        piece += part;
+      }
+      if (piece.trim()) chunks.push(piece.trim());
+      continue;
+    }
+    if (buf && (buf + sentence).length > SPEAK_CHUNK_MAX) flush();
+    buf += sentence;
+  }
+  flush();
+  return chunks;
+}
+
+let _speakQueue = [];
+let _speakIndex = 0;
+let _speakWatchdog = null;
+
+function stopSpeaking() {
+  _speakQueue = [];
+  _speakIndex = 0;
+  if (_speakWatchdog) { clearTimeout(_speakWatchdog); _speakWatchdog = null; }
+  try { window.speechSynthesis.cancel(); } catch {}
+  if (_speakingButton) {
+    _speakingButton.dataset.speaking = 'false';
+    _speakingButton.textContent = '🔊';
+    _speakingButton.title = 'Read aloud';
+    _speakingButton.setAttribute('aria-label', 'Read aloud');
+    _speakingButton = null;
+  }
+}
+
+// Speaks queue position `_speakIndex` and arranges for the next one. `button`
+// is carried through as an identity check so a reading the user has already
+// stopped — or replaced by clicking a different message — cannot resurrect
+// itself when a stale utterance finally reports back.
+function speakNextChunk(button) {
+  if (_speakingButton !== button) return;
+  if (_speakIndex >= _speakQueue.length) { stopSpeaking(); return; }
+  const text = _speakQueue[_speakIndex++];
+  let utterance;
+  try { utterance = new window.SpeechSynthesisUtterance(text); }
+  catch { stopSpeaking(); return; }
+
+  const voice = pickVoice(_voices, _voiceChoice);
+  if (voice) { utterance.voice = voice; if (voice.lang) utterance.lang = voice.lang; }
+  utterance.rate = _speechRate;
+
+  const advance = () => {
+    if (_speakWatchdog) { clearTimeout(_speakWatchdog); _speakWatchdog = null; }
+    if (_speakingButton !== button) return;
+    speakNextChunk(button);
+  };
+  utterance.onend = advance;
+  // An utterance that errors ends the reading rather than skipping ahead: the
+  // usual cause is the engine going away, and racing through the remaining
+  // chunks in silence would just take longer to look broken.
+  utterance.onerror = () => { if (_speakingButton === button) stopSpeaking(); };
+
+  // Chromium occasionally drops an utterance without firing either callback,
+  // which used to leave the button stuck on ⏹ with nothing playing. Generous
+  // enough never to cut off real speech: roughly four times the time the text
+  // could plausibly take to read.
+  if (_speakWatchdog) clearTimeout(_speakWatchdog);
+  _speakWatchdog = setTimeout(advance, 4000 + text.length * 400);
+
+  try { window.speechSynthesis.speak(utterance); } catch { stopSpeaking(); }
+}
+
+function speakText(text, button) {
+  if (!SPEECH_AVAILABLE || !text) return;
+  stopSpeaking(); // only ever one reading at a time
+  const chunks = speechChunks(text);
+  if (!chunks.length) return;
+  _speakQueue = chunks;
+  _speakIndex = 0;
+  _speakingButton = button;
+  button.dataset.speaking = 'true';
+  button.textContent = '⏹';
+  button.title = 'Stop reading';
+  button.setAttribute('aria-label', button.title);
+  speakNextChunk(button);
+}
+
+// ── Dictation ────────────────────────────────────────────────────────────────
+// Speech is recognised in the user's BROWSER, not in here and not in the
+// extension host — see src/dictation-bridge.js for why. This file only drives
+// the microphone button and shows what comes back.
+//
+// There is no pause control. The browser's recogniser has no pause of its own,
+// so pausing meant tearing the engine down and building a new one, and the gap
+// swallowed whatever was said across it — a button that loses your words is
+// worse than no button. Stop, and press the mic again.
+//
+// Recognised speech is placed in the prompt box and NEVER sent on its own:
+// recognition mishears, and a mistaken message to a coding agent can start real
+// work. The user reads it, edits it, and presses send.
+const dictation = {
+  active: false,
+  // Whatever was already typed before dictation started. Every message from the
+  // page carries the WHOLE transcript so far, so text is replaced rather than
+  // appended — a dropped message costs nothing and re-recognised words cannot
+  // double up.
+  baseline: '',
+};
+
+// Why a session ended, when it is worth saying. A normal finish says nothing:
+// the words are in the box, which is the confirmation.
+const DICTATION_END_STATUS = {
+  timeout: 'dictation timed out',
+  failed: 'could not open the browser',
+};
+
+// What the browser page is doing, in the panel's words. 'browser' means the
+// open request went out; 'open' means the page actually connected back, which
+// is the first moment there is anything really listening.
+const DICTATION_STATE_STATUS = {
+  browser: 'opening your browser…',
+  open: 'browser open — press “Start talking”',
+  listening: 'listening in your browser…',
+  error: 'the browser page could not use the microphone',
+};
+
+function micSetStatus(text) {
+  const el = document.querySelector('#micStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  // The sidebar is narrow enough that a status can be elided; the tooltip is
+  // where the full reason stays readable.
+  el.title = text || '';
+  el.hidden = !text;
+}
+
+function micIdleTitle() { return 'Dictate a message (opens your browser)'; }
+
+function micSetRecording(on) {
+  const mic = document.querySelector('#micButton');
+  if (!mic) return;
+  mic.classList.toggle('recording', !!on);
+  mic.title = on ? 'Stop dictation' : micIdleTitle();
+  mic.setAttribute('aria-label', mic.title);
+}
+
+function toggleDictation() {
+  if (dictation.active) dictationStop(); else dictationStart();
+}
+
+function dictationStart() {
+  dictation.active = true;
+  dictation.baseline = (promptInput?.value || '').trim();
+  micSetRecording(true);
+  micSetStatus(DICTATION_STATE_STATUS.browser);
+  vscode.postMessage({ type: 'dictate' });
+}
+
+function dictationStop() {
+  if (!dictation.active) return;
+  vscode.postMessage({ type: 'dictateStop' });
+  dictationEnd('');
+}
+
+// VS Code destroys a webview when its panel is hidden and rebuilds it from
+// scratch on return, so this file can lose every trace of a session the
+// extension is still running. Anything arriving from that session is proof it
+// exists — adopt it rather than discarding it, which is what made a session
+// survive a tab switch in name only: the words kept coming and nothing in the
+// panel was listening for them.
+function dictationAdopt() {
+  if (dictation.active) return;
+  dictation.active = true;
+  dictation.baseline = (promptInput?.value || '').trim();
+  micSetRecording(true);
+}
+
+// Everything the page reports about itself, in one place so the button and the
+// status line can never disagree about whether speech is being heard.
+function dictationState(state) {
+  if (state === 'open' || state === 'listening') {
+    dictationAdopt();
+    micSetRecording(true);
+  } else if (!dictation.active) {
+    return;
+  }
+  micSetStatus(DICTATION_STATE_STATUS[state] || '');
+}
+
+// Called both by our own stop and by the extension's 'ended' — whichever side
+// notices first, the UI settles the same way.
+function dictationEnd(status) {
+  dictation.active = false;
+  micSetRecording(false);
+  micSetStatus(status || '');
+  promptInput?.focus();
+}
+
+// Each post carries the whole transcript, so this replaces rather than appends.
+function dictationText(text, done) {
+  if (!promptInput) return;
+  dictationAdopt();
+  const base = dictation.baseline;
+  const spoken = String(text || '');
+  promptInput.value = (base + (base && spoken ? ' ' : '') + spoken).trim();
+  autoResize();
+  updateSendButton();
+  if (done) micSetStatus('transcript received');
+}
+
 
 // What the copy button should actually put on the clipboard. rawMd is the
 // model's untouched output, which still contains its <think> blocks — the UI
@@ -3338,30 +4140,39 @@ function collapseToolProgress() {
   activityRowsById.clear();
 }
 
-function buildResultPreview(tool, result) {
+// `full` is present only on a RESTORED card whose recorded result was truncated
+// for storage (see makeCardRecord in src/extension.js). It carries the true size
+// of what the tool actually returned, so a restored card reports the same
+// numbers the live one did rather than the size of the excerpt that was kept.
+// Counts that come from scanning the text — matches, commits, diagnostics —
+// can only ever be as complete as the excerpt, so those are shown as "N+".
+function buildResultPreview(tool, result, full) {
   if (!result) return '';
   const r = String(result);
   if (r.startsWith('Error')) return r.slice(0, 90);
+  const rawLines    = full ? full.lines  : r.split('\n').length;
+  const filledLines = full ? full.filled : r.split('\n').filter(l => l.trim()).length;
+  const more = full ? '+' : '';
 
   switch (tool) {
     case 'read_file': case 'read_lines': {
-      const n = r.split('\n').length;
+      const n = rawLines;
       return `${n} line${n !== 1 ? 's' : ''}`;
     }
     case 'list_files': {
-      const n = r.split('\n').filter(l => l.trim()).length;
+      const n = filledLines;
       return `${n} file${n !== 1 ? 's' : ''}`;
     }
     case 'search_files': case 'search_codebase': {
       const n = r.split('\n').filter(l => l.trim() && !l.startsWith('---')).length;
-      return n ? `${n} match${n !== 1 ? 'es' : ''}` : 'no matches';
+      return n ? `${n}${more} match${n !== 1 ? 'es' : ''}` : 'no matches';
     }
     case 'run_command': case 'start_process': {
       const first = r.split('\n').find(l => l.trim());
       return first ? first.slice(0, 80) : 'done';
     }
     case 'read_process_output': {
-      const lines = r.split('\n').filter(l => l.trim()).length;
+      const lines = filledLines;
       return `${lines} line${lines !== 1 ? 's' : ''}`;
     }
     case 'write_file': case 'apply_edit': return 'saved';
@@ -3369,30 +4180,30 @@ function buildResultPreview(tool, result) {
     case 'rename_file': return 'renamed';
     case 'web_search': {
       const n = (r.match(/^\[\d+\]/gm) || []).length;
-      return n ? `${n} result${n !== 1 ? 's' : ''}` : r.slice(0, 60);
+      return n ? `${n}${more} result${n !== 1 ? 's' : ''}` : r.slice(0, 60);
     }
     case 'git_status': {
-      const n = r.split('\n').filter(l => l.trim()).length;
+      const n = filledLines;
       return n ? `${n} change${n !== 1 ? 's' : ''}` : 'clean';
     }
     case 'git_diff': {
       const n = (r.match(/^diff --git/gm) || []).length;
-      return n ? `${n} file${n !== 1 ? 's' : ''} changed` : 'no changes';
+      return n ? `${n}${more} file${n !== 1 ? 's' : ''} changed` : 'no changes';
     }
     case 'git_log': {
       const n = (r.match(/^commit /gm) || []).length;
-      return n ? `${n} commit${n !== 1 ? 's' : ''}` : r.slice(0, 60);
+      return n ? `${n}${more} commit${n !== 1 ? 's' : ''}` : r.slice(0, 60);
     }
     case 'git_blame': {
-      const n = r.split('\n').filter(l => l.trim()).length;
+      const n = filledLines;
       return `${n} line${n !== 1 ? 's' : ''}`;
     }
-    case 'fetch_url': return `${Math.round(r.length / 1024)} KB`;
+    case 'fetch_url': return `${Math.round((full ? full.chars : r.length) / 1024)} KB`;
     case 'get_diagnostics': {
       const errors   = (r.match(/\[Error\]/g)   || []).length;
       const warnings = (r.match(/\[Warning\]/g) || []).length;
       if (!errors && !warnings) return 'no issues';
-      return [errors && `${errors} error${errors !== 1 ? 's' : ''}`, warnings && `${warnings} warning${warnings !== 1 ? 's' : ''}`].filter(Boolean).join(', ');
+      return [errors && `${errors}${more} error${errors !== 1 ? 's' : ''}`, warnings && `${warnings}${more} warning${warnings !== 1 ? 's' : ''}`].filter(Boolean).join(', ');
     }
     case 'remember': return 'saved to memory';
     case 'forget':   return 'removed from memory';
@@ -3443,7 +4254,7 @@ function addToolCallCard(tool, args, callId) {
   scrollToBottom();
 }
 
-function addToolResultCard(tool, result, callId) {
+function addToolResultCard(tool, result, callId, full) {
   // With an id this is exact. Without one (the XML fallback path small models
   // use), falling straight back to currentActivityRowEl picked whichever row
   // was created LAST — wrong whenever read-only tools ran in parallel, since
@@ -3470,7 +4281,7 @@ function addToolResultCard(tool, result, callId) {
   const iconEl = row.querySelector('.act-icon');
   if (iconEl) iconEl.innerHTML = isError ? '<span class="act-x">✕</span>' : '<span class="act-check">✓</span>';
 
-  const preview = buildResultPreview(tool, String(result || ''));
+  const preview = buildResultPreview(tool, String(result || ''), full);
   if (preview) {
     const resultEl = row.querySelector('.act-result');
     if (resultEl) resultEl.textContent = preview;
