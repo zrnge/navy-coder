@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 0.2.7
+## [0.2.7] - 2026-08-16
 
 ### Added
 - **Agent Skills.** Navy had rules (always on, always in context) and slash commands (you invoke them). It had nothing the *model* reaches for on its own, and nothing that could carry more material than fits in a prompt. A skill is a folder with a `SKILL.md`; what separates it from a command is **progressive disclosure** — only the name and description are in context, the body is read when the model decides the task calls for it, and `references/` one file at a time after that. A skill can carry a 400-line reference document and three scripts for about thirty tokens a turn.
