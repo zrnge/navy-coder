@@ -13,6 +13,23 @@ function check(name, cond, detail) {
   else { failures.push(name); console.log('  FAIL ' + name + (detail ? ' — ' + detail : '')); }
 }
 
+// Reads a source file for inspection, with line endings normalised to LF.
+//
+// Git checks out with CRLF on Windows by default, so these tests run against
+// different bytes on the two CI runners. That is not hypothetical: themeTokenSuite
+// finds the end of the :root block by searching for a newline, a closing brace
+// and a newline, which matches nothing in a CRLF file — so its `rules` slice
+// became a single character and eleven assertions failed on windows-latest while
+// ubuntu-latest stayed green.
+//
+// Line endings are not what any of these tests are about, so they are removed at
+// the door rather than guarded against at every call site.
+function readSource(...parts) {
+  return require('fs')
+    .readFileSync(require('path').join(__dirname, '..', ...parts), 'utf8')
+    .split('\r\n').join('\n');
+}
+
 function run(steps) {
   const w = createWebview();
   for (const s of steps) w.post(s);
@@ -1030,8 +1047,7 @@ function slashCommandSuite() {
 function themeTokenSuite() {
   console.log('\ncss: tints follow the theme instead of freezing one:');
 
-  const css = require('fs').readFileSync(
-    require('path').join(__dirname, '..', 'media', 'styles.css'), 'utf8');
+  const css = readSource('media', 'styles.css');
 
   // The :root block declares the palette; everything after it must consume it.
   const rootEnd = css.indexOf('\n}\n');
@@ -1873,8 +1889,7 @@ function commandApprovalSuite() {
   // not wrap, and .command-card sets overflow: hidden, so a command wider than
   // the sidebar was clipped with no way to scroll to the rest — approving
   // something you could not finish reading.
-  const css = require('fs').readFileSync(
-    require('path').join(__dirname, '..', 'media', 'styles.css'), 'utf8');
+  const css = readSource('media', 'styles.css');
   const at = css.indexOf('.tool-details {');
   const rule = at === -1 ? '' : css.slice(at, css.indexOf('}', at));
   check('.tool-details has a rule at all', at !== -1);
