@@ -42,30 +42,6 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
             </g>
           </svg>
           <span class="brand-title">Navy</span>
-          <svg class="brand-thinking" viewBox="0 0 24 24" width="13" height="13" fill="none" aria-label="Thinking" title="Navy is thinking…">
-            <circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="1.8"/>
-            <circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.5"/>
-            <g stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(0 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(45 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(90 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(135 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(180 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(225 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(270 12 12)"/>
-              <line x1="12" y1="9.2" x2="12" y2="2.5" transform="rotate(315 12 12)"/>
-            </g>
-            <g fill="currentColor">
-              <circle cx="12" cy="2" r="1" transform="rotate(0 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(45 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(90 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(135 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(180 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(225 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(270 12 12)"/>
-              <circle cx="12" cy="2" r="1" transform="rotate(315 12 12)"/>
-            </g>
-          </svg>
         </div>
         <!-- Live status (elastic, mostly hidden) -->
         <div class="topbar-info">
@@ -79,18 +55,18 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                built per model, not a fixed list, so a 1M-token model offers
                sizes an 8k one never will. Hidden entirely while no window is
                known, rather than offering a guess. -->
-          <select id="contextSelect" class="select-compact context-select" title="Context window"></select>
+          <select id="contextSelect" class="select-compact context-select" title="Context window" aria-label="Context window"></select>
           <span id="tokenCounter" class="token-counter" title="Tokens used"></span>
           <span id="inlineEditBadge" class="inline-edit-badge"></span>
         </div>
         <!-- Mode selects + icon buttons -->
         <div class="topbar-actions">
-          <select id="thinkingLevelSelect" title="Thinking depth" class="select-compact">
+          <select id="thinkingLevelSelect" title="Thinking depth" aria-label="Thinking depth" class="select-compact">
             <option value="fast">Fast</option>
             <option value="medium" selected>Med</option>
             <option value="high">High</option>
           </select>
-          <select id="approvalModeSelect" title="Edit approval mode" class="select-compact">
+          <select id="approvalModeSelect" title="Edit approval mode" aria-label="Edit approval mode" class="select-compact">
             <option value="ask-always">Ask</option>
             <option value="auto-approve">Auto</option>
           </select>
@@ -112,6 +88,16 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 7v6h-6"></path>
               <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"></path>
+            </svg>
+          </button>
+          <button id="outlineButton" type="button" class="icon-button" title="Chat outline (Ctrl+O)" aria-label="Chat outline" aria-expanded="false" aria-controls="outlinePanel">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="9" y1="6" x2="20" y2="6"></line>
+              <line x1="9" y1="12" x2="20" y2="12"></line>
+              <line x1="9" y1="18" x2="20" y2="18"></line>
+              <circle cx="4.5" cy="6" r="1.4" fill="currentColor" stroke="none"></circle>
+              <circle cx="4.5" cy="12" r="1.4" fill="currentColor" stroke="none"></circle>
+              <circle cx="4.5" cy="18" r="1.4" fill="currentColor" stroke="none"></circle>
             </svg>
           </button>
           <button id="searchButton" type="button" class="icon-button" title="Search chat (Ctrl+F)" aria-label="Search chat">
@@ -142,8 +128,8 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       </div>
       <!-- Row 2: context selectors (project · model) -->
       <div class="topbar-row topbar-row2">
-        <select id="projectSelect" title="Project directory" class="select-project"></select>
-        <select id="modelSelect" title="Model" class="select-model"></select>
+        <select id="projectSelect" title="Project directory" aria-label="Project directory" class="select-project"></select>
+        <select id="modelSelect" title="Model" class="select-model" aria-label="Model"></select>
       </div>
       <!-- Row 3: session tabs — one per open project. A background tab's turn
            keeps running (see its spinner) but only the active tab's
@@ -152,7 +138,15 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
            row) so it lays out exactly like row 1/row 2 above it. -->
       <div id="sessionTabs" class="session-tabs" role="tablist"></div>
     </header>
-    <div class="context-bar"><div id="contextBarFill" class="context-bar-fill ok"></div></div>
+    <!-- How full the context window is. This was a pair of bare divs whose only
+         readable form was a "title" on the inner one — a tooltip on a node that
+         cannot take focus, so keyboard and touch users never saw it and assistive
+         tech was told nothing at all. It is a progressbar, so it says so, and the
+         numbers live in aria-valuetext where they can actually be read. -->
+    <div class="context-bar" id="contextBar" role="progressbar"
+         aria-label="Context window used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="contextBarFill" class="context-bar-fill ok"></div>
+    </div>
 
     <div id="debugPanel" class="debug-panel" style="display:none"></div>
 
@@ -171,6 +165,25 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
     </div>
 
     <!-- Settings panel -->
+    <!-- Chat outline. A long conversation is hard to move around in: the only
+         way back to something you asked twenty turns ago was to scroll and read.
+         This lists the turns — the questions, which are what a conversation is
+         actually structured around — and jumps to one. Built from the DOM on
+         open rather than kept as a parallel list, so it cannot drift out of step
+         with what is on screen. -->
+    <div id="outlinePanel" class="outline-panel" style="display:none" aria-label="Chat outline">
+      <div class="outline-header">
+        <span class="outline-title">Chat outline</span>
+        <span id="outlineCount" class="outline-count"></span>
+        <button id="outlineClose" type="button" class="memory-action-btn" title="Close" aria-label="Close outline">✕</button>
+      </div>
+      <div id="outlineList" class="outline-list" role="list"></div>
+      <p id="outlineEmpty" class="outline-empty" hidden>
+        Nothing to jump to yet — the prompts you send appear here, so you can get
+        back to any of them without scrolling.
+      </p>
+    </div>
+
     <div id="settingsPanel" class="settings-panel" style="display:none">
       <div class="settings-header">
         <span class="settings-title">⚙ Settings</span>
@@ -179,8 +192,17 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       <div class="settings-body">
         <form id="settingsForm">
 
+          <!-- Three sections, because these controls answer three unrelated
+               questions: what Navy talks to, how it behaves, and what it does
+               with search and speech. They used to run together in one
+               undifferentiated column, so finding a field meant reading all of
+               them. <fieldset>/<legend> rather than styled divs — a screen
+               reader then announces the section when focus enters it. -->
+          <fieldset class="setting-section">
+            <legend class="setting-legend">Connection</legend>
+
           <div class="setting-group">
-            <label class="setting-label">Provider</label>
+            <label class="setting-label" for="settingProvider">Provider</label>
             <select id="settingProvider" class="setting-select">
               <option value="ollama">Ollama (local)</option>
               <option value="lmstudio">LM Studio (local)</option>
@@ -205,7 +227,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                hidden for it — navy.host describes a machine-local server and
                is deliberately ignored in cloud mode. -->
           <div class="setting-group" id="settingOllamaModeGroup" style="display:none">
-            <label class="setting-label">Ollama</label>
+            <label class="setting-label" for="settingOllamaMode">Ollama</label>
             <select id="settingOllamaMode" class="setting-input">
               <option value="local">Local (installed on this machine)</option>
               <option value="cloud">Ollama Cloud (ollama.com — no install needed)</option>
@@ -214,46 +236,31 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
           </div>
 
           <div class="setting-group" id="settingHostGroup">
-            <label class="setting-label">Ollama Host</label>
+            <label class="setting-label" for="settingHost">Ollama Host</label>
             <input id="settingHost" type="text" class="setting-input" placeholder="http://localhost:11434" />
             <span class="setting-hint">URL where Ollama is running. Change this to connect to a remote server or different port (e.g. http://192.168.1.10:11434).</span>
           </div>
 
           <div class="setting-group" id="settingApiBaseGroup" style="display:none">
-            <label class="setting-label">API Base URL</label>
+            <label class="setting-label" for="settingApiBase">API Base URL</label>
             <input id="settingApiBase" type="text" class="setting-input" placeholder="" />
             <span class="setting-hint" id="settingApiBaseHint">Base URL for the API endpoint.</span>
           </div>
 
           <div class="setting-group" id="settingApiKeyGroup" style="display:none">
-            <label class="setting-label">API Key</label>
+            <label class="setting-label" for="settingApiKey">API Key</label>
             <input id="settingApiKey" type="password" class="setting-input" placeholder="sk-..." autocomplete="off" />
             <span class="setting-hint">Your API key for this provider. Stored in VS Code's encrypted secrets — each provider keeps its own key.</span>
           </div>
+          </fieldset>
+
+          <fieldset class="setting-section">
+            <legend class="setting-legend">Search &amp; speech</legend>
 
           <div class="setting-group">
-            <label class="setting-label">Web Search API Key <span class="setting-optional">(optional)</span></label>
+            <label class="setting-label" for="settingSearchApiKey">Web Search API Key <span class="setting-optional">(optional)</span></label>
             <input id="settingSearchApiKey" type="password" class="setting-input" placeholder="tvly-… (Tavily) or Brave key — empty = DuckDuckGo" autocomplete="off" />
             <span class="setting-hint">Tavily keys (tvly-…) and Brave Search keys are auto-detected. Leave empty to use free DuckDuckGo search.</span>
-          </div>
-
-          <div class="setting-row">
-            <div class="setting-group setting-half">
-              <label class="setting-label">Temperature</label>
-              <input id="settingTemperature" type="number" class="setting-input" min="0" max="2" step="0.05" placeholder="0.2" />
-            </div>
-            <div class="setting-group setting-half">
-              <label class="setting-label">Max Tool Iterations</label>
-              <input id="settingMaxIter" type="number" class="setting-input" min="1" max="200" step="1" placeholder="50" />
-            </div>
-          </div>
-
-          <div class="setting-group">
-            <label class="setting-label">Edit Format</label>
-            <select id="settingEditFormat" class="setting-select">
-              <option value="search-replace">Search / Replace (surgical edits)</option>
-              <option value="whole-file">Whole file (full rewrite)</option>
-            </select>
           </div>
 
           <!-- Read-aloud. The list is filled in by the webview from the
@@ -262,21 +269,55 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                machine, so there is nothing to declare in package.json. -->
           <div class="setting-row">
             <div class="setting-group setting-half">
-              <label class="setting-label">Read-aloud Voice</label>
+              <label class="setting-label" for="settingSpeechVoice">Read-aloud Voice</label>
               <select id="settingSpeechVoice" class="setting-select">
                 <option value="">Automatic</option>
               </select>
             </div>
             <div class="setting-group setting-half">
-              <label class="setting-label">Reading Speed</label>
+              <label class="setting-label" for="settingSpeechRate">Reading Speed</label>
               <input id="settingSpeechRate" type="number" class="setting-input" min="0.5" max="2" step="0.05" placeholder="1" />
+            </div>
+          </div>
+          </fieldset>
+
+          <fieldset class="setting-section">
+            <legend class="setting-legend">Behaviour</legend>
+
+          <div class="setting-row">
+            <div class="setting-group setting-half">
+              <label class="setting-label" for="settingTemperature">Temperature</label>
+              <input id="settingTemperature" type="number" class="setting-input" min="0" max="2" step="0.05" placeholder="0.2" />
+            </div>
+            <div class="setting-group setting-half">
+              <label class="setting-label" for="settingMaxIter">Max Tool Iterations</label>
+              <input id="settingMaxIter" type="number" class="setting-input" min="1" max="200" step="1" placeholder="50" />
             </div>
           </div>
 
           <div class="setting-group">
-            <label class="setting-label">System Prompt</label>
+            <label class="setting-label" for="settingEditFormat">Edit Format</label>
+            <select id="settingEditFormat" class="setting-select">
+              <option value="search-replace">Search / Replace (surgical edits)</option>
+              <option value="whole-file">Whole file (full rewrite)</option>
+            </select>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label" for="settingSystemPrompt">System Prompt</label>
             <textarea id="settingSystemPrompt" class="setting-textarea" rows="5" placeholder="You are a concise AI coding assistant..."></textarea>
           </div>
+          </fieldset>
+
+          <!-- This panel carries the eleven settings you change while working.
+               The other seventeen are declared in package.json and edited in
+               VS Code's own settings UI, which already has search and sync —
+               duplicating them here would mean two places to look and two
+               places for them to disagree. -->
+          <p class="settings-more">
+            More settings — sandboxing, caps, indexing, completions —
+            live in <button type="button" id="openVsSettingsLink" class="settings-link">VS Code Settings</button>.
+          </p>
 
           <div class="settings-footer">
             <button type="submit" class="settings-save-btn">Save Settings</button>
@@ -290,7 +331,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" class="search-bar-icon">
         <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
-      <input id="searchInput" type="text" class="search-input" placeholder="Search messages…" autocomplete="off">
+      <input id="searchInput" type="text" class="search-input" placeholder="Search messages…" aria-label="Search messages" autocomplete="off">
       <span id="searchCount" class="search-count"></span>
       <button id="searchClose" class="search-close" title="Close search">✕</button>
     </div>
@@ -304,6 +345,18 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       <pre id="shellOutput" class="shell-output"></pre>
     </div>
 
+    <!-- The transcript is wrapped so the two scroll arrows have somewhere to
+         anchor. They cannot live inside .messages itself: an absolutely
+         positioned child of a scroll container scrolls away with the content.
+         The wrapper takes the exact grid slot the section used to occupy. -->
+    <div class="messages-wrap">
+      <button type="button" id="msgPrev" class="scroll-arrow up" hidden
+              title="Previous message (Alt+↑)" aria-label="Previous message">
+        <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="3"
+             fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 15l6-6 6 6"></path>
+        </svg>
+      </button>
     <section id="messages" class="messages" aria-live="polite">
       <div id="welcome" class="welcome">
         <div class="welcome-logo">
@@ -343,14 +396,69 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
           <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">▶ Run project</button>
         </div>
         <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files${version ? ' · <span class="welcome-version">v' + version + '</span>' : ''}</p>
+
+        <!-- Shown only when the model list came back empty or failed. That is
+             the most common first-run state, and it used to report itself as
+             the word "No models" in a dropdown with the actual error hidden in
+             a title tooltip — so the one screen that most needs to tell you
+             what to do next was the least informative in the panel. The two
+             buttons are the two things that actually resolve it. -->
+        <div id="welcomeProblem" class="welcome-problem" hidden>
+          <p class="welcome-problem-title">No models available</p>
+          <p class="welcome-problem-detail" id="welcomeProblemDetail"></p>
+          <div class="welcome-problem-actions">
+            <button type="button" id="welcomeTestBtn" class="welcome-problem-btn primary">Test connection</button>
+            <button type="button" id="welcomeSettingsBtn" class="welcome-problem-btn">Open settings</button>
+          </div>
+        </div>
       </div>
     </section>
+      <button type="button" id="msgNext" class="scroll-arrow down" hidden
+              title="Next message (Alt+↓)" aria-label="Next message">
+        <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="3"
+             fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 9l6 6 6-6"></path>
+        </svg>
+      </button>
+    </div>
 
     <div class="composer-wrap">
+      <!-- Autoscroll stops the moment you scroll up, which is right — it must
+           not yank you away from something you are reading. But there was then
+           no way back and no sign anything was still arriving, so scrolling up
+           during a long turn stranded you. Shown only while away from the
+           bottom, and it counts what landed meanwhile. Lives inside
+           .composer-wrap so "bottom: 100%" parks it directly above the composer
+           however tall the textarea has grown. -->
+      <!-- Centred above the composer, on its own now that the step arrows have
+           moved to the ends of the scrollbar. -->
+      <div class="chat-nav">
+        <button type="button" id="jumpLatest" class="jump-latest" hidden>
+          <span id="jumpLatestText">Jump to latest</span>
+          <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.4"
+               fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 9l6 6 6-6"></path>
+          </svg>
+        </button>
+      </div>
       <form id="chatForm" class="composer">
         <input type="file" id="fileAttachInput" multiple hidden>
         <div class="input-area">
-          <textarea id="prompt" rows="1" placeholder="Ask Navy to code, edit, or run commands..."></textarea>
+          <!-- role="combobox" because this box does control a popup listbox:
+               typing "/" opens the command menu and "@" opens the file menu,
+               both role="listbox" with role="option" children. Without the role
+               the two menus were orphaned from the input that drives them —
+               nothing announced that a menu had opened, and arrowing through it
+               announced nothing either, because aria-activedescendant is only
+               honoured on a combobox and the options had no ids to point at.
+               A multiline textarea carrying this role is the same construction
+               GitHub's own @-mention composer uses. aria-expanded is kept in
+               sync by syncComboboxState() in main.js. The placeholder is not a
+               label, hence aria-label as well. -->
+          <textarea id="prompt" rows="1"
+            aria-label="Ask Navy to code, edit, or run commands"
+            role="combobox" aria-expanded="false" aria-autocomplete="list" aria-haspopup="listbox"
+            placeholder="Ask Navy to code, edit, or run commands..."></textarea>
           <div class="input-meta">
             <div class="file-chips" id="fileChips">
               <button type="button" id="addContextButton" class="chip chip-add" title="Add current file to context">+ Add file</button>

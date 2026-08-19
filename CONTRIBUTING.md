@@ -8,8 +8,8 @@ to touch for the two most common changes.
 
 ```bash
 npm install          # devDependencies only — see the invariant below
-npm run check        # syntax check
-npm test             # 1,293 tests, no network, no API keys
+npm run check        # parses every JS file under src/ media/ test/ eval/
+npm test             # 1,482 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -134,6 +134,28 @@ Two more run on demand, deliberately outside `npm test`:
   provider base URL is still live, using a deliberately invalid key so no
   secrets are needed. Run it before cutting a release; CI runs it weekly.
 
+
+**`npm run check`** (`test/check-syntax.js`) parses every JS file under `src/`,
+`media/`, `test/` and `eval/`. It used to be `node --check src/extension.js` —
+one file of thirty-seven — and `node --check` does not follow `require`, so no
+module that file imports was covered, nor `media/main.js`, which ships raw
+instead of being bundled. A syntax error there ships a webview that does nothing
+at all and the old check passed on it.
+
+It also carries two guards for mistakes that parse cleanly or fail confusingly:
+
+- **A backtick inside `src/webview-html.js`.** That file is one enormous template
+  literal, so a stray backtick — most easily inside an HTML comment, where it
+  looks like ordinary prose — closes the template and turns the rest of the
+  document into broken JavaScript. It has happened three times. The parse catches
+  it, but the error points at the word *after* the backtick, so the guard names
+  the line and says what actually went wrong.
+- **U+FFFD anywhere under `src/` or `media/`.** The replacement character is what
+  is left when bytes fail to decode as UTF-8, so nobody types one deliberately —
+  finding one means a file went through a lossy encoding round-trip and a real
+  character was destroyed. One reached the shipped webview and drew as a
+  missing-glyph box on a button. Prose may mention it; code may not.
+
 Running `test:vscode` from VS Code's own integrated terminal works — the runner
 clears the inherited `ELECTRON_RUN_AS_NODE`, which would otherwise make the
 downloaded editor start as plain Node and reject every flag it is given.
@@ -217,6 +239,25 @@ re-litigation in a patch:
 `parseSkill` and `manifestFor` are pure and stay that way; that is what makes
 every frontmatter constraint testable as its own case. Anything needing the
 filesystem belongs in `SkillRegistry`.
+
+## The browser target
+
+`package.json` declares `"browserslist": ["chrome >= 122"]`. Nothing in the
+build reads it — esbuild bundles only `src/extension.js` for Node, and `media/`
+ships raw — so it exists for one reason: CSS compat linters (VS Code's Edge
+Tools among them) otherwise assume the whole history of Chrome and flag every
+modern feature as unsupported.
+
+The number is **derived from `engines.vscode`**, currently `^1.90.0`, which
+ships Electron 29 and therefore Chromium 122. **Move it whenever `engines.vscode`
+moves**, and never upward past what that minimum actually provides — the point
+is to describe the oldest engine Navy runs on, not the newest one available.
+
+`media/styles.css` builds every tint with `color-mix()`, which needs Chromium
+111. That is not enforceable from CSS and fails silently — on an older engine
+every tinted background resolves to nothing and the panel renders flat — so
+`themeTokenSuite` in `test/webview-run.js` asserts the declared target stays at
+or above 111 for as long as the stylesheet uses `color-mix`.
 
 ## Adding a setting
 

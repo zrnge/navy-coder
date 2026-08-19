@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -35,6 +35,9 @@
   "engines": {
     "vscode": "^1.90.0"
   },
+  "browserslist": [
+    "chrome >= 122"
+  ],
   "icon": "media/icon.png",
   "categories": [
     "AI"
@@ -80,9 +83,14 @@
           "description": "Optional custom instructions appended to every conversation (e.g. coding style preferences). Does not replace or override Navy's built-in tool-use rules."
         },
         "navy.skills": {
-          "type": ["string", "array"],
+          "type": [
+            "string",
+            "array"
+          ],
           "default": "auto",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Agent Skills: folders with a SKILL.md, read from .navy/skills/ and .claude/skills/ in the project and from Navy's global storage. \"auto\" offers every installed skill to the model; \"off\" loads none; an array of names offers only those. Every offered skill's name and description sits in EVERY request, so this is a real cost on a small local model — Navy caps the total against the model's own context window and says in the output channel which skills it left out. A skill never grants permission: its `allowed-tools` is shown but never honoured, and anything it runs or changes still goes through the approval gate."
         },
         "navy.speechVoice": {
@@ -493,7 +501,7 @@
   "scripts": {
     "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
-    "check": "node --check src/extension.js",
+    "check": "node test/check-syntax.js",
     "vscode:prepublish": "npm run build",
     "package": "vsce package",
     "test": "node test/run.js && node test/webview-run.js",

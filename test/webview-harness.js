@@ -92,6 +92,10 @@ function createWebview(options = {}) {
   // depend on frame timing.
   window.requestAnimationFrame = (cb) => { cb(0); return 0; };
   window.cancelAnimationFrame = () => {};
+  // jsdom has no layout and therefore no scrollIntoView. Without this stub any
+  // code path that keeps a highlighted item in view throws instead of running,
+  // which silently removed the dropdown arrow-key navigation from test reach.
+  window.Element.prototype.scrollIntoView = function scrollIntoView() {};
 
   const script = fs.readFileSync(path.join(__dirname, '..', 'media', 'main.js'), 'utf8');
   window.eval(script);

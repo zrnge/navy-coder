@@ -1060,6 +1060,17 @@ class NavyCoderViewProvider {
         case 'deleteSlashCommand':
           await this.deleteSlashCommand(message.file);
           break;
+        // The settings panel carries the eleven settings you change while
+        // working; the rest are edited in VS Code's own UI. Filtering on
+        // 'navy.' opens it already scoped to this extension.
+        case 'openVsSettings':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'navy.');
+          break;
+        // Offered from the no-models notice. Same routine as the Command
+        // Palette entry, so there is one diagnosis to keep correct.
+        case 'testProvider':
+          await this.testProviderConnection();
+          break;
         case 'saveSettings': {
           const cfg = vscode.workspace.getConfiguration('navy');
           const s = message.settings || {};

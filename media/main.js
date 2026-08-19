@@ -11,7 +11,6 @@ const addContextButton = document.querySelector('#addContextButton');
 const fileChips = document.querySelector('#fileChips');
 const modelSelect = document.querySelector('#modelSelect');
 const clearButton = document.querySelector('#clearButton');
-const stopButton  = document.querySelector('#stopButton');
 const undoButton = document.querySelector('#undoButton');
 const redoButton = document.querySelector('#redoButton');
 const projectSelect = document.querySelector('#projectSelect');
@@ -160,6 +159,32 @@ function getOpenDropdown() {
   return null;
 }
 
+// Keeps the composer's combobox attributes matching whichever menu is open.
+// Called from every place that opens, closes or moves the highlight in one, so
+// the input and the listbox can never disagree about what is showing.
+//
+// aria-activedescendant is the only way a screen reader can follow an arrow-key
+// highlight that never moves DOM focus — focus stays in the textarea the whole
+// time, so without it the highlight is silent. It points at an id, which is why
+// the options are given one here rather than left anonymous.
+function syncComboboxState() {
+  if (!promptInput) return;
+  const dropdown = getOpenDropdown();
+  if (!dropdown) {
+    promptInput.setAttribute('aria-expanded', 'false');
+    promptInput.removeAttribute('aria-controls');
+    promptInput.removeAttribute('aria-activedescendant');
+    return;
+  }
+  const items = [...dropdown.children];
+  items.forEach((it, i) => { if (!it.id) it.id = dropdown.id + '-opt-' + i; });
+  promptInput.setAttribute('aria-expanded', 'true');
+  promptInput.setAttribute('aria-controls', dropdown.id);
+  const active = items.find(i => i.classList.contains('active'));
+  if (active) promptInput.setAttribute('aria-activedescendant', active.id);
+  else promptInput.removeAttribute('aria-activedescendant');
+}
+
 function moveDropdownSelection(dropdown, dir) {
   const items = [...dropdown.children];
   let idx = items.findIndex(i => i.classList.contains('active'));
@@ -169,7 +194,11 @@ function moveDropdownSelection(dropdown, dir) {
     it.classList.toggle('active', i === idx);
     it.setAttribute('aria-selected', i === idx ? 'true' : 'false');
   });
-  items[idx].scrollIntoView({ block: 'nearest' });
+  // ARIA before scrolling, not after: scrollIntoView is presentation and can be
+  // absent (jsdom has no layout, so it is missing there outright). Announcing
+  // the highlight must not depend on a call that might not exist.
+  syncComboboxState();
+  items[idx].scrollIntoView?.({ block: 'nearest' });
 }
 
 promptInput.addEventListener('keydown', (event) => {
@@ -256,7 +285,22 @@ function closeLightbox() {
 lightboxBackdrop?.addEventListener('click', closeLightbox);
 lightboxClose?.addEventListener('click', closeLightbox);
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && imageLightbox && !imageLightbox.classList.contains('hidden')) closeLightbox();
+  if (e.key !== 'Escape') return;
+  // Innermost surface first: with the lightbox open over the settings panel,
+  // Escape should close the image, not the panel underneath it.
+  if (imageLightbox && !imageLightbox.classList.contains('hidden')) { closeLightbox(); return; }
+  // Settings was the one dismissible surface that ignored Escape — the
+  // dropdowns, the lightbox and the search bar all close on it, so the panel
+  // not doing so was the odd one out rather than a decision.
+  if (outlinePanel && outlinePanel.style.display !== 'none') {
+    closeOutline();
+    outlineButton?.focus();    // don't strand focus on a node that just went away
+    return;
+  }
+  if (settingsPanel && settingsPanel.style.display !== 'none') {
+    settingsPanel.style.display = 'none';
+    settingsButton?.focus();
+  }
 });
 
 sendButton.addEventListener('click', (event) => {
@@ -269,32 +313,6 @@ sendButton.addEventListener('click', (event) => {
 
 clearButton.addEventListener('click', () => {
   vscode.postMessage({ type: 'clear' });
-});
-
-stopButton?.addEventListener('click', () => {
-  vscode.postMessage({ type: 'stop' });
-});
-
-// Commit/PR/Run Tests each launch a native VS Code dialog/progress flow with no
-// webview-visible busy signal to key off of (unlike Send/Stop, which track
-// `isBusy` via start/done messages) — so a rapid double-click posts the same
-// runCommand twice with no feedback that anything happened. A short disable
-// window on the clicked button is enough to stop that without needing a wider
-// protocol change to report each native command's actual completion.
-function runUtilityCommand(button, command) {
-  if (!button || button.disabled) return;
-  button.disabled = true;
-  setTimeout(() => { button.disabled = false; }, 3000);
-  vscode.postMessage({ type: 'runCommand', command });
-}
-document.getElementById('commitButton')?.addEventListener('click', (e) => {
-  runUtilityCommand(e.currentTarget, 'navy.generateCommit');
-});
-document.getElementById('prButton')?.addEventListener('click', (e) => {
-  runUtilityCommand(e.currentTarget, 'navy.generatePR');
-});
-document.getElementById('testButton')?.addEventListener('click', (e) => {
-  runUtilityCommand(e.currentTarget, 'navy.runTests');
 });
 
 projectSelect?.addEventListener('change', () => {
@@ -402,29 +420,382 @@ function closeSearch() {
   if (searchBar) searchBar.style.display = 'none';
   filterMessages('');
   _searchMatches = []; _searchIdx = -1;
+  // Leaving focus on a control that just went away strands the keyboard in
+  // nowhere; the prompt is where you were headed anyway.
+  promptInput?.focus();
+}
+
+// A search that matches nothing hides every message, which left the panel
+// completely blank with the only explanation being a small "0 results" up in
+// the search bar — easy to read as "the chat is gone" rather than "nothing
+// matched". Created on demand rather than declared in the markup because
+// renderHistory() clears #messages wholesale.
+function searchEmptyEl() {
+  let el = document.getElementById('searchEmpty');
+  if (!el) {
+    el = document.createElement('p');
+    el.id = 'searchEmpty';
+    el.className = 'search-empty';
+    messagesEl.appendChild(el);
+  } else if (el.parentElement !== messagesEl) {
+    messagesEl.appendChild(el);   // survived a re-render elsewhere
+  }
+  return el;
+}
+
+function setSearchCount(text) {
+  const countEl = document.getElementById('searchCount');
+  if (countEl) countEl.textContent = text;
 }
 
 function filterMessages(query) {
   const q = query.toLowerCase().trim();
   _searchMatches = [];
+  _searchIdx = -1;
   document.querySelectorAll('.message').forEach(el => {
+    el.classList.remove('search-current');
     if (!q) { el.style.display = ''; return; }
     const text = el.textContent.toLowerCase();
     const hit = text.includes(q);
     el.style.display = hit ? '' : 'none';
     if (hit) _searchMatches.push(el);
   });
-  const countEl = document.getElementById('searchCount');
-  if (countEl) countEl.textContent = q ? (_searchMatches.length + ' results') : '';
+
+  const empty = searchEmptyEl();
+  if (q && _searchMatches.length === 0) {
+    // The term is quoted back because it is often a typo, and seeing it is what
+    // makes that obvious.
+    empty.textContent = 'No messages match “' + query.trim() + '”.';
+    empty.hidden = false;
+  } else {
+    empty.hidden = true;
+  }
+
+  // "1 results" was wrong every time exactly one thing matched, which is a
+  // common outcome for a search.
+  const n = _searchMatches.length;
+  setSearchCount(!q ? '' : n === 0 ? 'no matches' : n === 1 ? '1 result' : n + ' results');
+}
+
+// Enter walks the matches, Shift+Enter walks back — the behaviour every other
+// find bar has. _searchIdx has been declared since this feature landed and was
+// never read: the matches were collected and then there was no way to visit
+// them, so a search on a long chat left you scrolling by hand.
+function stepSearch(dir) {
+  if (!_searchMatches.length) return;
+  _searchMatches[_searchIdx]?.classList.remove('search-current');
+  _searchIdx = (_searchIdx + dir + _searchMatches.length) % _searchMatches.length;
+  const el = _searchMatches[_searchIdx];
+  el.classList.add('search-current');
+  el.scrollIntoView?.({ block: 'center' });
+  setSearchCount((_searchIdx + 1) + ' of ' + _searchMatches.length);
 }
 
 searchButton?.addEventListener('click', openSearch);
 searchClose?.addEventListener('click', closeSearch);
 searchInput?.addEventListener('input', () => filterMessages(searchInput.value));
-searchInput?.addEventListener('keydown', e => { if (e.key === 'Escape') closeSearch(); });
+searchInput?.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeSearch(); return; }
+  if (e.key === 'Enter') { e.preventDefault(); stepSearch(e.shiftKey ? -1 : 1); }
+});
 
 document.addEventListener('keydown', ev => {
   if ((ev.ctrlKey || ev.metaKey) && ev.key === 'f') { ev.preventDefault(); openSearch(); }
+  // Ctrl+O sits beside Ctrl+F deliberately: search is for when you remember the
+  // words, the outline is for when you only remember roughly when you asked.
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'o') { ev.preventDefault(); toggleOutline(); }
+});
+
+
+
+// The scrollbar's real width, measured off the element rather than assumed.
+// The stylesheet asks for 5px, but VS Code's webview host applies its own
+// scrollbar styling on top, so the drawn width can be larger — which is why
+// parking the arrows at "requested width + 1px" still left them on the track.
+//
+// offsetWidth - clientWidth is the space the scrollbar actually takes out of the
+// box. It reports 0 for an overlay scrollbar, which draws over the content
+// instead of reserving room, so the requested width is used as a floor.
+const SCROLLBAR_MIN = 5;
+const SCROLL_ARROW_GAP = 4;
+
+function syncScrollArrowInset() {
+  if (!messagesEl) return;
+  const measured = messagesEl.offsetWidth - messagesEl.clientWidth;
+  const width = Math.max(measured, SCROLLBAR_MIN);
+  document.documentElement.style.setProperty(
+    '--scroll-arrow-inset', (width + SCROLL_ARROW_GAP) + 'px');
+}
+
+// Re-measured on resize: a scrollbar can appear or disappear as the panel is
+// dragged wider or narrower, and its width can differ between displays.
+window.addEventListener('resize', syncScrollArrowInset);
+syncScrollArrowInset();
+
+// ── Step one message at a time ───────────────────────────────────────────────
+// The outline is for going somewhere you already have in mind. These are for
+// reading back through a conversation a turn at a time, without hunting for
+// where one message ends and the next begins — which is genuinely hard in a
+// long reply full of cards and code blocks.
+//
+// Position is set with scrollTop rather than scrollIntoView(): the message is
+// meant to land at the TOP of the view, since what you want is the start of it,
+// and scrollIntoView's alignment is advisory once a container is involved.
+// The two arrows sit at the top and bottom ends of the scrollbar rather than in
+// a cluster above the composer: that is where a reader's eye already is when
+// they are moving through a long transcript, and it costs no width at all.
+const msgPrevBtn = document.querySelector('#msgPrev');
+const msgNextBtn = document.querySelector('#msgNext');
+
+// Positions are measured against the scroll container, never with offsetTop.
+// offsetTop is relative to the nearest POSITIONED ancestor, and .messages is not
+// positioned — so it was measured from the page and silently included the height
+// of everything above the transcript. That is why the jumps were wrong only
+// sometimes: the error is exactly the topbar's height, which changes when it
+// wraps to two rows on a narrow sidebar and when a panel opens above.
+//
+// A rect delta has no such origin problem, and lands the message exactly at the
+// top of the view — which is what these arrows are for.
+const MSG_STEP_EPSILON = 2;   // px, for float rounding only — not a visual offset
+
+// How far the element sits below the top edge of the scroll container, right
+// now. Scrolling by exactly this amount puts its top edge at the top of the view.
+function messageOffsetWithin(el) {
+  return el.getBoundingClientRect().top - messagesEl.getBoundingClientRect().top;
+}
+
+// The arrows step between USER messages: each one starts a turn, so this walks
+// the conversation question by question, the same units the outline lists.
+// Stepping over assistant replies as well would mean two presses per exchange
+// and landing halfway through a reply full of cards.
+// Messages hidden by an active search are skipped — they have no box to scroll to.
+function userTurns() {
+  return [...messagesEl.querySelectorAll('.message.user')]
+    .filter(el => el.style.display !== 'none');
+}
+
+// Which turn the reader is on: the last one whose top edge has passed the top of
+// the view. -1 means they are above the first turn, which is a real position
+// (the transcript has padding, and assistant content can precede it) and not the
+// same as being on turn 0.
+function currentTurnIndex(list) {
+  let idx = -1;
+  for (let i = 0; i < list.length; i++) {
+    if (messageOffsetWithin(list[i]) <= MSG_STEP_EPSILON) idx = i;
+    else break;
+  }
+  return idx;
+}
+
+function stepMessage(dir) {
+  const list = userTurns();
+  if (!list.length) return;
+  const here = currentTurnIndex(list);
+  let next;
+  if (here === -1) {
+    // Above the first turn: there is nothing before it to go back to.
+    if (dir < 0) return;
+    next = 0;
+  } else {
+    next = Math.min(list.length - 1, Math.max(0, here + dir));
+    if (next === here) return;
+  }
+  // Exactly the top of the message, with no slack — landing a few pixels short
+  // leaves the previous message's last line on screen, which reads as having
+  // arrived in the wrong place.
+  messagesEl.scrollTop += messageOffsetWithin(list[next]);
+  // Stepping is deliberate movement, so autoscroll must not haul the reader back
+  // down mid-reply — unless they stepped onto the last turn, which is the same
+  // thing as choosing to follow along again.
+  userScrolledUp = next < list.length - 1;
+  updateChatNav();
+}
+
+function updateChatNav() {
+  // A scrollbar appears the moment content first overflows, so its width is
+  // re-checked alongside the arrows that sit beside it.
+  syncScrollArrowInset();
+  const list = userTurns();
+  // Hidden when there is nothing to navigate: one turn, or a conversation short
+  // enough to fit without scrolling. Two permanently dead arrows are worse than
+  // no arrows — they read as broken rather than as "nothing to do here".
+  const scrollable = messagesEl.scrollHeight > messagesEl.clientHeight + 1;
+  const navigable = list.length >= 2 && scrollable;
+  if (!navigable) {
+    if (msgPrevBtn) msgPrevBtn.hidden = true;
+    if (msgNextBtn) msgNextBtn.hidden = true;
+    return;
+  }
+
+  const here = currentTurnIndex(list);
+  const atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= 1;
+  // Both arrows stay put and go DISABLED at their ends; only "there is nothing
+  // to navigate at all" hides them, and that is a state a conversation sits in
+  // rather than passes through.
+  //
+  // They used to hide individually, which was tidier and wrong. Next hides at
+  // the bottom and Prev at the top — and the bottom is where every reply leaves
+  // you — so in ordinary scrolling each arrow blinked in and out independently.
+  // A control that is sometimes not there cannot be aimed at, and reads as
+  // broken rather than as considerate. A greyed arrow over the text is a much
+  // smaller cost than a moving target.
+  if (msgPrevBtn) {
+    msgPrevBtn.hidden = false;
+    msgPrevBtn.disabled = here <= 0;
+  }
+  // A short last turn near the bottom can never reach the top of the view, so
+  // without the atBottom check Next would sit enabled and do nothing when pressed.
+  if (msgNextBtn) {
+    msgNextBtn.hidden = false;
+    msgNextBtn.disabled = here >= list.length - 1 || atBottom;
+  }
+}
+
+msgPrevBtn?.addEventListener('click', () => stepMessage(-1));
+msgNextBtn?.addEventListener('click', () => stepMessage(1));
+
+document.addEventListener('keydown', (e) => {
+  if (!e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === 'ArrowUp')   { e.preventDefault(); stepMessage(-1); }
+  if (e.key === 'ArrowDown') { e.preventDefault(); stepMessage(1); }
+});
+
+// ── Chat outline ─────────────────────────────────────────────────────────────
+// Navigation for a long conversation. Scrolling was the only way back to
+// something asked twenty turns ago, and search only helps when you remember the
+// words. The outline lists the turns and jumps to one.
+//
+// Rebuilt from the DOM every time it opens rather than maintained alongside it.
+// A parallel list would have to be kept in step with restore, tab switching,
+// clearing and every path that appends a turn — and the failure mode of getting
+// that wrong is an outline that navigates to the wrong place, which is worse
+// than no outline.
+const outlineButton = document.querySelector('#outlineButton');
+const outlinePanel = document.querySelector('#outlinePanel');
+const outlineListEl = document.querySelector('#outlineList');
+
+const OUTLINE_LABEL_MAX = 72;
+
+function outlineLabelFor(article, index) {
+  const raw = (article.dataset.outlineText || article.textContent || '').trim();
+  // First non-empty line: a prompt often opens with context and the first line
+  // is the part that identifies it. Whitespace is collapsed so a pasted block
+  // does not render as one very tall row.
+  const firstLine = raw.split('\n').map(l => l.trim()).find(Boolean) || '(empty prompt)';
+  const flat = firstLine.replace(/\s+/g, ' ');
+  return {
+    n: index + 1,
+    text: flat.length > OUTLINE_LABEL_MAX ? flat.slice(0, OUTLINE_LABEL_MAX - 1) + '…' : flat,
+    full: raw,
+  };
+}
+
+// Deliberately the same list the arrows step through. They used to be two
+// separate queries and only one of them filtered out messages hidden by an
+// active search — so with a search running the outline still offered the turns
+// it had just hidden, and choosing one scrolled to an element with no box at
+// all, landing at a nonsense position with nothing to show for it.
+const outlineTurns = userTurns;
+
+function renderOutline() {
+  if (!outlineListEl) return;
+  const turns = outlineTurns();
+  outlineListEl.innerHTML = '';
+
+  const empty = document.querySelector('#outlineEmpty');
+  const count = document.querySelector('#outlineCount');
+  if (empty) empty.hidden = turns.length > 0;
+  if (count) count.textContent = turns.length ? turns.length + (turns.length === 1 ? ' turn' : ' turns') : '';
+
+  turns.forEach((article, i) => {
+    const { n, text, full } = outlineLabelFor(article, i);
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'outline-row';
+    row.setAttribute('role', 'listitem');
+    // The full prompt on the tooltip, because the row is one truncated line and
+    // the difference between two similar prompts is often past the cut.
+    row.title = full;
+
+    const num = document.createElement('span');
+    num.className = 'outline-num';
+    num.textContent = n;
+    const label = document.createElement('span');
+    label.className = 'outline-label';
+    label.textContent = text;
+    row.append(num, label);
+
+    row.addEventListener('click', () => jumpToTurn(article));
+    outlineListEl.appendChild(row);
+  });
+}
+
+// Scrolling alone leaves you at a wall of text with no idea which one you asked
+// for, so the target is briefly marked. The class is removed on a timer rather
+// than left, since a permanent highlight would accumulate one per jump.
+let _outlineFlashTimer = null;
+function jumpToTurn(article) {
+  closeOutline();
+  // Same measurement the arrows use, so a jump from the outline and a step with
+  // the arrows land a message in exactly the same place. scrollIntoView would
+  // also work here, but it is advisory once a scroll container is involved and
+  // would leave the two paths free to disagree.
+  messagesEl.scrollTop += messageOffsetWithin(article);
+  // Jumping is an explicit move away from the bottom; autoscroll must not drag
+  // the reader straight back down on the next chunk.
+  userScrolledUp = true;
+  updateJumpLatest?.();
+  for (const el of messagesEl.querySelectorAll('.outline-target')) el.classList.remove('outline-target');
+  article.classList.add('outline-target');
+  clearTimeout(_outlineFlashTimer);
+  _outlineFlashTimer = setTimeout(() => article.classList.remove('outline-target'), 1600);
+}
+
+function openOutline() {
+  if (!outlinePanel) return;
+  // Settings and the outline are both full-width sheets under the topbar, each
+  // up to 60–75vh. Open together they leave almost nothing of the conversation
+  // showing, and neither is something you read while using the other.
+  if (settingsPanel) settingsPanel.style.display = 'none';
+  renderOutline();
+  outlinePanel.style.display = 'block';
+  outlineButton?.setAttribute('aria-expanded', 'true');
+  // Focus the first entry so the panel is usable from the keyboard the moment
+  // it opens, rather than needing a Tab through it first.
+  outlineListEl?.querySelector('.outline-row')?.focus();
+}
+
+function closeOutline() {
+  if (!outlinePanel) return;
+  outlinePanel.style.display = 'none';
+  outlineButton?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleOutline() {
+  if (!outlinePanel) return;
+  if (outlinePanel.style.display === 'none' || !outlinePanel.style.display) openOutline();
+  else { closeOutline(); outlineButton?.focus(); }
+}
+
+outlineButton?.addEventListener('click', toggleOutline);
+document.querySelector('#outlineClose')?.addEventListener('click', () => {
+  closeOutline();
+  outlineButton?.focus();
+});
+
+// Up/Down walk the list; Home/End reach the ends of a long conversation without
+// a dozen keypresses. Enter and Space come free with <button>.
+outlineListEl?.addEventListener('keydown', (e) => {
+  const rows = [...outlineListEl.querySelectorAll('.outline-row')];
+  const here = rows.indexOf(document.activeElement);
+  if (here === -1) return;
+  const step = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
+  if (!step && e.key !== 'Home' && e.key !== 'End') return;
+  e.preventDefault();
+  const next = e.key === 'Home' ? 0
+    : e.key === 'End' ? rows.length - 1
+    : (here + step + rows.length) % rows.length;
+  rows[next]?.focus();
 });
 
 // ── Export ───────────────────────────────────────────────────────────────────
@@ -546,11 +917,34 @@ function updateSettingsFieldVisibility(isProviderChange) {
 settingsButton?.addEventListener('click', () => {
   const visible = settingsPanel?.style.display !== 'none';
   if (settingsPanel) settingsPanel.style.display = visible ? 'none' : 'block';
-  if (!visible) vscode.postMessage({ type: 'getSettings' });
+  if (!visible) {
+    closeOutline();   // the other topbar sheet — see openOutline()
+    vscode.postMessage({ type: 'getSettings' });
+  }
 });
 
 closeSettingsButton?.addEventListener('click', () => {
   if (settingsPanel) settingsPanel.style.display = 'none';
+});
+
+// The seventeen settings this panel does not carry are edited in VS Code's own
+// UI. A button rather than an <a href="command:…"> — the webview's CSP blocks
+// command links, and this keeps the one message channel the rest of the panel
+// already uses.
+document.querySelector('#openVsSettingsLink')?.addEventListener('click', () => {
+  vscode.postMessage({ type: 'openVsSettings' });
+});
+
+// The two ways out of a "no models" state, offered at the point of failure
+// rather than left for the user to find in the Command Palette.
+document.querySelector('#welcomeTestBtn')?.addEventListener('click', () => {
+  vscode.postMessage({ type: 'testProvider' });
+});
+document.querySelector('#welcomeSettingsBtn')?.addEventListener('click', () => {
+  if (settingsPanel) settingsPanel.style.display = 'block';
+  // Same pair as the topbar button — opening without asking for the current
+  // values would show an empty form over settings that are actually set.
+  vscode.postMessage({ type: 'getSettings' });
 });
 
 // The mic is always shown: dictation does not run in here, so nothing this
@@ -601,9 +995,56 @@ settingsForm?.addEventListener('submit', (e) => {
   if (settingsPanel) settingsPanel.style.display = 'none';
 });
 
+// ── Jump to latest ───────────────────────────────────────────────────────────
+// Shown only while scrolled away from the bottom. It counts what arrived in the
+// meantime, because "there is more below" and "there are four new replies below"
+// are different things to a reader deciding whether to go back.
+const jumpLatestBtn = document.querySelector('#jumpLatest');
+// How many things were in the transcript at the moment the reader left the
+// bottom. The count is the difference against that, NOT a tally of arrivals:
+// scrollToBottom() is called several times per reply (turn start, each chunk,
+// each card), so counting calls reported "3 new messages" for a single answer.
+// Comparing child counts also gets streaming right for free — a reply that
+// streams for a minute is still one message, because it is one bubble.
+let _awayBaseline = null;
+
+function missedWhileAway() {
+  if (_awayBaseline === null) return 0;
+  return Math.max(0, messagesEl.children.length - _awayBaseline);
+}
+
+function updateJumpLatest() {
+  if (!jumpLatestBtn) return;
+  if (!userScrolledUp) { jumpLatestBtn.hidden = true; _awayBaseline = null; return; }
+  if (_awayBaseline === null) _awayBaseline = messagesEl.children.length;
+  const n = missedWhileAway();
+  const label = document.querySelector('#jumpLatestText');
+  if (label) {
+    label.textContent = n === 0 ? 'Jump to latest'
+      : n === 1 ? '1 new message'
+      : n + ' new messages';
+  }
+  jumpLatestBtn.hidden = false;
+}
+
+// Called wherever content lands, so the label keeps up during a turn rather
+// than only refreshing when the reader happens to scroll.
+function noteContentWhileAway() {
+  if (userScrolledUp) updateJumpLatest();
+}
+
+jumpLatestBtn?.addEventListener('click', () => {
+  userScrolledUp = false;
+  _awayBaseline = null;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  updateJumpLatest();
+});
+
 messagesEl.addEventListener('scroll', () => {
   const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
   userScrolledUp = !nearBottom;
+  updateJumpLatest();
+  updateChatNav();
 });
 
 // ── Webview self-watchdog ────────────────────────────────────────────────────
@@ -1105,7 +1546,15 @@ window.addEventListener('message', (event) => {
       const pct = Math.min(100, (message.used / message.max) * 100);
       contextBarFill.style.width = pct + '%';
       contextBarFill.className = 'context-bar-fill ' + (pct > 85 ? 'danger' : pct > 60 ? 'warn' : 'ok');
-      contextBarFill.title = `Context: ${message.used.toLocaleString()} / ${message.max.toLocaleString()} tokens (${Math.round(pct)}%)`;
+      const label = `Context: ${message.used.toLocaleString()} / ${message.max.toLocaleString()} tokens (${Math.round(pct)}%)`;
+      contextBarFill.title = label;
+      // The bar is also the only place this number appears, and colour alone
+      // does not carry "nearly full" to anyone who cannot see it.
+      const bar = document.querySelector('#contextBar');
+      if (bar) {
+        bar.setAttribute('aria-valuenow', String(Math.round(pct)));
+        bar.setAttribute('aria-valuetext', label);
+      }
     }
   }
 
@@ -1640,12 +2089,14 @@ function showSlashDropdown(query) {
 
   dropdown.style.display = 'block';
   slashDropdownVisible = true;
+  syncComboboxState();
 }
 
 function hideSlashDropdown() {
   const d = document.getElementById('slashDropdown');
   if (d) d.style.display = 'none';
   slashDropdownVisible = false;
+  syncComboboxState();
 }
 
 function applySlashCommand(cmd) {
@@ -1840,11 +2291,13 @@ function renderAtDropdown(files, state) {
     dropdown.appendChild(item);
   }
   dropdown.style.display = 'block';
+  syncComboboxState();
 }
 
 function hideAtDropdown() {
   const dropdown = document.querySelector('#atDropdown');
   if (dropdown) dropdown.style.display = 'none';
+  syncComboboxState();
 }
 
 function renderSymbolDropdown(symbols) {
@@ -1884,6 +2337,7 @@ function renderSymbolDropdown(symbols) {
     dropdown.appendChild(item);
   }
   dropdown.style.display = 'block';
+  syncComboboxState();
 }
 
 function sendPrompt() {
@@ -1982,7 +2436,6 @@ function setBusy(busy) {
   sendButton.classList.toggle('stop-mode', busy);
   sendButton.setAttribute('aria-label', busy ? 'Stop' : 'Send message');
   sendButton.title = busy ? 'Stop' : 'Send';
-  if (stopButton) stopButton.style.display = busy ? '' : 'none';
   if (clearButton) clearButton.style.display = busy ? 'none' : '';
   includeContext.disabled = busy;
   document.querySelector('.app')?.classList.toggle('is-thinking', busy);
@@ -2271,6 +2724,19 @@ function renderModelOptions(select, models, selectedValue) {
   }
 }
 
+// The no-models notice on the welcome screen. Kept beside populateModels so the
+// two can never disagree about whether there is a problem.
+function showModelProblem(detail) {
+  const box = document.querySelector('#welcomeProblem');
+  if (!box) return;
+  if (detail === null) { box.hidden = true; return; }
+  const el = document.querySelector('#welcomeProblemDetail');
+  // The provider's own words, not a paraphrase — "insufficient balance" and
+  // "invalid api key" need different fixes and only the provider knows which.
+  if (el) el.textContent = detail;
+  box.hidden = false;
+}
+
 function populateModels(models, current, error) {
   const previous = modelSelect.value || current;
 
@@ -2286,9 +2752,13 @@ function populateModels(models, current, error) {
       setStatus('No models pulled');
     }
     modelSelect.appendChild(option);
+    showModelProblem(error
+      || 'The provider answered, but has no models to offer. For local Ollama, '
+         + 'pull one first; for a hosted provider, check the key and base URL.');
     return;
   }
 
+  showModelProblem(null);
   setStatus(models.length + ' models');
   // Prefer `current` if it's actually in the list; otherwise fall back to
   // whatever the select previously held (`previous`) — matches the original
@@ -2343,7 +2813,11 @@ function renderFileChips() {
     const remove = document.createElement('button');
     remove.className = 'chip-remove';
     remove.type = 'button';
-    remove.textContent = '�';
+    // U+2715, matching every other remove control. This line held a literal
+    // U+FFFD for a while — the replacement character, i.e. what is left when
+    // bytes fail to decode as UTF-8 — so the file chip's remove button drew
+    // as a missing-glyph box while the identical buttons beside it were fine.
+    remove.textContent = '✕';
     remove.title = 'Remove file';
     remove.addEventListener('click', () => {
       attachedFiles = attachedFiles.filter((f) => f !== file);
@@ -2376,6 +2850,12 @@ function createMessageHeader(role) {
 function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
   const article = document.createElement('article');
   article.className = `message ${role}`;
+  // The outline reads this rather than the rendered bubble: a long prompt is
+  // split into a visible preview plus a hidden overflow span, so textContent
+  // would silently give the outline the whole thing including the part the
+  // reader cannot see. Kept only for user turns, which are what the outline
+  // lists — they are the questions the conversation is structured around.
+  if (role === 'user') article.dataset.outlineText = text;
 
   // User messages have no header — right-aligned bubble speaks for itself
   if (role !== 'user') {
@@ -2637,13 +3117,49 @@ function renderSessionTabs(sessions) {
   const multiple = sessions.length > 1;
   for (const s of sessions) {
     const tab = document.createElement('div');
-    tab.className = 'session-tab' + (s.id === activeSessionId ? ' active' : '') + (s.busy ? ' busy' : '');
+    const isActive = s.id === activeSessionId;
+    tab.className = 'session-tab' + (isActive ? ' active' : '') + (s.busy ? ' busy' : '');
     tab.setAttribute('role', 'tab');
+    // A <div role="tab"> is not focusable on its own, and these had no tabindex
+    // — so the tab strip could not be reached by keyboard at all, while the ✕
+    // inside each tab could, being a real <button>. You could close a chat
+    // without being able to switch to one.
+    //
+    // Roving tabindex: exactly one tab is in the tab sequence (the active one),
+    // and the arrow keys move between them from there. That is one Tab stop for
+    // the whole strip rather than one per chat, which is the point — a dozen
+    // open chats should not be a dozen stops on the way to the prompt box.
+    tab.tabIndex = isActive ? 0 : -1;
+    tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
     // s.id is an opaque generated identifier, not meaningful to show. Every
     // visible tab already belongs to the SAME project (shown once, in the
     // dropdown above) — so the tooltip is just the chat's own name.
     tab.title = s.name;
     tab.addEventListener('click', () => switchToSessionTab(s.id));
+    tab.addEventListener('keydown', (e) => {
+      // Enter and Space are what a role="tab" is expected to answer to; a <div>
+      // gives neither for free the way a <button> would.
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); switchToSessionTab(s.id); return; }
+      // Only when there is more than one chat — the ✕ is hidden in that case
+      // too, because closing the last tab is not something this strip offers.
+      if ((e.key === 'Delete' || e.key === 'Backspace') && multiple) {
+        e.preventDefault();
+        vscode.postMessage({ type: 'closeSessionTab', sessionId: s.id });
+        return;
+      }
+      const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (!step && e.key !== 'Home' && e.key !== 'End') return;
+      e.preventDefault();
+      const tabs = [...sessionTabsEl.querySelectorAll('[role="tab"]')];
+      const here = tabs.indexOf(tab);
+      // Wrapping is the expected behaviour for a tablist — running off the end
+      // of a strip you cannot see the end of would just feel broken.
+      const next = e.key === 'Home' ? 0
+        : e.key === 'End' ? tabs.length - 1
+        : (here + step + tabs.length) % tabs.length;
+      tabs[next]?.focus();
+      tabs[next]?.click();
+    });
 
     const label = document.createElement('span');
     label.className = 'session-tab-label';
@@ -2663,6 +3179,14 @@ function renderSessionTabs(sessions) {
       closeBtn.className = 'session-tab-close';
       closeBtn.textContent = '✕';
       closeBtn.title = 'Close tab';
+      // "✕" alone reads as an unlabelled glyph; naming the chat says which one
+      // is about to close, which matters when several are open.
+      closeBtn.setAttribute('aria-label', 'Close chat ' + s.name);
+      // Deliberately left in the tab sequence. Taking it out would cut the strip
+      // to a single stop, which is tidier, but closing a chat by keyboard would
+      // then depend on knowing that Delete does it — and anyone who did not know
+      // would simply lose the ability. Delete is added below as the faster path,
+      // not as a replacement for a control you can find by pressing Tab.
       closeBtn.addEventListener('click', (e) => {
         e.stopPropagation(); // must not also trigger the tab's own switch-click
         vscode.postMessage({ type: 'closeSessionTab', sessionId: s.id });
@@ -2676,6 +3200,9 @@ function renderSessionTabs(sessions) {
   addBtn.type = 'button';
   addBtn.className = 'session-tab-add';
   addBtn.title = 'Start a new chat in this project';
+  // "+" is not a name. The title carries it visually; aria-label carries it to
+  // anything that does not surface a tooltip.
+  addBtn.setAttribute('aria-label', 'Start a new chat in this project');
   addBtn.textContent = '+';
   addBtn.addEventListener('click', () => vscode.postMessage({ type: 'newSessionTab' }));
   sessionTabsEl.appendChild(addBtn);
@@ -3082,7 +3609,14 @@ function updateMemoryPanel(mem) {
 // so streaming chunks and card insertions never cause competing scroll jumps.
 let _scrollPending = false;
 function scrollToBottom() {
-  if (userScrolledUp || _scrollPending) return;
+  // Every site that appends content calls this, so it is also the one place
+  // that reliably knows something arrived — including while the reader is away.
+  // A new message can turn a one-message chat into a navigable one, and can
+  // re-enable Next for someone sitting on what used to be the last message, so
+  // the arrows are refreshed here rather than inside the scrolled-away branch.
+  updateChatNav();
+  if (userScrolledUp) { noteContentWhileAway(); return; }
+  if (_scrollPending) return;
   _scrollPending = true;
   requestAnimationFrame(() => {
     _scrollPending = false;
@@ -3211,13 +3745,36 @@ function renderMarkdown(text) {
   // this regex runs on every render of every reply. Real fences are 3 or 4
   // backticks; capping at 8 keeps every legitimate form parsing identically
   // while making the pathological case constant-time.
-  const codeRe = /(?:^|\n)(`{3,8})([\w.+\-]*)(?::([^\s\n]+))?[^\n]*\n([\s\S]*?)\n\1[ \t]*(?=$|\n)/g;
+  //
+  // The opening fence may be indented, and that indentation is captured so it
+  // can be stripped back off the content. This used to demand the fence sit hard
+  // against the left margin, so a single leading space stopped it being a code
+  // block at all — and a block written inside a list item is ALWAYS indented, to
+  // the list's content column. The most ordinary shape there is,
+  //
+  //     2. Run:
+  //
+  //        ```cmd
+  //        call build.bat
+  //        ```
+  //
+  // therefore rendered as a paragraph with the fences shown literally. It looked
+  // flush-left in the panel only because HTML collapses leading whitespace, which
+  // is what made it read as "code fences are broken" rather than "indented ones
+  // are". The closing fence gets its own [ \t]* because it need not match the
+  // opening indent.
+  const codeRe = /(?:^|\n)([ \t]*)(`{3,8})([\w.+\-]*)(?::([^\s\n]+))?[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=$|\n)/g;
   let pos = 0;
   let m;
   while ((m = codeRe.exec(cleaned)) !== null) {
     const textBefore = cleaned.slice(pos, m.index);
     if (textBefore) segments.push({ type: 'text', content: textBefore });
-    segments.push({ type: 'code', language: m[2] || '', path: m[3] || '', code: m[4] });
+    segments.push({
+      type: 'code',
+      language: m[3] || '',
+      path: m[4] || '',
+      code: stripIndent(m[5], m[1]),
+    });
     pos = codeRe.lastIndex;
   }
   if (pos < cleaned.length) segments.push({ type: 'text', content: cleaned.slice(pos) });
@@ -3228,6 +3785,21 @@ function renderMarkdown(text) {
       : renderBlockMarkdown(seg.content)
   ).join('');
   return thinkingHtml + body;
+}
+
+// Removes the opening fence's indentation from each line of its content, so a
+// block written inside a list item does not arrive with the list's indentation
+// baked into the code. A line indented less than the fence loses only what it
+// has; a line indented MORE keeps the remainder, which is what preserves the
+// shape of already-indented code inside the block.
+function stripIndent(code, indent) {
+  if (!indent) return code;
+  const width = indent.length;
+  return code.split('\n').map((line) => {
+    let i = 0;
+    while (i < width && (line[i] === ' ' || line[i] === '\t')) i++;
+    return line.slice(i);
+  }).join('\n');
 }
 
 // Render block-level constructs (headings, lists, blockquotes, tables, paragraphs).
@@ -4087,6 +4659,14 @@ function getOrCreateActivityLog() {
     sealCurrentBubble();
     const log = document.createElement('div');
     log.className = 'activity-log';
+    // #messages is aria-live="polite", and every descendant inherits it. That is
+    // right for the reply — you want to hear the answer as it arrives — and
+    // badly wrong for the machinery underneath it: a turn that runs a build
+    // would read thousands of lines of output aloud, and every tool row in
+    // between, with no way to get past it. The conversation stays live; the
+    // transcript of what the agent did while producing it does not. It is still
+    // fully readable, just on request rather than shouted.
+    log.setAttribute('aria-live', 'off');
     // Attach inside the active assistant message so it's visually grouped with
     // the response it belongs to, not floating between turns in the stream.
     const parent = activeAssistantMessage || messagesEl;
@@ -4330,7 +4910,7 @@ function createTermCard(tool, commandText, streamId) {
     </div>
     <div class="term-row term-out-row" style="display:none">
       <span class="term-label">OUT</span>
-      <pre class="term-out"></pre>
+      <pre class="term-out" aria-live="off"></pre>
     </div>`;
   card.querySelector('.term-in').textContent = commandText;
   appendTurnCard(card);

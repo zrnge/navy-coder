@@ -1,5 +1,402 @@
 # Changelog
 
+## [0.2.8] - 2026-08-19
+
+A UI/UX release. No new tools, no new providers, nothing new the agent can do —
+the two additions are both ways of moving around a conversation you already
+have. Everything else is the panel itself: how it reads on a theme that is not
+the author's, whether it can be operated without a mouse, and a set of things
+that were quietly wrong for anyone who looked closely.
+
+Much of this was found by measuring rather than by looking — contrast ratios
+computed rather than eyeballed, scrollbar clearance read off the element rather
+than assumed, spacing changes verified by expanding tokens back and diffing
+against the previous file. Where a fix could rot silently, it is pinned by a
+test: the suite grew from 1,293 to 1,482.
+
+### Added
+
+- **Step through the conversation one turn at a time.** Two arrows sit at the
+  ends of the scrollbar — up at the top, down at the bottom — or Alt+Up and
+  Alt+Down. Where the outline is for going somewhere you already have in mind,
+  these are for reading back through a conversation, which is hard to do by
+  scrolling once a reply is full of cards and code blocks, because nothing marks
+  where one message ends and the next begins.
+
+  They sit at the scrollbar rather than in a cluster above the composer: that is
+  where the eye already is when moving through a long transcript, and it costs no
+  width at all in a sidebar that runs out of it first. Square, a hairline off the
+  top and bottom edges, and cleared from the scrollbar on the right by a measured
+  amount rather than a guessed one.
+
+  That clearance is measured off the element at runtime rather than assumed:
+  this stylesheet asks for a 5px scrollbar, but VS Code's webview applies its own
+  styling on top, so the drawn width is not the requested one and positioning
+  against the requested value left the arrows sitting on the track. The gap is
+  re-measured on resize and whenever the transcript changes, since a scrollbar
+  appears the moment content first overflows, and it falls back to the requested
+  width for overlay scrollbars, which reserve no room to measure. They carry no
+  shadow for the same reason the gap exists: a shadow spreads in every direction
+  and would bleed straight back over the track. The jump-to-latest pill keeps the
+  centre above the composer to itself. Both arrows stay in place at every scroll
+  position and go disabled at their ends. Hiding each at its own end was tidier
+  and unusable: Next hides at the bottom and Previous at the top, and the bottom
+  is where every reply leaves you — so in ordinary scrolling each blinked in and
+  out independently, which reads as broken and cannot be aimed at. They go away
+  only when there is nothing to navigate at all, which is a state a conversation
+  sits in rather than passes through.
+
+  Anchoring them needed the transcript wrapped in a positioned container: an
+  absolutely positioned child of a scroll container scrolls away with the
+  content. The wrapper takes the exact grid slot the transcript held, so nothing
+  else moved.
+
+  They step between **your** messages, landing each exactly at the top of the
+  view. Each one starts a turn, so this walks the conversation question by
+  question, in the same units the outline lists; stepping over replies too would
+  mean two presses per exchange and landing halfway through a long answer.
+
+  Positions are measured as a rect delta against the scroll container, never with
+  `offsetTop`. `offsetTop` is relative to the nearest *positioned* ancestor, and
+  `.messages` is not positioned — so the first version measured from the page and
+  silently included everything above the transcript, landing short by exactly the
+  topbar's height. That is why it only went wrong sometimes: the topbar's height
+  changes when it wraps to two rows on a narrow sidebar and when a panel opens
+  above it. The outline uses the same measurement, so a jump and a step land a
+  message in the same place rather than being free to disagree.
+
+  Which turn you are on is derived from scroll position on every press rather
+  than remembered, so scrolling by hand, jumping from the outline and stepping
+  all agree with nothing to keep in sync. The arrows disable at the ends instead
+  of wrapping — wrapping from the first turn to the last would feel like losing
+  your place — and also once the transcript cannot scroll further, since a short
+  last turn can never reach the top of the view and Next would otherwise stay lit
+  and do nothing. They hide entirely in a chat short enough to fit on screen,
+  where two permanently dead arrows would read as broken. Stepping away from the
+  end parks autoscroll, so a streaming reply does not haul you back down.
+
+  Only plain Alt+arrow is claimed — a bare arrow key still belongs to whatever
+  has focus.
+
+- **A chat outline, to move around a long conversation.** Getting back to
+  something you asked twenty turns ago meant scrolling and reading, and search
+  only helps when you remember the words you used. The outline button in the
+  topbar — or Ctrl+O — lists the turns in the current chat and jumps to any of
+  them. It lists your prompts rather than every message, because those are what
+  a conversation is actually structured around; each is one truncated line, with
+  the whole prompt on the tooltip since two similar prompts often differ past
+  the cut, and a multi-line prompt shows only its first line so the list never
+  grows taller than the scrolling it replaces.
+
+  Landing somewhere in a wall of text is disorienting without being told which
+  one you landed on, so the target is briefly outlined. Jumping also counts as
+  leaving the bottom, so autoscroll does not drag you back down on the next
+  chunk of the reply.
+
+  It is rebuilt from the transcript every time it opens rather than kept as a
+  list alongside it. A parallel list would have to stay in step with restore,
+  tab switching, clearing and every path that appends a turn, and the failure
+  mode of getting that wrong is an outline that navigates to the wrong place —
+  worse than not having one. It is reachable entirely from the keyboard: the
+  first entry takes focus on open, arrows walk the list, Home and End reach the
+  ends, and Escape closes it. It is the one topbar control kept at the narrowest
+  width, where search and export are dropped: both of those have another way in,
+  and Ctrl+O is not discoverable the way a Command Palette entry is.
+
+### Fixed
+
+- **The panel was built for a dark theme and only looked right in one.** Every
+  wash, hover fill and tinted border was written as a literal
+  `rgba(88, 166, 255, α)` — that is the *fallback* value of the accent token, not
+  the token — at eighteen different alphas, plus the same pattern for red, amber
+  and green. So the accent itself followed the theme while everything meant to
+  tint it stayed frozen at the dark-theme blue, and on a light theme, or any
+  theme whose link colour is not blue, the two disagreed. All 49 are now mixed
+  from the token they belong to with `color-mix()`, in four steps rather than
+  eighteen; the spread between 0.06 and 0.09 was accretion, not intent.
+
+  The worse cases were the ones that vanished outright: table zebra striping and
+  the diff "skipped lines" band were white at 2% opacity, invisible on a light
+  background, and the diff action bar was black at 15%, a heavy grey slab. All
+  three now mix from the foreground colour, so they invert with the theme. The
+  error banner's text was a fixed pale red that disappeared into a light
+  background. The shell panel was pinned to near-black with pale green text
+  regardless of theme, and now follows VS Code's own terminal colours.
+
+  Three places keep fixed colours deliberately, and now say so in a comment: the
+  Stop button (solid red, so it can never be mistaken for the theme's salmon
+  charts-red), the image remove button, and the lightbox controls — the last two
+  sit over a user's own image or over a near-opaque scrim, where no theme token
+  can predict the ground behind them.
+
+- **Cards of different kinds did not line up with each other.** Tool, diff,
+  terminal, command and run-project cards are one family that had drifted into
+  four different header paddings (8/12, 10/14, 5/10 and 12/14), two different
+  card backgrounds and three different margins, so a turn containing several
+  kinds read as several designs stacked together. They now share one set of
+  measurements. Terminal rows stay tighter than a card header on purpose — a
+  card holds many of them — but share the horizontal padding, which is what
+  makes the text line up down the column.
+
+  Behind that, spacing is now a 2px scale rather than nineteen ad-hoc pixel
+  values with 7px, 9px and 22px among them. The 161 substitutions were verified
+  by expanding the tokens back and diffing against the previous file: every one
+  resolves to the value it replaced, so the only spacing that moved is the card
+  geometry above.
+
+- **Two logos sat side by side in the topbar.** The brand wheel had a second,
+  near-identical wheel next to it that appeared only while a turn was running —
+  two marks saying one thing, in the row that runs out of width first on a
+  narrow sidebar. The second is gone and the brand mark itself now spins while
+  Navy is working, which is both smaller and easier to notice: the thing you are
+  already looking at starts moving.
+
+- **High contrast modes are handled.** VS Code ships high-contrast themes and
+  Windows has its own, both of which put the renderer into `forced-colors`,
+  where the OS overrides every colour, drops box-shadows and removes gradients.
+  Most of the panel survives that untouched, but three things lost real
+  information rather than decoration: cards are typed entirely by a coloured
+  left rail, which flattened to one system colour and made every card look
+  alike; the context bar is a gradient fill, which was removed outright, leaving
+  an empty track; and diff added/removed lines are distinguished by background
+  tint. Card type is now restated as a border *style*, which forced-colors
+  preserves, the bar gets a real border and a system fill, and the +/- markers
+  carry the diff. `forced-color-adjust: none` is deliberately used nowhere — it
+  opts an element out of the user's contrast choice, which is the opposite of
+  the point.
+
+- **Scrolling up during a long turn stranded you.** Autoscroll stops the moment
+  you scroll away, which is correct — it must not drag you off something you are
+  reading — but there was no way back and no sign anything was still arriving. A
+  "jump to latest" button now appears while you are away and counts what landed
+  meanwhile. It counts messages, not scroll events: the first version tallied
+  calls to `scrollToBottom()`, which fires several times per reply and announced
+  "3 new messages" for one answer. A reply that streams for a minute is one
+  message, because it is one bubble.
+
+- **Chat search could count matches but not visit them.** `_searchIdx` had been
+  declared since the feature landed and never read, so a search on a long chat
+  left you scrolling by hand. Enter now steps through matches and Shift+Enter
+  steps back, wrapping at both ends, with the current one outlined. A search
+  matching nothing hid every message and left the panel blank with only "0
+  results" in the bar, which reads as "the chat is gone" — it now says so where
+  the messages were, quoting the term back because it is usually a typo. And it
+  no longer says "1 results".
+
+- **Fifteen font sizes were fractional** — 10.5, 11.5, 12.5 and 13.5px, which
+  cannot land on a whole device pixel at 100% zoom on a non-HiDPI display and
+  render blurry. Rounded to whole pixels: up for the smallest secondary text and
+  for code bodies, where half a pixel of legibility is worth more than half a
+  pixel of room, down where the row is already tight. Twelve sizes became eight,
+  and every size relationship is preserved.
+
+- **`.composer-wrap` declared `position` twice** — `sticky` in its own rule and
+  `relative` in another far below, same specificity, so the later silently won
+  and the sticky had been dead for as long as both existed. Nothing was broken
+  by it: the composer is the last row of a three-row grid, which pins it without
+  sticky doing anything. Merged into one declaration so the next person to
+  change it can see what it actually is.
+
+- **An indented code fence was not a code block.** The fence had to begin hard
+  against the left margin: one leading space and it stopped being code entirely,
+  rendering as a paragraph with the backticks and language tag shown as text and
+  inline markdown chewing through the command. A block written inside a list item
+  is *always* indented, to the list's content column — so the commonest shape in
+  any set of build instructions,
+
+      2. Run:
+
+         ```cmd
+         call build.bat
+         ```
+
+  never became a card. It looked flush-left in the panel only because HTML
+  collapses leading whitespace, which is what made it read as "code fences are
+  broken" rather than "indented ones are".
+
+  The opening fence's indentation is now matched and stripped back off each line
+  of the content, so the list's indentation does not end up baked into the code
+  while any deeper indentation the code has of its own survives. The closing
+  fence no longer has to sit at the same indent as the opening one. The fence
+  length stays capped: a 160,000-backtick run once froze the renderer for 14.5
+  seconds, and it still renders in about 20ms.
+
+- **The remove button on an attached file drew as a missing-glyph box.** It was
+  assigned a literal U+FFFD — the replacement character, which is what is left
+  behind when bytes fail to decode as UTF-8 — where its three sibling remove
+  buttons all use U+2715. So one control in a row of identical controls rendered
+  as a question mark in a diamond, which reads as "this app cannot display
+  Unicode" rather than "one character in the source was corrupted". Nothing was
+  wrong with Unicode handling: filenames with accents, em dashes and CJK
+  characters render correctly, and there are tests for that now.
+
+  `npm run check` now fails on a U+FFFD anywhere under `src/` or `media/`. Nobody
+  types one deliberately, so finding one means a file has been through a lossy
+  encoding round-trip and a real character was destroyed — silently, since the
+  code still parses and runs.
+
+- **You could be asked to approve a command you could not finish reading.** The
+  approval card renders the command in a `<pre class="tool-details">`, and that
+  class had no CSS rule behind it at all — so it fell back to a bare `<pre>`,
+  which does not wrap, inside a card that sets `overflow: hidden`. A command
+  wider than the sidebar was clipped, with no way to scroll to the rest of it.
+  Reading the command before it runs is the entire purpose of that card. It now
+  wraps, and breaks mid-token, because a command is one unbroken string more
+  often than not — a long URL, a path, a base64 argument.
+
+- **The outline offered turns an active search had hidden.** It and the step
+  arrows were two separate queries for "the turns you can navigate to", and only
+  the arrows filtered out messages the search had hidden — so the outline still
+  listed them, and choosing one scrolled to an element with no box, landing at a
+  nonsense position with nothing highlighted. They share one definition now.
+
+- **Settings and the outline could be open at the same time.** Both are
+  full-width sheets under the topbar, each up to 60–75vh, so together they left
+  almost none of the conversation visible. Opening either now closes the other.
+
+- **Four controls removed from the webview left their wiring behind** — a stop
+  button, and the commit, PR and run-tests buttons. Twenty-eight lines of
+  listeners and a `setBusy` branch for elements that no longer exist anywhere in
+  the markup and are never created. Harmless, since every call was optional-chained,
+  but it read as though those controls were still there. The commands themselves
+  are untouched and still run from the Command Palette.
+
+- **Buttons defined only by a coloured fill vanished under forced-colors.** Send,
+  Save Settings and the jump-to-latest pill each set a background and no border,
+  and forced-colors flattens the fill onto the system palette — leaving what
+  looked like a run of plain text. They get a border there now.
+
+- **The chat tab strip could not be reached by keyboard.** Tabs were
+  `<div role="tab">` with no `tabindex`, so nothing in the strip was focusable —
+  while the ✕ inside each tab was, being a real `<button>`. You could close a
+  chat without keyboard but never switch to one. Tabs now use a roving tabindex
+  (one Tab stop for the whole strip, arrow keys between them, wrapping at both
+  ends, Home/End), answer Enter and Space, and carry `aria-selected` so a screen
+  reader can tell which chat is open. Delete closes the focused chat, and the ✕
+  deliberately stays in the tab order rather than being replaced by that
+  shortcut — a keyboard path nobody can discover is not a keyboard path. The ✕
+  and the + also have names now instead of reading as a bare glyph.
+
+- **The composer drove two menus and was wired to neither.** Typing `/` or `@`
+  opens a `role="listbox"`, but the textarea had no combobox semantics, so
+  nothing announced that a menu had appeared, and arrowing through it announced
+  nothing either — the highlight never moves DOM focus, and `aria-activedescendant`
+  is the only thing that can report it. The options had no `id`s to point at in
+  any case. The composer now declares `role="combobox"` with `aria-expanded`,
+  `aria-controls` and `aria-activedescendant` kept in sync from every site that
+  opens, closes or moves a highlight, and it has a name of its own rather than
+  relying on the placeholder.
+
+- **Eight looping animations ignored `prefers-reduced-motion`.** The block had it
+  backwards: it switched off the ten one-shot entrance fades, which last 0.18s,
+  and left every infinite spinner and pulse running — the ones that run for the
+  whole length of a turn, which is the longest anyone looks at the panel. The
+  original one-line `.spin-wheel { animation: none }` also silently missed two
+  spinners whose rules out-specify it (`.rp-wheel-wrap .spin-wheel` and
+  `.activity-row.running .act-icon .spin-wheel`), so those are now spelled out at
+  full depth.
+
+- **Nine pieces of muted text failed WCAG AA on contrast.** `--muted` on the
+  panel background is 5.05:1, which passes — but each of these dimmed it further
+  with `opacity`, and the worst (`.diff-ln`, the line numbers in a diff, at 0.45)
+  landed on **2.01:1**, under half the 4.5:1 requirement, on 10px text where the
+  large-text allowance does not apply either. The opacity is gone; `--muted` was
+  always the de-emphasis and did not need help. De-emphasis below it has to come
+  from size or weight, since transparency spends contrast that is not there.
+
+- **The project selector's focus state was invisible.** `#projectSelect:focus`
+  set `border-color` to `--border-hover` — the same value that select already
+  uses for `:hover` — so focusing it while the pointer was over it changed
+  nothing at all, and away from the pointer it was far weaker than the gold every
+  other select in the topbar focuses to. Being an id selector it also outranked
+  `.select-project:focus`, which had the right colour all along; deleting the
+  rule is the whole fix.
+
+- **Twelve settings labels were labels in appearance only.** Every field in the
+  panel had a visible caption above it with exactly the right words, and not one
+  carried a `for` — so the association existed for sighted users and for nobody
+  else, and a screen reader announced "combo box" with no indication of what it
+  set. Eight fields were leaning on their placeholder, which is not a label and
+  disappears the moment anything is typed. All twelve are now associated, and the
+  six controls whose only name came from a `title` — which needs a pointer to
+  hover, so keyboard and touch users never saw it — carry an `aria-label` too.
+
+- **The context bar told assistive technology nothing.** How full the context
+  window is was two bare `<div>`s, with the actual numbers in a `title` on the
+  inner one — a tooltip on an element that cannot take focus, so it was
+  unreachable by keyboard, unavailable on touch, and invisible to a screen
+  reader, which left colour as the only signal that a chat was nearly full. It is
+  a `role="progressbar"` now, with the count in `aria-valuetext`.
+
+- **A running build read its entire output aloud.** `#messages` is
+  `aria-live="polite"` and every descendant inherits that, so streaming terminal
+  output and every tool activity row were announced as they arrived — thousands
+  of lines, with no way past them. The reply stays live, because hearing the
+  answer arrive is the point; the transcript of what the agent did to produce it
+  no longer interrupts. It is still fully readable, on request rather than
+  shouted.
+
+- **Four destructive buttons were smaller than a reliable target.** Close chat,
+  remove attachment, remove image and delete command are drawn at 14–18px,
+  under the 24×24 WCAG 2.2 asks for, and two sit directly beside another control
+  where a near miss does something rather than nothing. The drawn size is
+  unchanged — the rows are deliberately tight — but each now centres a
+  transparent 24×24 hit area on itself, so only the pointer's reach grows.
+
+- **Escape now closes the settings panel.** The dropdowns, the lightbox and the
+  search bar all closed on Escape and the panel did not, which was an oversight
+  rather than a decision. Focus returns to the button that opened it instead of
+  being stranded on a hidden node, and an open lightbox still takes Escape first.
+
+### Changed
+
+- **The settings panel is grouped.** Its controls answer three unrelated
+  questions — what Navy talks to, how it behaves, and what it does with search
+  and speech — and used to run together in one undifferentiated column where
+  finding a field meant reading all of them. They are now three sections, built
+  as real `<fieldset>`/`<legend>` pairs rather than styled headings, so a screen
+  reader announces the section when focus enters it.
+
+  The panel carries the eleven settings you change while working; the other
+  seventeen are edited in VS Code's own settings UI, which already has search
+  and sync. It now says so, with a link that opens that UI already filtered to
+  `navy.` — previously nothing in the panel indicated the other seventeen
+  existed.
+
+- **An empty model list explains itself and offers a way out.** This is the most
+  common first-run state and it was the least informative screen in the panel:
+  the dropdown read "No models", the provider's actual error was hidden in a
+  `title` tooltip, and the welcome screen went on offering six chips that could
+  not succeed. There is now a notice on the welcome screen carrying the
+  provider's own words — "insufficient balance" and "invalid api key" need
+  different fixes and only the provider knows which — with buttons for the two
+  things that actually resolve it: the connection self-test, and Settings. An
+  empty list with no error at all (a reachable Ollama with nothing pulled)
+  explains that case separately instead of rendering blank.
+
+  It is amber rather than red: nothing has failed yet, the panel simply cannot
+  do anything useful until it is resolved. Red stays for a request that errored,
+  so the two remain distinguishable at a glance.
+
+- **`npm run check` checked one file out of thirty-seven.** It was
+  `node --check src/extension.js`, and `node --check` does not follow `require`,
+  so no module that file imports was ever parsed — nor was `media/main.js`, which
+  ships raw instead of being bundled, meaning a syntax error there ships a
+  webview that does nothing and the check still passes. It now parses every JS
+  file under `src/`, `media/`, `test/` and `eval/`. It found a real one on the
+  first run: a backtick inside an HTML comment in `src/webview-html.js`, closing
+  the template literal the entire document is built from.
+
+- **`package.json` declares a browser target.** Nothing in the build reads it —
+  esbuild bundles only `src/extension.js` for Node, and `media/` ships raw — but
+  without one, CSS compat linters assume the whole history of Chrome and flag
+  every modern feature as unsupported. `chrome >= 122` is what `engines.vscode`
+  (`^1.90.0`, Electron 29) actually provides, and it moves when that moves. A
+  test now ties the two together: the tints need Chromium 111 for `color-mix`,
+  which fails silently on an older engine — every tinted background resolves to
+  nothing and the panel renders flat — so lowering the target trips a test
+  instead of shipping that.
+
 ## [0.2.7] - 2026-08-16
 
 ### Added
