@@ -59,7 +59,10 @@ async function fetchWithRetry(url, init) {
   // reading the same config while the override was "in effect"). `model`
   // stays a normal top-level argument — the caller already passes the
   // fallback's own model there, same as any other call.
-  async function streamAssistant(provider, host, model, messages, temperature, signal = null, onChunk = null, override = null) {
+  // `toolsApiOverride`, when given, replaces the built-in TOOLS_API for this
+  // call (MCP tools are still appended) — the turn loop passes the reduced core
+  // set here for small models, see _shouldReduceTools in extension.js.
+  async function streamAssistant(provider, host, model, messages, temperature, signal = null, onChunk = null, override = null, toolsApiOverride = null) {
     const config = vscode.workspace.getConfiguration('navy');
     // aiProvider drives the secrets lookup key below, so overriding it here
     // is sufficient — no separate branch needed for the apiKey fetch itself.
@@ -70,7 +73,7 @@ async function fetchWithRetry(url, init) {
 
     // Built-in tools plus any live MCP server tools (dynamic per request, so
     // connecting/disconnecting a server needs no reload).
-    const toolsApi = TOOLS_API.concat(provider.mcp?.getToolsApi?.() || []);
+    const toolsApi = (toolsApiOverride || TOOLS_API).concat(provider.mcp?.getToolsApi?.() || []);
 
     if (aiProvider === 'anthropic') {
       return await streamAnthropic(provider, model, messages, temperature, apiKey, apiBase, signal, onChunk, toolsApi);
@@ -771,10 +774,18 @@ async function fetchWithRetry(url, init) {
     let match;
     while ((match = regex1.exec(text)) !== null) {
       const name = match[1].trim();
+      // A tool that takes no arguments has nothing to put between the tags, and
+      // models write it exactly that way: `<tool name="finish"></tool>`. An
+      // empty body is not malformed JSON, it is the absence of arguments — but
+      // JSON.parse('') throws, so this used to become a __parse_error__ call and
+      // the tool never ran. Affects every zero-argument tool: finish,
+      // request_more_tools, git_status.
+      const body = match[2].trim();
+      if (!body) { calls.push({ name, args: {} }); continue; }
       try {
-        calls.push({ name, args: JSON.parse(match[2].trim()) });
+        calls.push({ name, args: JSON.parse(body) });
       } catch {
-        const fixed = match[2].trim().replace(/,\s*}/, '}').replace(/'/g, '"');
+        const fixed = body.replace(/,\s*}/, '}').replace(/'/g, '"');
         try { calls.push({ name, args: JSON.parse(fixed) }); }
         catch (e) { calls.push({ name: '__parse_error__', args: { tool: name, error: e.message } }); }
       }

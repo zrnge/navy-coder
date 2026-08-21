@@ -2161,6 +2161,49 @@ textarea:focus {
 }
 .settings-save-btn:hover { background: var(--gold-hover); }
 
+/* ── Icons ────────────────────────────────────────────────────────────────── */
+/* Font Awesome Free paths, bundled as an inline sprite by src/webview-html.js
+   and referenced with <use> (see src/icons.js). Sized in `em` and filled with
+   currentColor on purpose: an icon then takes the size and the colour of
+   whatever text it sits in — including every theme-following token — which is
+   exactly what the emoji they replaced could not do, since an emoji is a
+   fixed-colour glyph the OS picks and renders at its own metrics.
+
+   The -0.1em nudge sits the glyph on the text's optical centre rather than its
+   baseline, which is where a square icon otherwise lands. */
+.icon {
+  width: 1em;
+  height: 1em;
+  fill: currentColor;
+  vertical-align: -0.1em;
+  flex-shrink: 0;
+}
+/* An icon that labels text needs a little more air than the literal space
+   between them gives. The two lists are split by which side the icon sits on —
+   getting that wrong is invisible in a screenshot but reads as a wobble in the
+   spacing, and every selector here is pinned by a test against the classes the
+   panel actually renders, so a renamed container cannot leave a dead rule
+   behind. Icons that are a control's ONLY content (copy, close, read-aloud)
+   appear in neither list: they need no gap at all. */
+.diff-status .icon,
+.diff-skip .icon,
+.diag-badge .icon,
+.bg-task-badge .icon,
+.bg-task-status .icon,
+.bg-task-log-line .icon,
+.settings-title .icon,
+.msg-attach-badge .icon,
+.welcome-chip .icon,
+.think-summary .icon,
+.think-streaming .icon,
+.diff-approve .icon,
+.diff-reject .icon { margin-right: 0.4em; }
+
+/* Trailing icons — the label comes first and the glyph closes the phrase. */
+.rp-open-btn .icon,
+.history-more-btn .icon,
+.msg-expand-btn .icon { margin-left: 0.4em; }
+
 /* ── Queued message badge ─────────────────────────────────────────────────── */
 .queued-badge {
   font-size: 10px;
@@ -2171,6 +2214,73 @@ textarea:focus {
   border-radius: 4px;
   padding: var(--space-1) 5px;
   white-space: nowrap;
+}
+
+/* ── Queued prompt: the row under its own bubble ──────────────────────────── */
+/* Sits below the bubble and inherits the user column's right alignment, so it
+   reads as belonging to that message rather than to the conversation. Unlike
+   the copy and read-aloud buttons this is NOT hover-only: it is the one chance
+   to stop something that has not happened yet, and it disappears on its own the
+   moment the prompt starts running. */
+.msg-queue-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: calc(var(--space-1) * -1);
+  font-size: 10px;
+}
+.msg-queue-tag {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--gold);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-radius: 4px;
+  padding: var(--space-1) 5px;
+  white-space: nowrap;
+}
+.msg-queue-cancel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) 7px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.msg-queue-cancel:hover:not(:disabled) {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: var(--red-line);
+}
+.msg-queue-cancel:disabled { opacity: 0.6; cursor: default; }
+
+/* A queued prompt is waiting, not sent — the softened bubble says so at a
+   glance, next to sent messages that carry the full accent. */
+.message.user.is-queued .message-bubble {
+  background: var(--accent-wash);
+  border-style: dashed;
+}
+
+/* Cancelled: kept in place rather than deleted (they are the user's own words,
+   and undoing a mistaken click must not cost them), but dimmed and labelled so
+   the transcript never implies it was sent. */
+/* The de-emphasis is the flattened background and the dashed border, not
+   transparency: --muted is already at the contrast floor, and spending more of
+   it on opacity would leave the text under WCAG AA (the same trap 0.2.8 found
+   in nine other rules). */
+.message.user.is-cancelled .message-bubble {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+}
+.msg-queue-tag.cancelled {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--border);
+  font-weight: 600;
 }
 
 /* ── System notice ────────────────────────────────────────────────────────── */

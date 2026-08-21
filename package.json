@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -273,6 +273,21 @@
             "Commands run inside a Docker container built from the project's own .devcontainer/Dockerfile, with only the project folder mounted"
           ],
           "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a Docker container instead of running them directly on your machine. Requires Docker to be installed and running, and the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` — Navy refuses to guess at a generic image, since a container that doesn't actually match the project's real toolchain would be a false sense of safety. This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\nWorks on Windows, macOS and Linux. With sandboxing on, Navy targets the container rather than the host: commands are written for and run through POSIX `sh` even from a Windows host, since that is what the container actually provides."
+        },
+        "navy.reducedToolset": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Reduce automatically for small local models (local Ollama / LM Studio when the model name suggests ≤9B parameters or the effective context window is ≤16k tokens)",
+            "Always offer the reduced core set, on every provider and model",
+            "Always offer every tool (the behavior of previous versions)"
+          ],
+          "markdownDescription": "Offer small models a reduced core tool set instead of all ~37 tools. The full tool schemas ride along on **every** request — several thousand tokens that a small local model pays out of an already-small window, and a longer menu measurably worsens tool *choice* on small models. The core set keeps the read → edit → verify loop, search/retrieval, run/test, git status/diff, and skills; everything else (renames, deletes, git history, web access, background processes, LSP symbol tools, delegation) is withheld but listed in the prompt, and the model unlocks all of it mid-turn with one `request_more_tools` call when the task needs it. This is a context optimisation, never a permission change: an unlocked tool goes through exactly the same approval gate as always. The Output panel says when a turn ran reduced."
         },
         "navy.contextWindow": {
           "type": "number",

@@ -1,5 +1,133 @@
 # Changelog
 
+## [0.2.9] - 2026-08-21
+
+Three changes you can see and one you can't. The agent asks small models to
+carry less; a prompt you queued can be taken back; every emoji in the panel is
+now a real icon that follows your theme. The one you can't see is the eval
+harness, which turned out to have been measuring the wrong thing entirely — and
+saying so is more useful than quietly fixing it, because it means every number
+it produced before this release was wrong.
+
+Suite: 1,482 to 1,579.
+
+### Added
+
+- **A reduced tool set for small models** (`navy.reducedToolset`). All 37 tool
+  schemas used to ride along on every single request. On a hosted frontier model
+  that is noise; on a 7B model with an 8-16k window it is a real fraction of the
+  whole context, spent before the task is even described — and a longer menu
+  makes a small model's tool *choice* worse, not better.
+
+  A turn Navy judges small is offered a core of seventeen instead: read, edit,
+  verify, search, run, test, git status and diff, skills. The other twenty are
+  named in the prompt but withheld, and one `request_more_tools` call unlocks
+  all of them for the rest of the turn — so the model is never left concluding a
+  capability does not exist, which is the failure mode of simply removing tools.
+  Measured on the wire, the core schemas cost 52% of the full set.
+
+  `auto` applies this only to **local** providers (local Ollama, LM Studio) and
+  only when the model's name suggests ≤9B parameters or its effective window is
+  ≤16k. A hosted model named "mini" has a large window and handles a wide tool
+  list fine, and Ollama Cloud runs models too big to fit on your machine — both
+  keep everything. `on` and `off` override in either direction, and the Output
+  channel says when a turn ran reduced.
+
+  This is a context optimisation and **never a permission boundary**: nothing
+  checks the tier before running a tool, and an unlocked tool goes through
+  exactly the same approval gate as always.
+
+  Honest about the evidence: the token saving is measured and certain, the
+  quality effect is not. An A/B over the 22-task eval on `qwen2.5-coder:7b`
+  scored 74% then 28% for the reduced arm against 65% then 56% for the full one
+  — run-to-run variance on a 7B model swamping whatever the tier does. A claim
+  either way needs repeated runs per arm, which is why there is no claim here.
+
+- **Cancel a queued prompt.** Anything sent while Navy is working waits its
+  turn, and that wait can be minutes — but the transcript showed it as though it
+  had been sent, and the only way out was Stop, which killed the running turn
+  too. Each waiting prompt now carries a Cancel button under its own bubble.
+
+  It is deliberately not a hover-only control like copy and read-aloud: those
+  act on something already finished, while this is the one chance to stop
+  something that has not happened yet, and a control you must discover by
+  hovering is one most people never find. It retires itself the moment the
+  prompt actually starts.
+
+  Cancelling keeps your words. The bubble stays, dimmed and labelled "Cancelled
+  — not sent", rather than vanishing — deleting what someone typed to undo a
+  mis-click is its own small disaster, and the copy button still works on it. It
+  stops being a target in the outline and the turn arrows, though: those list
+  the questions a conversation is built from, and this one never became one.
+
+  Clicking asks the extension rather than resolving locally, because only that
+  side knows whether the turn just picked the prompt up. Lose that race and the
+  button quietly goes away instead of lying about what it can still do.
+
+- **The eval harness can A/B a setting.** `--config <key>=<value>` pins any
+  `navy.*` setting for a run and `--label <name>` tags the saved results, so two
+  arms differing in one setting can be compared later by their files rather than
+  by memory. Every run now also reports a `TOKENS` line — prompt and completion
+  summed across all tasks, and the average prompt tokens per model call. Pass
+  and fail alone cannot tell "same score, cheaper" from "no effect"; that line
+  can, and it is what caught the truncation bug below.
+
+### Changed
+
+- **Every emoji in the panel is now a Font Awesome icon.** An emoji is a
+  fixed-colour glyph the operating system chooses and draws at its own metrics:
+  it cannot follow a VS Code theme, it renders differently on every platform,
+  and on some it does not render at all. The slash-command menu, the welcome
+  chips, close and copy and read-aloud, approve and reject, the activity log's
+  ticks and crosses, background-task and process badges, the reasoning marker,
+  attachment badges and the diff bands are all drawn from real icons now, sized
+  in `em` and filled with `currentColor` — so each one takes the size and colour
+  of the text it sits in, including every theme token.
+
+  They are bundled, not linked. Only the 38 icons Navy actually draws ship, as
+  raw SVG paths in `src/icons.js`, emitted once per document as an inline sprite
+  that every use site references — no webfont, no icon CSS, no CDN, nothing
+  fetched at runtime, and no `font-src` entry added to the panel's CSP. A
+  webfont would have meant ~400KB for two dozen glyphs and a missing-glyph box
+  whenever it failed to load.
+
+  Custom slash commands keep whatever glyph their own markdown file gives them.
+  Built-ins name an icon instead, and that name is sanitised before it reaches
+  the markup, since a repository can write one.
+
+  `tools/build-icons.js` regenerates the set from a local Font Awesome package
+  and is the only thing that ever needs one; the generated file is committed.
+  Font Awesome Free icons are CC BY 4.0, which requires attribution — the notice
+  is in `src/icons.js` and in the README, and both stay.
+
+### Fixed
+
+- **The eval harness was measuring truncation, not the model.** It never set a
+  context window, so every request went to Ollama at its own ~2048-token default
+  and was silently cut down — the model could not see most of its system prompt,
+  let alone the files. The new token accounting is what exposed it: all 570
+  model calls across two full runs reported *exactly* ~2,050 prompt tokens,
+  which is not a number a real workload produces twice.
+
+  This invalidates every result the harness saved before this release, including
+  the ones in `eval/results/` from July. It now fetches the model's real window
+  per task, the same way the panel does when you pick a model. The difference is
+  not subtle: `fix-off-by-one` failed in both truncated arms and passes in three
+  model calls at a 16k window.
+
+- **A tool call with no arguments never ran.** `finish` takes no arguments, so
+  models write `<tool name="finish"></tool>` — and the empty body went to
+  `JSON.parse('')`, threw, and came back as a parse error instead of a call, so
+  the tool never ran. An empty body now means what it looks like. Affected every
+  zero-argument tool: `finish`, `git_status`, and the new `request_more_tools`.
+
+- **Stop dropped queued prompts without saying so.** Pressing Stop has always
+  cleared the queue — otherwise the next prompt fires the instant the abort
+  lands — but the bubbles for those prompts stayed in the transcript looking
+  exactly like messages that had been sent. Stop now names what it dropped and
+  each one is marked, as is anything still waiting when the extension host dies,
+  where nothing is coming to run it.
+
 ## [0.2.8] - 2026-08-19
 
 A UI/UX release. No new tools, no new providers, nothing new the agent can do —

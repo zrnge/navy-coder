@@ -10,12 +10,14 @@
 
 - **Agentic tool loop** — Navy reads files, searches the codebase, runs commands, and applies edits autonomously until the task is done, remembering what it actually did (files read, commands run and their exit code) across the whole conversation, not just what it said it did
 - **Diff approval gate** — every file change is shown as a side-by-side diff; you approve or reject before it's written
+- **Queue a prompt while Navy works — and take it back** — anything you send during a running turn waits its turn, and its own bubble carries a Cancel button for as long as it is still waiting; cancelling leaves your text in the transcript, marked as never sent, rather than deleting what you wrote or forcing you to Stop the running turn to get rid of it
 - **Multiple projects, multiple chats** — a tab strip holds several conversations per project (a running turn keeps streaming in a background tab while you work in another), and Navy remembers every project you've ever opened in a small catalog (`~/.navy/projects.json`) so you can jump back into one without re-browsing for its folder — picking one offers to replace the current workspace or add it alongside what's already open
 - **11 AI providers** — Ollama, LM Studio, OpenAI, Anthropic Claude, DeepSeek, Google Gemini, xAI Grok, z.ai, Groq, OpenRouter, and any custom OpenAI-compatible endpoint — with a native path for Anthropic extended thinking and Gemini's thinking/tool-call signatures, not just an OpenAI-compatible shim
 - **Per-provider API keys** — switch providers without losing other keys; keys live in VS Code's OS keychain, never on disk
 - **Opt-in cross-provider failover** (`navy.providerFallbacks`) — an ordered list of backup providers Navy falls through to on a genuinely transient failure (rate limit, outage, network error) — never for an auth/quota/context-length problem, and every fallback attempt is announced in the chat before it runs
 - **Running cost estimate** — a cumulative token counter with an approximate $ cost for well-known hosted models, priced per turn using whichever provider actually served it; local models always show $0
 - **Deep retrieval** — `find_relevant_files` blends keyword search with semantic embeddings (chunked per-file, not truncated to the first slice) and real LSP symbol matches, and the repository map the model sees is enriched with a one-line function/class outline per file, not just a bare file tree
+- **Reduced tool set for small models** (`navy.reducedToolset`) — the full ~37 tool schemas ride on every request, which is a real tax on a 7B local model's context and measurably worsens its tool choice; a small local model (Ollama/LM Studio, ≤9B-named or ≤16k effective window) is instead offered a lean core covering read → edit → verify, and unlocks the full set mid-turn with one `request_more_tools` call when the task needs it — a context optimization, never a permission change
 - **`delegate_research`** — the model can spin off an isolated, read-only sub-agent for a broad investigation, getting back only the written conclusion instead of filling the main conversation with every file it looked at
 - **Opt-in Docker sandboxing** (`navy.sandboxMode`) — run commands, tests, and dev servers inside a container built from the project's own `.devcontainer`/`Dockerfile`, as a second layer of isolation on top of the approval gate, on every host — see [Safety](#safety)
 - **Opt-in persistent background processes** (`navy.persistBackgroundProcesses`) — let a dev server survive a window reload instead of being killed, with its output logged to a file and Navy offering to stop it if you reopen the project with one still running
@@ -260,7 +262,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 1,063 tests: extension host + webview, no network or API keys needed
+npm test        # 1,579 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 
@@ -275,3 +277,9 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the repo layout, the invariants t
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+### Third-party assets
+
+Navy's interface icons are from **[Font Awesome Free](https://fontawesome.com)** 7.3.1, licensed **[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)**.
+
+Only the ~38 icons the panel actually draws are bundled, as raw SVG paths in [`src/icons.js`](src/icons.js) — no webfont, no icon CSS, and nothing fetched at runtime, so the panel renders identically offline and in a workspace with no network. To change the set, see [`tools/build-icons.js`](tools/build-icons.js). No other third-party code ships in the extension.

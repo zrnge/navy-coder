@@ -222,6 +222,37 @@ typed arguments are appended to the end of the template instead, which is a
 sensible fallback and a poor design — put the placeholder where the words
 belong.
 
+## Adding an icon
+
+Icons are Font Awesome Free paths bundled as an inline SVG sprite — never a
+webfont, never a CDN, never an emoji. Three reasons, in order: an emoji is a
+fixed-colour glyph the OS chooses, so it cannot follow a VS Code theme and looks
+different on every platform; a webfont would need a `font-src` CSP entry and
+~400KB for two dozen glyphs, and renders as a missing-glyph box when it fails;
+and both leave the panel dependent on something outside the repository.
+
+To add one:
+
+1. Add `navyName: 'fa-icon-name'` to `ICON_MAP` in `tools/build-icons.js`. The
+   left side is what Navy calls it — pick the meaning (`refactor`), not the
+   picture (`arrows-rotate`), so re-drawing it later is a one-line change here.
+2. Regenerate: `node tools/build-icons.js --fa <path to an extracted
+   @fortawesome/fontawesome-free package>`. `src/icons.js` is generated and
+   committed, so no build and no user ever needs the network or the package.
+3. Use it: `icon('refactor')` returns markup, in `media/main.js` and in
+   `src/webview-html.js` alike. It is `innerHTML`, so anything you interpolate
+   beside it needs `escapeHtml` — several of these call sites used to be
+   `textContent`, where that was free.
+4. If it sits next to a text label, add its container to the spacing rules in
+   `media/styles.css` — the leading list or the trailing one, depending on which
+   side the glyph is on. `iconSuite` fails on a rule naming a class nothing
+   renders, so a renamed container cannot leave a dead rule behind.
+
+`iconSuite` in `test/webview-run.js` also fails the build if any name does not
+resolve to a symbol in the sprite (a typo renders *nothing*, silently), or if an
+emoji reappears in rendered markup. Font Awesome Free is CC BY 4.0: attribution
+is a licence condition, so the notices in `src/icons.js` and the README stay.
+
 ## Touching skills
 
 `src/skills.js`, and read `docs/skills-design.md` first — it argues the

@@ -19,3 +19,6 @@ eval/**
 **/*.map
 # CI config — repository tooling, of no use inside an installed extension.
 .github/**
+# Same: the icon generator runs against a Font Awesome package at development
+# time and writes src/icons.js, which is what the bundle actually carries.
+tools/**

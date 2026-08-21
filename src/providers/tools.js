@@ -410,6 +410,18 @@ const TOOLS = [
     }
   },
   {
+    // Offered ONLY on the reduced tier (see TOOLS_API_CORE below), but listed
+    // here with every other tool because TOOLS is what parseToolCalls checks a
+    // name against before accepting a JSON-formatted call. Left out of this
+    // list, an unlock request from a model using the JSON fallback — small
+    // local models, exactly the population the reduced tier exists for — was
+    // silently discarded, which read to the turn loop as "no tool calls" and
+    // ended the turn without doing anything.
+    name: 'request_more_tools',
+    description: 'Unlock the full tool set for the rest of this turn. You are offered a reduced core set to keep your context small; the withheld tools are listed in the system prompt. Call this FIRST when the task needs one of them (rename/move/delete files, line insert/delete, git history or blame, web search or fetching a URL, docs search, background processes or dev servers, LSP symbol lookup/rename/references, delegating research). Returns the newly available tools.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
     name: 'finish',
     description: 'Signal that the task is fully complete and no further tool calls are needed.',
     parameters: { type: 'object', properties: {} }
@@ -417,9 +429,57 @@ const TOOLS = [
 ];
 
 // Ollama-compatible tool schema (OpenAI function-calling format).
-const TOOLS_API = TOOLS
-  .filter(t => t.name !== 'finish')
+//
+// Two names never reach the wire schema:
+//   finish — on the native path "no tool calls" IS the finish signal, so
+//     offering it as a real tool only invites a wasted call.
+//   request_more_tools — meaningless on the full tier, where nothing is
+//     withheld; TOOLS_API_CORE adds it back for the tier that needs it.
+const NEVER_OFFERED = new Set(['finish', 'request_more_tools']);
+const toApiSchema = (tools) => tools
+  .filter(t => !NEVER_OFFERED.has(t.name))
   .map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
+
+const TOOLS_API = toApiSchema(TOOLS);
+
+// ── Reduced tool set for small models ────────────────────────────────────────
+// Every schema above rides along on EVERY request. On a hosted frontier model
+// that's noise; on a 7B local model with a 8-32k window it's a real fraction of
+// the whole context, and — worse — more near-synonym tools measurably degrade
+// tool CHOICE on small models. So a turn that _shouldReduceTools (extension.js)
+// judges small is offered only this core, plus request_more_tools to unlock the
+// rest on demand. This is a context/quality optimisation, never a permission
+// boundary: executeTool never checks the tier, and everything a withheld tool
+// does still goes through the same approval gate when unlocked.
+//
+// What earns a place in the core: the tools the workflow rules treat as the
+// default loop (read → edit → verify), the retrieval entry point the rules say
+// to call FIRST, and anything the system prompt actively instructs the model to
+// call (activate_skill for the skills manifest, remember for rule 7, finish for
+// the fallback path). Everything else — moves/deletes, git history, web access,
+// background processes, LSP symbol tools, delegation — is one request_more_tools
+// call away, and the withheld names are listed in the prompt so the model knows
+// what it can ask for rather than concluding the capability doesn't exist.
+const CORE_TOOL_NAMES = new Set([
+  'read_file', 'read_lines', 'write_file', 'list_files', 'apply_edit', 'edit_line',
+  'search_codebase', 'find_relevant_files', 'run_command', 'run_tests',
+  'get_diagnostics', 'check_syntax', 'git_status', 'git_diff',
+  'activate_skill', 'remember', 'request_more_tools', 'finish',
+]);
+
+// Core tools, in TOOLS order. request_more_tools is a core name, so it comes
+// along automatically — and being IN the core set is also what keeps it out of
+// WITHHELD_TOOLS, which would otherwise offer the model the tool it is already
+// holding as something to unlock.
+const TOOLS_CORE = TOOLS.filter(t => CORE_TOOL_NAMES.has(t.name));
+// The one place request_more_tools reaches a wire schema: toApiSchema drops it
+// as never-offered, so the core tier adds it back explicitly.
+const TOOLS_API_CORE = toApiSchema(TOOLS_CORE).concat({
+  type: 'function',
+  function: (({ name, description, parameters }) => ({ name, description, parameters }))(
+    TOOLS.find(t => t.name === 'request_more_tools')),
+});
+const WITHHELD_TOOLS = TOOLS.filter(t => !CORE_TOOL_NAMES.has(t.name));
 
 const TOOL_PROMPT = `You are Navy Coder, an expert AI coding assistant embedded inside VS Code. You have DIRECT ACCESS to the user's project files through tools — you do NOT need the user to paste any code.
 
@@ -461,4 +521,19 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from cmd.exe per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.
 19. DELEGATION: for a broad investigation you don't need to keep the raw detail of — "how does X work here", "find every place Y is used and summarize the pattern" — prefer delegate_research over doing it yourself with many read/search calls: you get back only the written conclusion instead of filling your own context with files you won't need again. Do NOT delegate anything that needs to WRITE, run a command, or that's simple enough to resolve in 1-2 tool calls yourself — delegation has overhead and the sub-agent can't act on what it finds.`
 
-module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT };
+// The core-tier system prompt is TOOL_PROMPT with the "Available tools:" line
+// rewritten to the core set, plus an explicit account of what's withheld and
+// how to get it. Derived from the literal rather than templating TOOL_PROMPT
+// itself, so the full-set prompt every existing conversation was built on stays
+// byte-for-byte what it was. A test pins that the swap actually landed, since
+// a silent regex miss here would just quietly ship the full list.
+const TOOL_PROMPT_CORE = TOOL_PROMPT.replace(
+  /^Available tools: .*$/m,
+  'Available tools: ' + TOOLS_CORE.map(t => t.name).join(', ') + '.'
+) + `
+
+## Reduced tool set (small model / small context window)
+To keep your context small, only the core tools listed above are offered right now. These tools also exist but are withheld: ${WITHHELD_TOOLS.map(t => t.name).join(', ')}.
+If the task genuinely needs one of them, call request_more_tools FIRST — it unlocks all of them for the rest of the turn. A workflow rule above that names a withheld tool applies only after unlocking; until then, use the core tools.`;
+
+module.exports = { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_CORE, TOOLS_API_CORE, TOOL_PROMPT_CORE, CORE_TOOL_NAMES, WITHHELD_TOOLS };

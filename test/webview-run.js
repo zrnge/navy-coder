@@ -1920,14 +1920,17 @@ function fileChipSuite() {
   const chips = [...d.querySelectorAll('.chip-file')];
   check('each attached file gets a chip', chips.length === 3, String(chips.length));
 
-  // The remove button carried a literal U+FFFD — the replacement character left
-  // behind when bytes fail to decode as UTF-8 — so it drew as a missing-glyph
-  // box beside three sibling buttons that rendered fine. It reads as "this app
-  // cannot do Unicode"; it was one corrupted character in the source.
+  // This button used to carry a literal U+FFFD — the replacement character left
+  // behind when bytes fail to decode as UTF-8 — and drew as a missing-glyph box
+  // beside three siblings that rendered fine. It now draws from the icon sprite,
+  // which removes that whole class of bug: an <svg><use> reference either
+  // resolves or draws nothing, and cannot be corrupted into a different glyph
+  // by an encoding mistake. What is worth pinning is that it references the
+  // close icon at all.
   for (const c of chips) {
-    check('the remove button is U+2715, not a corrupted glyph',
-      c.querySelector('.chip-remove').textContent === '✕',
-      'U+' + c.querySelector('.chip-remove').textContent.codePointAt(0).toString(16));
+    const use = c.querySelector('.chip-remove use');
+    check('the remove button draws the close icon from the sprite',
+      use?.getAttribute('href') === '#i-close', use?.getAttribute('href') || 'no <use>');
   }
 
   // And the labels themselves: non-ASCII filenames survive intact.
@@ -1935,6 +1938,330 @@ function fileChipSuite() {
   check('an accented, em-dashed filename survives',
     labels.includes('héllo—ünicode.tsx'), labels.join(', '));
   check('a CJK filename survives', labels.includes('テスト.py'), labels.join(', '));
+  w.close();
+}
+
+// ── Icons ───────────────────────────────────────────────────────────────────
+// The panel used to label its controls with emoji: a fixed-colour glyph the OS
+// chooses, drawn at its own metrics, which cannot follow a VS Code theme and
+// renders differently (or not at all) per platform. They are now Font Awesome
+// Free paths bundled as an inline sprite. The failure mode of a sprite is a
+// silent one — a mistyped name renders nothing at all — so what these tests
+// pin above all is that every name actually resolves.
+function iconSuite() {
+  console.log('\nicons: bundled SVG, theme-following, no emoji left:');
+
+  const w = createWebview();
+  const d = w.document;
+
+  const sprite = d.querySelector('#iconSprite');
+  check('the sprite is embedded in the document', Boolean(sprite));
+  check('…exactly once — a second copy would duplicate every id',
+    d.querySelectorAll('#iconSprite').length === 1);
+  check('…and is hidden, so it takes no space at the top of the panel',
+    /display:\s*none/.test(sprite?.getAttribute('style') || ''));
+
+  // Symbol ids carry an `i-` prefix so they cannot collide with any other id in
+  // the document; the names the call sites use are the bare ones.
+  const defined = new Set([...d.querySelectorAll('#iconSprite symbol')]
+    .map(s => (s.getAttribute('id') || '').replace(/^i-/, '')));
+  check('the sprite defines icons', defined.size >= 30, String(defined.size));
+
+  // Every name used anywhere must exist in the sprite. This is the test that
+  // earns its keep: `icon('closee')` throws nothing, logs nothing, and simply
+  // draws an empty box where a control's only label should be.
+  const mainSrc = readSource('media', 'main.js');
+  const htmlSrc = readSource('src', 'webview-html.js');
+  const used = new Set();
+  for (const src of [mainSrc, htmlSrc]) {
+    for (const m of src.matchAll(/\bicon\('([a-z0-9-]+)'/g)) used.add(m[1]);
+    for (const m of src.matchAll(/#i-([a-z0-9-]+)/g)) used.add(m[1]);
+  }
+  const unresolved = [...used].filter(n => !defined.has(n));
+  check('every icon name used resolves to a symbol in the sprite',
+    unresolved.length === 0, unresolved.join(', '));
+  check('…and enough names are actually in use for that to mean something',
+    used.size >= 20, String(used.size));
+
+  // The whole point of leaving emoji behind: an icon takes the colour and size
+  // of the text it sits in, so it follows the theme like everything else.
+  const css = readSource('media', 'styles.css');
+  const iconRule = /\.icon\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('icons are filled with currentColor, so they follow the theme',
+    /fill:\s*currentColor/.test(iconRule), iconRule.trim());
+  check('…and sized in em, so they follow the text they label',
+    /width:\s*1em/.test(iconRule) && /height:\s*1em/.test(iconRule));
+
+  // Emoji creeping back in would be invisible until someone opened the panel on
+  // a light theme or a machine with different emoji fonts. Comments are allowed
+  // to mention them (several explain this very change); rendered strings are not.
+  // Arrows (U+2190-21FF) are deliberately NOT listed: "Ctrl+Shift+P → Reload
+  // Window" is prose, not an icon, and an SVG in the middle of a sentence would
+  // be the wrong fix for it.
+  const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2900}-\u{2AFF}\u{2B00}-\u{2BFF}]/u;
+  const offenders = [];
+  for (const [name, src] of [['media/main.js', mainSrc], ['src/webview-html.js', htmlSrc]]) {
+    src.split('\n').forEach((line, i) => {
+      const code = line.replace(/^\s*(\/\/|\*|<!--).*$/, '').split('//')[0];
+      if (EMOJI.test(code)) offenders.push(`${name}:${i + 1}`);
+    });
+  }
+  check('no emoji left in the markup or the rendered strings',
+    offenders.length === 0, offenders.slice(0, 6).join(', '));
+
+  // The icon-spacing rules name containers by class. A container that gets
+  // renamed leaves a rule that matches nothing — invisible in a screenshot,
+  // and it reads as a wobble in the spacing rather than as a bug — so every
+  // class those rules mention has to exist somewhere that renders an icon.
+  const spacingSelectors = [...css.matchAll(/\.([a-z-]+) \.icon[,{]/g)].map(m => m[1]);
+  const rendered = mainSrc + htmlSrc;
+  const dead = [...new Set(spacingSelectors)].filter(cls => !rendered.includes(cls));
+  check('every icon-spacing rule names a container the panel really renders',
+    dead.length === 0, dead.join(', '));
+  check('…and there are rules for both sides, leading and trailing',
+    /margin-right:\s*0\.4em/.test(css) && /margin-left:\s*0\.4em/.test(css));
+
+  // A slash command from a repository can name its own icon, and that name
+  // reaches an href — so it is sanitised rather than trusted.
+  w.post({ type: 'slashCommands', commands: [
+    { cmd: '/evil', label: 'Evil', desc: 'x', prompt: 'p', custom: true,
+      iconName: 'close"/><script>bad()</script><x y="' }] });
+  const p = d.querySelector('#prompt');
+  p.value = '/';
+  p.dispatchEvent(new w.window.Event('input'));
+  check('an icon name from a repo file cannot break out of the attribute',
+    d.querySelectorAll('#slashDropdown script').length === 0);
+  w.close();
+
+  // Built-ins: every one of them must name an icon that exists, or the command
+  // menu — the feature most people meet first — draws a column of blanks.
+  const listed = [...mainSrc.matchAll(/iconName:\s*'([a-z0-9-]+)'/g)].map(m => m[1]);
+  check('every built-in slash command names a real icon',
+    listed.length >= 15 && listed.every(n => defined.has(n)),
+    listed.filter(n => !defined.has(n)).join(', ') || String(listed.length));
+
+  // Provenance: Font Awesome Free is CC BY 4.0, which requires attribution.
+  const icons = readSource('src', 'icons.js');
+  check('the generated icon file carries its Font Awesome attribution',
+    /Font Awesome Free/.test(icons) && /CC BY 4\.0/.test(icons));
+  check('…and the README does too, where a reader of the repo will see it',
+    /Font Awesome/.test(readSource('README.md')));
+  check('the icon file is generated, and says so',
+    /GENERATED by tools\/build-icons\.js/.test(icons));
+}
+
+// ── Cancelling a queued prompt ──────────────────────────────────────────────
+// A prompt typed while Navy is working sits in the queue, sometimes for
+// minutes, and used to be unstoppable: the transcript showed it as if sent and
+// the only way out was Stop, which killed the running turn too. These drive the
+// real send path and the real message protocol.
+function queueCancelSuite() {
+  console.log('\nqueue: a queued prompt can be taken back:');
+
+  // Sending while a turn is running: the prompt goes out with an id, and the
+  // bubble only gets its Cancel row once the extension confirms it is queued.
+  let w = createWebview();
+  let d = w.document;
+  // While a turn runs the send BUTTON is the Stop button, so Enter in the
+  // composer is the real way a prompt gets queued — drive that. Reads w/d on
+  // each call because the suite rebuilds them for each scenario.
+  const send = (text) => {
+    const p = d.querySelector('#prompt');
+    p.value = text;
+    p.dispatchEvent(new w.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  };
+
+  w.post({ type: 'start' });
+  send('second thing');
+  const ask = w.sent.filter(m => m.type === 'ask').pop();
+  check('the send carries an id the extension can queue it under',
+    Boolean(ask && ask.queueId), JSON.stringify(ask));
+  check('no Cancel appears before the extension says it was queued',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+
+  w.post({ type: 'queued', id: ask.queueId, position: 1 });
+  const cancelBtn = d.querySelector('.msg-queue-cancel');
+  check('once queued, the bubble carries a Cancel button', Boolean(cancelBtn));
+  check('…on the queued message itself, not the topbar',
+    d.querySelector('.message.user.is-queued .msg-queue-cancel') !== null);
+  check('…labelled for a screen reader too',
+    cancelBtn.getAttribute('aria-label') === 'Cancel queued message');
+  check('…and it is visible without hovering (no hover-only rule for it)',
+    !readSource('media', 'styles.css').match(/:hover\s+\.msg-queue-cancel/));
+  check('the topbar still counts what is waiting',
+    d.querySelector('#queuedBadge').textContent === '1 queued');
+
+  // Clicking asks the extension; nothing is resolved locally, because only the
+  // extension knows whether the turn has already picked the prompt up.
+  cancelBtn.click();
+  check('clicking asks the extension to cancel that id',
+    w.sent.some(m => m.type === 'cancelQueued' && m.id === ask.queueId));
+  check('…and the button cannot be clicked twice while that is in flight',
+    cancelBtn.disabled === true);
+  check('the message is NOT removed on click alone',
+    d.querySelectorAll('.message.user').length === 1);
+
+  w.post({ type: 'queueCancelled', id: ask.queueId, ok: true, remaining: 0 });
+  check('confirmed: the bubble stays — the words are the user\'s own',
+    d.querySelectorAll('.message.user').length === 1);
+  check('…but is marked cancelled, so the transcript never implies it was sent',
+    d.querySelector('.message.user.is-cancelled') !== null);
+  check('…and says so in words, not just a colour',
+    /Cancelled/.test(d.querySelector('.msg-queue-tag.cancelled')?.textContent || ''));
+  check('…with no Cancel button left to press',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+  check('the badge clears when nothing is left waiting',
+    d.querySelector('#queuedBadge').style.display === 'none');
+
+  // A cancelled prompt never became a turn, so it is not a navigation target.
+  d.querySelector('#outlineButton').click();
+  check('the outline does not offer a jump to a message that was never sent',
+    d.querySelectorAll('.outline-row').length === 0,
+    String(d.querySelectorAll('.outline-row').length));
+  w.close();
+
+  // Losing the race: the turn picked the prompt up between click and handler.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('too late');
+  const lateId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: lateId, position: 1 });
+  d.querySelector('.msg-queue-cancel').click();
+  w.post({ type: 'queueCancelled', id: lateId, ok: false, remaining: 0 });
+  check('a prompt that already started is not marked cancelled',
+    d.querySelector('.message.user.is-cancelled') === null);
+  check('…and its dead Cancel button goes away rather than lying',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+  w.close();
+
+  // Draining: the prompt starts running, so there is nothing left to cancel.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('runs next');
+  const runId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: runId, position: 1 });
+  w.post({ type: 'queueDrained', id: runId, remaining: 0 });
+  check('a prompt that starts running loses its Cancel button',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+  check('…and is a normal sent message again, not a cancelled one',
+    d.querySelector('.message.user.is-cancelled') === null &&
+    d.querySelector('.message.user.is-queued') === null);
+  w.close();
+
+  // The same drain, in the order the extension REALLY sends it: the turn's
+  // finally block posts 'done' first and drains the queue only afterwards. Any
+  // state the webview discards on 'done' is therefore gone before the drain
+  // refers to it — which is precisely how a Cancel button came to outlive its
+  // prompt and sit on a finished turn forever, with nothing left to cancel.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('runs after done');
+  const doneId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: doneId, position: 1 });
+  w.post({ type: 'done' });
+  check('a queued prompt keeps its Cancel button when the turn ahead finishes '
+    + '— it has not run yet, so it can still be taken back',
+    d.querySelectorAll('.msg-queue-cancel').length === 1);
+  w.post({ type: 'queueDrained', id: doneId, remaining: 0 });
+  check('…and loses it once the drain starts it, even after that done',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+  w.post({ type: 'start' });
+  check('…leaving no queue row behind on the finished turn',
+    d.querySelectorAll('.msg-queue-row').length === 0);
+  w.post({ type: 'done' });
+  check('…and none after the whole exchange ends',
+    d.querySelectorAll('.msg-queue-row').length === 0);
+  w.close();
+
+  // Stop drops the whole queue. Those bubbles must not keep posing as sent.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('first queued');
+  const idA = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  send('second queued');
+  const idB = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: idA, position: 1 });
+  w.post({ type: 'queued', id: idB, position: 2 });
+  check('two waiting prompts, two Cancel buttons',
+    d.querySelectorAll('.msg-queue-cancel').length === 2);
+  check('the badge counts both', d.querySelector('#queuedBadge').textContent === '2 queued');
+  w.post({ type: 'queueCleared', ids: [idA, idB], remaining: 0 });
+  check('Stop marks every dropped prompt, rather than leaving them looking sent',
+    d.querySelectorAll('.message.user.is-cancelled').length === 2,
+    String(d.querySelectorAll('.message.user.is-cancelled').length));
+  check('…and clears the badge', d.querySelector('#queuedBadge').style.display === 'none');
+  w.close();
+
+  // The backend dying is the one case with nothing left to announce the queue's
+  // fate: those prompts will never be sent, and no queueCleared is coming. The
+  // watchdog's recovery has to retire them itself, or the panel shows Cancel
+  // buttons for prompts nothing is holding. Called directly — the real trigger
+  // is four minutes of silence.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('never runs');
+  const deadId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: deadId, position: 1 });
+  w.window.busyRecovery();
+  check('a dead backend marks its queued prompts cancelled, not still-waiting',
+    d.querySelectorAll('.message.user.is-cancelled').length === 1);
+  check('…and leaves no Cancel button for a prompt nothing is holding',
+    d.querySelectorAll('.msg-queue-cancel').length === 0);
+  check('…and clears the count', d.querySelector('#queuedBadge').style.display === 'none');
+  w.close();
+
+  // The webview's idea of "busy" is not the extension's. The extension goes
+  // busy at the top of a turn and only posts 'start' hundreds of lines later,
+  // after the repo map and retrieval — seconds, on a large project. A prompt
+  // sent in THAT window is genuinely queued, so it must still get its handle;
+  // the first version only remembered sends made while the webview already
+  // believed it was busy, which left these with no tag, no Cancel button, and
+  // nothing for Stop to mark afterwards.
+  w = createWebview();
+  d = w.document;
+  send('sent before start arrives');   // no 'start' posted yet — webview thinks idle
+  const earlyId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: earlyId, position: 1 });
+  check('a prompt queued before the turn announces itself still gets a Cancel button',
+    d.querySelectorAll('.msg-queue-cancel').length === 1);
+  w.post({ type: 'queueCleared', ids: [earlyId], remaining: 0 });
+  check('…and Stop can still mark it, rather than leaving it looking sent',
+    d.querySelectorAll('.message.user.is-cancelled').length === 1);
+  w.close();
+
+  // A prompt can be queued TWICE: the drain hands it to askNavy a tick later,
+  // and if another turn has begun by then it goes back in the queue. It carries
+  // its id both times, so the bubble has to be re-markable after being cleared.
+  w = createWebview();
+  d = w.document;
+  w.post({ type: 'start' });
+  send('queued, drained, queued again');
+  const againId = w.sent.filter(m => m.type === 'ask').pop().queueId;
+  w.post({ type: 'queued', id: againId, position: 1 });
+  w.post({ type: 'done' });
+  w.post({ type: 'queueDrained', id: againId, remaining: 0 });
+  check('cleared on drain', d.querySelectorAll('.msg-queue-cancel').length === 0);
+  w.post({ type: 'queued', id: againId, position: 1 });
+  check('a re-queued prompt gets its Cancel button back',
+    d.querySelectorAll('.msg-queue-cancel').length === 1);
+  check('…on the same bubble, not a second one',
+    d.querySelectorAll('.message.user').length === 1);
+  w.close();
+
+  // Every bubble carries an id now, so what keeps an ordinary message plain is
+  // that nothing ever says it was queued — a 'queued' event naming some OTHER
+  // id must not decorate it.
+  w = createWebview();
+  d = w.document;
+  send('not busy');
+  w.post({ type: 'queued', id: 'some-other-id', position: 1 });
+  check('an idle send grows no queue row',
+    d.querySelectorAll('.msg-queue-row').length === 0);
   w.close();
 }
 
@@ -2018,6 +2345,8 @@ msgStepSuite();
 scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
+iconSuite();
+queueCancelSuite();
 indentedFenceSuite();
 slashCommandSuite();
 terminalSuite();

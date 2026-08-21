@@ -386,7 +386,7 @@ function readFileTail(filePath, maxBytes) {
 }
 
 // Tool definitions — used both for the XML-fallback prompt and for native Ollama tool calling.
-const { TOOLS, TOOLS_API, TOOL_PROMPT } = require('./providers/tools.js');
+const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, WITHHELD_TOOLS } = require('./providers/tools.js');
 
 // ── Replayable record of a turn's tool cards ────────────────────────────────
 // A session used to persist only role + text, so reopening a chat replaced
@@ -833,13 +833,19 @@ class NavyCoderViewProvider {
           await this.closeSessionTab(message.sessionId || '');
           break;
         case 'ask':
-          await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || []);
+          await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || [], message.queueId || '');
+          break;
+        case 'cancelQueued':
+          this.cancelQueuedMessage(message.id || '');
           break;
         case 'stop':
           // Stop means stop everything — including prompts waiting in the queue,
           // otherwise the next queued message fires the instant the abort lands.
-          this.messageQueue = [];
-          this.view?.webview.postMessage({ type: 'queueDrained', remaining: 0 });
+          // The webview is told WHICH prompts were dropped, not just that the
+          // count is now zero: each one is already sitting in the transcript as
+          // a user bubble, and leaving those looking sent is the same lie that
+          // cancelling one by hand has to avoid.
+          this._dropQueuedMessages();
           this.abortController?.abort();
           this.cancelPendingApprovals();
           break;
@@ -1240,7 +1246,9 @@ class NavyCoderViewProvider {
   clearChat() {
     // Clearing mid-turn: abort the running turn and drop queued prompts first, so a
     // ghost turn can't keep streaming into (and re-saving over) the cleared chat.
-    this.messageQueue = [];
+    // The queueCleared notice is harmless here (the transcript is about to go)
+    // and keeps every queue-abandoning path on one code path.
+    this._dropQueuedMessages();
     this.abortController?.abort();
     this.cancelPendingApprovals();
     this.messages = [];
@@ -2754,13 +2762,42 @@ class NavyCoderViewProvider {
     this.view?.webview.postMessage({ type: 'sessionLoaded', count: 0, memory: await this.loadProjectMemory(), projectRoot: this.projectRoot });
   }
 
-  async askNavy(prompt, includeContext, selectedModel, attachedFiles = [], images = []) {
+  // Drops every prompt still waiting in the queue and tells the webview which
+  // ones went, so their bubbles can be marked instead of silently posing as
+  // sent. Shared by Stop and clearChat — both abandon the queue, and having one
+  // of them forget to say so is exactly how a bubble ends up lying.
+  _dropQueuedMessages() {
+    const ids = this.messageQueue.map(m => m.queueId).filter(Boolean);
+    this.messageQueue = [];
+    this.view?.webview.postMessage({ type: 'queueCleared', ids, remaining: 0 });
+  }
+
+  // Removes ONE queued prompt by the id the webview generated for it. Racy by
+  // nature: the turn can finish and drain the queue between the click and this
+  // handler, so a miss is a normal outcome, not an error — `ok: false` tells
+  // the webview the message is already running and its cancel affordance
+  // should simply go away. Only ever touches the queue: a prompt that has
+  // started is the running turn's business, and Stop is the control for that.
+  cancelQueuedMessage(id) {
+    if (!id) return;
+    const before = this.messageQueue.length;
+    this.messageQueue = this.messageQueue.filter(m => m.queueId !== id);
+    const removed = this.messageQueue.length < before;
+    this.view?.webview.postMessage({
+      type: 'queueCancelled', id, ok: removed, remaining: this.messageQueue.length,
+    });
+  }
+
+  async askNavy(prompt, includeContext, selectedModel, attachedFiles = [], images = [], queueId = '') {
     if (!prompt.trim()) return;
 
-    // Queue while busy so the user can keep typing freely.
+    // Queue while busy so the user can keep typing freely. queueId is the
+    // webview's handle on the bubble it already drew for this prompt — it is
+    // what lets that bubble carry a working Cancel button (see
+    // cancelQueuedMessage) and what identifies the prompt when it starts.
     if (this.isBusy) {
-      this.messageQueue.push({ prompt, includeContext, selectedModel, attachedFiles, images });
-      this.view?.webview.postMessage({ type: 'queued', position: this.messageQueue.length });
+      this.messageQueue.push({ prompt, includeContext, selectedModel, attachedFiles, images, queueId });
+      this.view?.webview.postMessage({ type: 'queued', id: queueId, position: this.messageQueue.length });
       return;
     }
 
@@ -2798,11 +2835,11 @@ class NavyCoderViewProvider {
   // result plus { usedProvider, usedModel } so the caller can tag rawBlocks/
   // cost/meta with whichever provider ACTUALLY served this call, not
   // whatever's configured as primary.
-  async _streamWithFallback(host, model, messages, temperature) {
+  async _streamWithFallback(host, model, messages, temperature, toolsApiOverride = null) {
     const config = vscode.workspace.getConfiguration('navy');
     const primaryProvider = config.get('provider', 'ollama');
     try {
-      const result = await streamAssistant(this, host, model, messages, temperature, this.abortController?.signal);
+      const result = await streamAssistant(this, host, model, messages, temperature, this.abortController?.signal, null, null, toolsApiOverride);
       return { ...result, usedProvider: primaryProvider, usedModel: model };
     } catch (primaryError) {
       if (this.abortController?.signal.aborted) throw primaryError; // never fall back from an intentional Stop
@@ -2820,8 +2857,11 @@ class NavyCoderViewProvider {
         this._announceFallback(`${reason} — trying fallback: ${fbLabel} (${fb.model})…`);
         try {
           const fbHost = (fb.provider === 'ollama' || fb.provider === 'lmstudio') ? (fb.host || host) : host;
+          // The fallback keeps the SAME tool tier as the primary: the transcript
+          // so far was built against that tool list, and mid-turn consistency
+          // matters more than briefly widening the set for a bigger model.
           const result = await streamAssistant(this, fbHost, fb.model, messages, temperature, this.abortController?.signal, null,
-            { aiProvider: fb.provider, apiBase: fb.apiBase });
+            { aiProvider: fb.provider, apiBase: fb.apiBase }, toolsApiOverride);
           this._announceFallback(`Fallback succeeded: ${fbLabel}`);
           return { ...result, usedProvider: fb.provider, usedModel: fb.model };
         } catch (fbError) {
@@ -2883,6 +2923,16 @@ class NavyCoderViewProvider {
     const temperature = tempByLevel[this.thinkingLevel] ?? config.get('temperature', 0.2);
     const maxIterations = config.get('maxToolIterations', 50);
     const maxContextChars = config.get('maxContextChars', 12000);
+
+    // Reduced tool tier for small models — decided once so the system prompt
+    // and every model call this turn agree on which tools are on offer.
+    // `extraToolsUnlocked` flips when the model calls request_more_tools; from
+    // the next model call on it gets the full schemas.
+    const reducedTools = this._shouldReduceTools(model);
+    let extraToolsUnlocked = false;
+    if (reducedTools) {
+      this.log?.(`Reduced tool set for ${model}: offering ${TOOLS_API_CORE.length} core tools, withholding ${WITHHELD_TOOLS.length} (request_more_tools unlocks them). navy.reducedToolset=off disables this.`);
+    }
 
     const activeEditor = vscode.window.activeTextEditor;
     const activeFile = activeEditor ? activeEditor.document.fileName : '';
@@ -2987,7 +3037,7 @@ class NavyCoderViewProvider {
     // OS/shell facts are always included — even with no project open, a wrong
     // guess here (e.g. assuming PowerShell or a Unix tool on Windows) is what
     // makes run_command calls fail in ways that look like blind guessing.
-    let systemContent = TOOL_PROMPT
+    let systemContent = (reducedTools ? TOOL_PROMPT_CORE : TOOL_PROMPT)
       + `\n\n## CURRENT ENVIRONMENT (these are facts, do NOT guess or invent alternatives)\n`
       + `- Operating system: ${osPlatform}\n`
       + `- run_command executes through: ${shellName} (${shellNote})\n`
@@ -3242,7 +3292,9 @@ class NavyCoderViewProvider {
         resetWatchdog();
         // Keep the request within the context window on long multi-step tasks.
         if (iteration > 0) this._compactMessages(messages);
-        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = await this._streamWithFallback(host, model, messages, temperature);
+        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = await this._streamWithFallback(
+          host, model, messages, temperature,
+          reducedTools && !extraToolsUnlocked ? TOOLS_API_CORE : null);
         lastUsedProvider = usedProvider;
         lastUsedModel = usedModel;
         // Model call finished — stop the watchdog so it can't fire while tools run or
@@ -3426,6 +3478,26 @@ class NavyCoderViewProvider {
         // Separate out calls that should be short-circuited.
         const toolsToRun = [];
         for (const tool of nonFinish) {
+          // request_more_tools is pure turn-loop state, never a real tool: it
+          // flips the tier so the NEXT model call carries the full schemas.
+          // Handled unconditionally (not only when reduced) because a model can
+          // imitate a call it saw earlier in the transcript — answering "already
+          // available" beats executeTool's unknown-tool error. Names only in the
+          // result: the native path gets real schemas on the next request, and
+          // the fallback path never sees schemas for ANY tool, just names.
+          if (tool.name === 'request_more_tools') {
+            const r = (!reducedTools || extraToolsUnlocked)
+              ? '[All tools are already available — call the one you need directly.]'
+              : '[Full tool set unlocked for the rest of this turn. Now also available: '
+                + WITHHELD_TOOLS.map(t => t.name).join(', ')
+                + '. Call them exactly like any other tool.]';
+            extraToolsUnlocked = true;
+            const callId = this.generateId();
+            postToolCall(tool.name, tool.args, callId);
+            postToolResult(tool.name, tool.args, r, callId);
+            toolResults.push(makeToolResult(tool, r));
+            continue;
+          }
           // Deduplicate stable read-only calls.
           if (DEDUP_TOOLS.has(tool.name)) {
             const key = tool.name + ':' + JSON.stringify(tool.args || {});
@@ -3664,12 +3736,22 @@ class NavyCoderViewProvider {
       // Drain the message queue — process the next queued message if any.
       if (this.messageQueue.length > 0) {
         const next = this.messageQueue.shift();
-        this.view?.webview.postMessage({ type: 'queueDrained', remaining: this.messageQueue.length });
+        // `id` names the prompt that is STARTING, so the webview can retire
+        // exactly that bubble's Cancel button. Once a prompt is out of the
+        // queue there is nothing left to cancel — Stop is the control from
+        // here on, and a button that silently stopped working would be worse
+        // than no button.
+        this.view?.webview.postMessage({ type: 'queueDrained', id: next.queueId || '', remaining: this.messageQueue.length });
         // Fire-and-forget, so it MUST carry its own catch: an unhandled
         // rejection out of the turn loop can take down the extension host,
         // which surfaces to the user as Navy simply dying mid-task.
         setImmediate(() => {
-          this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || [])
+          // Carries its queueId back in. This runs a tick later, so another turn
+          // can have started in between (the user sends again in that window) —
+          // askNavy then puts this prompt BACK in the queue, and without its own
+          // id it would be re-queued as an anonymous entry: no Cancel button on a
+          // bubble that is genuinely waiting again, and nothing for Stop to name.
+          this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || [], next.queueId || '')
             .catch(e => this._reportTurnFailure(e, 'queued message'));
         });
       }
@@ -3848,6 +3930,31 @@ class NavyCoderViewProvider {
     if (/\b(mini|tiny|nano|micro)\b/.test(m)) return true;
     const paramMatch = m.match(/[:\-_](\d+(?:\.\d+)?)b\b/);
     return Boolean(paramMatch && parseFloat(paramMatch[1]) <= 9);
+  }
+
+  // Whether this turn should offer the model the reduced core tool set instead
+  // of all of TOOLS_API (see tools.js for what the core is and why). Decided
+  // once per turn: the full schemas cost thousands of tokens per request and
+  // measurably worsen tool choice on small models, and the model can widen the
+  // set itself mid-turn via request_more_tools. 'auto' applies it only to LOCAL
+  // providers (local Ollama, LM Studio) — hosted "mini"-named models have big
+  // windows and handle wide tool lists fine, and Ollama Cloud runs models too
+  // large to fit locally — and only when the model's name suggests ≤9B params
+  // or its effective window is genuinely small. Never a permission boundary:
+  // executeTool doesn't check the tier, so a withheld tool that somehow gets
+  // called still runs (through the same approval gate as always).
+  _shouldReduceTools(model) {
+    const config = vscode.workspace.getConfiguration('navy');
+    const mode = config.get('reducedToolset', 'auto');
+    if (mode === 'on') return true;
+    if (mode === 'off') return false;
+    const provider = config.get('provider', 'ollama');
+    const isLocal = provider === 'lmstudio' ||
+      (provider === 'ollama' && config.get('ollamaMode', 'local') === 'local');
+    if (!isLocal) return false;
+    const ctx = this.modelContextLength || this.modelContextMax;
+    return this._isLikelySmallModel(model) ||
+      (Number.isFinite(ctx) && ctx > 0 && ctx <= 16384);
   }
 
   _promptRequestsFileAction(prompt) {

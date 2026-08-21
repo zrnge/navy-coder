@@ -1,6 +1,13 @@
 // Webview HTML shell — extracted from extension.js so the file stays focused and
 // the markup is unit-testable. Pure: given the resolved URIs / nonce / version it
 // returns the full document string. The extension computes the vscode-specific bits.
+//
+// Icons come from the inline sprite this file embeds once (see src/icons.js):
+// Font Awesome Free paths, bundled, so the panel needs no webfont, no icon CSS
+// and no network — and every icon inherits the theme through currentColor
+// rather than being a fixed-colour emoji glyph the OS picks for us.
+const { spriteHtml, icon } = require('./icons.js');
+
 function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -12,6 +19,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
   <title>Navy Coder</title>
 </head>
 <body>
+  ${spriteHtml()}
   <main class="app">
     <header class="topbar">
       <!-- Row 1: brand · live status · mode controls · actions -->
@@ -156,7 +164,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
         <span class="memory-panel-title">Project Memory</span>
         <div class="memory-panel-actions">
           <button id="clearMemoryButton" type="button" class="memory-action-btn" title="Clear all memories">Clear all</button>
-          <button id="closeMemoryButton" type="button" class="memory-action-btn" title="Close">✕</button>
+          <button id="closeMemoryButton" type="button" class="memory-action-btn" title="Close">${icon('close')}</button>
         </div>
       </div>
       <div id="memoryContent" class="memory-content">
@@ -175,7 +183,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       <div class="outline-header">
         <span class="outline-title">Chat outline</span>
         <span id="outlineCount" class="outline-count"></span>
-        <button id="outlineClose" type="button" class="memory-action-btn" title="Close" aria-label="Close outline">✕</button>
+        <button id="outlineClose" type="button" class="memory-action-btn" title="Close" aria-label="Close outline">${icon('close')}</button>
       </div>
       <div id="outlineList" class="outline-list" role="list"></div>
       <p id="outlineEmpty" class="outline-empty" hidden>
@@ -186,8 +194,8 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
 
     <div id="settingsPanel" class="settings-panel" style="display:none">
       <div class="settings-header">
-        <span class="settings-title">⚙ Settings</span>
-        <button id="closeSettingsButton" type="button" class="memory-action-btn" title="Close">✕</button>
+        <span class="settings-title">${icon('settings')} Settings</span>
+        <button id="closeSettingsButton" type="button" class="memory-action-btn" title="Close">${icon('close')}</button>
       </div>
       <div class="settings-body">
         <form id="settingsForm">
@@ -333,14 +341,14 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       </svg>
       <input id="searchInput" type="text" class="search-input" placeholder="Search messages…" aria-label="Search messages" autocomplete="off">
       <span id="searchCount" class="search-count"></span>
-      <button id="searchClose" class="search-close" title="Close search">✕</button>
+      <button id="searchClose" class="search-close" title="Close search">${icon('close')}</button>
     </div>
 
     <!-- Live shell output panel (shown while run_command is streaming) -->
     <div id="shellPanel" class="shell-panel" style="display:none">
       <div class="shell-panel-header">
         <span class="shell-panel-title">Terminal output</span>
-        <button id="shellPanelClose" class="shell-panel-close" title="Dismiss">✕</button>
+        <button id="shellPanelClose" class="shell-panel-close" title="Dismiss">${icon('close')}</button>
       </div>
       <pre id="shellOutput" class="shell-output"></pre>
     </div>
@@ -388,12 +396,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
         <h1 class="welcome-title">Navy Coder</h1>
         <p class="welcome-tagline">AI coding agent — local with Ollama, or OpenAI, Claude, Gemini &amp; more.</p>
         <div class="welcome-chips">
-          <button type="button" class="welcome-chip" data-prompt="Review the active file for bugs, edge cases, and improvements.">⚓ Review code</button>
-          <button type="button" class="welcome-chip" data-prompt="Edit the active file to ">✏️ Edit files</button>
-          <button type="button" class="welcome-chip" data-prompt="Search the codebase for ">🔍 Search codebase</button>
-          <button type="button" class="welcome-chip" data-prompt="Run the test suite and fix any failures.">🧪 Run tests</button>
-          <button type="button" class="welcome-chip" data-prompt="Generate a commit message for my staged changes.">📝 Git commit</button>
-          <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">▶ Run project</button>
+          <button type="button" class="welcome-chip" data-prompt="Review the active file for bugs, edge cases, and improvements.">${icon('review')} Review code</button>
+          <button type="button" class="welcome-chip" data-prompt="Edit the active file to ">${icon('edit')} Edit files</button>
+          <button type="button" class="welcome-chip" data-prompt="Search the codebase for ">${icon('search')} Search codebase</button>
+          <button type="button" class="welcome-chip" data-prompt="Run the test suite and fix any failures.">${icon('gen-tests')} Run tests</button>
+          <button type="button" class="welcome-chip" data-prompt="Generate a commit message for my staged changes.">${icon('commit')} Git commit</button>
+          <button type="button" class="welcome-chip" data-prompt="Run this project and give me the local URL.">${icon('run')} Run project</button>
         </div>
         <p class="welcome-hint">Type <code>/</code> for commands · paste images · <code>@</code> mention files${version ? ' · <span class="welcome-version">v' + version + '</span>' : ''}</p>
 
@@ -508,7 +516,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
     <div id="imageLightbox" class="lightbox hidden" role="dialog" aria-modal="true">
       <div id="lightboxBackdrop" class="lightbox-backdrop"></div>
       <img id="lightboxImg" class="lightbox-img" src="" alt="Full size preview">
-      <button id="lightboxClose" class="lightbox-close" title="Close (Esc)">✕</button>
+      <button id="lightboxClose" class="lightbox-close" title="Close (Esc)">${icon('close')}</button>
     </div>
   </main>
   <script nonce="${nonce}" src="${scriptUri}"></script>

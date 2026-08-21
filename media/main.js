@@ -23,7 +23,35 @@ const approvalQueue = document.querySelector('#approvalQueue');
 const approvalModeSelect = document.querySelector('#approvalModeSelect');
 const thinkingLevelSelect = document.querySelector('#thinkingLevelSelect');
 const contextSelect = document.querySelector('#contextSelect');
+// An icon, as markup. The path data lives once in the sprite the HTML shell
+// embeds (src/icons.js — Font Awesome Free, bundled, no network), so this is
+// only a reference to it: an icon costs ~40 bytes here rather than a repeated
+// path, and it inherits the surrounding colour through currentColor instead of
+// being an emoji whose colour and shape the OS chooses for us.
+//
+// Decorative by default: every icon in Navy either sits beside its own text or
+// on a control that already carries a title/aria-label, so announcing it again
+// would just say everything twice. Pass `label` where the icon IS the content.
+function icon(name, cls = '', label = '') {
+  // The name reaches an href attribute, and the slash menu takes it from a
+  // command definition a repository can write — so anything that is not an
+  // icon id is dropped rather than trusted. An unknown-but-clean name renders
+  // nothing, which is the right failure for a decorative glyph.
+  const id = String(name).replace(/[^a-z0-9-]/g, '');
+  const className = cls ? 'icon ' + cls : 'icon';
+  const a11y = label ? `role="img" aria-label="${label}"` : 'aria-hidden="true"';
+  return `<svg class="${className}" ${a11y}><use href="#i-${id}"/></svg>`;
+}
+
 const queuedBadge = document.querySelector('#queuedBadge');
+// Counter behind the id stamped on every sent bubble (`data-queue-id`). A
+// prompt sent while a turn is running has not reached any model yet, so it can
+// still be taken back, and that id is how the extension names it when it says
+// so. Deliberately NOT mirrored in a Map: the transcript already holds this,
+// and a parallel index only creates a second thing to keep in step — the first
+// version cleared it whenever a turn ended and so lost the handle to prompts
+// queued BEHIND that turn, stranding their Cancel buttons on screen forever.
+let queueSeq = 0;
 const statusText = document.querySelector('#statusText');
 const memoryButton = document.querySelector('#memoryButton');
 const memoryCount = document.querySelector('#memoryCount');
@@ -571,7 +599,10 @@ function messageOffsetWithin(el) {
 // Messages hidden by an active search are skipped — they have no box to scroll to.
 function userTurns() {
   return [...messagesEl.querySelectorAll('.message.user')]
-    .filter(el => el.style.display !== 'none');
+    // A cancelled queued prompt is still the user's text on screen, but it was
+    // never sent and so never started a turn — listing it would offer a jump to
+    // a question the conversation does not actually contain.
+    .filter(el => el.style.display !== 'none' && !el.classList.contains('is-cancelled'));
 }
 
 // Which turn the reader is on: the last one whose top edge has passed the top of
@@ -1291,7 +1322,7 @@ window.addEventListener('message', (event) => {
     renderAttachedTextChips();
     renderImagePreviews();
     updateAddButton();
-    if (queuedBadge) { queuedBadge.style.display = 'none'; queuedBadge.textContent = ''; }
+    setQueuedBadge(0);
   }
 
   if (message.type === 'models') {
@@ -1390,7 +1421,7 @@ window.addEventListener('message', (event) => {
       card.querySelector('.diff-actions')?.remove();
       card.querySelector('.diff-summary')?.remove();
       const status = card.querySelector('.diff-status');
-      if (status) status.textContent = message.approved ? '✓ Applied' : '✕ Rejected';
+      if (status) status.innerHTML = message.approved ? icon('check') + ' Applied' : icon('close') + ' Rejected';
       card.classList.add(message.approved ? 'is-approved' : 'is-rejected');
       const body = card.querySelector('.diff-body');
       if (body) {
@@ -1482,21 +1513,27 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'queued') {
-    if (queuedBadge) {
-      queuedBadge.textContent = message.position + ' queued';
-      queuedBadge.style.display = 'inline';
-    }
+    setQueuedBadge(message.position);
+    markArticleQueued(message.id);
   }
 
   if (message.type === 'queueDrained') {
-    if (queuedBadge) {
-      if (message.remaining === 0) {
-        queuedBadge.style.display = 'none';
-        queuedBadge.textContent = '';
-      } else {
-        queuedBadge.textContent = message.remaining + ' queued';
-      }
-    }
+    setQueuedBadge(message.remaining);
+    // This prompt is now running: it left the queue, so there is nothing left
+    // to cancel and its Cancel button goes rather than staying on as a control
+    // that would quietly do nothing.
+    clearQueuedMark(message.id);
+  }
+
+  if (message.type === 'queueCancelled') {
+    setQueuedBadge(message.remaining);
+    if (message.ok) markArticleCancelled(message.id);
+    else clearQueuedMark(message.id); // lost the race — it had already started
+  }
+
+  if (message.type === 'queueCleared') {
+    setQueuedBadge(0);
+    for (const id of message.ids || []) markArticleCancelled(id);
   }
 
   if (message.type === 'restrictedMode') {
@@ -1582,7 +1619,12 @@ window.addEventListener('message', (event) => {
     const badge = document.getElementById('diagBadge');
     if (badge) {
       const total = (message.errors || 0) + (message.warnings || 0);
-      badge.textContent = (message.errors ? `⚠ ${message.errors}` : '') + (message.warnings && !message.errors ? `◈ ${message.warnings}` : '');
+      // Counts, coerced rather than interpolated raw: this line writes markup
+      // now (it holds an icon), where it used to set textContent and could not
+      // have rendered anything it was handed.
+      const errs = Number(message.errors) || 0;
+      const warns = Number(message.warnings) || 0;
+      badge.innerHTML = (errs ? icon('warning') + ` ${errs}` : '') + (warns && !errs ? icon('info') + ` ${warns}` : '');
       badge.className = 'diag-badge' + (message.errors > 0 ? ' diag-error' : ' diag-warn');
       badge.style.display = total > 0 ? 'inline-flex' : 'none';
     }
@@ -1684,10 +1726,10 @@ function getOrCreateBgTaskEl(taskId, promptText) {
   el.dataset.taskId = taskId;
   el.innerHTML = `
     <div class="bg-task-header">
-      <span class="bg-task-badge">⚙ BG</span>
+      <span class="bg-task-badge">${icon('background')} BG</span>
       <span class="bg-task-prompt" title="${escapeHtml(promptText)}">${escapeHtml(promptText.slice(0, 80))}${promptText.length > 80 ? '…' : ''}</span>
-      <span class="bg-task-status running">● running</span>
-      <button class="bg-task-abort" title="Abort">✕</button>
+      <span class="bg-task-status running">${icon('running')} running</span>
+      <button class="bg-task-abort" title="Abort" aria-label="Abort background task">${icon('close')}</button>
     </div>
     <details class="bg-task-details" open>
       <summary class="bg-task-summary">Activity log</summary>
@@ -1748,7 +1790,7 @@ function handleBgTaskUpdate(msg) {
     const line = document.createElement('div');
     line.className = 'bg-task-log-line';
     const argsStr = JSON.stringify(msg.args || {}).slice(0, 120);
-    line.textContent = `⚙ ${msg.tool}(${argsStr})`;
+    line.innerHTML = icon('tool') + ' ' + escapeHtml(`${msg.tool}(${argsStr})`);
     logEl.appendChild(line);
     scrollToBottom();
   } else if (msg.status === 'toolResult') {
@@ -1764,14 +1806,14 @@ function handleBgTaskUpdate(msg) {
     }
     if (msg.status === 'done') {
       statusEl.className = 'bg-task-status done';
-      statusEl.textContent = '✓ done';
+      statusEl.innerHTML = icon('check') + ' done';
       refs.el.querySelector('.bg-task-details')?.removeAttribute('open');
     } else if (msg.status === 'aborted') {
       statusEl.className = 'bg-task-status aborted';
-      statusEl.textContent = '✕ aborted';
+      statusEl.innerHTML = icon('close') + ' aborted';
     } else {
       statusEl.className = 'bg-task-status error';
-      statusEl.textContent = '✕ error';
+      statusEl.innerHTML = icon('close') + ' error';
       const line = document.createElement('div');
       line.className = 'bg-task-log-line error';
       line.textContent = msg.message || 'Unknown error';
@@ -1790,10 +1832,10 @@ function appendBgProcessOutput(id, chunk, isStderr) {
     el.className = 'message message-bg-process';
     el.innerHTML = `
       <div class="bg-task-header">
-        <span class="bg-task-badge">⬡ PROC</span>
+        <span class="bg-task-badge">${icon('process')} PROC</span>
         <span class="bg-task-prompt">${escapeHtml(String(id))}</span>
-        <span class="bg-task-status running">● running</span>
-        <button class="bg-task-abort bg-proc-stop" title="Stop process">✕</button>
+        <span class="bg-task-status running">${icon('running')} running</span>
+        <button class="bg-task-abort bg-proc-stop" title="Stop process" aria-label="Stop process">${icon('close')}</button>
       </div>
       <pre class="bg-process-output"></pre>`;
     // Background TASKS had an abort button; background PROCESSES did not, even
@@ -1824,7 +1866,7 @@ function markBgProcessDone(id, exitCode) {
   const refs = bgProcessPanels.get(id) || (appendBgProcessOutput(id, ''), bgProcessPanels.get(id));
   if (!refs) return;
   refs.statusEl.className = exitCode === 0 ? 'bg-task-status done' : 'bg-task-status error';
-  refs.statusEl.textContent = exitCode === 0 ? `✓ exited (0)` : `✕ exited (${exitCode})`;
+  refs.statusEl.innerHTML = exitCode === 0 ? icon('check') + ' exited (0)' : icon('close') + ` exited (${escapeHtml(String(exitCode))})`;
   refs.el.querySelector('.bg-proc-stop')?.remove();
   bgProcessPanels.delete(id);
 }
@@ -1889,7 +1931,7 @@ function setRunProjectReady(url) {
     urlEl.innerHTML =
       `<span class="rp-dot"></span>` +
       (safeUrl ? `<a class="rp-link" href="${escapeHtml(safeUrl)}" title="${escapeHtml(safeUrl)}">${escapeHtml(safeUrl)}</a>` : `<span class="rp-link">${escapeHtml(url)}</span>`) +
-      `<button class="rp-open-btn" data-url="${escapeHtml(safeUrl || url)}">Open ↗</button>`;
+      `<button class="rp-open-btn" data-url="${escapeHtml(safeUrl || url)}">Open ${icon('external')}</button>`;
     urlEl.querySelector('.rp-open-btn')?.addEventListener('click', (e) => {
       vscode.postMessage({ type: 'openUrl', url: e.currentTarget.dataset.url });
     });
@@ -1922,7 +1964,7 @@ function setRunProjectStopped(exitCode) {
 
   runProjectCardEl.classList.add('stopped');
   if (statusEl) { statusEl.textContent = exitCode === 0 ? 'Stopped' : `Crashed (${exitCode})`; statusEl.classList.remove('ready'); statusEl.classList.add(exitCode === 0 ? 'stopped' : 'crashed'); }
-  if (wheelWrap) wheelWrap.innerHTML = `<span class="rp-stopped-icon">■</span>`;
+  if (wheelWrap) wheelWrap.innerHTML = `<span class="rp-stopped-icon">${icon('stopped')}</span>`;
   if (stopBtn)   stopBtn.remove();
   if (dotEl)     dotEl.classList.add('offline');
 }
@@ -1935,22 +1977,22 @@ function autoResize() {
 // ── Slash commands ────────────────────────────────────────────────────────────
 
 const SLASH_COMMANDS = [
-  { cmd: '/fix',             label: 'Fix',           icon: '🔧', desc: 'Fix bugs in the active file',              prompt: 'Find and fix all bugs in this file. Explain each fix.' },
-  { cmd: '/explain',         label: 'Explain',       icon: '💡', desc: 'Explain what this code does',              prompt: 'Explain what this code does in clear terms. Cover the purpose, key logic, and any non-obvious parts.' },
-  { cmd: '/review',          label: 'Review',        icon: '🔍', desc: 'Code review with suggestions',             prompt: 'Perform a thorough code review. Check for bugs, performance issues, security problems, and style improvements.' },
-  { cmd: '/test',            label: 'Test',          icon: '✅', desc: 'Run tests and fix failures',               prompt: 'Run the test suite, show the results, and fix any failing tests.' },
-  { cmd: '/generate-tests',  label: 'Gen Tests',     icon: '🧪', desc: 'Generate unit tests for this file',        prompt: 'Generate comprehensive unit tests for the active file. First read_file to see its full content. Cover the happy path, edge cases, and error paths. Use the existing test framework — check package.json and any existing test files first to match conventions.' },
-  { cmd: '/optimize',        label: 'Optimize',      icon: '⚡', desc: 'Optimize code performance',               prompt: 'Analyze the active file for performance bottlenecks. First read_file to see its full content. Identify the most impactful issues (unnecessary re-renders, redundant I/O, O(n²) loops, etc.) and apply optimizations without changing observable behaviour. Explain each change.' },
-  { cmd: '/security',        label: 'Security',      icon: '🔒', desc: 'Security audit this code',                 prompt: 'Perform a thorough security audit of this project. Use list_files then read_file on the relevant source files. Check for OWASP Top 10 issues: injection (SQL, command, XSS), broken authentication, insecure deserialization, security misconfiguration, sensitive data exposure, and access control flaws. For each issue found: quote the vulnerable line, explain the risk and attack vector, then show the corrected code.' },
-  { cmd: '/commit',          label: 'Commit',        icon: '📝', desc: 'Generate a git commit message',            prompt: 'Generate a conventional commit message for the current staged changes.' },
-  { cmd: '/pr',              label: 'PR',            icon: '🚀', desc: 'Generate a PR description',               prompt: 'Generate a pull request title and description for the changes in this branch compared to main.' },
-  { cmd: '/pr-review',       label: 'PR Review',     icon: '👁',  desc: 'Review a pull request',                   prompt: '' },
-  { cmd: '/refactor',        label: 'Refactor',      icon: '♻️', desc: 'Refactor for clarity and performance',    prompt: 'Refactor this code for better readability, maintainability, and performance. Keep behaviour identical.' },
-  { cmd: '/docs',            label: 'Docs',          icon: '📖', desc: 'Add documentation and comments',          prompt: 'Add clear JSDoc/docstring comments to all public functions and classes in the active file. First read_file to see its current content. Keep comments concise, accurate, and focused on WHY not WHAT. Then apply the changes with apply_edit.' },
-  { cmd: '/debug',           label: 'Debug',         icon: '🐛', desc: 'Help diagnose the current problem',        prompt: 'Help me debug this. Start by calling get_diagnostics on the active file, then read_file to see the code, then run_tests if a test suite exists. Identify the root cause and apply a fix.' },
-  { cmd: '/search',          label: 'Web Search',    icon: '🌐', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
-  { cmd: '/run',             label: 'Run Project',   icon: '▶',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
-  { cmd: '/bg',              label: 'Background',    icon: '⚙️', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
+  { cmd: '/fix',             label: 'Fix',           iconName: 'fix', desc: 'Fix bugs in the active file',              prompt: 'Find and fix all bugs in this file. Explain each fix.' },
+  { cmd: '/explain',         label: 'Explain',       iconName: 'explain', desc: 'Explain what this code does',              prompt: 'Explain what this code does in clear terms. Cover the purpose, key logic, and any non-obvious parts.' },
+  { cmd: '/review',          label: 'Review',        iconName: 'review', desc: 'Code review with suggestions',             prompt: 'Perform a thorough code review. Check for bugs, performance issues, security problems, and style improvements.' },
+  { cmd: '/test',            label: 'Test',          iconName: 'test', desc: 'Run tests and fix failures',               prompt: 'Run the test suite, show the results, and fix any failing tests.' },
+  { cmd: '/generate-tests',  label: 'Gen Tests',     iconName: 'gen-tests', desc: 'Generate unit tests for this file',        prompt: 'Generate comprehensive unit tests for the active file. First read_file to see its full content. Cover the happy path, edge cases, and error paths. Use the existing test framework — check package.json and any existing test files first to match conventions.' },
+  { cmd: '/optimize',        label: 'Optimize',      iconName: 'optimize', desc: 'Optimize code performance',               prompt: 'Analyze the active file for performance bottlenecks. First read_file to see its full content. Identify the most impactful issues (unnecessary re-renders, redundant I/O, O(n²) loops, etc.) and apply optimizations without changing observable behaviour. Explain each change.' },
+  { cmd: '/security',        label: 'Security',      iconName: 'security', desc: 'Security audit this code',                 prompt: 'Perform a thorough security audit of this project. Use list_files then read_file on the relevant source files. Check for OWASP Top 10 issues: injection (SQL, command, XSS), broken authentication, insecure deserialization, security misconfiguration, sensitive data exposure, and access control flaws. For each issue found: quote the vulnerable line, explain the risk and attack vector, then show the corrected code.' },
+  { cmd: '/commit',          label: 'Commit',        iconName: 'commit', desc: 'Generate a git commit message',            prompt: 'Generate a conventional commit message for the current staged changes.' },
+  { cmd: '/pr',              label: 'PR',            iconName: 'pr', desc: 'Generate a PR description',               prompt: 'Generate a pull request title and description for the changes in this branch compared to main.' },
+  { cmd: '/pr-review',       label: 'PR Review',     iconName: 'pr-review',  desc: 'Review a pull request',                   prompt: '' },
+  { cmd: '/refactor',        label: 'Refactor',      iconName: 'refactor', desc: 'Refactor for clarity and performance',    prompt: 'Refactor this code for better readability, maintainability, and performance. Keep behaviour identical.' },
+  { cmd: '/docs',            label: 'Docs',          iconName: 'docs', desc: 'Add documentation and comments',          prompt: 'Add clear JSDoc/docstring comments to all public functions and classes in the active file. First read_file to see its current content. Keep comments concise, accurate, and focused on WHY not WHAT. Then apply the changes with apply_edit.' },
+  { cmd: '/debug',           label: 'Debug',         iconName: 'debug', desc: 'Help diagnose the current problem',        prompt: 'Help me debug this. Start by calling get_diagnostics on the active file, then read_file to see the code, then run_tests if a test suite exists. Identify the root cause and apply a fix.' },
+  { cmd: '/search',          label: 'Web Search',    iconName: 'web', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
+  { cmd: '/run',             label: 'Run Project',   iconName: 'run',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
+  { cmd: '/bg',              label: 'Background',    iconName: 'background', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
 ];
 
 // Commands loaded from markdown files by the extension — see
@@ -2034,12 +2076,12 @@ function showSlashDropdown(query) {
   const ORIGIN_LABEL = { project: 'project', shared: 'project', personal: 'personal', skill: 'skill' };
   dropdown.innerHTML = matches.map((c, i) =>
     `<div class="slash-item" role="option" aria-selected="false" data-idx="${i}" data-cmd="${escapeHtml(c.cmd)}">
-      <span class="slash-icon">${escapeHtml(c.icon || '')}</span>
+      <span class="slash-icon">${c.iconName ? icon(c.iconName) : escapeHtml(c.icon || '')}</span>
       <span class="slash-label">${escapeHtml(c.label || c.cmd.slice(1))}</span>
       <span class="slash-desc">${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}</span>
       ${c.custom ? `<span class="slash-origin">${escapeHtml(ORIGIN_LABEL[c.origin] || 'custom')}</span>` : ''}
       ${c.removable ? `<button type="button" class="slash-remove" tabindex="-1"
-        title="Remove ${escapeHtml(c.cmd)}" aria-label="Remove the ${escapeHtml(c.cmd)} command">×</button>` : ''}
+        title="Remove ${escapeHtml(c.cmd)}" aria-label="Remove the ${escapeHtml(c.cmd)} command">${icon('close')}</button>` : ''}
     </div>`
   ).join('');
   dropdown.querySelectorAll('.slash-item').forEach(item => {
@@ -2077,7 +2119,7 @@ function showSlashDropdown(query) {
   add.className = 'slash-item slash-item-new';
   add.setAttribute('role', 'option');
   add.setAttribute('aria-selected', 'false');
-  add.innerHTML = `<span class="slash-icon">＋</span>
+  add.innerHTML = `<span class="slash-icon">${icon('plus')}</span>
     <span class="slash-label">New command</span>
     <span class="slash-desc">Write your own prompt as a markdown file</span>`;
   add.addEventListener('mousedown', (e) => {
@@ -2162,7 +2204,7 @@ function renderImagePreviews() {
     removeBtn.className = 'image-chip-remove';
     removeBtn.dataset.idx = String(i);
     removeBtn.title = 'Remove';
-    removeBtn.textContent = '✕';
+    removeBtn.innerHTML = icon('close');
     removeBtn.addEventListener('click', () => {
       pastedImages.splice(i, 1);
       renderImagePreviews();
@@ -2202,7 +2244,7 @@ function renderAttachedTextChips() {
     rm.type = 'button';
     rm.className = 'text-chip-remove';
     rm.title = 'Remove';
-    rm.textContent = '✕';
+    rm.innerHTML = icon('close');
     rm.addEventListener('click', () => { attachedTexts.splice(i, 1); renderAttachedTextChips(); });
     chip.appendChild(badge);
     chip.appendChild(name);
@@ -2375,10 +2417,23 @@ function sendPrompt() {
     finalPrompt = blocks + '\n\n' + prompt;
   }
 
-  addMessage('user', prompt, attachedTexts.map(f => f.name), pastedImages.length);
+  const article = addMessage('user', prompt, attachedTexts.map(f => f.name), pastedImages.length);
   promptInput.value = '';
   promptInput.style.height = 'auto';
   updateSendButton();
+
+  // Every send carries an id, and the bubble is stamped with it — not only the
+  // sends this side believes are queued. The webview's `isBusy` is not the
+  // extension's: the extension goes busy at the top of a turn and only says so
+  // hundreds of lines later, after building the repo map and running retrieval,
+  // which on a large project is seconds. A prompt sent in that window really is
+  // queued, and gating the handle on `isBusy` left it with no Queued tag, no
+  // Cancel button, and no way for Stop to mark it afterwards.
+  //
+  // The stamp costs one attribute on a bubble that already exists, and only a
+  // 'queued' event ever draws anything from it.
+  const queueId = 'q' + (++queueSeq) + '_' + Date.now();
+  article.dataset.queueId = queueId;
 
   // When busy, the backend queues the message and sends back a 'queued' event.
   vscode.postMessage({
@@ -2388,7 +2443,8 @@ function sendPrompt() {
     model: modelSelect.value,
     activeFile: activeFilePath,
     attachedFiles,
-    images: pastedImages.map(i => i.dataUrl)
+    images: pastedImages.map(i => i.dataUrl),
+    queueId
   });
   pastedImages = [];
   attachedTexts = [];
@@ -2405,6 +2461,14 @@ function busyRecovery() {
   activeAssistantContent = '';
   setBusy(false);
   collapseToolProgress();
+  // The backend is gone, so anything still queued died with it and will never
+  // be sent. Say so on those bubbles rather than leaving them offering a Cancel
+  // button for a prompt nothing is holding — this is the one path that has to
+  // retire the queue itself, because there is no longer anything to announce it.
+  for (const el of [...messagesEl.querySelectorAll('.message.is-queued')]) {
+    markArticleCancelled(el.dataset.queueId);
+  }
+  setQueuedBadge(0);
   addMessage('error', 'Navy stopped responding. If this keeps happening try Ctrl+Shift+P → "Developer: Reload Window".');
 }
 
@@ -2445,7 +2509,14 @@ function setBusy(busy) {
   if (busy) {
     armBusyWatchdog(true); // fresh turn — always start a clean 4-minute window
   } else {
-    if (queuedBadge) { queuedBadge.style.display = 'none'; queuedBadge.textContent = ''; }
+    // Deliberately does NOT touch the queue. A turn ending is not the queue
+    // emptying: the extension posts 'done' and only THEN drains, so a prompt
+    // waiting behind this turn is about to start and still owns its bubble's
+    // Cancel button. Clearing here dropped the id the drain was about to name,
+    // which left that button on screen for the rest of the conversation with
+    // nothing behind it. The queue announces its own state — queueDrained,
+    // queueCancelled, queueCleared — and those are the only things that retire
+    // a Cancel button.
     promptInput.focus();
   }
 }
@@ -2561,7 +2632,7 @@ function renderHistory(history) {
     const more = document.createElement('button');
     more.type = 'button';
     more.className = 'history-more-btn';
-    more.textContent = `Show ${hidden} earlier message${hidden === 1 ? '' : 's'} ↑`;
+    more.innerHTML = `Show ${hidden} earlier message${hidden === 1 ? '' : 's'} ` + icon('expand-less');
     more.addEventListener('click', () => {
       // renderHistoryItem appends to the end, so the earlier messages are
       // rendered there and then moved, as a block, to just above this button —
@@ -2817,7 +2888,7 @@ function renderFileChips() {
     // U+FFFD for a while — the replacement character, i.e. what is left when
     // bytes fail to decode as UTF-8 — so the file chip's remove button drew
     // as a missing-glyph box while the identical buttons beside it were fine.
-    remove.textContent = '✕';
+    remove.innerHTML = icon('close');
     remove.title = 'Remove file';
     remove.addEventListener('click', () => {
       attachedFiles = attachedFiles.filter((f) => f !== file);
@@ -2892,13 +2963,13 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
       const toggle = document.createElement('button');
       toggle.type = 'button';
       toggle.className = 'msg-expand-btn';
-      toggle.textContent = `Show ${restLines.length} more lines ↓`;
+      toggle.innerHTML = `Show ${restLines.length} more lines ` + icon('expand-more');
       toggle.addEventListener('click', () => {
         const collapsed = overflow.hidden;
         overflow.hidden = !collapsed;
-        toggle.textContent = collapsed
-          ? 'Show less ↑'
-          : `Show ${restLines.length} more lines ↓`;
+        toggle.innerHTML = collapsed
+          ? 'Show less ' + icon('expand-less')
+          : `Show ${restLines.length} more lines ` + icon('expand-more');
       });
       bubble.appendChild(document.createElement('br'));
       bubble.appendChild(toggle);
@@ -2917,13 +2988,13 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
       for (const name of attachedFileNames) {
         const b = document.createElement('span');
         b.className = 'msg-attach-badge';
-        b.textContent = '📎 ' + name;
+        b.innerHTML = icon('attachment') + ' ' + escapeHtml(name);
         badges.appendChild(b);
       }
       if (imageCount > 0) {
         const b = document.createElement('span');
         b.className = 'msg-attach-badge';
-        b.textContent = `🖼 ${imageCount} image${imageCount > 1 ? 's' : ''}`;
+        b.innerHTML = icon('image') + ` ${imageCount} image${imageCount > 1 ? 's' : ''}`;
         badges.appendChild(b);
       }
       bubble.appendChild(badges);
@@ -2949,7 +3020,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     copyBtn.className = 'msg-copy-btn';
     copyBtn.title = role === 'user' ? 'Copy your message' : 'Copy message';
     copyBtn.setAttribute('aria-label', copyBtn.title);
-    copyBtn.textContent = '⧉';
+    copyBtn.innerHTML = icon('copy');
     copyBtn.addEventListener('click', () => {
       // Prefer the article: a reply split across several bubbles by tool activity
       // records its full markdown there, so copy still yields the whole reply.
@@ -2957,8 +3028,8 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
         ? text
         : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
       vscode.postMessage({ type: 'copy', text: payload });
-      copyBtn.textContent = '✓';
-      setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
+      copyBtn.innerHTML = icon('check');
+      setTimeout(() => { copyBtn.innerHTML = icon('copy'); }, 1200);
     });
     article.appendChild(copyBtn);
 
@@ -2970,7 +3041,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
       speakBtn.className = 'msg-speak-btn';
       speakBtn.title = 'Read aloud';
       speakBtn.setAttribute('aria-label', 'Read aloud');
-      speakBtn.textContent = '🔊';
+      speakBtn.innerHTML = icon('speak');
       speakBtn.addEventListener('click', () => {
         // Clicking the button that is already speaking stops it — the same
         // control both starts and cancels, so there is never a reading you
@@ -2989,6 +3060,111 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
   messagesEl.appendChild(article);
   scrollToBottom();
   return article;
+}
+
+// ── Queued prompts ─────────────────────────────────────────────────────────
+// A prompt typed while Navy is working is shown in the transcript immediately
+// but not sent until the running turn ends, so there is a window — sometimes
+// minutes long — in which it can still be taken back. These three functions
+// are that affordance: the badge counts, the row on the bubble cancels.
+
+function setQueuedBadge(remaining) {
+  if (!queuedBadge) return;
+  if (!remaining) {
+    queuedBadge.style.display = 'none';
+    queuedBadge.textContent = '';
+  } else {
+    queuedBadge.textContent = remaining + ' queued';
+    queuedBadge.style.display = 'inline';
+  }
+}
+
+// Adds the "Queued · Cancel" row under the bubble. Deliberately NOT a
+// hover-only control like copy and read-aloud: those act on something already
+// in the past, while this one is the only chance to stop something that has
+// not happened yet, and a control you must first discover by hovering is one
+// most people never find.
+// The bubble an id belongs to, asked of the transcript itself — the extension
+// may name an id at any later point, including after the turn it was queued
+// behind has finished, which is the whole reason a prompt is queued.
+//
+// Compared as a value rather than built into a selector: an id round-trips
+// through the extension, and a selector would then need escaping to stay
+// well-formed.
+function findQueuedArticle(id) {
+  if (!id) return null;
+  return [...messagesEl.querySelectorAll('.message[data-queue-id]')]
+    .find(el => el.dataset.queueId === id) || null;
+}
+
+function markArticleQueued(id) {
+  const article = findQueuedArticle(id);
+  if (!article || article.querySelector('.msg-queue-row')) return;
+  article.dataset.queueId = id;
+  article.classList.add('is-queued');
+  const row = document.createElement('div');
+  row.className = 'msg-queue-row';
+  const tag = document.createElement('span');
+  tag.className = 'msg-queue-tag';
+  tag.textContent = 'Queued';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'msg-queue-cancel';
+  cancel.textContent = 'Cancel';
+  cancel.title = 'Cancel this queued message — it has not been sent yet';
+  cancel.setAttribute('aria-label', 'Cancel queued message');
+  cancel.addEventListener('click', () => {
+    // Disabled rather than resolved here: only the extension knows whether the
+    // prompt is still in the queue, and a bubble that erased itself on click
+    // would be wrong exactly when the turn had just picked it up.
+    cancel.disabled = true;
+    cancel.textContent = 'Cancelling…';
+    vscode.postMessage({ type: 'cancelQueued', id });
+  });
+  row.appendChild(tag);
+  row.appendChild(cancel);
+  article.appendChild(row);
+  scrollToBottom();
+}
+
+// The prompt left the queue by starting — drop the affordance, keep the bubble
+// exactly as any other sent message.
+// The id stays on the bubble. A prompt can be queued more than once — the drain
+// hands it back to askNavy, which re-queues it if another turn has started in
+// the meantime — and the id is how it would be found again. `is-queued` is the
+// class that says it is waiting NOW; the attribute only says which prompt it is.
+function clearQueuedMark(id) {
+  const article = findQueuedArticle(id);
+  if (!article) return;
+  article.classList.remove('is-queued');
+  article.querySelector('.msg-queue-row')?.remove();
+}
+
+// Cancelled for real. The bubble stays — it is the user's own text, and
+// deleting words someone typed to undo an action they took by mistake is its
+// own small disaster — but it is dimmed and labelled so the transcript never
+// implies it was sent. It also stops being a navigation target: the outline
+// and the turn arrows list the questions a conversation is built from, and
+// this one never became one.
+function markArticleCancelled(id) {
+  const article = findQueuedArticle(id);
+  if (!article) return;
+  article.classList.remove('is-queued');
+  article.classList.add('is-cancelled');
+  // Stop dropped the queue before this bubble ever got its row, so there may
+  // be nothing to replace — build the row in that case rather than leaving the
+  // label loose in the article, where it would not be laid out with the rest.
+  let row = article.querySelector('.msg-queue-row');
+  if (row) row.innerHTML = '';
+  else {
+    row = document.createElement('div');
+    row.className = 'msg-queue-row';
+    article.appendChild(row);
+  }
+  const tag = document.createElement('span');
+  tag.className = 'msg-queue-tag cancelled';
+  tag.textContent = 'Cancelled — not sent';
+  row.appendChild(tag);
 }
 
 // ── Plan checklist card ────────────────────────────────────────────────────
@@ -3177,7 +3353,7 @@ function renderSessionTabs(sessions) {
       const closeBtn = document.createElement('button');
       closeBtn.type = 'button';
       closeBtn.className = 'session-tab-close';
-      closeBtn.textContent = '✕';
+      closeBtn.innerHTML = icon('close');
       closeBtn.title = 'Close tab';
       // "✕" alone reads as an unlabelled glyph; naming the chat says which one
       // is about to close, which matters when several are open.
@@ -3421,12 +3597,14 @@ function renderStreamingContent() {
       _streamPre.className = 'streaming-pre';
       activeAssistantBubble.appendChild(_streamPre);
     }
-    _streamPre.textContent = display + (thinkingLive ? '\n\n💭 Reasoning…' : '');
+    // Plain text by design — this is the raw-stream view, so the reasoning note
+    // is the word alone rather than an icon it has no way to render.
+    _streamPre.textContent = display + (thinkingLive ? '\n\nReasoning…' : '');
   } else {
     // Formatted markdown, live — an in-progress fenced code block simply falls
     // back to plain text until its closing fence arrives, then reformats.
     _streamPre = null;
-    activeAssistantBubble.innerHTML = renderMarkdown(display) + (thinkingLive ? '<div class="think-streaming">💭 Reasoning…</div>' : '');
+    activeAssistantBubble.innerHTML = renderMarkdown(display) + (thinkingLive ? `<div class="think-streaming">${icon('reasoning')} Reasoning…</div>` : '');
     // renderMarkdown emits Copy/Apply buttons on every completed code block. This
     // used to run only on the final flush, so mid-stream those buttons rendered
     // with no listeners attached — clicking Apply did nothing at all. The DOM is
@@ -3723,12 +3901,12 @@ function renderMarkdown(text) {
   let thinkingHtml = '';
   cleaned = cleaned.replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi, (_, inner) => {
     const safe = inner.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    thinkingHtml += `<details class="think-block"><summary class="think-summary">💭 Reasoning <span class="think-toggle-hint">(click to expand)</span></summary><pre class="think-content">${safe}</pre></details>`;
+    thinkingHtml += `<details class="think-block"><summary class="think-summary">${icon('reasoning')} Reasoning <span class="think-toggle-hint">(click to expand)</span></summary><pre class="think-content">${safe}</pre></details>`;
     return '';
   });
   // Handle an unclosed <think> tag still streaming — show a live indicator.
   if (/^<think(?:ing)?>/i.test(cleaned.trim())) {
-    return '<div class="think-streaming">💭 Reasoning…</div>';
+    return `<div class="think-streaming">${icon('reasoning')} Reasoning…</div>`;
   }
   // Strip orphan think tags (closing tag with no opening, or vice versa) — some
   // models emit malformed tags that would otherwise leak into the chat as literal text.
@@ -4315,7 +4493,7 @@ function stopSpeaking() {
   try { window.speechSynthesis.cancel(); } catch {}
   if (_speakingButton) {
     _speakingButton.dataset.speaking = 'false';
-    _speakingButton.textContent = '🔊';
+    _speakingButton.innerHTML = icon('speak');
     _speakingButton.title = 'Read aloud';
     _speakingButton.setAttribute('aria-label', 'Read aloud');
     _speakingButton = null;
@@ -4368,7 +4546,7 @@ function speakText(text, button) {
   _speakIndex = 0;
   _speakingButton = button;
   button.dataset.speaking = 'true';
-  button.textContent = '⏹';
+  button.innerHTML = icon('speak-stop');
   button.title = 'Stop reading';
   button.setAttribute('aria-label', button.title);
   speakNextChunk(button);
@@ -4701,7 +4879,7 @@ function collapseOneActivityLog(log) {
   const summary = document.createElement('summary');
   summary.className = 'activity-summary';
   summary.innerHTML =
-    (errors ? `<span class="act-x">✕</span>` : `<span class="act-check">✓</span>`) +
+    (errors ? `<span class="act-x">${icon('close')}</span>` : `<span class="act-check">${icon('check')}</span>`) +
     ` ${count} step${count !== 1 ? 's' : ''}` +
     (verbStr ? ` — ${escapeHtml(verbStr)}` : '');
   details.appendChild(summary);
@@ -4859,7 +5037,7 @@ function addToolResultCard(tool, result, callId, full) {
   row.classList.add(isError ? 'is-error' : 'is-done');
 
   const iconEl = row.querySelector('.act-icon');
-  if (iconEl) iconEl.innerHTML = isError ? '<span class="act-x">✕</span>' : '<span class="act-check">✓</span>';
+  if (iconEl) iconEl.innerHTML = isError ? `<span class="act-x">${icon('close')}</span>` : `<span class="act-check">${icon('check')}</span>`;
 
   const preview = buildResultPreview(tool, String(result || ''), full);
   if (preview) {
@@ -4931,12 +5109,12 @@ function createTermCard(tool, commandText, streamId) {
   copyBtn.type = 'button';
   copyBtn.className = 'term-copy-btn';
   copyBtn.title = 'Copy command and output';
-  copyBtn.textContent = '⧉';
+  copyBtn.innerHTML = icon('copy');
   copyBtn.addEventListener('click', () => {
     const body = refs.outEl.textContent || '';
     vscode.postMessage({ type: 'copy', text: '$ ' + commandText + (body ? '\n' + body : '') });
-    copyBtn.textContent = '✓';
-    setTimeout(() => { copyBtn.textContent = '⧉'; }, 1200);
+    copyBtn.innerHTML = icon('check');
+    setTimeout(() => { copyBtn.innerHTML = icon('copy'); }, 1200);
   });
   card.querySelector('.term-in-row').appendChild(copyBtn);
 
@@ -5052,7 +5230,7 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   const approve = document.createElement('button');
   approve.type = 'button';
   approve.className = 'diff-approve';
-  approve.textContent = '✓ Approve';
+  approve.innerHTML = icon('check') + ' Approve';
   approve.addEventListener('click', () => {
     approve.disabled = true;
     reject.disabled = true;
@@ -5061,7 +5239,7 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   const reject = document.createElement('button');
   reject.type = 'button';
   reject.className = 'diff-reject';
-  reject.textContent = '✕ Reject';
+  reject.innerHTML = icon('close') + ' Reject';
   reject.addEventListener('click', () => {
     approve.disabled = true;
     reject.disabled = true;
@@ -5109,7 +5287,7 @@ function addPendingCommandCard(id, command) {
   const approve = document.createElement('button');
   approve.type = 'button';
   approve.className = 'diff-approve';
-  approve.textContent = '▶ Run';
+  approve.innerHTML = icon('run') + ' Run';
   approve.addEventListener('click', () => {
     approve.disabled = true;
     reject.disabled = true;
@@ -5118,7 +5296,7 @@ function addPendingCommandCard(id, command) {
   const reject = document.createElement('button');
   reject.type = 'button';
   reject.className = 'diff-reject';
-  reject.textContent = '✕ Reject';
+  reject.innerHTML = icon('close') + ' Reject';
   reject.addEventListener('click', () => {
     approve.disabled = true;
     reject.disabled = true;
@@ -5263,7 +5441,7 @@ function renderDiff(oldText, newText) {
       if (!visible[k]) {
         let skip = 0;
         while (k < max && !visible[k]) { skip++; k++; }
-        html += `<div class="diff-skip">↕ ${skip} unchanged line${skip > 1 ? 's' : ''}</div>`;
+        html += `<div class="diff-skip">${icon('collapsed')} ${skip} unchanged line${skip > 1 ? 's' : ''}</div>`;
         continue;
       }
       if (rows >= MAX_ROWS) { truncated = true; break; }
@@ -5277,7 +5455,7 @@ function renderDiff(oldText, newText) {
       k++;
     }
     if (truncated) {
-      html += `<div class="diff-skip">↕ diff truncated — use the editor diff view for the full change</div>`;
+      html += `<div class="diff-skip">${icon('collapsed')} diff truncated — use the editor diff view for the full change</div>`;
     }
     return { html, added, removed };
   }
@@ -5302,7 +5480,7 @@ function renderDiff(oldText, newText) {
       // Count how many hidden unchanged rows in a row.
       let skip = 0;
       while (k < ops.length && !visible[k]) { skip++; k++; }
-      html += `<div class="diff-skip">↕ ${skip} unchanged line${skip > 1 ? 's' : ''}</div>`;
+      html += `<div class="diff-skip">${icon('collapsed')} ${skip} unchanged line${skip > 1 ? 's' : ''}</div>`;
       continue;
     }
     const op = ops[k];
@@ -5322,7 +5500,7 @@ function renderDiff(oldText, newText) {
     k++;
   }
   if (truncated) {
-    html += `<div class="diff-skip">↕ diff truncated — use the editor diff view for the full change</div>`;
+    html += `<div class="diff-skip">${icon('collapsed')} diff truncated — use the editor diff view for the full change</div>`;
   }
 
   return { html: html || diffRow(' ', 'diff-unchanged', null, null, 'No changes'), added, removed };

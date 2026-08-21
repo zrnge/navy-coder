@@ -19,8 +19,17 @@ npm run eval -- --task edit-scope-single-constant     # one task
 npm run eval -- --category edit-precision             # one category
 npm run eval -- --compare eval/results/baseline.json  # diff vs a saved run
 npm run eval -- --keep                                # keep temp repos to inspect
+npm run eval -- --config reducedToolset=off           # pin any navy.* setting (repeatable)
+npm run eval -- --label full-tools                    # tag the saved results file
 npm run eval -- --help
 ```
+
+`--config`/`--label` exist for A/B runs: pin the setting under test in each arm
+and label the arms so the saved files say what they measured. Every run also
+reports a `TOKENS` line (prompt + completion summed across all tasks, and
+average prompt tokens per model call) — for a config change like the reduced
+tool set, that is the measurement pass/fail alone can't make: "same score,
+cheaper" and "no effect" look identical without it.
 
 API keys come from the environment, never the repo:
 

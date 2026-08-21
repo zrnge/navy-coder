@@ -61,6 +61,51 @@ console.log('\nliteralReplace:');
     literalReplace('  a();\r\n  b();', 'a();\nb();', 'c();') === 'c();');
 }
 
+// ── 1a1. Reduced tool tier (tools.js) ────────────────────────────────────────
+// The core/withheld split and the derived core prompt are pure data — pin the
+// invariants a typo or a template drift would silently break: a core name that
+// no longer exists just vanishes from the offer, and a regex miss in the
+// Available-tools swap would quietly ship the full list to reduced turns.
+console.log('\nreduced tool tier:');
+{
+  const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, CORE_TOOL_NAMES, WITHHELD_TOOLS } =
+    require('../src/providers/tools.js');
+  const allNames = new Set(TOOLS.map(t => t.name));
+  check('every core name is a real tool (no typo drift)',
+    [...CORE_TOOL_NAMES].every(n => allNames.has(n)),
+    [...CORE_TOOL_NAMES].filter(n => !allNames.has(n)).join(', '));
+  check('core + withheld partition the full set',
+    CORE_TOOL_NAMES.size + WITHHELD_TOOLS.length === TOOLS.length &&
+    WITHHELD_TOOLS.every(t => !CORE_TOOL_NAMES.has(t.name)));
+  const apiNames = (api) => api.map(t => t.function.name);
+  check('request_more_tools offered only in the core API',
+    apiNames(TOOLS_API_CORE).includes('request_more_tools') &&
+    !apiNames(TOOLS_API).includes('request_more_tools'));
+  check('finish never appears in a wire schema',
+    !apiNames(TOOLS_API).includes('finish') && !apiNames(TOOLS_API_CORE).includes('finish'));
+  const coreLine = TOOL_PROMPT_CORE.match(/^Available tools: .*$/m)?.[0] || '';
+  const fullLine = TOOL_PROMPT.match(/^Available tools: .*$/m)?.[0] || '';
+  check('core prompt swaps the Available-tools line (regex actually matched)',
+    coreLine !== fullLine && coreLine.includes('request_more_tools') && !coreLine.includes('rename_symbol'));
+  check('full prompt line untouched', fullLine.includes('rename_symbol') && !fullLine.includes('request_more_tools'));
+  check('core prompt names the withheld tools',
+    TOOL_PROMPT_CORE.includes('withheld: ') &&
+    WITHHELD_TOOLS.every(t => TOOL_PROMPT_CORE.includes(t.name)));
+  check('core schemas cost well under half the full set',
+    JSON.stringify(TOOLS_API_CORE).length < JSON.stringify(TOOLS_API).length * 0.6,
+    `${JSON.stringify(TOOLS_API_CORE).length} vs ${JSON.stringify(TOOLS_API).length}`);
+
+  // parseToolCalls accepts a JSON-formatted call only for a name it finds in
+  // TOOLS, so being listed there is what makes the unlock reachable from the
+  // JSON fallback path (exercised in reducedToolsetSuite, which has the vscode
+  // mock llm.js needs at load). Being a known NAME must not make it an offered
+  // SCHEMA on the full tier, where nothing is withheld and the call is waste.
+  check('request_more_tools is a known tool name (the JSON fallback gate)',
+    TOOLS.some(t => t.name === 'request_more_tools'));
+  check('…while the full tier still never offers it as a schema',
+    !apiNames(TOOLS_API).includes('request_more_tools'));
+}
+
 // ── 1a2. Fenced-code regexes must not backtrack catastrophically ─────────────
 // Both the webview renderer and the provider-side edit extractor match fences
 // with a backreference. Left unbounded (`{3,}`), a long run of backticks in
@@ -3183,6 +3228,119 @@ function queueOllamaFetch(replies, captured) {
 // screenshot showed 16+ consecutive "index.html ✓ Applied" cards). Proves the
 // soft nudge fires at edit #5, diagnostics stop being fed after that, and
 // further writes are hard-blocked once the file has been edited 10 times.
+// The queue side of cancelling a queued prompt: a prompt sent while busy waits
+// under the id the webview gave it, cancelling removes exactly that one, and
+// every path that abandons the queue says which prompts it dropped — a bubble
+// that keeps posing as sent is the failure this feature exists to prevent.
+async function queueCancelSuite() {
+  console.log('\nqueued prompts (cancel, drain, drop):');
+  const os = require('os');
+  const { vscode } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-queue-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    provider._wslCache = { available: false };
+    const lastOf = (type) => [...posted].reverse().find(m => m.type === type);
+    // Waits for any turn this suite started — including one the queue drained
+    // into the background — to actually finish. The leading ticks are the whole
+    // trick: the drain shifts the prompt out of the queue and the finishing
+    // turn clears isBusy BEFORE the setImmediate it scheduled has run, so a
+    // poll that only looks at those two sees "idle" and returns while the next
+    // turn is still pending.
+    const settle = async () => {
+      for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+      for (let i = 0; i < 300 && (provider.isBusy || provider.messageQueue.length); i++) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+    };
+
+    // Queue three prompts behind a turn that is "running".
+    provider.isBusy = true;
+    await provider.askNavy('one', false, null, [], [], 'q1');
+    await provider.askNavy('two', false, null, [], [], 'q2');
+    await provider.askNavy('three', false, null, [], [], 'q3');
+    check('queue: a prompt sent while busy waits', provider.messageQueue.length === 3);
+    check('queue: the webview is told its id and position',
+      lastOf('queued')?.id === 'q3' && lastOf('queued')?.position === 3,
+      JSON.stringify(lastOf('queued')));
+
+    // Cancel the middle one — order of the rest must be preserved.
+    provider.cancelQueuedMessage('q2');
+    check('cancel: removes exactly that prompt',
+      provider.messageQueue.map(m => m.queueId).join() === 'q1,q3',
+      provider.messageQueue.map(m => m.queueId).join());
+    check('cancel: confirmed to the webview with the new count',
+      lastOf('queueCancelled')?.ok === true && lastOf('queueCancelled')?.remaining === 2,
+      JSON.stringify(lastOf('queueCancelled')));
+
+    // Cancelling something that already left the queue is a normal race, not
+    // an error: the webview needs ok:false so it can retire a dead button.
+    provider.cancelQueuedMessage('q2');
+    check('cancel: a second cancel of the same id reports ok:false',
+      lastOf('queueCancelled')?.ok === false);
+    check('cancel: an unknown id changes nothing', provider.messageQueue.length === 2);
+    provider.cancelQueuedMessage('');
+    check('cancel: an empty id is ignored outright',
+      lastOf('queueCancelled')?.id === 'q2' && provider.messageQueue.length === 2);
+
+    // Stop drops the rest and NAMES them, so their bubbles can be marked.
+    provider._dropQueuedMessages();
+    check('stop: the queue is emptied', provider.messageQueue.length === 0);
+    check('stop: every dropped prompt is named, not just counted',
+      lastOf('queueCleared')?.ids.join() === 'q1,q3',
+      JSON.stringify(lastOf('queueCleared')));
+
+    // Draining: the prompt that STARTS is named, so its Cancel button can go.
+    provider.isBusy = false;
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { text: 'first turn done' },
+      { text: 'queued turn done' },
+    ]);
+    provider.isBusy = true;
+    await provider.askNavy('waiting one', false, null, [], [], 'qd1');
+    provider.isBusy = false;
+    await provider.askNavy('the running one', false, null, [], []);
+    check('drain: the started prompt is identified',
+      lastOf('queueDrained')?.id === 'qd1', JSON.stringify(lastOf('queueDrained')));
+    check('drain: …and the queue is empty behind it',
+      lastOf('queueDrained')?.remaining === 0);
+    // The drained prompt runs as a fire-and-forget turn (the drain hands it to
+    // setImmediate rather than awaiting it). It has to be waited out HERE: left
+    // running, it outlives this suite and consumes the mocked replies the NEXT
+    // suite queued for its own provider, failing tests that have nothing to do
+    // with the queue.
+    await settle();
+
+    // A prompt with no id still queues and still runs — an older webview, or a
+    // path that never set one, must not lose messages over a missing handle.
+    posted.length = 0;
+    provider.isBusy = true;
+    await provider.askNavy('no id', false, null, [], []);
+    check('an id-less prompt still queues', provider.messageQueue.length === 1);
+    check('…and is reported with an empty id rather than crashing',
+      lastOf('queued')?.id === '');
+    provider._dropQueuedMessages();
+    check('…and is dropped without appearing in the named list',
+      lastOf('queueCleared')?.ids.length === 0);
+  } catch (e) {
+    check('queue cancel suite ran', false, e.stack || e.message);
+  } finally {
+    // Nothing of this suite's may still be running when the mock fetch is
+    // pulled out from under it — see the settle() comment above.
+    if (provider) { provider.messageQueue = []; provider.isBusy = false; }
+    global.fetch = realFetch;
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 async function writeLoopGuardSuite() {
   console.log('\nwrite-loop guard (repeated edits to one file):');
   const os = require('os');
@@ -3223,6 +3381,124 @@ async function writeLoopGuardSuite() {
   } finally {
     global.fetch = realFetch;
     if (provider) { clearTimeout(provider._cpSaveTimer); clearInterval(provider._heartbeat); clearTimeout(provider._watchdog); }
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// The _shouldReduceTools gate: 'auto' must only ever fire for LOCAL providers
+// (a hosted mini-named model or Ollama Cloud giant must never lose tools), and
+// the explicit settings must win over every heuristic. ctrl.reset() does not
+// restore ctrl.config, so the keys this suite sets are snapshotted and restored
+// — leaking reducedToolset:'on' into later suites would fail them mysteriously.
+async function reducedToolsetSuite() {
+  console.log('\nreduced toolset gate:');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  const TOUCHED = ['provider', 'ollamaMode', 'reducedToolset'];
+  const saved = {};
+  for (const k of TOUCHED) if (k in ctrl.config) saved[k] = ctrl.config[k];
+
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-tooltier-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    const set = (over) => Object.assign(ctrl.config,
+      { provider: 'ollama', ollamaMode: 'local', reducedToolset: 'auto' }, over);
+
+    set({});
+    provider.modelContextLength = null; provider.modelContextMax = null;
+    check('auto: 7B-named local model reduces', provider._shouldReduceTools('qwen2.5-coder:7b') === true);
+    check('auto: big local model, unknown window stays full', provider._shouldReduceTools('qwen2.5-coder:32b') === false);
+    provider.modelContextLength = 8192;
+    check('auto: small effective window reduces regardless of name', provider._shouldReduceTools('qwen2.5-coder:32b') === true);
+    provider.modelContextLength = 131072;
+    check('auto: big window, big name stays full', provider._shouldReduceTools('qwen2.5-coder:32b') === false);
+    set({ provider: 'openai' });
+    provider.modelContextLength = null;
+    check('auto: hosted mini-named model never reduces', provider._shouldReduceTools('gpt-4o-mini') === false);
+    set({ ollamaMode: 'cloud' });
+    check('auto: Ollama Cloud never reduces, even a small-named model', provider._shouldReduceTools('deepseek-v4:7b') === false);
+    set({ provider: 'lmstudio' });
+    check('auto: LM Studio counts as local', provider._shouldReduceTools('phi3-mini-4k') === true);
+    set({ reducedToolset: 'off' });
+    check('off: never reduces', provider._shouldReduceTools('qwen2.5-coder:1.5b') === false);
+    set({ reducedToolset: 'on', provider: 'anthropic' });
+    check('on: always reduces, hosted included', provider._shouldReduceTools('claude-sonnet-5') === true);
+
+    // Full loop: the gate deciding to reduce is worthless unless the request
+    // that leaves the process actually carries the core schemas — and unless a
+    // request_more_tools call widens the VERY NEXT request while the turn keeps
+    // running normally (the interception must feed a tool result back, not
+    // derail the loop).
+    const { TOOLS_API, TOOLS_API_CORE } = require('../src/providers/tools.js');
+    set({});
+    provider.modelContextLength = null; provider.modelContextMax = null;
+    provider.view = { webview: { postMessage: () => {} } };
+    provider._wslCache = { available: false };
+    const readTmp = (n) => { try { return fs.readFileSync(path.join(tmp, n), 'utf8'); } catch { return null; } };
+
+    const captured = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'request_more_tools', args: {} }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'tier.txt', content: 'hi' } }] },
+      { text: 'done' },
+    ], captured);
+    await provider.askNavy('please add tier.txt', false, 'qwen2.5-coder:7b', [], []);
+    const names = (i) => (captured[i]?.tools || []).map(t => t.function.name);
+    check('reduced turn: request carries exactly the core schemas',
+      captured[0]?.tools?.length === TOOLS_API_CORE.length &&
+      names(0).includes('request_more_tools') && !names(0).includes('web_search'));
+    check('reduced turn: system prompt is the core variant',
+      /Reduced tool set/.test(captured[0]?.messages?.find(m => m.role === 'system')?.content || ''));
+    check('request_more_tools widens the very next request',
+      captured[1]?.tools?.length === TOOLS_API.length &&
+      names(1).includes('web_search') && !names(1).includes('request_more_tools'));
+    check('the turn keeps working after the unlock', readTmp('tier.txt') === 'hi');
+
+    // The unlock has to survive the JSON fallback, not just native tool
+    // calling: small local models — the whole reason the reduced tier exists —
+    // are exactly the ones that print their calls as JSON instead of using the
+    // native API. parseToolCalls drops a JSON call whose name it cannot find in
+    // TOOLS, so an unlock request used to vanish in silence, which the loop
+    // then read as "no tool calls" and ended the turn having done nothing.
+    const { parseToolCalls } = require('../src/providers/llm.js');
+    const parsesUnlock = (text) =>
+      parseToolCalls(text).some(c => c.name === 'request_more_tools');
+    check('unlock: a fenced-JSON call is parsed',
+      parsesUnlock('```json\n{"name": "request_more_tools", "arguments": {}}\n```'));
+    check('unlock: a bare-JSON call is parsed',
+      parsesUnlock('{"name": "request_more_tools", "arguments": {}}'));
+    check('unlock: the XML form is parsed',
+      parsesUnlock('<tool name="request_more_tools">{}</tool>'));
+    // A zero-argument tool has nothing to put between the tags, and models
+    // write it that way. An empty body used to reach JSON.parse('') and come
+    // back as a __parse_error__ call, so the tool never ran — true for `finish`
+    // too, which is the most-called zero-argument tool there is.
+    check('unlock: an EMPTY XML body counts as no arguments, not a parse error',
+      parsesUnlock('<tool name="request_more_tools"></tool>'));
+    check('finish: the same empty-body form works',
+      parseToolCalls('<tool name="finish"></tool>').every(c => c.name === 'finish'));
+    check('a malformed non-empty body is still reported as a parse error',
+      parseToolCalls('<tool name="read_file">{not json</tool>')
+        .some(c => c.name === '__parse_error__'));
+
+    // Control: a big local model gets the full set and the full prompt.
+    const captured2 = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured2);
+    await provider.askNavy('hello there', false, 'qwen2.5-coder:32b', [], []);
+    check('full-tier turn: all schemas, full prompt',
+      captured2[0]?.tools?.length === TOOLS_API.length &&
+      !/Reduced tool set/.test(captured2[0]?.messages?.find(m => m.role === 'system')?.content || ''));
+  } catch (e) {
+    check('reduced toolset suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    for (const k of TOUCHED) { if (k in saved) ctrl.config[k] = saved[k]; else delete ctrl.config[k]; }
+    ctrl.reset?.();
     try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }
 }
@@ -6486,6 +6762,8 @@ undoRedoSuite()
   .then(syntaxCheckSuite)
   .then(robustnessSuite)
   .then(writeLoopGuardSuite)
+  .then(queueCancelSuite)
+  .then(reducedToolsetSuite)
   .then(hallucinationSuite)
   .then(toolLedgerSuite)
   .then(costEstimateSuite)

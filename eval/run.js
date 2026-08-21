@@ -31,7 +31,7 @@ const { TASKS } = require('./tasks.js');
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const out = { concurrency: 1, timeout: 180000 };
+  const out = { concurrency: 1, timeout: 180000, config: {} };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--provider')      out.provider = argv[++i];
@@ -42,6 +42,18 @@ function parseArgs(argv) {
     else if (a === '--timeout')  out.timeout = parseInt(argv[++i], 10) * 1000;
     else if (a === '--host')     out.host = argv[++i];
     else if (a === '--keep')     out.keep = true;
+    else if (a === '--label')    out.label = argv[++i];
+    else if (a === '--config') {
+      // Any navy.* setting, as key=value — this is how an A/B run pins the
+      // variable under test (e.g. --config reducedToolset=off for the arm
+      // that measures the OLD behavior). Coerce the obvious scalar types so
+      // boolean/number settings compare correctly against their defaults.
+      const [k, ...rest] = String(argv[++i] || '').split('=');
+      const raw = rest.join('=');
+      const v = raw === 'true' ? true : raw === 'false' ? false
+        : raw !== '' && !isNaN(Number(raw)) ? Number(raw) : raw;
+      if (k) out.config[k] = v;
+    }
     else if (a === '--help' || a === '-h') out.help = true;
   }
   return out;
@@ -57,6 +69,8 @@ Navy eval runner
   npm run eval -- --compare <results.json>       diff against a previous run
   npm run eval -- --timeout 240                  per-task timeout in seconds
   npm run eval -- --keep                         keep temp repos for inspection
+  npm run eval -- --config <key>=<value>         set any navy.* setting for the run (repeatable)
+  npm run eval -- --label <name>                 tag the saved results file (e.g. an A/B arm)
 
 API key: set NAVY_EVAL_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY / …).
 Local Ollama needs no key.
@@ -149,7 +163,15 @@ async function runTask(task, cfg, vscodeMock) {
     provider._wslCache = { available: false };
 
     const chunks = [];
-    provider.view = { webview: { postMessage: (m) => { if (m.type === 'chunk' && m.text) chunks.push(m.text); } } };
+    // Token accounting rides on the same tokenCount messages the cost gauge
+    // uses — prompt tokens across a whole task is the direct measure of what a
+    // config change (e.g. the reduced tool set) actually saves, where pass/fail
+    // alone can't distinguish "same result, cheaper" from "no effect".
+    const tokens = { prompt: 0, completion: 0, modelCalls: 0 };
+    provider.view = { webview: { postMessage: (m) => {
+      if (m.type === 'chunk' && m.text) chunks.push(m.text);
+      else if (m.type === 'tokenCount') { tokens.prompt += m.prompt || 0; tokens.completion += m.completion || 0; tokens.modelCalls++; }
+    } } };
 
     // The turn must be able to finish on its own: auto-approve, or every write
     // blocks forever waiting for a click that will never come.
@@ -163,7 +185,20 @@ async function runTask(task, cfg, vscodeMock) {
       embeddingModel: cfg.embeddingModel || '',
       apiBase: '',
       systemPrompt: '',
+      // --config overrides land LAST so they win over the harness defaults.
+      ...cfg.config,
     });
+
+    // Without this, Ollama runs at its own small default num_ctx and silently
+    // truncates the prompt — an eval then measures truncation, not the model
+    // (discovered when token accounting showed every call in an A/B reporting
+    // exactly ~2050 prompt tokens, both arms). Real Navy fetches the window
+    // when a model is picked in the UI; the eval provider skips that path, so
+    // do it here. A --config contextWindow=N still clamps the fetched value,
+    // same as the user's own setting does.
+    if (cfg.provider === 'ollama') {
+      try { await provider.fetchModelContext(cfg.host, cfg.model, cfg.apiKey); } catch {}
+    }
 
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; provider.abortController?.abort(); }, cfg.timeout);
@@ -198,6 +233,7 @@ async function runTask(task, cfg, vscodeMock) {
       status: verdict.pass ? 'PASS' : 'FAIL',
       reason: verdict.reason,
       ms: Date.now() - started,
+      tokens,
     };
   } catch (e) {
     return { id: task.id, category: task.category, status: 'ERROR', reason: 'harness: ' + e.message, ms: Date.now() - started };
@@ -236,6 +272,14 @@ function report(results, cfg) {
   console.log('─'.repeat(66));
   const pct = scored ? Math.round((pass.length / scored) * 100) : 0;
   console.log(`  SCORE: ${pass.length}/${scored} (${pct}%)` + (err.length ? `  —  ${err.length} errored, run is INCOMPLETE` : ''));
+  const tok = results.reduce((a, r) => ({
+    prompt: a.prompt + (r.tokens?.prompt || 0),
+    completion: a.completion + (r.tokens?.completion || 0),
+    modelCalls: a.modelCalls + (r.tokens?.modelCalls || 0),
+  }), { prompt: 0, completion: 0, modelCalls: 0 });
+  if (tok.modelCalls) {
+    console.log(`  TOKENS: ${tok.prompt.toLocaleString()} prompt + ${tok.completion.toLocaleString()} completion over ${tok.modelCalls} model calls (avg ${Math.round(tok.prompt / tok.modelCalls).toLocaleString()} prompt/call)`);
+  }
   console.log('─'.repeat(66));
 
   if (fail.length) {
@@ -246,7 +290,7 @@ function report(results, cfg) {
     console.log('\n  Errors (not scored — harness/provider problems):');
     for (const e of err) console.log(`    ! ${e.id}\n      ${e.reason}`);
   }
-  return { pass: pass.length, fail: fail.length, error: err.length, scored, pct };
+  return { pass: pass.length, fail: fail.length, error: err.length, scored, pct, tokens: tok };
 }
 
 function compare(current, baselinePath) {
@@ -286,6 +330,8 @@ async function main() {
     host: args.host || 'http://localhost:11434',
     timeout: args.timeout,
     keep: args.keep,
+    config: args.config || {},
+    label: args.label || '',
     apiKey: process.env.NAVY_EVAL_API_KEY
       || process.env[(args.provider || '').toUpperCase() + '_API_KEY']
       || process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || '',
@@ -333,9 +379,12 @@ async function main() {
   const outDir = path.join(__dirname, 'results');
   fs.mkdirSync(outDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const outFile = path.join(outDir, `${cfg.provider}_${cfg.model.replace(/[^\w.-]/g, '-')}_${stamp}.json`);
+  const labelPart = cfg.label ? cfg.label.replace(/[^\w.-]/g, '-') + '_' : '';
+  const outFile = path.join(outDir, `${cfg.provider}_${cfg.model.replace(/[^\w.-]/g, '-')}_${labelPart}${stamp}.json`);
   fs.writeFileSync(outFile, JSON.stringify({
     provider: cfg.provider, model: cfg.model, ranAt: new Date().toISOString(),
+    ...(cfg.label ? { label: cfg.label } : {}),
+    ...(Object.keys(cfg.config).length ? { config: cfg.config } : {}),
     summary, results,
   }, null, 2));
   console.log(`\n  saved: ${path.relative(ROOT, outFile)}\n`);
