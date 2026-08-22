@@ -273,6 +273,305 @@ function runningSuite() {
 }
 
 // ── Bubbles, history and copy ───────────────────────────────────────────────
+// ── Underscores in identifiers ──────────────────────────────────────────────
+// Emphasis with `_` used to fire inside words. Every reply a coding assistant
+// writes is full of snake_case — read_file, apply_edit, MAX_RETRIES — so the
+// underscore in one identifier opened emphasis and the one in the next closed
+// it: both underscores disappeared and everything between them, often most of a
+// paragraph, rendered italic. Seen in the wild as "read readfile(...)" with the
+// rest of the line in italics.
+function snakeCaseSuite() {
+  console.log('\nmarkdown: underscores inside words are not emphasis:');
+
+  const render = (text) => {
+    const w = run([{ type: 'start' }, { type: 'chunk', text }, { type: 'done' }]);
+    const html = w.document.querySelector('#messages .message.assistant .message-bubble').innerHTML;
+    w.close();
+    return html;
+  };
+
+  let h = render('Use apply_edit or write_file next.');
+  check('a pair of snake_case names is left alone',
+    h.includes('apply_edit') && h.includes('write_file') && !h.includes('<em>'), h);
+
+  h = render('Set MAX_RETRIES and MIN_DELAY.');
+  check('SCREAMING_CASE constants survive too',
+    h.includes('MAX_RETRIES') && h.includes('MIN_DELAY') && !h.includes('<em>'), h);
+
+  h = render('read read_file(c:/x/scene.js); ran "echo EXITOK || echo EXIT_FAIL" (exit 0)');
+  check('the line from the bug report renders verbatim',
+    h.includes('read_file(c:/x/scene.js)') && h.includes('EXIT_FAIL') && !h.includes('<em>'), h);
+
+  h = render('see https://example.com/a_b_c/d_e_f now');
+  check('a URL full of underscores is not italicised', !h.includes('<em>'), h);
+
+  // The feature still has to work where it is genuinely meant to.
+  h = render('this is _emphasised_ and this is __really bold__ text');
+  check('real _emphasis_ still renders', /<em>emphasised<\/em>/.test(h), h);
+  check('real __bold__ still renders', /<strong>really bold<\/strong>/.test(h), h);
+
+  // Two deliberate departures from CommonMark, both for the same reason: the
+  // spec is written for prose, and this panel is full of Python and shell.
+  // Anything genuinely ambiguous can be written in backticks, which are lifted
+  // out before any emphasis rule runs.
+  h = render('the __init__ method');
+  check('a dunder is an identifier here, not bold — CommonMark says bold',
+    h.includes('__init__') && !h.includes('<strong>'), h);
+  h = render('a*b*c and 2*3*4 and **real bold**');
+  check('`*` is NOT intraword here — CommonMark allows it, multiplication wins',
+    h.includes('a*b*c') && h.includes('2*3*4') && !h.includes('<em>')
+    && /<strong>real bold<\/strong>/.test(h), h);
+
+  // Globs are the `*` version of the same bug, and just as common in this
+  // panel: "delete *.log and *.tmp" rendered as "delete <em>.log and </em>.tmp".
+  // A `*` against whitespace or a slash is a path, not emphasis.
+  h = render('Delete *.log and *.tmp files.');
+  check('a pair of globs is left alone',
+    h.includes('*.log') && h.includes('*.tmp') && !h.includes('<em>'), h);
+  h = render('Run tests on **/*.spec.js and src/*.ts');
+  check('a recursive glob survives intact',
+    h.includes('**/*.spec.js') && h.includes('src/*.ts') && !h.includes('<em>'), h);
+  h = render('Match **/*.a and **/*.b now');
+  check('two double-star globs do not become bold',
+    !h.includes('<strong>') && !h.includes('<em>'), h);
+  h = render('def f(*args, **kwargs): pass');
+  check('Python star-args survive',
+    h.includes('*args') && h.includes('**kwargs') && !h.includes('<em>'), h);
+
+  // A `*` standing in for an index or an argument. The guard for this was
+  // written on the wrong side of the delimiter — a lookahead placed before the
+  // run only ever inspected the `*` itself, so it never rejected anything and
+  // these still emphasised.
+  h = render('Set data[*], then read items[*].');
+  check('a star used as an index is not emphasis',
+    h.includes('data[*]') && h.includes('items[*]') && !h.includes('<em>'), h);
+  h = render('Call f(*), g(*) next');
+  check('…nor one standing in for an argument',
+    h.includes('f(*)') && h.includes('g(*)') && !h.includes('<em>'), h);
+  h = render('**Note:** delete *.log now');
+  check('real bold still works beside a glob',
+    /<strong>Note:<\/strong>/.test(h) && h.includes('*.log') && !h.includes('<em>'), h);
+
+  // Bold whose CONTENT ends in a slash — which every URL does. The first
+  // version of the glob guard refused any closing run preceded by `/`, so
+  // "running at **http://localhost:5173/Vidz/**" rendered with its asterisks
+  // showing. The glob shapes are stopped by the OPENING guard instead: `**/`
+  // starts a path, `/**` merely ends one.
+  h = render('running at **http://localhost:5173/Vidz/**.');
+  check('bold around a URL ending in a slash still renders',
+    /<strong>http:\/\/localhost:5173\/Vidz\/<\/strong>/.test(h), h);
+  h = render('see **src/lib/** now');
+  check('…and bold around a directory path does too',
+    /<strong>src\/lib\/<\/strong>/.test(h), h);
+
+  // The emphasis rules use nested quantifiers, which is how this repo got a
+  // 14.5-second renderer freeze once before (see the fenced-code regex note).
+  // A reply is rendered on every chunk, so anything superlinear here is felt as
+  // the panel locking up mid-answer, not as a slow function.
+  const hostile = [
+    '*'.repeat(5000),
+    '*a'.repeat(3000),
+    '**'.repeat(4000),
+    'rm *.log '.repeat(3000),
+  ];
+  // Timed without reading the DOM back: a reply of pure asterisks can render to
+  // nothing at all, and 'done' drops an empty bubble — the cost is what is being
+  // measured here, not the output.
+  const started = Date.now();
+  for (const t of hostile) {
+    const w = run([{ type: 'start' }, { type: 'chunk', text: t }, { type: 'done' }]);
+    w.close();
+  }
+  const elapsed = Date.now() - started;
+  check('pathological asterisk runs do not backtrack catastrophically',
+    elapsed < 3000, elapsed + 'ms for ' + hostile.length + ' renders');
+}
+
+// ── Property: code-ish text passes through untouched ────────────────────────
+// Every renderer bug found so far was the same failure — characters that were
+// not markup disappeared, and emphasis appeared where none was asked for. That
+// is checkable without enumerating cases: take lines whose `_` and `*` are all
+// parts of identifiers, globs and argument lists, and assert that NOTHING goes
+// missing and NO emphasis is invented.
+//
+// This is the test that generalises. Run against the renderer as it shipped in
+// 0.2.9 it fails on 17 of these 19 lines, including the exact text from the bug
+// report; the enumerated cases above would each have had to be predicted.
+function noContentLossSuite() {
+  console.log('\nmarkdown property: identifiers, globs and args survive intact:');
+
+  // Whitespace and the characters that only ever act as block structure here.
+  const IGNORE = /[\s#>|+]|(?:^|\n)\s*-+|\[|\]|\(|\)|`/g;
+  const counts = (s) => {
+    const m = new Map();
+    for (const ch of s.replace(IGNORE, '')) m.set(ch, (m.get(ch) || 0) + 1);
+    return m;
+  };
+
+  const CODEISH = [
+    'Call apply_edit then write_file on src/app_main.js',
+    'Delete *.log and *.tmp files from the build',
+    'Run tests on **/*.spec.js and src/*.ts now',
+    'def f(*args, **kwargs): return kwargs',
+    'Set MAX_RETRIES=5 and MIN_DELAY=0.25 in config_prod.json',
+    'The read_file tool and the write_file tool differ',
+    'Open C:\\Users\\me\\src\\app_v2.js next',
+    'Override __init__ and __repr__ in my_class.py',
+    'Rename user_id to account_id across the codebase',
+    'Match a_b_c and d_e_f and g_h_i in one line',
+    'Globs: *.json *.yaml *.toml all match',
+    'Shell: rm -rf build/*.o && make all',
+    'Python: items[*], data["a_b"], func(*seq)',
+    'Env: $HOME_DIR and ${OTHER_VAR} and %APPDATA%',
+    'Regex needs a_b\\d+ and c_d\\w*',
+    'snake_case_one, snake_case_two, snake_case_three',
+    'EXIT_OK or EXIT_FAIL decides the branch',
+    'A trailing underscore_ and a _leading one',
+    'Multiply 2*3*4 and compare a*b',
+    'Set data[*], then read items[*].',
+    'Call f(*), g(*) next',
+    'Paths: **/*.ts, src/*.js, build/*.o',
+  ];
+
+  const mangled = [];
+  for (const input of CODEISH) {
+    const w = run([{ type: 'start' }, { type: 'chunk', text: input }, { type: 'done' }]);
+    const el = w.document.querySelector('#messages .message.assistant');
+    const text = [...el.querySelectorAll('.message-bubble')].map(b => b.textContent || '').join(' ');
+    const want = counts(input);
+    const got = counts(text);
+    const missing = [];
+    for (const [ch, n] of want) {
+      if ((got.get(ch) || 0) < n) missing.push(JSON.stringify(ch));
+    }
+    const invented = el.querySelector('.message-bubble em, .message-bubble strong');
+    if (missing.length || invented) {
+      mangled.push(input.slice(0, 40) + (missing.length ? ' [lost ' + missing.join(',') + ']' : ' [invented emphasis]'));
+    }
+    w.close();
+  }
+  check('no code-ish line loses a character or gains emphasis',
+    mangled.length === 0, mangled.slice(0, 4).join(' | '));
+
+  // The other half of the property: emphasis that IS asked for must still work,
+  // or "lose nothing" would be trivially satisfiable by rendering plain text.
+  const emphasis = [
+    ['make it *fast*', '<em>fast</em>'],
+    ['make it **fast**', '<strong>fast</strong>'],
+    ['make it ***fast***', '<strong><em>fast</em></strong>'],
+    ['this is _em_ here', '<em>em</em>'],
+    ['__really important__ note', '<strong>really important</strong>'],
+    ['**Done:** all good', '<strong>Done:</strong>'],
+    ['a *multi word phrase* here', '<em>multi word phrase</em>'],
+    ['~~struck~~ out', '<del>struck</del>'],
+  ];
+  const broken = [];
+  for (const [input, expected] of emphasis) {
+    const w = run([{ type: 'start' }, { type: 'chunk', text: input }, { type: 'done' }]);
+    const html = w.document.querySelector('#messages .message.assistant .message-bubble').innerHTML;
+    if (!html.includes(expected)) broken.push(input + ' -> ' + html);
+    w.close();
+  }
+  check('…while every form of real emphasis still renders',
+    broken.length === 0, broken.join(' | '));
+}
+
+// ── Streaming must not change the result ────────────────────────────────────
+// A reply arrives in chunks whose boundaries fall wherever the provider put
+// them — mid-word, mid-fence, mid-table. Whatever the reader ends up looking at
+// has to be what the same text rendered in one piece would have produced, or a
+// reply is silently different depending on network timing.
+function streamConsistencySuite() {
+  console.log('\nmarkdown: a streamed reply renders the same as a whole one:');
+
+  const DOC = [
+    'Here is the plan.',
+    '',
+    '1. Read src/app_main.js',
+    '   ```js',
+    '   const x = 1;',
+    '   ```',
+    '2. Delete *.log files',
+    '',
+    '| col | val |',
+    '|-----|-----|',
+    '| a   | 1   |',
+    '',
+    '**Done:** see [docs](https://ex.com/a_(b)) for more.',
+  ].join('\n');
+
+  const deliver = (chunks) => {
+    const w = run([{ type: 'start' }, ...chunks.map(text => ({ type: 'chunk', text })), { type: 'done' }]);
+    const html = w.document.querySelector('#messages .message.assistant').innerHTML;
+    w.close();
+    return html;
+  };
+
+  const whole = deliver([DOC]);
+  for (const size of [1, 3, 17, 64]) {
+    const parts = [];
+    for (let i = 0; i < DOC.length; i += size) parts.push(DOC.slice(i, i + size));
+    check(`a reply split into ${size}-character chunks renders identically`,
+      deliver(parts) === whole);
+  }
+}
+
+// ── Ordered lists interrupted by code ───────────────────────────────────────
+// Anything that is not a list line ends the list, and a fenced code block
+// between two steps is the common shape here — so numbered instructions came
+// out as "1." then "1." again, because each fragment started a fresh <ol>.
+function listNumberingSuite() {
+  console.log('\nmarkdown: numbered steps keep counting past a code block:');
+
+  const render = (text) => {
+    const w = run([{ type: 'start' }, { type: 'chunk', text }, { type: 'done' }]);
+    const html = w.document.querySelector('#messages .message.assistant .message-bubble').innerHTML;
+    w.close();
+    return html;
+  };
+
+  let h = render('1. step\n   ```js\n   const a = 1;\n   ```\n2. next');
+  check('the list after a code block resumes at 2', /<ol start="2">/.test(h), h.slice(-120));
+  check('…and the first half still starts at 1', /<ol><li>step<\/li><\/ol>/.test(h), h.slice(0, 80));
+
+  h = render('1. one\n2. two\n3. three');
+  check('an uninterrupted list needs no start attribute',
+    /<ol><li>one<\/li><li>two<\/li><li>three<\/li><\/ol>/.test(h), h);
+
+  h = render('5. five\n6. six');
+  check('a list the model started at 5 is honoured', /<ol start="5">/.test(h), h);
+
+  h = render('- a\n- b');
+  check('bullets are unaffected', /<ul><li>a<\/li><li>b<\/li><\/ul>/.test(h), h);
+}
+
+// ── Link URLs containing parentheses ────────────────────────────────────────
+function linkParenSuite() {
+  console.log('\nmarkdown: a URL may contain parentheses:');
+
+  const render = (text) => {
+    const w = run([{ type: 'start' }, { type: 'chunk', text }, { type: 'done' }]);
+    const el = w.document.querySelector('#messages .message.assistant .message-bubble');
+    const a = el.querySelector('a');
+    const out = { href: a ? a.getAttribute('href') : null, text: el.textContent };
+    w.close();
+    return out;
+  };
+
+  let r = render('[wiki](https://en.wikipedia.org/wiki/Foo_(bar))');
+  check('a Wikipedia-style URL keeps its closing paren',
+    r.href === 'https://en.wikipedia.org/wiki/Foo_(bar)', String(r.href));
+  check('…and no stray ")" is printed after the link', !r.text.trim().endsWith(')'), r.text);
+
+  r = render('[docs](https://example.com/a/b)');
+  check('an ordinary URL is unchanged', r.href === 'https://example.com/a/b', String(r.href));
+
+  // The sanitiser must still win: a scheme that can execute is neutralised
+  // whether or not it contains parentheses.
+  r = render('[x](javascript:alert(1))');
+  check('a javascript: URL is still defused', r.href === '#', String(r.href));
+}
+
 function bubbleSuite() {
   console.log('\nchat bubbles, history and copy:');
 
@@ -2050,6 +2349,141 @@ function iconSuite() {
     /GENERATED by tools\/build-icons\.js/.test(icons));
 }
 
+// ── The running-task dock ───────────────────────────────────────────────────
+// A dev server announces itself as a card where it was started, and the
+// transcript scrolls. Twenty replies later the server is still up and both its
+// status and its Stop button are somewhere above the fold, so the only way to
+// stop one you had forgotten was to hunt for the card. The dock mirrors what is
+// running, immediately above the composer, and empties itself as things end.
+function taskDockSuite() {
+  console.log('\ntask dock: anything still running stays above the composer:');
+
+  const w = createWebview();
+  const d = w.document;
+  const el = d.querySelector('#taskDock');
+  const rows = () => [...el.querySelectorAll('.task-dock-row')];
+  const names = () => rows().map(r => r.querySelector('.task-dock-name').textContent);
+
+  check('the dock is out of the way when nothing is running', el.hidden === true);
+
+  w.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
+  check('a starting dev server appears in the dock', el.hidden === false && names().join() === 'Vidz');
+  check('…showing the command it is running',
+    rows()[0].querySelector('.task-dock-detail').textContent === 'npm run dev');
+  check('…and marked as not yet up',
+    !rows()[0].querySelector('.task-dock-dot').classList.contains('ready'));
+  check('…with its own Stop button',
+    rows()[0].querySelector('.task-dock-stop').title === 'Stop server');
+
+  w.post({ type: 'runProjectReady', url: 'http://localhost:5173/Vidz/' });
+  check('once live, the dock shows the URL rather than the command',
+    rows()[0].querySelector('.task-dock-detail').textContent === 'http://localhost:5173/Vidz/');
+  check('…and the status light turns',
+    rows()[0].querySelector('.task-dock-dot').classList.contains('ready'));
+
+  // A second kind of running thing shares the dock.
+  w.post({ type: 'bgProcessOutput', id: 'watcher', chunk: 'building…' });
+  check('a background process joins it', names().join() === 'Vidz,watcher');
+  check('…with the stop action that belongs to a process',
+    rows()[1].querySelector('.task-dock-stop').title === 'Stop process');
+
+  // The dock is a control, not just a readout.
+  rows()[0].querySelector('.task-dock-stop').click();
+  check('Stop in the dock asks the extension to stop that server',
+    w.sent.some(m => m.type === 'stopRunProject'));
+  check('…and the button cannot be pressed twice while that is in flight',
+    rows()[0].querySelector('.task-dock-stop').disabled === true);
+
+  w.post({ type: 'runProjectStopped', exitCode: 0 });
+  check('a stopped server leaves the dock', names().join() === 'watcher');
+  check('…but its card stays in the conversation, where it happened',
+    d.querySelectorAll('.run-project-card').length === 1);
+
+  w.post({ type: 'bgProcessDone', id: 'watcher', exitCode: 0 });
+  check('with nothing running the dock hides again',
+    el.hidden === true && rows().length === 0);
+  w.close();
+
+  // Clicking a row is how you get from "something is running" to "what has it
+  // been doing" — the card is the log, the dock is only the handle.
+  const w2 = createWebview();
+  const d2 = w2.document;
+  w2.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
+  d2.querySelector('.task-dock-label').click();
+  check('clicking the row marks the card it belongs to',
+    d2.querySelectorAll('.run-project-card.outline-target').length === 1);
+  w2.close();
+
+  // The rows point at cards. Replacing the transcript detaches every one of
+  // them, so a row left behind would scroll nowhere at all.
+  const w3 = createWebview();
+  const d3 = w3.document;
+  w3.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
+  w3.post({ type: 'restore', messages: [{ role: 'user', text: 'different chat' }] });
+  check('switching chats empties the dock rather than stranding a row',
+    d3.querySelector('#taskDock').hidden === true);
+  w3.close();
+
+  // A process can outlive the window that started it (navy.persistBackgroundProcesses).
+  // Navy records each one under a task path — navy/<project>/<task> — so on
+  // reopen it can say WHICH task is still running, not just that some pid is.
+  // Before this, the only sign was a notification at startup: dismiss it, or
+  // miss it while the window was still loading, and nothing anywhere said a
+  // dev server was still up.
+  const w4 = createWebview();
+  const d4 = w4.document;
+  w4.post({ type: 'restoredProcesses', root: 'E:/Vidz', processes: [
+    { taskPath: 'navy/Vidz/dev-server', id: '__run_project__', label: 'Vidz',
+      command: 'npm run dev', url: 'http://localhost:5173/', pid: 123 },
+    { taskPath: 'navy/Vidz/tsc-watch', id: 'tsc-watch', label: 'tsc-watch',
+      command: 'tsc -w', url: '', pid: 456 },
+  ] });
+  const r4 = () => [...d4.querySelectorAll('.task-dock-row')];
+  check('a process from a previous session appears on reopen', r4().length === 2);
+  check('…marked as predating this window',
+    r4().every(r => r.classList.contains('restored')));
+  check('…and saying so in words, not only by colour',
+    /previous session/i.test(r4()[0].querySelector('.task-dock-tag')?.textContent || ''));
+  check('a recovered dev server still knows its address',
+    r4()[0].querySelector('.task-dock-detail').textContent === 'http://localhost:5173/');
+  check('…and offers to open it', Boolean(r4()[0].querySelector('.task-dock-open')));
+  check('one without a URL shows its command instead, and offers no Open',
+    r4()[1].querySelector('.task-dock-detail').textContent === 'tsc -w'
+    && !r4()[1].querySelector('.task-dock-open'));
+  check('each offers its log — the only record of it that survived',
+    r4().every(r => r.querySelector('.task-dock-log')));
+
+  // These belong to the project, not to a conversation.
+  w4.post({ type: 'restore', messages: [{ role: 'user', text: 'a different chat' }] });
+  check('switching chats does NOT retire a recovered process',
+    d4.querySelectorAll('.task-dock-row').length === 2);
+
+  // Stopping one names the task path — the webview never gets to name a pid.
+  r4()[0].querySelector('.task-dock-stop').click();
+  const stopMsg = w4.sent.find(m => m.type === 'stopRestoredProcess');
+  check('Stop asks by task path, not by pid',
+    stopMsg && stopMsg.taskPath === 'navy/Vidz/dev-server' && stopMsg.pid === undefined,
+    JSON.stringify(stopMsg));
+  check('…and names the project it belongs to', stopMsg.root === 'E:/Vidz');
+  r4()[0].querySelector('.task-dock-log').click();
+  check('Log asks for that task path too',
+    w4.sent.some(m => m.type === 'showRestoredLog' && m.taskPath === 'navy/Vidz/dev-server'));
+
+  w4.post({ type: 'restoredProcesses', root: 'E:/Vidz', processes: [] });
+  check('once the extension confirms none are left, the dock goes',
+    d4.querySelector('#taskDock').hidden === true);
+  w4.close();
+
+  // The dock takes real height instead of floating: the composer must still be
+  // reachable, and the last line of a reply must not end up behind it.
+  const css = readSource('media', 'styles.css');
+  const rule = /\.task-dock\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('the dock is laid out in the flow, not floated over the transcript',
+    !/position:\s*(?:absolute|fixed)/.test(rule), rule.trim());
+  check('…and is capped so it cannot push the composer off a short panel',
+    /max-height/.test(rule) && /overflow-y:\s*auto/.test(rule), rule.trim());
+}
+
 // ── Cancelling a queued prompt ──────────────────────────────────────────────
 // A prompt typed while Navy is working sits in the queue, sometimes for
 // minutes, and used to be unstoppable: the transcript showed it as if sent and
@@ -2346,12 +2780,18 @@ scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
 iconSuite();
+taskDockSuite();
 queueCancelSuite();
 indentedFenceSuite();
 slashCommandSuite();
 terminalSuite();
 taskSuite();
 runningSuite();
+snakeCaseSuite();
+listNumberingSuite();
+linkParenSuite();
+noContentLossSuite();
+streamConsistencySuite();
 bubbleSuite();
 highlightSuite();
 speechSuite();

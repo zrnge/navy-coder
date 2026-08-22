@@ -35,7 +35,37 @@ function extractFunction(source, header) {
   let depth = 0, i = source.indexOf('{', start);
   for (let j = i; j < source.length; j++) {
     if (source[j] === '{') depth++;
-    else if (source[j] === '}') { depth--; if (depth === 0) return source.slice(start, j + 1); }
+    else if (source[j] === '}') {
+      depth--;
+      if (depth === 0) {
+        const body = source.slice(start, j + 1);
+        // A brace inside a string OR a comment counts here just as much as a
+        // real one, so an unbalanced one ends the function early and the caller
+        // gets "Unexpected end of input" from eval — an error that says nothing
+        // about where it came from. Check it here and name the actual cause.
+        // Callers extract both plain functions and class methods, and a method
+        // is not a valid expression on its own — it has to be read back inside
+        // an object literal. Only when NEITHER shape parses is the extraction
+        // genuinely broken.
+        let parseError = null;
+        try {
+          new Function('return ' + body);
+        } catch (e1) {
+          try {
+            new Function('return ({ ' + body + ' })');
+          } catch { parseError = e1; }
+        }
+        try {
+          if (parseError) throw parseError;
+        } catch (e) {
+          throw new Error(
+            `extractFunction stopped early on "${header}" — a lone { or } inside a `
+            + `string or comment throws off the brace count. Write it as an escape `
+            + `(\\u007B / \\u007D) or keep the braces balanced. Parser said: ${e.message}`);
+        }
+        return body;
+      }
+    }
   }
   throw new Error('unbalanced braces for: ' + header);
 }
@@ -1501,6 +1531,50 @@ async function persistentBgProcessSuite() {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-bgpersist-'));
     provider = new NavyCoderViewProvider(makeContext(tmp));
     provider.projectRoot = tmp;
+
+    // ── Task paths ──────────────────────────────────────────────────────────
+    // A pid is not an identity: it is recycled, it means nothing after a
+    // restart, and nobody recognises one. The task path does all three jobs —
+    // it names the project and the task, it is the same string across windows,
+    // and it is what a stop request refers to.
+    const projectName = path.basename(tmp);
+    check('task path names the project and the task',
+      provider._taskPathFor(tmp, 'tsc-watch') === `navy/${projectName}/tsc-watch`,
+      provider._taskPathFor(tmp, 'tsc-watch'));
+    check('the dev server gets a name a person would recognise',
+      provider._taskPathFor(tmp, '__run_project__') === `navy/${projectName}/dev-server`);
+    const pathA = provider._taskPathFor(tmp, 'a');
+    const pathB = provider._taskPathFor(tmp, 'a');
+    check('the same task yields the same path every time',
+      pathA === pathB && pathA.startsWith('navy/'), JSON.stringify(pathA));
+    check('a name with separators in it cannot reshape the path',
+      provider._taskPathFor(tmp, 'a/../b c').split('/').length === 3,
+      provider._taskPathFor(tmp, 'a/../b c'));
+    check('a project with no root still yields a usable path',
+      provider._taskPathFor('', 'x') === 'navy/project/x');
+
+    // ── Stopping a process this window never owned ──────────────────────────
+    // Recovered rows are stopped BY PATH. The webview never names a pid, and
+    // the record is re-verified as ours immediately before anything is
+    // signalled — minutes can pass between the check that put it on screen and
+    // the click, and a recycled pid must never be killed on Navy's say-so.
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    const bogus = `navy/${projectName}/ghost`;
+    await provider._writeBgManifest(tmp, [
+      { id: 'ghost', taskPath: bogus, pid: 999999, command: 'x', startedAt: Date.now(), kind: 'start_process' },
+    ]);
+    const note = await provider.stopRestoredProcess(tmp, bogus);
+    check('stopping a dead record reports it rather than signalling anything',
+      /already exited|no longer recorded/i.test(note), note);
+    check('…and the record is dropped',
+      (await provider._readBgManifest(tmp)).length === 0);
+    check('…and the panel is told what is left',
+      posted.some(m => m.type === 'restoredProcesses' && m.processes.length === 0));
+
+    const unknown = await provider.stopRestoredProcess(tmp, `navy/${projectName}/never-existed`);
+    check('an unknown task path is refused, not guessed at',
+      /no longer recorded/i.test(unknown), unknown);
 
     // Off by default, and reflects the setting once toggled — this is the
     // gate every persist-mode branch below is behind.
@@ -3671,12 +3745,28 @@ async function toolLedgerSuite() {
     // Pure formatting checks — no model loop needed.
     check('_describeReadCall: read_file includes the path',
       provider._describeReadCall({ name: 'read_file', args: { path: 'a/b.js' } }) === 'read_file(a/b.js)');
-    check('_renderTurnLedger: empty/undefined meta renders nothing',
-      provider._renderTurnLedger(undefined) === '' && provider._renderTurnLedger({}) === '');
-    check('_renderTurnLedger: formats reads, writes, and commands together',
-      /read a\.js, b\.js/.test(provider._renderTurnLedger({ reads: ['a.js', 'b.js'] }))
-      && /wrote c\.js/.test(provider._renderTurnLedger({ files: ['c.js'] }))
-      && /ran "npm test" \(exit 0\)/.test(provider._renderTurnLedger({ commandLog: [{ cmd: 'npm test', exit: 0 }] })));
+    check('_turnLedgerParts: empty/undefined meta renders nothing',
+      provider._turnLedgerParts(undefined) === '' && provider._turnLedgerParts({}) === '');
+    check('_turnLedgerParts: formats reads, writes, and commands together',
+      /read a\.js, b\.js/.test(provider._turnLedgerParts({ reads: ['a.js', 'b.js'] }))
+      && /wrote c\.js/.test(provider._turnLedgerParts({ files: ['c.js'] }))
+      && /ran "npm test" \(exit 0\)/.test(provider._turnLedgerParts({ commandLog: [{ cmd: 'npm test', exit: 0 }] })));
+
+    // A model that used tools and then reported files it never wrote escaped
+    // the hallucination guard entirely — that guard only fires when NO tool was
+    // called all turn. This is the reported bug: "navy said i changed this and
+    // that while it did not change anything".
+    const claims = (t) => provider._claimsFilesChanged(t);
+    check('claim check: the exact line from the bug report is a claim',
+      claims('**Changed:** `test-visual.mjs`, `src/scene.js`'));
+    check('claim check: a plain Changed: line counts too',
+      claims('Done: stuff\nChanged: scene.js\nResult: succeeded'));
+    check('claim check: the documented "no files" form is NOT a claim',
+      !claims('**Changed:** No files changed') && !claims('Changed: none') && !claims('Changed: n/a'));
+    check('claim check: prose naming no file is NOT a claim',
+      !claims('**Changed:** the behaviour of the retry loop'));
+    check('claim check: a reply with no report at all is NOT a claim',
+      !claims('I read the file and it looks fine.'));
 
     // Turn 1: reads source.js, writes out.js, then finishes.
     global.fetch = queueOllamaFetch([
@@ -3700,12 +3790,26 @@ async function toolLedgerSuite() {
     await provider.askNavy('do the second task', false, null, [], []);
     const sentMessages = captured[0]?.messages || [];
     const turn1Reply = sentMessages.find(m => m.role === 'assistant' && /read source\.js and wrote out\.js/.test(m.content || ''));
-    check('turn ledger: reaches the model on the NEXT turn',
-      Boolean(turn1Reply) && /\[Tool activity that turn/.test(turn1Reply.content));
-    check('turn ledger: names the exact file that was read',
-      /read_file\(source\.js\)/.test(turn1Reply?.content || ''));
-    check('turn ledger: names the exact file that was written',
-      /wrote out\.js/.test(turn1Reply?.content || ''));
+    const sys = sentMessages.find(m => m.role === 'system')?.content || '';
+    check('turn ledger: reaches the model on the NEXT turn', /What earlier turns already did/.test(sys));
+    check('turn ledger: names the exact file that was read', /read_file\(source\.js\)/.test(sys));
+    check('turn ledger: names the exact file that was written', /wrote out\.js/.test(sys));
+    check('turn ledger: numbers the turn it belongs to', /- Turn 1: /.test(sys));
+
+    // The bug this shape exists to prevent. Appended to the assistant message,
+    // the record read to the model as something IT had written, so it copied
+    // the format into its own replies — and, writing prose rather than reading
+    // a tool result, invented the contents: a turn that changed nothing still
+    // announced files it had "written". An assistant message must carry only
+    // what the model actually said.
+    check('turn ledger: NOT appended to the model-facing assistant message',
+      Boolean(turn1Reply) && !/Tool activity|read_file\(source\.js\)/.test(turn1Reply.content),
+      JSON.stringify(turn1Reply?.content || '').slice(0, 120));
+    check('turn ledger: the assistant message is exactly what was said',
+      turn1Reply?.content === 'Done — read source.js and wrote out.js.',
+      JSON.stringify(turn1Reply?.content || ''));
+    check('turn ledger: the system prompt tells the model not to reproduce it',
+      /never reproduce this list in a reply/.test(sys));
 
     // And it must not show up in the webview — main.js's own rendering of
     // meta only reads files/deleted/commands, never reads/commandLog.
@@ -4611,7 +4715,13 @@ async function embedIndexSuite() {
   check('vectors: a truncated payload decodes to null, never a short vector',
     decodeVector('AAAB') === null);
   check('vectors: empty input decodes to null', decodeVector('') === null && decodeVector(null) === null);
-  check('vectors: sharding is deterministic', shardOf('src/app.js') === shardOf('src/app.js'));
+  // Asserted against a real value, not just against itself: `a === a` holds
+  // just as well when the function returns undefined for everything, so the
+  // shape of what comes back is half the check.
+  const shardA = shardOf('src/app.js');
+  const shardB = shardOf('src/app.js');
+  check('vectors: sharding is deterministic',
+    shardA === shardB && /^[0-9a-f]{2}$/.test(shardA), JSON.stringify(shardA));
   check('vectors: …and spreads across shards',
     new Set(Array.from({ length: 200 }, (_, i) => shardOf('src/file' + i + '.js'))).size > 8);
 

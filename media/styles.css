@@ -1196,6 +1196,142 @@ select option:hover {
   border-top: 1px solid var(--border);
 }
 
+/* ── Running-task dock ────────────────────────────────────────────────────── */
+/* Sits inside .composer-wrap, above the composer and below the transcript, so
+   it is part of the furniture that never scrolls rather than something floating
+   over the conversation. Nothing is absolutely positioned: the dock takes real
+   height, which pushes the transcript up instead of covering its last line —
+   the jump-to-latest pill already occupies the floating layer here, and two
+   things hovering over the same corner is how the last line of a reply gets
+   hidden behind a control.
+
+   Capped and scrollable: three dev servers and a background task must not push
+   the composer off a short panel. */
+.task-dock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 25vh;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-5);
+  background: var(--sunken);
+  border-top: 1px solid var(--border);
+}
+.task-dock[hidden] { display: none; }
+
+.task-dock-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;                     /* lets the label ellipsise instead of pushing Stop out */
+}
+
+/* Green once the thing is actually up, amber while it is still starting —
+   the same distinction the card's own status makes, small enough to read as
+   a status light rather than as decoration. */
+.task-dock-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  animation: task-dock-pulse 1.8s ease-in-out infinite;
+}
+.task-dock-dot.ready { background: var(--green); animation: none; }
+@keyframes task-dock-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+.task-dock-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  color: var(--text);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.task-dock-label:hover .task-dock-name { text-decoration: underline; }
+
+.task-dock-name {
+  flex-shrink: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+/* The command or URL. First to give up space on a narrow sidebar, because the
+   name and the Stop button are what the row is for. */
+.task-dock-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
+}
+
+/* Recovered from a previous session: worth saying, because "still running" and
+   "started just now" call for different reactions, and the row is otherwise
+   identical. Amber rather than red — nothing is wrong, it simply predates this
+   window. */
+.task-dock-row.restored .task-dock-dot { background: var(--amber); animation: none; }
+.task-dock-tag {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid var(--amber-line);
+  border-radius: 3px;
+  padding: 1px 4px;
+  white-space: nowrap;
+}
+
+.task-dock-open,
+.task-dock-log {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.task-dock-open:hover,
+.task-dock-log:hover { color: var(--text); border-color: var(--border-hover); }
+
+.task-dock-stop {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--red);
+  background: var(--red-soft);
+  border: 1px solid var(--red-line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.task-dock-stop:hover:not(:disabled) { border-color: var(--red-line-strong); }
+.task-dock-stop:disabled { opacity: 0.6; cursor: default; }
+
 .composer {
   max-width: 100%;
   margin: 0 auto;

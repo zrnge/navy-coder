@@ -1013,6 +1013,34 @@ class NavyCoderViewProvider {
           // notification happen identically either way.
           if (message.id) await this.toolKillProcess(message.id);
           break;
+        case 'stopRestoredProcess': {
+          // A process from a PREVIOUS session: this window never had a handle
+          // on it, so it cannot go through toolKillProcess — it is identified
+          // by its task path and re-verified against the manifest before
+          // anything is signalled.
+          const root = message.root || this.projectRoot;
+          if (root && message.taskPath) {
+            const note = await this.stopRestoredProcess(root, message.taskPath);
+            if (note) this.view?.webview.postMessage({ type: 'statusText', text: note });
+          }
+          break;
+        }
+        case 'showRestoredLog': {
+          // "Show output" on a recovered row. The log is the only thing left of
+          // a process this window never owned, and it is a real file on disk.
+          const root = message.root || this.projectRoot;
+          const list = root ? await this._readBgManifest(root) : [];
+          const rec = list.find(r => (r.taskPath || this._taskPathFor(root, r.id)) === message.taskPath);
+          if (rec?.logPath) {
+            try {
+              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(rec.logPath));
+              await vscode.window.showTextDocument(doc, { preview: true });
+            } catch (e) {
+              vscode.window.showWarningMessage('Could not open that log: ' + e.message);
+            }
+          }
+          break;
+        }
         case 'openDiffFile':
           // "Open in editor" on a diff card — the card can only ever show a
           // truncated view of a large change, and it used to say "use the
@@ -1964,6 +1992,11 @@ class NavyCoderViewProvider {
       type: 'sessionLoaded', count: 0, memory, projectRoot: root,
       sessionPrompt: 0, sessionCompletion: 0, sessionTotal: 0, estimatedCost: null, costKnown: true,
     });
+    // Same reason loadProjectSession does it: 'restore' wipes the transcript,
+    // and with it the dev server's card and the dock row pointing at it. A new
+    // tab is not a new machine — anything still running has to be re-announced
+    // or its Stop button exists nowhere at all.
+    this._sendLiveCardState();
   }
 
   // Switches the ACTIVE tab to the session `sessionId` — used by tab clicks.
@@ -3054,6 +3087,11 @@ class NavyCoderViewProvider {
     // context window on a huge repo / big memory / long rules file — _compactMessages
     // only prunes tool results and images, never the system message.
     const cap = (s, n) => s.length > n ? s.slice(0, n) + `\n…[truncated ${s.length - n} chars]` : s;
+    // Same idea, from the other end. The turn ledger is oldest-first, so
+    // capping its head keeps turns 1-30 and drops everything recent — the exact
+    // inverse of what a record of "what has already been done" is for.
+    const capTail = (s, n) => s.length > n
+      ? `…[${s.length - n} earlier characters trimmed]\n` + s.slice(-n) : s;
     // navy.systemPrompt: user-supplied preferences, appended AFTER the mandatory
     // tool-use rules so it can't accidentally override them. Guarded against the
     // legacy pre-agentic-loop default text (SEARCH/REPLACE fence instructions) —
@@ -3072,6 +3110,13 @@ class NavyCoderViewProvider {
     }
     if (this.sessionDigest) {
       systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + cap(this.sessionDigest, 6000);
+    }
+    // Navy own record of what past turns actually did, stated by the harness
+    // in a place the model reads as context rather than as its own output, so
+    // there is no format here for it to imitate.
+    const historyLedger = this._historyLedger();
+    if (historyLedger) {
+      systemContent += '\n\n## What earlier turns already did (recorded by Navy — NOT your words; never reproduce this list in a reply)\n' + capTail(historyLedger, 4000);
     }
     if (diagnosticsContext) systemContent += diagnosticsContext;
     // Names and descriptions only — the bodies are read by activate_skill when
@@ -3185,12 +3230,13 @@ class NavyCoderViewProvider {
     }
 
     for (const item of this.messages) {
-      // Append a compact record of what the turn actually DID (files read/
-      // written, commands run) to the model-facing copy of its text — see
-      // _renderTurnLedger. item.text itself is left untouched, since it's
-      // also what the webview displays and what the digest below excerpts.
-      const ledger = item.role === 'assistant' ? this._renderTurnLedger(item.meta) : '';
-      messages.push({ role: item.role, content: item.text + ledger });
+      // Exactly what was said, and nothing else. What each turn DID is real
+      // and the model needs it — but it must NOT ride along on an assistant
+      // message: a model reads its own prior turns as examples of how it
+      // writes, so a note appended there becomes a format it copies. Once it
+      // is copying the shape it invents the contents too, reporting files it
+      // never touched. That record is in the system prompt now — _historyLedger.
+      messages.push({ role: item.role, content: item.text });
     }
 
     const userText = userParts.join('\n\n---\n\n');
@@ -3422,6 +3468,23 @@ class NavyCoderViewProvider {
             }
             footer = '\n\n---\n' + parts.join('  \n');
           }
+          // A turn that used tools escapes the guard above — it only catches a
+          // reply with no tool calls at all — so a model that ran commands and
+          // then reported files it never wrote passed unchallenged. This is the
+          // same claim checked against Navy's own record of the turn: if the
+          // report names files and nothing was written, renamed or deleted, say
+          // so rather than letting the claim stand.
+          // Only claimed when Navy could actually have seen the change. A turn
+          // that edited through run_command — `git apply`, `sed -i`, a codemod
+          // — changes files without any write TOOL being called, and warning
+          // there would call a true report a fabrication.
+          const fabricatedChangeClaim = !changedFiles.length && !deletedFiles.length
+            && !ranCmds.length
+            && this._claimsFilesChanged(responseText);
+          if (fabricatedChangeClaim) {
+            footer += (footer ? '\n' : '\n\n---\n')
+              + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but Navy did not write, rename or delete anything — check before relying on it.';
+          }
           if (hallucinationWarned) {
             footer += (footer ? '\n' : '\n\n---\n')
               + '⚠️ **No files were actually changed.** The model described a file action above but never called a tool — nothing was saved. Ask it to actually write/apply the change, or apply the code yourself.';
@@ -3515,7 +3578,7 @@ class NavyCoderViewProvider {
             }
             seenReadCalls.add(key);
             // Record what was actually looked at (capped) so a LATER turn can be told
-            // this turn already read/searched it — see _renderTurnLedger.
+            // this turn already read/searched it — see _historyLedger.
             if (taskChanges.reads.length < 12) {
               const d = this._describeReadCall(tool);
               if (d) taskChanges.reads.push(d);
@@ -3661,7 +3724,7 @@ class NavyCoderViewProvider {
         if (taskChanges.deleted.length) meta.deleted = taskChanges.deleted.filter(Boolean).map(p => path.basename(p));
         if (taskChanges.commands.length) {
           meta.commands = taskChanges.commands.length; // display only — media/main.js renders this as a count
-          meta.commandLog = taskChanges.commands;       // model-facing only — see _renderTurnLedger
+          meta.commandLog = taskChanges.commands;       // model-facing only — see _historyLedger
         }
         // reads: model-facing only — the webview has no use for it and ignores unknown meta keys.
         if (taskChanges.reads.length) meta.reads = taskChanges.reads;
@@ -3693,7 +3756,7 @@ class NavyCoderViewProvider {
           text: persistedText,
           ...(Object.keys(meta).length ? { meta } : {}),
           // Visual only. Kept off `meta` on purpose: meta is read back into the
-          // model's context by _renderTurnLedger, and the cards are already
+          // model's context by _historyLedger, and the cards are already
           // described there far more cheaply than replaying them as prose.
           ...(cardLog.length ? { cards: cardLog } : {}),
         });
@@ -3759,7 +3822,7 @@ class NavyCoderViewProvider {
   }
 
   // Short human-readable label for a read-type tool call, for the turn ledger
-  // (see _renderTurnLedger) — never shown in the chat UI, just fed back to the
+  // (see _historyLedger) — never shown in the chat UI, just fed back to the
   // model so it knows what a PAST turn actually looked at, not just what that
   // turn's reply claimed.
   _describeReadCall(tool) {
@@ -3794,7 +3857,30 @@ class NavyCoderViewProvider {
   // know it already read a file or ran a command two turns ago unless it
   // happened to mention that in prose, and routinely re-did work it had
   // already done. This gives it a compact, verifiable record instead.
-  _renderTurnLedger(meta) {
+  // Every past turn's real tool activity, numbered, as ONE block for the
+  // system prompt. Built from the same per-turn meta the tests pin, and
+  // deliberately placed outside the conversation itself: as an assistant-role
+  // suffix this record taught the model to end its replies with a bracketed
+  // activity list of its own — invented, since it was writing prose rather
+  // than reading a tool result — which is how a turn that changed nothing
+  // still claimed to have written files.
+  _historyLedger() {
+    const lines = [];
+    let turn = 0;
+    for (const item of this.messages) {
+      if (item.role !== 'assistant') continue;
+      turn++;
+      const parts = this._turnLedgerParts(item.meta);
+      if (parts) lines.push('- Turn ' + turn + ': ' + parts);
+    }
+    return lines.join('\n');
+  }
+
+  // The bare description of one turn's tool activity: "read a.js; wrote b.js".
+  // Shared by _historyLedger, which is the only consumer — it exists as its own
+  // function because the per-turn shape is what the tests pin and what any
+  // future per-turn use would want.
+  _turnLedgerParts(meta) {
     if (!meta) return '';
     const parts = [];
     if (meta.reads?.length) parts.push('read ' + meta.reads.join(', '));
@@ -3803,8 +3889,7 @@ class NavyCoderViewProvider {
     if (meta.commandLog?.length) {
       parts.push('ran ' + meta.commandLog.map(c => '"' + c.cmd + '"' + (c.exit === 0 ? ' (exit 0)' : ' (exit ' + c.exit + ')')).join(', '));
     }
-    if (!parts.length) return '';
-    return '\n\n[Tool activity that turn, for your own reference — do not repeat unnecessarily: ' + parts.join('; ') + ']';
+    return parts.join('; ');
   }
 
   // Sums token usage (and estimated cost) across every PERSISTED turn of the
@@ -3893,6 +3978,24 @@ class NavyCoderViewProvider {
   // otherwise trust that narration verbatim. Pure, so it's directly testable.
   // Deliberately requires a creation/change VERB near a file-ish NOUN (not just
   // the word "done") to avoid false positives on ordinary explanations.
+  // Does this reply's structured task report NAME files as changed? Rule 8 in
+  // TOOL_PROMPT asks for a `**Changed:**` line listing what the turn touched,
+  // and "No files changed" is its documented form for a turn that touched
+  // nothing — so anything else on that line is a claim about this turn's work,
+  // checkable against what Navy actually observed. Pure + testable.
+  _claimsFilesChanged(text) {
+    if (!text) return false;
+    const m = /(?:^|\n)\s*(?:\*\*)?Changed:?(?:\*\*)?\s*([^\n]*)/i.exec(text);
+    if (!m) return false;
+    const claim = m[1].trim().replace(/[`*_]/g, '');
+    if (!claim) return false;
+    // The documented ways of saying "nothing".
+    if (/^(?:none|nothing|no files? changed|no|n\/a|-+)$/i.test(claim)) return false;
+    // Must actually name something file-shaped, so prose like "Changed: the
+    // behaviour of the retry loop" is not read as a file claim.
+    return /[\w-]+\.[a-zA-Z0-9]{1,6}(?![\w])/.test(claim);
+  }
+
   _looksLikeFalseCompletionClaim(text) {
     if (!text || !text.trim()) return false;
     const verb = 'creat(?:ed|e)|written|wrote|writing|sav(?:ed|e)|add(?:ed)?|updat(?:ed|e)|modif(?:ied|y)|fix(?:ed)?|implement(?:ed)?|generat(?:ed|e)|appl(?:ied|y)|edit(?:ed|s)?|chang(?:ed|e)';
@@ -5720,7 +5823,8 @@ class NavyCoderViewProvider {
       proc.unref();
       Object.assign(entry, { proc, persist: true, root, pid: proc.pid, logPath });
       this.bgProcesses.set('__run_project__', entry);
-      await this._addToBgManifest(root, { id: '__run_project__', pid: proc.pid, command: cmd, startedAt: Date.now(), logPath, kind: 'run_project' });
+      await this._addToBgManifest(root, { id: '__run_project__', taskPath: this._taskPathFor(root, '__run_project__'),
+        pid: proc.pid, command: cmd, startedAt: Date.now(), logPath, kind: 'run_project' });
 
       let tries = 0;
       const poll = setInterval(() => {
@@ -5755,6 +5859,14 @@ class NavyCoderViewProvider {
     const proc = spawn(resolved.bin, resolved.args, this._spawnOptions(resolved, { detached: !isWin }));
     entry.proc = proc;
     this.bgProcesses.set('__run_project__', entry);
+    // Deliberately NOT written to the project's bg manifest. That file is
+    // shared by every window open on this project, and a non-persistent server
+    // belongs to THIS window — it is killed when this window closes
+    // (_disposeSession tree-kills it). Recording it made a sibling window
+    // classify a live server as an orphan from a previous session and offer to
+    // stop it, which is a far worse failure than the one it was added to
+    // catch. navy.persistBackgroundProcesses is the supported way to have a
+    // server outlive its window, and that path records and recovers properly.
 
     const onData = (chunk) => {
       const text = chunk.toString();
@@ -5768,6 +5880,13 @@ class NavyCoderViewProvider {
           const url = m[0].replace(/0\.0\.0\.0/, 'localhost');
           entry.url = url;
           this.view?.webview.postMessage({ type: 'runProjectReady', url });
+          // Persist it: after a restart the pid alone cannot tell anyone WHERE
+          // the server is, and "a process is running" is a much less useful
+          // thing to be told than "your dev server is still on this address".
+          // Only the persistent path has a manifest record to update.
+          if (entry.persist && entry.root) {
+            this._updateBgManifestEntry(entry.root, proc.pid, { url }).catch(() => {});
+          }
         }
       }
     };
@@ -5780,7 +5899,7 @@ class NavyCoderViewProvider {
       this.bgProcesses.delete('__run_project__');
       this.view?.webview.postMessage({ type: 'runProjectStopped', exitCode: entry.exitCode });
     });
-    proc.on('error', (e) => {
+    proc.on('error', () => {
       this.view?.webview.postMessage({ type: 'runProjectStopped', exitCode: -1 });
       this.bgProcesses.delete('__run_project__');
     });
@@ -5827,7 +5946,8 @@ class NavyCoderViewProvider {
       proc.unref();
       Object.assign(entry, { proc, persist: true, root: persistRoot, pid: proc.pid, logPath });
       this.bgProcesses.set(id, entry);
-      await this._addToBgManifest(persistRoot, { id, pid: proc.pid, command, startedAt: entry.startedAt, logPath, kind: 'start_process' });
+      await this._addToBgManifest(persistRoot, { id, taskPath: this._taskPathFor(persistRoot, id),
+        pid: proc.pid, command, startedAt: entry.startedAt, logPath, kind: 'start_process' });
 
       proc.on('exit', code => {
         entry.exitCode = code ?? 0;

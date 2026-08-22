@@ -22,3 +22,4 @@ eval/**
 # Same: the icon generator runs against a Font Awesome package at development
 # time and writes src/icons.js, which is what the bundle actually carries.
 tools/**
+panel-preview.html

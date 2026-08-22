@@ -1280,6 +1280,15 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'restore') {
     renderHistory(message.messages);
+    // The dock points at cards in the transcript, and this replaced all of
+    // them — a row pointing at a detached card would scroll nowhere. A
+    // process that is genuinely still alive re-registers itself on its next
+    // line of output, which is also when it gets its card back.
+    //
+    // Recovered rows stay: they belong to the PROJECT, not to a conversation.
+    // They never had a card here, and a dev server does not stop being up
+    // because you opened a different chat.
+    dropTasksWithCards();
     updateWelcome();
   }
 
@@ -1323,6 +1332,7 @@ window.addEventListener('message', (event) => {
     renderImagePreviews();
     updateAddButton();
     setQueuedBadge(0);
+    dropTasksWithCards();
   }
 
   if (message.type === 'models') {
@@ -1686,6 +1696,28 @@ window.addEventListener('message', (event) => {
     markBgProcessDone(message.id, message.exitCode);
   }
 
+  // Processes that outlived the window that started them. Navy records what it
+  // launches under a task path — navy/<project>/<task> — so after a restart it
+  // can say WHICH task is still running rather than only that some pid is.
+  if (message.type === 'restoredProcesses') {
+    for (const key of [...runningTasks.keys()]) {
+      if (runningTasks.get(key)?.restored) runningTasks.delete(key);
+    }
+    for (const p of message.processes || []) {
+      runningTasks.set(p.taskPath, {
+        label: p.label || p.taskPath,
+        detail: p.url || p.command || '',
+        status: 'ready',
+        restored: true,
+        url: p.url || '',
+        stopTitle: 'Stop',
+        showLog: () => vscode.postMessage({ type: 'showRestoredLog', root: message.root, taskPath: p.taskPath }),
+        stop: () => vscode.postMessage({ type: 'stopRestoredProcess', root: message.root, taskPath: p.taskPath }),
+      });
+    }
+    renderTaskDock();
+  }
+
   // ── Run-project card ──────────────────────────────────────────────────────────
   if (message.type === 'runProjectStart') {
     showRunProjectCard(message.projectName, message.command);
@@ -1739,6 +1771,13 @@ function getOrCreateBgTaskEl(taskId, promptText) {
 
   el.querySelector('.bg-task-abort').addEventListener('click', () => {
     vscode.postMessage({ type: 'killBackgroundTask', taskId });
+  });
+
+  setRunningTask('bg:' + taskId, {
+    label: promptText.slice(0, 48) + (promptText.length > 48 ? '…' : ''),
+    detail: 'background task', status: 'ready', cardEl: el,
+    stopTitle: 'Abort task',
+    stop: () => vscode.postMessage({ type: 'killBackgroundTask', taskId }),
   });
 
   messagesEl.appendChild(el);
@@ -1821,6 +1860,7 @@ function handleBgTaskUpdate(msg) {
     }
     refs.el.querySelector('.bg-task-abort')?.remove();
     bgTaskEls.delete(msg.taskId);
+    clearRunningTask('bg:' + msg.taskId);
     scrollToBottom();
   }
 }
@@ -1848,6 +1888,11 @@ function appendBgProcessOutput(id, chunk, isStderr) {
     if (welcomeEl) welcomeEl.style.display = 'none';
     refs = { el, outputEl: el.querySelector('.bg-process-output'), statusEl: el.querySelector('.bg-task-status') };
     bgProcessPanels.set(id, refs);
+    setRunningTask('proc:' + id, {
+      label: String(id), detail: 'background process', status: 'ready', cardEl: el,
+      stopTitle: 'Stop process',
+      stop: () => vscode.postMessage({ type: 'killBgProcess', id }),
+    });
   }
   const text = document.createTextNode(chunk);
   refs.outputEl.appendChild(text);
@@ -1869,9 +1914,132 @@ function markBgProcessDone(id, exitCode) {
   refs.statusEl.innerHTML = exitCode === 0 ? icon('check') + ' exited (0)' : icon('close') + ` exited (${escapeHtml(String(exitCode))})`;
   refs.el.querySelector('.bg-proc-stop')?.remove();
   bgProcessPanels.delete(id);
+  clearRunningTask('proc:' + id);
 }
 
 // ── Run-project persistent card ───────────────────────────────────────────────
+
+// ── Running-task dock ───────────────────────────────────────────────────────
+// A dev server, a background process and a /bg task all announce themselves as
+// a card in the transcript, and the transcript scrolls. Twenty replies later
+// the thing is still running and both its status and its Stop button are
+// somewhere far above — so the only way to stop a server you had forgotten was
+// to scroll for it, or to ask the model to do it.
+//
+// The dock mirrors what is running RIGHT NOW, immediately above the composer.
+// It deliberately mirrors rather than moves: the card stays where it happened,
+// because that is what says WHEN it started, and a card that relocated itself
+// would leave a hole in the record. Each row carries the same stop action as
+// the card, and clicking the row scrolls to the card itself.
+const taskDockEl = document.querySelector('#taskDock');
+const runningTasks = new Map(); // key → { label, detail, status, stop, cardEl }
+
+function setRunningTask(key, task) {
+  runningTasks.set(key, { ...(runningTasks.get(key) || {}), ...task });
+  renderTaskDock();
+}
+
+// Drops the rows tied to a card in THIS transcript, keeping the ones recovered
+// from a previous session, which have no card and outlive any one conversation.
+function dropTasksWithCards() {
+  for (const [key, t] of [...runningTasks]) if (!t.restored) runningTasks.delete(key);
+  renderTaskDock();
+}
+
+function clearRunningTask(key) {
+  if (runningTasks.delete(key)) renderTaskDock();
+}
+
+function renderTaskDock() {
+  if (!taskDockEl) return;
+  taskDockEl.innerHTML = '';
+  if (runningTasks.size === 0) {
+    taskDockEl.hidden = true;
+    return;
+  }
+  taskDockEl.hidden = false;
+
+  for (const [key, t] of runningTasks) {
+    const row = document.createElement('div');
+    row.className = 'task-dock-row';
+    row.dataset.key = key;
+
+    const dot = document.createElement('span');
+    dot.className = 'task-dock-dot' + (t.status === 'ready' ? ' ready' : '');
+    row.appendChild(dot);
+
+    const label = document.createElement('button');
+    label.type = 'button';
+    label.className = 'task-dock-label';
+    label.title = 'Show this in the conversation';
+    const name = document.createElement('span');
+    name.className = 'task-dock-name';
+    name.textContent = t.label || key;
+    label.appendChild(name);
+    if (t.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'task-dock-detail';
+      detail.textContent = t.detail;
+      label.appendChild(detail);
+    }
+    // The dock says something is running; the card says what it has been doing.
+    // Clicking here is how you get from one to the other.
+    label.addEventListener('click', () => {
+      const card = runningTasks.get(key)?.cardEl;
+      if (!card || !card.isConnected) return;   // a recovered row has no card
+      card.scrollIntoView({ block: 'center' });
+      card.classList.add('outline-target');
+      setTimeout(() => card.classList.remove('outline-target'), 1600);
+    });
+    row.appendChild(label);
+
+    // A process recovered from a previous session has no card in this
+    // transcript to point at — the conversation it belonged to is gone. It says
+    // where it came from instead, and offers its log, which is the only record
+    // of it that survived.
+    if (t.restored) {
+      row.classList.add('restored');
+      const tag = document.createElement('span');
+      tag.className = 'task-dock-tag';
+      tag.textContent = 'from a previous session';
+      tag.title = 'Started before this window was opened · ' + key;
+      row.appendChild(tag);
+    }
+    if (t.url) {
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'task-dock-open';
+      open.title = 'Open ' + t.url;
+      open.innerHTML = icon('external') + ' Open';
+      open.addEventListener('click', () => vscode.postMessage({ type: 'openUrl', url: t.url }));
+      row.appendChild(open);
+    }
+    if (t.showLog) {
+      const log = document.createElement('button');
+      log.type = 'button';
+      log.className = 'task-dock-log';
+      log.title = 'Open the log this process has been writing';
+      log.textContent = 'Log';
+      log.addEventListener('click', t.showLog);
+      row.appendChild(log);
+    }
+
+    if (t.stop) {
+      const stop = document.createElement('button');
+      stop.type = 'button';
+      stop.className = 'task-dock-stop';
+      stop.title = t.stopTitle || 'Stop';
+      stop.setAttribute('aria-label', (t.stopTitle || 'Stop') + ': ' + (t.label || key));
+      stop.innerHTML = icon('stopped') + ' Stop';
+      stop.addEventListener('click', () => {
+        stop.disabled = true;
+        t.stop();
+      });
+      row.appendChild(stop);
+    }
+    taskDockEl.appendChild(row);
+  }
+}
 
 let runProjectCardEl = null;
 
@@ -1914,6 +2082,11 @@ function showRunProjectCard(projectName, command) {
 
   appendTurnCard(card);
   runProjectCardEl = card;
+  setRunningTask('run-project', {
+    label: projectName, detail: command, status: 'starting', cardEl: card,
+    stopTitle: 'Stop server',
+    stop: () => vscode.postMessage({ type: 'stopRunProject' }),
+  });
   if (welcomeEl) welcomeEl.style.display = 'none';
   scrollToBottom();
 }
@@ -1937,6 +2110,7 @@ function setRunProjectReady(url) {
     });
   }
   if (wheelEl) wheelEl.classList.add('ready');
+  setRunningTask('run-project', { status: 'ready', detail: url });
   scrollToBottom();
 }
 
@@ -1967,6 +2141,7 @@ function setRunProjectStopped(exitCode) {
   if (wheelWrap) wheelWrap.innerHTML = `<span class="rp-stopped-icon">${icon('stopped')}</span>`;
   if (stopBtn)   stopBtn.remove();
   if (dotEl)     dotEl.classList.add('offline');
+  clearRunningTask('run-project');
 }
 
 function autoResize() {
@@ -4138,8 +4313,16 @@ function renderList(lines, startI, baseIndent) {
     i++;
   }
 
+  // A numbered list carries its own starting number. Anything that is not a
+  // list line ends the list — a fenced code block between two steps is the
+  // common case — so "1. step / ```code``` / 2. next" renders as two separate
+  // <ol>s, and the second one silently restarted at 1. Instructions numbered
+  // 1, 2, 3 in the model's text came out as 1, 1, 1 the moment they had code
+  // between them, which is most of the time here.
   const tag = isOrdered ? 'ol' : 'ul';
-  return [`<${tag}>${items.map(it => `<li>${it}</li>`).join('')}</${tag}>`, i];
+  const firstNum = isOrdered ? parseInt(lines[startI].trim(), 10) : 1;
+  const startAttr = isOrdered && firstNum > 1 ? ` start="${firstNum}"` : '';
+  return [`<${tag}${startAttr}>${items.map(it => `<li>${it}</li>`).join('')}</${tag}>`, i];
 }
 
 // Render inline markdown (bold, italic, code, links, strikethrough).
@@ -4153,14 +4336,73 @@ function renderInline(text) {
     codeSpans.push(c);
     return NUL + 'C' + (codeSpans.length - 1) + NUL;
   });
-  h = h.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  h = h.replace(/__(.+?)__/g, '<strong>$1</strong>');
-  h = h.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  h = h.replace(/_([^_]+)_/g, '<em>$1</em>');
+  // Emphasis, with the two guards that stop it eating code.
+  //
+  // `_` must not fire INSIDE a word — CommonMark's rule, and it exists for
+  // exactly the text a coding assistant writes constantly: `read_file`,
+  // `apply_edit`, `MAX_RETRIES`. Unguarded, the underscore in read_file opened
+  // emphasis and the one in EXIT_FAIL closed it, so both vanished and
+  // everything between them — often most of a paragraph — rendered italic.
+  //
+  // `*` gets the same treatment plus two more, because in this panel a `*` is
+  // far more often code than emphasis:
+  //   · not against whitespace or a slash — that is a glob. "delete *.log and
+  //     *.tmp" rendered as "delete <em>.log and </em>.tmp"; `**/*.spec.js` worse.
+  //   · not immediately before a closing bracket or separator — `items[*]`,
+  //     `func(*seq)` and `data[*],` are argument syntax, and emphasis never
+  //     begins with a `]`.
+  //   · not intraword — `2*3*4` is multiplication here, not `2<em>3</em>4`.
+  //
+  // The last one is a deliberate departure from CommonMark, which permits
+  // intraword `*`. The spec is written for prose; this is a panel where people
+  // paste shell and Python, and the same reasoning already applies to `_`.
+  // Emphasis that is actually meant — *word*, **word**, ***word*** — is
+  // untouched, and anything genuinely ambiguous can still be written in
+  // backticks, which are pulled out above before any of this runs.
+  // The closing-brace character is written as an escape rather than literally:
+  // test/run.js extracts this function from the source by counting braces, so a
+  // lone unbalanced one — in a string OR in a comment — truncates the extracted
+  // copy mid-function, and it no longer parses.
+  // BEFORE an opening run, and AFTER it — two different positions, and putting
+  // both on the left of the delimiter is why the second one did nothing at all:
+  // a lookahead placed there only ever inspected the `*` itself, which is never
+  // one of these characters, so `items[*]` and `f(*), g(*)` still emphasised.
+  const BEFORE = '(?<![A-Za-z0-9])';                        // before an opening run
+  const OPENED = '(?![\\s/\\]\\)\\u007D,;])';               // after an opening run
+  const AFTER = '(?![A-Za-z0-9])';                          // after a closing run
+  // A slash before the CLOSING delimiter only means "glob" for a single star —
+  // `src/*.ts`, where the star is the wildcard. For a `**` run it means the
+  // bolded text simply ended in a slash, which is what every URL does:
+  // "running at **http://localhost:5173/Vidz/**" rendered with its asterisks
+  // showing, because the closing run was refused. The glob shapes `**` has to
+  // survive (`**/*.spec.js`) are already stopped by OPENED, which refuses a run
+  // followed by a slash.
+  const CLOSE_RUN = '(?<!\\s)';                             // before a `**` / `***` close
+  const CLOSE_ONE = '(?<![\\s/])';                          // before a single `*` close
+  const star = (n) => new RegExp(
+    BEFORE + '\\*{' + n + '}' + OPENED + '((?:[^*\\n]|\\*(?!\\*{' + (n - 1) + '}))+?)' + CLOSE_RUN + '\\*{' + n + '}' + AFTER, 'g');
+  h = h.replace(star(3), '<strong><em>$1</em></strong>');
+  h = h.replace(star(2), '<strong>$1</strong>');
+  // `__x__` is bold in CommonMark, but a bare identifier between double
+  // underscores is a Python dunder — `__init__`, `__name__`, `__repr__` — far
+  // more often than it is bold, and models write bold as `**` anyway. Bold via
+  // `__` therefore requires the content to contain a space.
+  // The content must also not contain another `__`, or "__init__ and __repr__"
+  // matches as one run from the first delimiter to the last and swallows both
+  // dunders plus the words between them.
+  h = h.replace(/(?<![A-Za-z0-9])__((?:[^_\n]|_(?!_))*?\s(?:[^_\n]|_(?!_))*?)__(?![A-Za-z0-9])/g, '<strong>$1</strong>');
+  h = h.replace(new RegExp(BEFORE + '\\*' + OPENED + '([^*\\n]+?)' + CLOSE_ONE + '\\*' + AFTER, 'g'), '<em>$1</em>');
+  // `_` is excluded from the boundaries as well as the alphanumerics: a `_`
+  // sitting against another `_` belongs to a dunder run (`__init__`), not to an
+  // emphasis delimiter, and without this the italic rule picks up the inner
+  // pair the bold rule just declined and renders _<em>init</em>_.
+  h = h.replace(/(?<![A-Za-z0-9_])_([^_]+)_(?![A-Za-z0-9_])/g, '<em>$1</em>');
   h = h.replace(/~~(.+?)~~/g, '<del>$1</del>');
   h = h.replace(new RegExp(NUL + 'C(\\d+)' + NUL, 'g'), (_, i) => '<code>' + codeSpans[Number(i)] + '</code>');
-  h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+  // The URL may contain balanced parentheses — Wikipedia, MSDN and Rust docs
+  // all produce them, and `[^)]+` stopped at the first one, so the link was
+  // truncated to a 404 and the leftover `)` was printed after it.
+  h = h.replace(/\[([^\]]+)\]\(((?:[^()\s]|\([^()]*\))+)\)/g, (_, label, url) => {
     // url is HTML-escaped at this point — unescape & before using in href.
     const rawUrl = url.replace(/&amp;/g, '&');
     const safe = /^https?:\/\//i.test(rawUrl) ? rawUrl : '#';

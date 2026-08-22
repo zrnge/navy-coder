@@ -43,6 +43,7 @@ function parseArgs(argv) {
     else if (a === '--host')     out.host = argv[++i];
     else if (a === '--keep')     out.keep = true;
     else if (a === '--label')    out.label = argv[++i];
+    else if (a === '--repeat')   out.repeat = Math.max(1, parseInt(argv[++i], 10) || 1);
     else if (a === '--config') {
       // Any navy.* setting, as key=value — this is how an A/B run pins the
       // variable under test (e.g. --config reducedToolset=off for the arm
@@ -71,6 +72,7 @@ Navy eval runner
   npm run eval -- --keep                         keep temp repos for inspection
   npm run eval -- --config <key>=<value>         set any navy.* setting for the run (repeatable)
   npm run eval -- --label <name>                 tag the saved results file (e.g. an A/B arm)
+  npm run eval -- --repeat 3                     run every task N times and report the majority
 
 API key: set NAVY_EVAL_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY / …).
 Local Ollama needs no key.
@@ -332,6 +334,7 @@ async function main() {
     keep: args.keep,
     config: args.config || {},
     label: args.label || '',
+    repeat: args.repeat || 1,
     apiKey: process.env.NAVY_EVAL_API_KEY
       || process.env[(args.provider || '').toUpperCase() + '_API_KEY']
       || process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || '',
@@ -360,16 +363,63 @@ async function main() {
     return;
   }
 
-  console.log(`\nRunning ${tasks.length} task(s) against ${cfg.provider}/${cfg.model}\n`);
+  // --repeat runs every task N times. A single pass of this suite cannot tell a
+  // real change from a model having a good afternoon: the same 22 tasks on
+  // qwen2.5-coder:7b scored 74% and then 28% across two runs of an A/B whose
+  // arms differed in one setting. Repetition is what turns "it scored X" into
+  // "it scores X most of the time", and a task that passes 2 of 3 times is a
+  // different fact from one that passes always — which is why each task's
+  // per-run outcomes are kept, not just its best or its last.
+  const repeat = Math.max(1, cfg.repeat || 1);
+  console.log(`\nRunning ${tasks.length} task(s)${repeat > 1 ? ` x${repeat} runs` : ''} against ${cfg.provider}/${cfg.model}\n`);
   const results = [];
   for (let i = 0; i < tasks.length; i++) {
     const t = tasks[i];
     process.stdout.write(`  [${String(i + 1).padStart(2)}/${tasks.length}] ${t.id.padEnd(34)}`);
-    const r = await runTask(t, cfg, { vscode, ctrl });
+    const runs = [];
+    for (let n = 0; n < repeat; n++) runs.push(await runTask(t, cfg, { vscode, ctrl }));
+
+    // The reported status is the majority outcome, so one flaky run neither
+    // condemns a task that usually works nor rescues one that usually does not.
+    // A tie between PASS and FAIL is reported as FAIL: "passes half the time"
+    // is not a pass.
+    const tally = (s) => runs.filter(r => r.status === s).length;
+    // A genuine majority across all three outcomes. Comparing PASS against FAIL
+    // alone reported 1 PASS + 2 ERROR as a pass, which is the harness saying a
+    // task works on the strength of a single run it mostly could not measure.
+    // PASS must also out-number ERROR; a PASS/FAIL tie goes to FAIL, because
+    // "works half the time" is not a pass.
+    const status = (tally('PASS') > tally('FAIL') && tally('PASS') > tally('ERROR')) ? 'PASS'
+      : tally('FAIL') >= tally('ERROR') && tally('FAIL') > 0 ? 'FAIL' : 'ERROR';
+    const chosen = runs.find(r => r.status === status) || runs[0];
+    // Averaged, not summed — for every number here. A --repeat 3 arm whose
+    // tokens were added up read as a 3x cost regression against a single-run
+    // baseline, which is the opposite of what repeating is for: the point is a
+    // steadier estimate of one run, not a bigger one.
+    const mean = (pick) => Math.round(runs.reduce((a, x) => a + (pick(x) || 0), 0) / runs.length);
+    const r = {
+      ...chosen,
+      status,
+      ms: mean(x => x.ms),
+      tokens: {
+        prompt: mean(x => x.tokens?.prompt),
+        completion: mean(x => x.tokens?.completion),
+        modelCalls: mean(x => x.tokens?.modelCalls),
+      },
+      ...(repeat > 1 ? { runs: runs.map(x => x.status), passRate: tally('PASS') / runs.length } : {}),
+    };
     results.push(r);
-    const mark = r.status === 'PASS' ? 'PASS' : r.status === 'FAIL' ? 'FAIL' : ' ERR';
-    console.log(`${mark}  ${(r.ms / 1000).toFixed(1)}s`);
-    if (r.status !== 'PASS') console.log(`         ${r.reason}`);
+
+    const mark = status === 'PASS' ? 'PASS' : status === 'FAIL' ? 'FAIL' : ' ERR';
+    const spread = repeat > 1 ? `  ${tally('PASS')}/${repeat} passed` : '';
+    console.log(`${mark}  ${(r.ms / 1000).toFixed(1)}s${spread}`);
+    if (status !== 'PASS') console.log(`         ${r.reason}`);
+    // A task that does not agree with itself is the most useful thing this
+    // harness can tell you: it means any single-run comparison including it is
+    // measuring noise.
+    if (repeat > 1 && tally('PASS') > 0 && tally('PASS') < repeat) {
+      console.log(`         FLAKY — ${runs.map(x => x.status[0]).join('')}`);
+    }
   }
 
   const summary = report(results, cfg);
@@ -384,6 +434,7 @@ async function main() {
   fs.writeFileSync(outFile, JSON.stringify({
     provider: cfg.provider, model: cfg.model, ranAt: new Date().toISOString(),
     ...(cfg.label ? { label: cfg.label } : {}),
+    ...(cfg.repeat > 1 ? { repeat: cfg.repeat } : {}),
     ...(Object.keys(cfg.config).length ? { config: cfg.config } : {}),
     summary, results,
   }, null, 2));

@@ -1,5 +1,190 @@
 # Changelog
 
+## [Unreleased] - 0.3.0
+
+It started with two bugs reported from real use, both in what Navy *says* rather
+than what it does — `read_file` printed as *readfile* with half the paragraph
+italicised, and a turn that changed nothing announcing files it had written.
+They turned out to be the same bug twice: something appended to a message the
+model reads as its own, and a markdown rule that consumed characters it had no
+business touching.
+
+Hunting for the rest of that family is most of this release. Four more renderer
+bugs were sitting in plain sight — shell globs, numbered steps, links with
+parentheses in them, `__init__` — and the answer to "how do we stop finding
+these one at a time" is a property rather than another list of cases: text whose
+`_` and `*` are all identifiers and globs must come through with nothing missing
+and no emphasis invented. Run against the renderer as it shipped in 0.2.9, it
+fails on 17 of its 19 lines.
+
+The other half is about knowing what is running. A dev server used to announce
+itself as a card and then scroll away, taking its Stop button with it, and a
+process that outlived its window left nothing behind but a notification you
+could miss. Both now sit above the chat input for as long as they are running.
+
+### Added
+
+- **Anything still running stays above the composer.** A dev server, a
+  background process and a `/bg` task each announce themselves as a card where
+  they were started — and then the conversation moves on. Twenty replies later
+  the server is still up, but its status and its Stop button have scrolled out
+  of reach, so the only ways to stop one you had forgotten were to hunt for the
+  card or to ask the model to do it.
+
+  A dock now sits directly above the input listing what is running right now,
+  each row with the stop action that belongs to it: Stop server, Stop process,
+  Abort task. A dev server shows the command while it is starting and its URL
+  once it is up, with a status light that stops pulsing when it is live.
+
+  It mirrors rather than moves. The card stays exactly where it happened,
+  because that is what records WHEN it started, and a card that relocated itself
+  would leave a hole in the conversation — clicking a dock row scrolls to that
+  card and marks it. Rows leave as their processes end, and the dock takes real
+  height rather than floating, so it can never cover the last line of a reply.
+  It is capped at a quarter of the panel and scrolls beyond that, so three
+  servers cannot push the composer off a short window.
+
+- **Every background task now has a path, and survives a restart with it.**
+  Navy records what it launches under `navy/<project>/<task>` — a dev server is
+  `navy/Vidz/dev-server`, a watcher is `navy/Vidz/tsc-watch`. A pid was never an
+  identity: it is recycled, it means nothing once the window is gone, and nobody
+  recognises one. A task path names the project and the job, reads the same in
+  every window, and is what a stop request refers to.
+
+  It is what makes reopening useful. A process started with
+  `navy.persistBackgroundProcesses` on outlives the window that launched it, and
+  the only sign of that used to be a notification at startup — dismiss it, or
+  miss it while the window was still loading, and nothing anywhere said your dev
+  server was still up. Recovered processes now appear in the task dock above the
+  composer, marked as predating this window, each with **Stop**, its **Log**,
+  and — because the detected URL is recorded too, not just the pid — **Open**
+  for a dev server that is still serving on the address it had before.
+
+  They belong to the project rather than to a conversation, so switching chats
+  does not retire them. Stopping one names its task path and never a pid: the
+  record is looked up and re-verified as Navy's own immediately before anything
+  is signalled, because minutes can pass between the check that put a row on
+  screen and the click, and a recycled pid must never be killed on Navy's word.
+
+- **A property test instead of another list of cases.** Every renderer bug found
+  so far was one failure wearing different clothes: characters that were not
+  markup vanished, and emphasis appeared where none was asked for. That is
+  checkable without predicting the next variant — take lines whose `_` and `*`
+  are all identifiers, globs and argument lists, and assert that nothing goes
+  missing and no emphasis is invented. Run against the renderer as it shipped in
+  0.2.9, it fails on 17 of its 19 lines, including the exact text from the bug
+  report. The enumerated cases each had to be thought of first; this one only
+  had to be written once.
+
+- **`npm run preview` opens the panel in a browser.** The one thing no suite
+  here can check is what the panel looks like: jsdom never paints, and the VS
+  Code integration suite is deliberately not a rendering test — so the icons in
+  0.2.9 shipped verified in structure and never once looked at. This builds a
+  standalone page from the real markup, the real stylesheet and the real
+  webview script, drives it with a scripted conversation that exercises every
+  slash-menu icon, both message roles, the cards, a queued prompt and the
+  markdown shapes that have been buggy, and opens it. It supplies both a light
+  and a dark palette so a colour that only works on one theme has somewhere to
+  show itself.
+
+- **`npm run lint` — ESLint has never actually run on this repo.** It was in
+  devDependencies with no configuration at all, so it only ever printed a
+  migration notice. The config is deliberately narrow: every rule catches a real
+  defect, none of them are style, and there are no plugin dependencies. It found
+  one thing immediately — a test asserting `shardOf(x) === shardOf(x)`, which
+  holds just as well if the function returns undefined for everything.
+
+- **`npm run eval -- --repeat N`.** A single pass of the eval suite cannot
+  tell a
+  real change from a model having a good afternoon: the same 22 tasks scored 74%
+  and then 28% across two runs of an A/B whose arms differed in one setting.
+  Repeat runs each task N times, reports the majority outcome, and marks any
+  task that disagrees with itself as FLAKY — which is the most useful thing the
+  harness can say, because it means every single-run comparison including that
+  task was measuring noise.
+
+### Fixed
+
+- **A new chat tab lost the dev server's Stop button.** Opening a tab replaces
+  the transcript, which takes the run-project card and its dock row with it —
+  and unlike switching chats, opening one never re-announced what was still
+  running. A new tab is not a new machine.
+
+
+- **`read_file` rendered as *readfile*, and took the rest of the paragraph
+  into italics with it.** Emphasis with `_` was firing inside words. Every reply
+  a coding assistant writes is full of snake_case — `read_file`, `apply_edit`,
+  `MAX_RETRIES` — so the underscore in one identifier opened emphasis and the
+  underscore in the next closed it: both disappeared, and everything between
+  them rendered italic. Two identifiers in a sentence was enough, which made
+  this one of the most-hit bugs in the panel while looking like a rare one.
+
+  `_` can no longer open or close emphasis against a letter or digit, which is
+  what CommonMark specifies and why it specifies it. `*` stays intraword-capable
+  — also per the spec — and `_emphasis_`, `__bold__` and `__init__` are
+  unaffected. Eight cases are pinned, one of them the exact line from the
+  report.
+
+- **Navy claimed it had changed files it never touched, and printed its own
+  internal notes into the chat.** One cause. After each turn Navy appends a
+  compact record of what that turn actually did — files read, files written,
+  commands run — for the model to consult on the next turn, so it does not redo
+  work it has already done. That record was appended to the **assistant**
+  message, and a model reads its own prior turns as examples of how it writes.
+  So it started ending replies with a bracketed activity list of its own; and
+  because it was writing prose rather than reading a tool result, it invented
+  the contents. A turn that changed nothing still announced files it had
+  "written", with Navy's own internal note visible underneath.
+
+  The record now goes in the system prompt, where a model reads it as context
+  rather than as its own output, so there is no format there to imitate.
+  Assistant messages carry only what the model actually said.
+
+- **Shell globs were eaten the same way.** `*` had no guard either, so "delete
+  *.log and *.tmp" lost both asterisks and italicised the middle, and
+  `**/*.spec.js` came out worse. A `*` sitting
+  against whitespace cannot close emphasis — that is CommonMark's own flanking
+  rule — and Navy adds one of its own: a `*` against a slash is a path, not
+  emphasis. `def f(*args, **kwargs)` survives now too. Intraword `2*3*4` still
+  works, as the spec allows.
+
+- **Numbered steps restarted at 1 after every code block.** Anything that is not
+  a list line ends a list, and a fenced block between two steps is the commonest
+  shape this panel produces — so "1. do this / ```code``` / 2. then that" was
+  rendered as two lists and the second began again at 1. The continuation now
+  carries the number the model actually wrote, so a list that starts at 5 does
+  too.
+
+- **A link whose URL contained parentheses was truncated.** Wikipedia, MSDN and
+  Rust doc URLs all have them; the URL was cut at the first `)`, giving a 404
+  and a stray `)` printed after the link.
+
+- **`__init__` rendered as bold *init*, and `items[*]` italicised itself.** Two
+  more of the same, found by the property test rather than by report. Both are
+  deliberate departures from CommonMark now: a bare identifier between double
+  underscores is a Python dunder far more often than it is bold (and models
+  write bold as `**` anyway), and `*` no longer fires intraword, because in this
+  panel `2*3*4` is multiplication. The spec is written for prose; this is a
+  panel full of Python and shell. Anything genuinely ambiguous can still be
+  written in backticks, which are lifted out before any emphasis rule runs.
+
+- **`tools/` was not syntax-checked.** `npm run check` scans `src`, `media`,
+  `test` and `eval` — the directory added in 0.2.9 was never on that list, so
+  the icon generator and the preview builder could have shipped unparseable.
+
+- **A truncated test extraction reported itself as "Unexpected end of input".**
+  `test/run.js` lifts pure functions out of the shipped source by counting
+  braces, and a lone brace inside a string or a comment ends the function early.
+  The extracted copy then fails to parse with an error naming neither the
+  function nor the cause. It now says which function stopped early and why.
+
+- **A false "Changed:" claim could pass unchallenged.** The hallucination guard
+  only fires when a turn calls no tools at all, so a model that ran commands and
+  then reported files it never wrote slipped past it. Navy now checks the
+  reply's own `Changed:` line against its record of the turn, and says plainly
+  when they disagree. The documented "No files changed" form, and prose that
+  names no file, are correctly left alone.
+
 ## [0.2.9] - 2026-08-21
 
 Three changes you can see and one you can't. The agent asks small models to

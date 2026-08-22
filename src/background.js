@@ -28,6 +28,21 @@ class BackgroundMethods {
 
   _bgManifestPath(root) { return path.join(root, '.navy', 'bg-processes.json'); }
 
+  // The stable handle for one background task: `navy/<project>/<task>`.
+  //
+  // A pid is not an identity — it is reused, it means nothing after a restart,
+  // and it is not something a person can recognise. This is: it names the
+  // project and the task, it is the same string across windows and restarts,
+  // and it is what the panel shows, what the log file is named after, and what
+  // a stop request refers to. `__run_project__` is spelled `dev-server` here
+  // because the path is read by people.
+  _taskPathFor(root, id) {
+    const project = path.basename(root || '') || 'project';
+    const task = id === '__run_project__' ? 'dev-server' : String(id || 'task');
+    const safe = (s) => String(s).replace(/[^a-z0-9._-]/gi, '-').replace(/^-+|-+$/g, '') || 'x';
+    return `navy/${safe(project)}/${safe(task)}`;
+  }
+
   async _readBgManifest(root) {
     const parsed = await this._readJsonFile(this._bgManifestPath(root), []);
     return Array.isArray(parsed) ? parsed : [];
@@ -60,6 +75,18 @@ class BackgroundMethods {
     return this._withBgManifestLock(root, async () => {
       await this.ensureNavyDir(root);
       return this._rmwJsonFile(this._bgManifestPath(root), [], (list) => [...(Array.isArray(list) ? list : []), record]);
+    });
+  }
+
+  // Merges fields into the record for one live pid — used when something about
+  // a running process becomes known only later, the dev server's URL being the
+  // case that matters: it appears in the output seconds after the spawn that
+  // wrote the record.
+  async _updateBgManifestEntry(root, pid, fields) {
+    return this._withBgManifestLock(root, async () => {
+      await this.ensureNavyDir(root);
+      return this._rmwJsonFile(this._bgManifestPath(root), [], (list) =>
+        (Array.isArray(list) ? list : []).map(r => r && r.pid === pid ? { ...r, ...fields } : r));
     });
   }
 
@@ -274,19 +301,101 @@ class BackgroundMethods {
       return;
     }
 
+    // Show them in the panel, not only in a notification. A dialog is a single
+    // moment: dismiss it — or miss it, because it arrives while the window is
+    // still opening — and there is nothing left anywhere saying a server is
+    // still up. These go into the task dock instead, where they sit above the
+    // composer with the same Stop button a process started in THIS window has,
+    // and where a dev server still carries the address it was serving on.
+    this._postRestoredProcesses(root, ours);
+
     const label = ours.length === 1 ? '1 background process' : `${ours.length} background processes`;
     const names = ours.map(describe).join(', ');
     const unverifiedNote = unverified.length
       ? ` (${unverified.length} further record(s) could not be verified and will be left alone.)`
       : '';
     const choice = await vscode.window.showWarningMessage(
-      `Navy left ${label} running from a previous session: ${names}. Stop them, or leave them running?${unverifiedNote}`,
+      `Navy left ${label} running from a previous session: ${names}. They are listed above the chat input, where you can stop them individually.${unverifiedNote}`,
       { modal: false }, 'Stop All', 'Leave Running'
     );
     if (choice === 'Stop All') {
       for (const rec of ours) this._killPidTree(rec.pid);
       await this._withBgManifestLock(root, () => this._writeBgManifest(root, unverified));
+      this._postRestoredProcesses(root, []);
     }
+  }
+
+  // Hands the webview everything that survived, keyed by its task path, and
+  // remembers which paths were shown for this root — stopRestoredProcess only
+  // ever re-posts those, so a later post can never introduce a row for a
+  // process this window owns and is already showing live.
+  _postRestoredProcesses(root, records) {
+    this._restoredShown = this._restoredShown || new Map();
+    this._restoredShown.set(root, new Set(
+      records.map(r => r.taskPath || this._taskPathFor(root, r.id))));
+    this.view?.webview.postMessage({
+      type: 'restoredProcesses',
+      root,
+      processes: records.map(r => ({
+        taskPath: r.taskPath || this._taskPathFor(root, r.id),
+        id: r.id,
+        label: r.id === '__run_project__' ? (path.basename(root || '') || 'dev server') : String(r.id),
+        command: r.command || '',
+        url: r.url || '',
+        pid: r.pid,
+        startedAt: r.startedAt || 0,
+      })),
+    });
+  }
+
+  // Stops one recovered process, by task path rather than by pid: the webview
+  // must never be able to name an arbitrary pid to kill. The record is looked
+  // up in the manifest and re-verified as ours immediately before the signal —
+  // the same check that guards the Stop All path, for the same reason, since
+  // minutes may have passed since the classification that put it on screen.
+  async stopRestoredProcess(root, taskPath) {
+    // Only the rows this window actually put on screen are ever re-posted.
+    // Re-sending the whole manifest would hand the panel this window's OWN live
+    // dev server as a row labelled "from a previous session", sitting next to
+    // the live one it already has.
+    const shown = this._restoredShown?.get(root);
+    const repost = async () => {
+      const list = await this._readBgManifest(root);
+      this._postRestoredProcesses(root,
+        list.filter(r => shown?.has(r.taskPath || this._taskPathFor(root, r.id))));
+    };
+
+    const list = await this._readBgManifest(root);
+    const rec = list.find(r => (r.taskPath || this._taskPathFor(root, r.id)) === taskPath);
+    if (!rec) {
+      // Re-post what IS still there rather than an empty list: an empty one
+      // tells the panel to drop every recovered row, including a second process
+      // that is still running and still needs its Stop button.
+      await repost();
+      return 'That process is no longer recorded — nothing to stop.';
+    }
+
+    const state = await this._classifyBgRecord(rec);
+    if (state === 'unverified') {
+      // Left in the manifest on purpose. An unverifiable record is the one case
+      // where Navy does not know what it is looking at, and dropping it makes a
+      // genuine orphan invisible forever — the opposite of what a record is
+      // for. Reported, never pruned, never signalled.
+      await repost();
+      return 'That pid could not be verified as the process Navy started, so it was left alone and kept on record.';
+    }
+    if (state === 'gone') {
+      await this._withBgManifestLock(root, () => this._writeBgManifest(root, list.filter(r => r !== rec)));
+      shown?.delete(taskPath);
+      await repost();
+      return 'That process had already exited.';
+    }
+
+    this._killPidTree(rec.pid);
+    await this._withBgManifestLock(root, () => this._writeBgManifest(root, list.filter(r => r !== rec)));
+    shown?.delete(taskPath);
+    await repost();
+    return `Stopped ${taskPath}.`;
   }
 }
 

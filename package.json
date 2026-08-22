@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -517,6 +517,8 @@
     "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "check": "node test/check-syntax.js",
+    "lint": "eslint .",
+    "preview": "node tools/preview.js",
     "vscode:prepublish": "npm run build",
     "package": "vsce package",
     "test": "node test/run.js && node test/webview-run.js",

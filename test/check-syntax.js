@@ -19,7 +19,7 @@ const path = require('path');
 const vm = require('vm');
 
 const ROOT = path.join(__dirname, '..');
-const DIRS = ['src', 'media', 'test', 'eval'];
+const DIRS = ['src', 'media', 'test', 'eval', 'tools'];
 const SKIP = new Set(['node_modules', 'dist', '.git', '.vscode-test', 'fixture']);
 
 function walk(dir, out = []) {

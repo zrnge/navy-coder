@@ -12,3 +12,4 @@ scratchpad/
 eval/results/*
 !eval/results/baseline*.json
 eval-weak.log
+panel-preview.html

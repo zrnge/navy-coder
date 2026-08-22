@@ -440,6 +440,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
            however tall the textarea has grown. -->
       <!-- Centred above the composer, on its own now that the step arrows have
            moved to the ends of the scrollbar. -->
+      <!-- Anything still running, docked where it cannot scroll away. The card
+           in the transcript stays exactly where it happened — that is the
+           record of when it started — but a dev server you launched twenty
+           replies ago scrolls out of reach, and its Stop button with it. This
+           mirrors the live ones only, and empties itself as they end. -->
+      <div id="taskDock" class="task-dock" hidden aria-live="polite"></div>
       <div class="chat-nav">
         <button type="button" id="jumpLatest" class="jump-latest" hidden>
           <span id="jumpLatestText">Jump to latest</span>
