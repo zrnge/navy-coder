@@ -139,7 +139,7 @@ async function fetchWithRetry(url, init) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...ollamaAuthHeaders(apiKey) },
       body: JSON.stringify(ollamaBody),
-      signal: signal || provider.abortController.signal
+      signal: signal || provider.abortController?.signal
     });
 
     if (!response.ok || !response.body) {
@@ -360,7 +360,7 @@ async function fetchWithRetry(url, init) {
       method: 'POST',
       headers: anthropicHeaders,
       body: JSON.stringify(b),
-      signal: signal || provider.abortController.signal,
+      signal: signal || provider.abortController?.signal,
     });
 
     const looksLikeCachingIssue = (txt) => /cache_control|cache/i.test(txt);
@@ -509,7 +509,7 @@ async function fetchWithRetry(url, init) {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-      signal: signal || provider.abortController.signal
+      signal: signal || provider.abortController?.signal
     });
 
     if (!response.ok || !response.body) {
@@ -673,7 +673,7 @@ async function fetchWithRetry(url, init) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
-      signal: signal || provider.abortController.signal,
+      signal: signal || provider.abortController?.signal,
     });
 
     if (!response.ok || !response.body) {

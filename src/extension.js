@@ -238,7 +238,32 @@ const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files',
   // activate_skill only reads a file the user installed. What a skill then
   // TELLS the model to do is gated as it always was — see src/skills.js.
   'activate_skill',
-  'web_search','fetch_url','get_terminal_output','read_process_output']);
+  'web_search','fetch_url','get_terminal_output','read_process_output',
+  // A sub-agent only ever reads, so delegating is parallel-safe: two
+  // investigations of different questions share nothing but the filesystem
+  // they are both reading. This is what lets a model fan out — "how does auth
+  // work here" and "where is the retry logic" answered at the same time rather
+  // than one after the other, each costing a full model-call budget in series.
+  'delegate_research']);
+
+// What a delegate_research sub-agent is itself allowed to call: everything
+// parallel-safe EXCEPT delegating again.
+//
+// The two sets were one, which was right while they agreed. They stopped
+// agreeing the moment delegation became parallel-safe: an agent that can
+// delegate can delegate to an agent that can delegate, and that recursion has
+// no natural floor. Each level costs its own model-call budget, the cost lands
+// on the delegating turn, and nothing in the returned text would tell you it
+// had happened. Derived from READ_ONLY by subtraction rather than written out
+// again, so a tool added to one is still added to both.
+const SUB_AGENT_TOOLS = new Set([...READ_ONLY].filter(n => n !== 'delegate_research'));
+
+// How many sub-agents may run at once. The batching path imposes no limit of
+// its own — for reads that is fine, but each delegation is a whole agent loop
+// with its own model calls, so a model that emitted a dozen would spend twelve
+// budgets simultaneously. Four is enough for the fan-out this exists for and
+// small enough that a runaway is bounded rather than expensive.
+const MAX_CONCURRENT_DELEGATIONS = 4;
 
 // Every shell Navy can run a command STRING through (navy.shell). Three
 // properties matter and they are not interchangeable:
@@ -555,6 +580,10 @@ class Session {
     // toolDelegateResearch is a separate method with no other channel back
     // into the turn's own token accounting.
     this.subAgentTokens = { prompt: 0, completion: 0 };
+    // Sub-agents running RIGHT NOW in this chat. Delegation is parallel-safe, so
+    // a model can fan several investigations out at once — this is what keeps
+    // that bounded. See MAX_CONCURRENT_DELEGATIONS.
+    this._activeDelegations = 0;
     // The model the currently-running turn was invoked with (the picker's
     // choice arrives per-request, so it can differ from navy.model). Read by
     // tools that make their own model calls — see toolDelegateResearch.
@@ -1532,7 +1561,7 @@ class NavyCoderViewProvider {
         apiBase:      c.get('apiBase',           ''),
         searchApiKey: maskedSearchKey,
         temperature:  c.get('temperature',       0.2),
-        maxIter:      c.get('maxToolIterations', 50),
+        maxIter:      c.get('maxToolIterations', 100),
         editFormat:   c.get('editFormat',        'search-replace'),
         systemPrompt: c.get('systemPrompt',      ''),
         speechVoice:  c.get('speechVoice',       ''),
@@ -2357,7 +2386,7 @@ class NavyCoderViewProvider {
     // Ollama speaks its own API; everyone else goes through the shared builder.
     const req = provider === 'ollama'
       ? { url: this._ollamaBase() + '/api/tags', headers: ollamaAuthHeaders(this._ollamaKey ? await this._ollamaKey() : apiKey) }
-      : this._modelListRequest(provider, config.get('apiBase', ''), config.get('host', ''), apiKey);
+      : this._modelListRequest(provider, config.get('apiBase', ''), config.get('host', 'http://localhost:11434'), apiKey);
 
     let verdict;
     try {
@@ -3081,7 +3110,7 @@ class NavyCoderViewProvider {
     // Map thinking level to temperature.
     const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7 };
     const temperature = tempByLevel[this.thinkingLevel] ?? config.get('temperature', 0.2);
-    const maxIterations = config.get('maxToolIterations', 50);
+    const maxIterations = config.get('maxToolIterations', 100);
     const maxContextChars = config.get('maxContextChars', 12000);
 
     // Reduced tool tier for small models — decided once so the system prompt
@@ -6362,7 +6391,7 @@ class NavyCoderViewProvider {
       const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
       const model = this.currentModel || config.get('model', '');
       const temperature = config.get('temperature', 0.2);
-      const maxIter = config.get('maxToolIterations', 50);
+      const maxIter = config.get('maxToolIterations', 100);
 
       const bgMessages = [
         { role: 'system', content: TOOL_PROMPT },
@@ -6548,6 +6577,25 @@ class NavyCoderViewProvider {
     // value should fall back to the default.
     const parsedSteps = parseInt(maxSteps, 10);
     const steps = Math.min(Math.max(Number.isFinite(parsedSteps) ? parsedSteps : 12, 1), 20);
+    // Refuse rather than queue. A queued delegation would sit holding the whole
+    // turn open while the model waited on a result it could not see coming;
+    // told plainly that it asked for too many at once, it can run the rest in
+    // the next step, which is the same work in a shape the user can follow.
+    const inFlight = this._session._activeDelegations || 0;
+    if (inFlight >= MAX_CONCURRENT_DELEGATIONS) {
+      return `[Refused: ${inFlight} research sub-agents are already running, which is the limit (${MAX_CONCURRENT_DELEGATIONS}). Wait for these results, then delegate the rest.]`;
+    }
+    this._session._activeDelegations = inFlight + 1;
+    try {
+      return await this._runDelegatedResearch(task, steps);
+    } finally {
+      this._session._activeDelegations = Math.max(0, (this._session._activeDelegations || 1) - 1);
+    }
+  }
+
+  // The sub-agent loop itself. Split out so the concurrency bookkeeping above
+  // cannot be skipped by an early return from inside it.
+  async _runDelegatedResearch(task, steps) {
     const config = vscode.workspace.getConfiguration('navy');
     // The model the DELEGATING turn is actually running on, not whatever
     // navy.model happens to say: the model picker sends its choice with the
@@ -6606,8 +6654,10 @@ ${task.trim()}`;
 
       for (const tool of nonFinish) {
         let result;
-        if (!READ_ONLY.has(tool.name)) {
-          result = `[Refused: delegate_research sub-agents are read-only — "${tool.name}" is not permitted. State your findings as text; the delegating agent will make any actual changes.]`;
+        if (!SUB_AGENT_TOOLS.has(tool.name)) {
+          result = tool.name === 'delegate_research'
+            ? '[Refused: "delegate_research" is not available inside a sub-agent — a sub-agent cannot delegate further. Investigate this yourself with the read-only tools, or say in your report that the question needs its own investigation.]'
+            : `[Refused: delegate_research sub-agents are read-only — "${tool.name}" is not permitted. State your findings as text; the delegating agent will make any actual changes.]`;
         } else {
           try { result = await this.executeTool(tool); }
           catch (e) { result = 'Error: ' + e.message; }

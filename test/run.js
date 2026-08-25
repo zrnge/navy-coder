@@ -7633,6 +7633,183 @@ async function diagnosticsSuite() {
   }
 }
 
+
+// Delegation used to be strictly one at a time: two unrelated questions cost
+// two full sub-agent budgets in series. It is parallel-safe — a sub-agent only
+// reads — so it now rides the same batching path as any other read-only call.
+// Which makes recursion the thing to pin: an agent that can delegate can
+// delegate to an agent that can delegate, and that has no natural floor.
+async function delegationFanOutSuite() {
+  console.log('\ndelegation fan-out (concurrent, bounded, non-recursive):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-fanout-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider.view = { webview: { postMessage: () => {} } };
+    provider._wslCache = { available: false };
+    // Delegation only ever happens inside a turn, which always has a controller.
+    provider.abortController = new AbortController();
+    fs.writeFileSync(path.join(tmp, 'a.txt'), 'alpha');
+
+    // ── delegate_research is now parallel-safe, and the sub-agent's own
+    //    permitted set is READ_ONLY minus delegating again. ────────────────
+    const extSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
+    check('READ_ONLY now contains delegate_research (so batching can run several)',
+      /'delegate_research'\]\);/.test(extSrc));
+    check('SUB_AGENT_TOOLS is derived from READ_ONLY, not written out again',
+      /SUB_AGENT_TOOLS = new Set\(\[\.\.\.READ_ONLY\]\.filter/.test(extSrc));
+    check('the sub-agent loop gates on SUB_AGENT_TOOLS, not READ_ONLY',
+      /if \(!SUB_AGENT_TOOLS\.has\(tool\.name\)\)/.test(extSrc));
+
+    // ── Two delegations issued together actually overlap. ─────────────────
+    // Each sub-agent answers in one model call, after a delay, so overlap is
+    // observable: serial execution cannot interleave the markers.
+    const events = [];
+    let call = 0;
+    global.fetch = async () => {
+      const id = ++call;
+      events.push('start:' + id);
+      await new Promise(r => setTimeout(r, 25));
+      events.push('end:' + id);
+      const evt = { message: { role: 'assistant', content: 'Findings for call ' + id }, done: true, prompt_eval_count: 5, eval_count: 5 };
+      return { ok: true, status: 200, body: makeOneShotBody(evt), text: async () => '' };
+    };
+
+    const both = await Promise.all([
+      provider.toolDelegateResearch('how does auth work', 2),
+      provider.toolDelegateResearch('where is the retry logic', 2),
+    ]);
+    check('two delegations run concurrently, not one after the other',
+      events.indexOf('start:2') < events.indexOf('end:1'), events.join(' | '));
+    check('each delegation returns its own findings',
+      both.length === 2 && both.every(r => /Findings for call/.test(r)), JSON.stringify(both));
+    check('the in-flight counter is back to zero afterwards', provider._session._activeDelegations === 0);
+
+    // ── Bounded. A runaway model must not spend a dozen budgets at once. ──
+    let release;
+    const held = new Promise(r => { release = r; });
+    global.fetch = async () => {
+      await held;
+      const evt = { message: { role: 'assistant', content: 'done' }, done: true, prompt_eval_count: 1, eval_count: 1 };
+      return { ok: true, status: 200, body: makeOneShotBody(evt), text: async () => '' };
+    };
+    const running = [];
+    for (let i = 0; i < 4; i++) running.push(provider.toolDelegateResearch('task ' + i, 1));
+    // Let the four register before asking for a fifth.
+    await new Promise(r => setImmediate(r));
+    const fifth = await provider.toolDelegateResearch('one too many', 1);
+    check('a fifth concurrent delegation is refused, not queued', /Refused/.test(fifth) && /limit \(4\)/.test(fifth), fifth);
+    check('…and the refusal tells the model what to do instead', /Wait for these results/.test(fifth));
+    release();
+    await Promise.all(running);
+    check('the counter drains back to zero after a refusal', provider._session._activeDelegations === 0);
+
+    // ── A sub-agent cannot delegate further. ─────────────────────────────
+    // One model call asks to delegate, the next answers in text.
+    const replies = [
+      { toolCalls: [{ name: 'delegate_research', args: { task: 'recurse forever' } }] },
+      { text: 'I could not delegate, so here is what I found directly.' },
+    ];
+    let n = 0;
+    global.fetch = async () => {
+      const next = replies[n++] || { text: 'done' };
+      const evt = next.toolCalls
+        ? { message: { role: 'assistant', content: '', tool_calls: next.toolCalls.map(tc => ({ function: { name: tc.name, arguments: JSON.stringify(tc.args) } })) }, done: true, prompt_eval_count: 1, eval_count: 1 }
+        : { message: { role: 'assistant', content: next.text }, done: true, prompt_eval_count: 1, eval_count: 1 };
+      return { ok: true, status: 200, body: makeOneShotBody(evt), text: async () => '' };
+    };
+    const nested = await provider.toolDelegateResearch('investigate, and try to delegate', 3);
+    check('a sub-agent that tries to delegate is refused rather than recursing',
+      /could not delegate/.test(nested), nested.slice(0, 160));
+    check('the recursion refusal is specific, not the generic read-only one',
+      n >= 2 && provider._session._activeDelegations === 0);
+
+    // The sub-agent's own instructions must still say so — the refusal is a
+    // backstop, not the primary mechanism.
+    check('the sub-agent prompt still forbids delegating further',
+      /cannot .*delegate further|CANNOT write.*delegate further/i.test(extSrc));
+  } finally {
+    global.fetch = realFetch;
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+
+// Every navy.* setting is declared once in the manifest and read many times in
+// the source, each read carrying its own fallback literal. When those disagree
+// the manifest wins at runtime and the fallback becomes dead code — right up
+// until the setting cannot be read, at which point Navy quietly behaves like a
+// version nobody shipped.
+//
+// maxToolIterations sat like that: the manifest said 100, three call sites
+// passed 50. The in-editor suite checks that declared settings resolve to their
+// declared defaults, which it reads FROM the manifest — so it could never see
+// the other half of the disagreement.
+async function settingsDefaultsSuite() {
+  console.log('\nsettings defaults (manifest vs code fallbacks):');
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const declared = manifest.contributes.configuration.properties;
+
+  const srcDir = path.join(__dirname, '..', 'src');
+  const files = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full); else if (e.name.endsWith('.js')) files.push(full);
+    }
+  })(srcDir);
+
+  // Only literals can be compared. An object/array default, or a computed one,
+  // is skipped rather than guessed at — a false alarm here would be worse than
+  // the gap, because the next person would learn to ignore this test.
+  const parseLiteral = (raw) => {
+    const t = raw.trim();
+    if (/^'[^']*'$/.test(t)) return { ok: true, value: t.slice(1, -1) };
+    if (/^-?\d+(\.\d+)?$/.test(t)) return { ok: true, value: Number(t) };
+    if (t === 'true') return { ok: true, value: true };
+    if (t === 'false') return { ok: true, value: false };
+    return { ok: false };
+  };
+
+  const mismatches = [];
+  let compared = 0;
+  // Matches both the inline form and the destructured-handle form; the key
+  // having to exist in the manifest is what keeps non-navy configs out.
+  const re = /\.get\(\s*'([A-Za-z][\w]*)'\s*,\s*([^),]+?)\s*\)/g;
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const [, key, rawDefault] = m;
+      const decl = declared['navy.' + key];
+      if (!decl || !('default' in decl)) continue;
+      const lit = parseLiteral(rawDefault);
+      if (!lit.ok) continue;
+      compared++;
+      if (lit.value !== decl.default) {
+        mismatches.push(`${path.basename(file)}: navy.${key} — manifest ${JSON.stringify(decl.default)}, code ${JSON.stringify(lit.value)}`);
+      }
+    }
+  }
+
+  check('settings: the suite actually found call sites to compare', compared > 20, 'compared ' + compared);
+  check('settings: every code fallback matches the manifest default', mismatches.length === 0,
+    '\n      ' + mismatches.join('\n      '));
+
+  // The specific one that was wrong, pinned by name so a regression is legible
+  // rather than just a count going up.
+  const extSrc = fs.readFileSync(path.join(srcDir, 'extension.js'), 'utf8');
+  check('settings: maxToolIterations agrees with the manifest everywhere it is read',
+    !/maxToolIterations', 50\)/.test(extSrc) && declared['navy.maxToolIterations'].default === 100);
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -7681,6 +7858,8 @@ undoRedoSuite()
   .then(contextBudgetLearningSuite)
   .then(pricingSuite)
   .then(diagnosticsSuite)
+  .then(delegationFanOutSuite)
+  .then(settingsDefaultsSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);
