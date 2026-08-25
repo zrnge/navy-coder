@@ -274,6 +274,24 @@
           "default": true,
           "description": "Show 'Ask Navy' code lens buttons above functions in the editor."
         },
+        "navy.modelPricing": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "in": {
+                "type": "number",
+                "description": "USD per 1M input tokens"
+              },
+              "out": {
+                "type": "number",
+                "description": "USD per 1M output tokens"
+              }
+            }
+          },
+          "markdownDescription": "Price models Navy does not know, so the running cost estimate covers them. Each key is matched as a case-insensitive substring of the model id, longest key first, and overrides the built-in table. Example: `{ \"my-finetune\": { \"in\": 1.5, \"out\": 6 } }`. Local providers are always free and ignore this."
+        },
         "navy.shell": {
           "type": "string",
           "default": "auto",

@@ -77,18 +77,54 @@ const htmlSrc = fs.readFileSync(path.join(ROOT, 'src', 'webview-html.js'), 'utf8
 // ── 1. literalReplace ────────────────────────────────────────────────────────
 console.log('\nliteralReplace:');
 {
+  // literalReplace's fuzzy branch calls reindentReplacement, which an
+  // extracted-and-eval'd function cannot see. Pull the REAL one into scope —
+  // a direct eval captures the enclosing bindings — rather than duplicating it
+  // here, so the two can never drift.
+  // eslint-disable-next-line no-unused-vars
+  const reindentReplacement = eval('(' + extractFunction(extSrc, 'function reindentReplacement') + ')');
   const literalReplace = eval('(' + extractFunction(extSrc, 'function literalReplace') + ')');
   check('exact match', literalReplace('abc def', 'def', 'xyz') === 'abc xyz');
+
+  // Indentation drift is the commonest local-model failure: right code, wrong
+  // leading whitespace. The fuzzy branch has always MATCHED through it — what
+  // it used to do was splice the replacement in at whatever indentation the
+  // model wrote, so a match four levels deep came back at column zero. Valid
+  // JavaScript, broken Python, and a mangled diff either way.
+  const cls = ['class A {', '    method() {', '        const x = 1;', '        return x;', '    }', '}'].join('\n');
+  check('fuzzy match re-anchors an under-indented replacement to the file',
+    literalReplace(cls, 'const x = 1;\nreturn x;', 'const x = 2;\nreturn x * 2;')
+      === ['class A {', '    method() {', '        const x = 2;', '        return x * 2;', '    }', '}'].join('\n'));
+
+  const py = ['def f():', '    if x:', '        do_a()', '        do_b()'].join('\n');
+  check('fuzzy match pulls an over-indented replacement back',
+    literalReplace(py, '            do_a()\n            do_b()', '            do_c()')
+      === ['def f():', '    if x:', '        do_c()'].join('\n'));
+
+  check('fuzzy match keeps the replacement\'s own internal nesting',
+    literalReplace(cls, 'const x = 1;\nreturn x;', 'if (y) {\n    return 1;\n}')
+      === ['class A {', '    method() {', '        if (y) {', '            return 1;', '        }', '    }', '}'].join('\n'));
+
+  // Never invent an indent when the two sides do not share a prefix — a tab
+  // file and a space search cannot be reconciled by arithmetic.
+  const tabbed = ['def f():', '\tif x:', '\t\tdo_a()'].join('\n');
+  check('fuzzy match leaves mixed tabs/spaces alone rather than guessing',
+    literalReplace(tabbed, '        do_a()', '        do_b()') === ['def f():', '\tif x:', '        do_b()'].join('\n'));
+
+  // An exact match must not be touched by any of this.
+  check('exact match is never re-indented',
+    literalReplace(cls, '        const x = 1;', '        const x = 3;')
+      === ['class A {', '    method() {', '        const x = 3;', '        return x;', '    }', '}'].join('\n'));
   check('CRLF file + LF search preserves CRLF',
     literalReplace('a\r\nb\r\nc', 'a\nb', 'A\nB') === 'A\r\nB\r\nc');
   check('LF file + CRLF search stays LF',
     literalReplace('a\nb\nc', 'a\r\nb', 'A\r\nB') === 'A\nB\nc');
-  check('fuzzy indentation match',
-    literalReplace('  foo();\n  bar();', 'foo();\nbar();', 'baz();') === 'baz();');
+  check('fuzzy indentation match keeps the FILE\'s indentation, not the search block\'s',
+    literalReplace('  foo();\n  bar();', 'foo();\nbar();', 'baz();') === '  baz();');
   check('ambiguous returns Error', literalReplace('x x', 'x', 'y') instanceof Error);
   check('not found returns null', literalReplace('abc', 'zzz', 'y') === null);
-  check('fuzzy on CRLF preserves CRLF',
-    literalReplace('  a();\r\n  b();', 'a();\nb();', 'c();') === 'c();');
+  check('fuzzy on CRLF preserves CRLF and the file\'s indentation',
+    literalReplace('  a();\r\n  b();', 'a();\nb();', 'c();') === '  c();');
 }
 
 // ── 1a1. Reduced tool tier (tools.js) ────────────────────────────────────────
@@ -195,6 +231,13 @@ console.log('\ncompactMessages:');
 {
   // Header includes the brace so we match the DEFINITION, not a call site.
   const body = extractFunction(extSrc, '_compactMessages(messages) {');
+  // _compactMessages calls the module-level assembledCharSize, which an
+  // extracted-and-eval'd function cannot see. Pull the REAL one out of the
+  // source into this scope rather than reimplementing it here: a direct eval
+  // captures the enclosing bindings, so the extracted method resolves it, and
+  // the two can never drift the way a hand-copied duplicate would.
+  // eslint-disable-next-line no-unused-vars
+  const assembledCharSize = eval('(' + extractFunction(extSrc, 'function assembledCharSize(messages) {') + ')');
   const extracted = eval('(function ' + body + ')');
   // The budget now comes from the model's real window via _contextCharCaps, so
   // the extracted method needs a host to read it from. Pinned to the old fixed
@@ -7293,6 +7336,193 @@ async function shellSelectionSuite() {
   }
 }
 
+
+// The context budget's two soft spots, both of which used to be absorbed by
+// CONTEXT_FILL rather than measured.
+async function contextBudgetLearningSuite() {
+  console.log('\ncontext budget (learned token ratio, assistant trimming):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-budget-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // ── The learned chars-per-token ratio. ─────────────────────────────────
+    check('token ratio: starts at the English-prose default', provider._charsPerToken() === 4);
+
+    // One sample on its own proves nothing — it is the DELTA between two calls
+    // that cancels the fixed overhead (tool schemas, system prompt).
+    provider._observeTokenRatio(100000, 25000);
+    check('token ratio: a single sample does not move the estimate', provider._charsPerToken() === 4);
+
+    // +30,000 chars for +10,000 tokens ⇒ 3.0 chars/token, smoothed 25% from 4.
+    provider._observeTokenRatio(130000, 35000);
+    const afterOne = provider._charsPerToken();
+    check('token ratio: moves toward the observed delta, smoothed', Math.abs(afterOne - 3.75) < 0.001, afterOne);
+
+    // Repeated consistent samples converge on the real figure.
+    let chars = 130000, tokens = 35000;
+    for (let i = 0; i < 20; i++) { chars += 30000; tokens += 10000; provider._observeTokenRatio(chars, tokens); }
+    check('token ratio: converges on the observed value', Math.abs(provider._charsPerToken() - 3) < 0.05, provider._charsPerToken());
+
+    // A shrinking prompt means compaction just ran — the delta is meaningless.
+    const before = provider._charsPerToken();
+    provider._observeTokenRatio(10000, 5000);          // seeds
+    provider._observeTokenRatio(5000, 4000);           // shrank
+    check('token ratio: a shrinking prompt is not sampled', provider._charsPerToken() === before);
+
+    // Too small a delta is integer-rounding noise, not signal. Clear the stored
+    // sample first — seeding a new scenario is itself a valid delta against
+    // whatever the previous one left behind.
+    provider._cptSample = null;
+    const beforeTiny = provider._charsPerToken();
+    provider._observeTokenRatio(200000, 50000);
+    provider._observeTokenRatio(200500, 50100);
+    check('token ratio: a sub-threshold delta is not sampled', provider._charsPerToken() === beforeTiny);
+
+    // Nonsense cannot escape the clamp — a token delta of 1 for 30k chars
+    // would otherwise claim 30,000 chars per token.
+    provider._cptSample = null;
+    provider._observeTokenRatio(300000, 60000);
+    provider._observeTokenRatio(330000, 60001);
+    check('token ratio: clamped to a physically sensible range',
+      provider._charsPerToken() > 1.4 && provider._charsPerToken() <= 8, provider._charsPerToken());
+
+    // …and the budget actually derives from it.
+    provider.modelContextLength = 100000;
+    provider.charsPerToken = 0;
+    const defaultCap = provider._contextCharCaps().compact;
+    provider.charsPerToken = 2;                     // e.g. a CJK-heavy conversation
+    const learnedCap = provider._contextCharCaps().compact;
+    check('token ratio: a denser conversation gets a SMALLER char budget',
+      learnedCap < defaultCap && learnedCap === Math.floor(100000 * 2 * 0.6), `${learnedCap} vs ${defaultCap}`);
+
+    // Clearing the chat must not carry a ratio into a conversation whose
+    // content mix has nothing to do with it.
+    provider.view = { webview: { postMessage: () => {} } };
+    provider.clearChat();
+    check('token ratio: cleared with the chat', provider._charsPerToken() === 4);
+
+    // ── Assistant text is now prunable when tool output runs out. ──────────
+    // Budget small enough that pruning every tool result cannot get under it,
+    // so the assistant pass is the only thing left.
+    provider.modelContextLength = 0;
+    provider._contextCharCaps = () => ({ compact: 50000, history: 40000 });
+
+    const msgs = [{ role: 'system', content: 'sys' }, { role: 'user', content: 'go' }];
+    for (let i = 0; i < 12; i++) {
+      msgs.push({ role: 'assistant', content: 'REASONING '.repeat(600), tool_calls: [{ id: 't' + i }] });
+      msgs.push({ role: 'tool', tool_call_id: 't' + i, content: 'X'.repeat(4000) });
+    }
+    const sizeBefore = msgs.reduce((a, m) => a + m.content.length, 0);
+    provider._compactMessages(msgs);
+    const sizeAfter = msgs.reduce((a, m) => a + m.content.length, 0);
+
+    check('assistant trim: the array is brought under budget', sizeAfter <= 50000, sizeAfter);
+    check('assistant trim: it actually shrank', sizeAfter < sizeBefore);
+    const assistants = msgs.filter(m => m.role === 'assistant');
+    check('assistant trim: every assistant message kept its tool_calls',
+      assistants.every(m => Array.isArray(m.tool_calls) && m.tool_calls.length === 1));
+    const trimmed = assistants.filter(m => /earlier reasoning trimmed/.test(m.content));
+    check('assistant trim: older reasoning was trimmed', trimmed.length > 0, trimmed.length);
+    check('assistant trim: the 3 most recent are left intact',
+      assistants.slice(-3).every(m => !/earlier reasoning trimmed/.test(m.content)));
+
+    // A provider replaying verbatim blocks must not be touched: trimming
+    // .content would not shrink what is sent, and dropping _rawBlocks to make
+    // it shrink risks the signature errors the field exists to prevent.
+    const raw = [{ role: 'system', content: 'sys' }];
+    for (let i = 0; i < 12; i++) {
+      raw.push({ role: 'assistant', content: 'THINKING '.repeat(600), tool_calls: [{ id: 'r' + i }],
+                 _rawBlocks: [{ type: 'thinking' }], _rawBlocksProvider: 'anthropic' });
+      raw.push({ role: 'tool', tool_call_id: 'r' + i, content: 'Y'.repeat(4000) });
+    }
+    provider._compactMessages(raw);
+    check('assistant trim: messages carrying _rawBlocks are never trimmed',
+      raw.filter(m => m.role === 'assistant').every(m => !/earlier reasoning trimmed/.test(m.content)));
+    check('assistant trim: …and they keep their raw blocks',
+      raw.filter(m => m.role === 'assistant').every(m => Array.isArray(m._rawBlocks)));
+  } finally {
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+
+// The pricing table's ordering is load-bearing and silent when wrong — a
+// single `gemini-.*flash` rule once billed 2.5-flash turns at 1.5-flash rates
+// and nothing failed. Every entry now names the model it exists FOR, and the
+// build breaks if a broader rule added above it starts swallowing that model.
+async function pricingSuite() {
+  console.log('\nmodel pricing (ordering, overrides):');
+  const pricing = require('../src/providers/pricing.js');
+  const { MODEL_PRICING, PRICING_AS_OF, estimateCost, parsePricingOverrides } = pricing;
+
+  // ── Ordering: every entry still wins for its own example. ──────────────
+  const shadowed = MODEL_PRICING.filter(e => MODEL_PRICING.find(p => p.re.test(e.example)) !== e);
+  check('pricing: no entry is shadowed by a broader rule above it', shadowed.length === 0,
+    shadowed.map(e => e.example).join(', '));
+  check('pricing: every entry declares the model it exists for',
+    MODEL_PRICING.every(e => typeof e.example === 'string' && e.example.length > 0));
+  check('pricing: every entry prices input and output', MODEL_PRICING.every(e =>
+    Number.isFinite(e.in) && Number.isFinite(e.out) && e.in >= 0 && e.out >= 0));
+  check('pricing: the table says when it was last checked', /^\d{4}-\d{2}-\d{2}$/.test(PRICING_AS_OF));
+
+  // The specific regression the comment in the table describes.
+  const flash25 = MODEL_PRICING.find(p => p.re.test('gemini-2.5-flash'));
+  const flash15 = MODEL_PRICING.find(p => p.re.test('gemini-1.5-flash'));
+  check('pricing: gemini 2.5-flash is not priced at 1.5-flash rates', flash25 !== flash15 && flash25.in === 0.3);
+
+  // ── Behaviour that must not change. ────────────────────────────────────
+  check('pricing: local providers are free whatever the model is called',
+    estimateCost('ollama', 'claude-opus-4-1', 1e6, 1e6) === 0 && estimateCost('lmstudio', 'gpt-5', 1e6, 1e6) === 0);
+  check('pricing: an unknown hosted model is null, never a guess',
+    estimateCost('anthropic', 'totally-unknown-future-model', 1000, 1000) === null);
+  check('pricing: a known model prices input and output separately',
+    estimateCost('anthropic', 'claude-sonnet-5', 1e6, 1e6) === 3 + 15);
+
+  // ── navy.modelPricing: a user can price what Navy has never heard of. ──
+  const override = { 'my-finetune': { in: 1.5, out: 6 } };
+  check('override: prices a model the built-in table does not know',
+    estimateCost('custom', 'acme/my-finetune-v2', 1e6, 1e6, override) === 7.5);
+  check('override: beats the built-in table for a model it DOES know',
+    estimateCost('anthropic', 'claude-sonnet-5', 1e6, 0, { 'claude-sonnet': { in: 99, out: 1 } }) === 99);
+  check('override: matching is case-insensitive',
+    estimateCost('custom', 'ACME/My-FineTune', 1e6, 0, override) === 1.5);
+  check('override: local providers still ignore it and stay free',
+    estimateCost('ollama', 'my-finetune', 1e6, 1e6, override) === 0);
+  check('override: the longest key wins, so a specific one is not shadowed',
+    estimateCost('custom', 'gpt-5-mini', 1e6, 0, { 'gpt-5': { in: 10, out: 10 }, 'gpt-5-mini': { in: 1, out: 1 } }) === 1);
+
+  // Malformed input must be dropped, never half-applied: a confident wrong
+  // number is worse than no number in the one place that touches real money.
+  for (const [label, bad] of [
+    ['a missing price', { x: { in: 1 } }],
+    ['a non-numeric price', { x: { in: 'free', out: 2 } }],
+    ['a negative price', { x: { in: -1, out: 2 } }],
+    ['a non-object value', { x: 5 }],
+    ['an array instead of an object', [{ in: 1, out: 2 }]],
+    ['null', null],
+  ]) {
+    check(`override: ${label} is ignored, not defaulted`,
+      estimateCost('anthropic', 'x-model', 1000, 1000, bad) === null, JSON.stringify(bad));
+  }
+  check('override: a valid entry beside a malformed one still applies',
+    estimateCost('custom', 'good-model', 1e6, 0, { 'bad': { in: 'x' }, 'good-model': { in: 2, out: 3 } }) === 2);
+  check('parsePricingOverrides: drops everything malformed',
+    parsePricingOverrides({ a: { in: 1, out: 2 }, b: { in: 'x', out: 2 }, c: null }).length === 1);
+
+  // ── The manifest has to declare it, or the setting silently does nothing. ──
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const decl = manifest.contributes.configuration.properties['navy.modelPricing'];
+  check('navy.modelPricing is declared and defaults to empty',
+    decl?.type === 'object' && JSON.stringify(decl.default) === '{}');
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -7338,6 +7568,8 @@ undoRedoSuite()
   .then(approvalScopeSuite)
   .then(toolBatchingSuite)
   .then(shellSelectionSuite)
+  .then(contextBudgetLearningSuite)
+  .then(pricingSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,714 tests, no network, no API keys
+npm test             # 1,760 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -59,6 +59,7 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/providers/tools.js` | ~450 | Tool schemas (`TOOLS`), the API-shaped copy (`TOOLS_API`), and the system prompt (`TOOL_PROMPT`) |
 | `src/providers/llm.js` | ~780 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
 | `src/providers/endpoints.js` | ~90 | **Single source of truth** for every provider base URL |
+| `src/providers/pricing.js` | ~105 | The cost table, its ordering invariant, and `navy.modelPricing` overrides |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
 | `src/providers/mcp.js` | ~300 | MCP client, stdio and streamable HTTP |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
@@ -189,6 +190,14 @@ have shipped with base URLs that never worked, so the last step is not optional.
    sensible verdict with a real key. A URL that merely *responds* is not
    necessarily correct — MiniMax's old host answers `/v1/models` perfectly and
    rejects every current key.
+
+7. **`src/providers/pricing.js`** — add a `MODEL_PRICING` entry for each model
+   family, most-specific-first, each with the `example` model id it exists for.
+   `pricingSuite` fails if a broader rule above it swallows that example, which
+   is the failure mode that once billed gemini-2.5-flash at 1.5-flash rates
+   with nothing to show for it. A hosted provider with no entry is not broken —
+   `estimateCost` returns null and the UI says the cost is unknown — but it is
+   a worse first impression than a number.
 
 Add a case to `providerEndpointSuite` in `test/run.js` pinning the new default.
 

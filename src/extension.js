@@ -66,7 +66,37 @@ const CHECK_SYNTAX_MAX_BYTES = 2 * 1024 * 1024;
 // covers that as well as leaving room for this turn's own growth. It is doing
 // both jobs at once, which is why raising it is not the free win it looks like.
 const CHARS_PER_TOKEN = 4;
+// Bounds on the LEARNED ratio (see _observeTokenRatio). Nothing real sits
+// outside these: ~1.5 is dense CJK, ~8 is highly repetitive text a BPE
+// tokenizer folds hard. Clamping means a bad sample degrades the estimate
+// rather than handing compaction a budget that is wrong by an order of
+// magnitude.
+const CHARS_PER_TOKEN_MIN = 1.5;
+const CHARS_PER_TOKEN_MAX = 8;
+// How fast the learned ratio moves. Low, because the mix of a conversation
+// changes slowly and a single odd sample should not swing the budget.
+const CPT_SMOOTHING = 0.25;
+// Below this much growth between two calls the delta is mostly noise — token
+// counts are integers and providers round.
+const CPT_MIN_DELTA_CHARS = 2000;
 const CONTEXT_FILL = 0.6;
+
+// Size of an assembled message array, the same way every budget check counts
+// it. Shared so the compactor, the pre-turn history cap and the token-ratio
+// calibration can never disagree about what "how big is this" means.
+//
+// Named for the ASSEMBLED array (system + history + this turn's churn), not
+// "messages", because _askNavyTurn already has a local `messagesCharSize`
+// holding a NUMBER — the size of this.messages. A module-level function by
+// that name is shadowed by it for the whole method, and the call fails with
+// "not a function" a long way from the declaration that caused it.
+function assembledCharSize(messages) {
+  let total = 0;
+  for (const m of messages) {
+    total += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
+  }
+  return total;
+}
 // A ceiling on the derived budget, not on the model. The assembled conversation
 // is measured and stringified synchronously on the extension host's main thread
 // on every iteration of every turn, so an unbounded budget on a 1M-token model
@@ -102,59 +132,10 @@ function rootBelongsToWorkspace(root, folderPaths) {
   });
 }
 
-// Approximate USD list price per 1M tokens, input/output separate — for
-// spend visibility (the running cost estimate next to the token counter),
-// NOT live pricing. Providers change prices without notice, so this is a
-// best-effort snapshot only: `estimateCost` returns null for anything it
-// can't confidently match rather than guessing, and the UI labels every
-// figure it does show as an estimate. First matching pattern wins, ordered
-// most-specific-first so e.g. "gpt-4o-mini" is checked before "gpt-4o".
-const MODEL_PRICING = [
-  { re: /claude-opus/i, in: 15, out: 75 },
-  { re: /claude-(?:\d[\w.-]*-)?sonnet|claude-3-[57]-sonnet/i, in: 3, out: 15 },
-  { re: /claude-haiku/i, in: 0.8, out: 4 },
-  { re: /gpt-4o-mini/i, in: 0.15, out: 0.6 },
-  { re: /gpt-4o/i, in: 2.5, out: 10 },
-  { re: /gpt-4\.1-mini/i, in: 0.4, out: 1.6 },
-  { re: /gpt-4\.1-nano/i, in: 0.1, out: 0.4 },
-  { re: /gpt-4\.1/i, in: 2, out: 8 },
-  { re: /gpt-5-nano/i, in: 0.05, out: 0.4 },
-  { re: /gpt-5-mini/i, in: 0.25, out: 2 },
-  { re: /gpt-5/i, in: 1.25, out: 10 },
-  { re: /^o1-mini|o1-preview/i, in: 3, out: 12 },
-  { re: /^o1\b/i, in: 15, out: 60 },
-  { re: /^o4-mini/i, in: 1.1, out: 4.4 },
-  { re: /^o3-mini/i, in: 1.1, out: 4.4 },
-  { re: /^o3\b/i, in: 2, out: 8 },
-  { re: /gpt-3\.5/i, in: 0.5, out: 1.5 },
-  // Gemini is split by generation on purpose: 2.x is priced very differently
-  // from 1.5, and a single `gemini-.*flash` rule quietly billed a 2.5-flash
-  // turn at 1.5-flash rates. Unversioned//unknown generations fall through to
-  // the last, oldest rule rather than being assumed to be the newest.
-  { re: /gemini-2\.[05].*flash-lite/i, in: 0.1, out: 0.4 },
-  { re: /gemini-2\.[05].*flash/i, in: 0.3, out: 2.5 },
-  { re: /gemini-2\.[05].*pro/i, in: 1.25, out: 10 },
-  { re: /gemini-.*flash/i, in: 0.075, out: 0.3 },
-  { re: /gemini-.*pro/i, in: 1.25, out: 5 },
-  { re: /deepseek-reasoner|deepseek-r1/i, in: 0.55, out: 2.19 },
-  { re: /deepseek-chat|deepseek-v3/i, in: 0.27, out: 1.1 },
-  { re: /grok/i, in: 3, out: 15 },
-  { re: /glm-4/i, in: 0.5, out: 1.5 },
-];
-
-// Pure function (no `this`) so it's directly testable and reusable. Returns
-// null when the cost genuinely can't be estimated (unrecognized model on a
-// hosted provider) — the caller must never substitute a guess for that, since
-// this is the one place in Navy that touches the user's actual money.
-// Local providers are unambiguously free — gated on the PROVIDER, not a
-// model-name guess, since a locally-run model can share a name with a
-// hosted one (e.g. "llama3") without sharing its price.
-function estimateCost(provider, model, promptTokens, completionTokens) {
-  if (provider === 'ollama' || provider === 'lmstudio') return 0;
-  const entry = MODEL_PRICING.find(p => p.re.test(model || ''));
-  if (!entry) return null;
-  return (promptTokens / 1_000_000) * entry.in + (completionTokens / 1_000_000) * entry.out;
-}
+// Model pricing lives in its own module — see src/providers/pricing.js for
+// why, and for how navy.modelPricing lets a user price a model Navy has
+// never heard of without waiting for a release.
+const { estimateCost, PRICING_AS_OF } = require('./providers/pricing.js');
 
 // workspaceState key holding the project root Navy last used in THIS workspace.
 // Deliberately not a setting — see _persistProjectRoot.
@@ -301,6 +282,50 @@ const SHELLS = {
 // Shared by _collectRelevance (keyword search) and _listCodeFiles (embedding
 // index) — both walk the same repo the same way, so a single definition
 // keeps their notion of "a code file worth looking at" from drifting apart.
+// Re-anchors a replacement block to the indentation of the region it is
+// actually replacing.
+//
+// Strategy 3 above matches on TRIMMED lines, which is the whole point — a
+// model reconstructing a search block from memory gets the code right and the
+// indentation wrong constantly, and refusing the edit over leading whitespace
+// wastes a round-trip. But the replacement was then spliced in at whatever
+// indentation the model happened to write, so a match found at four spaces
+// deep came back at column zero: a mangled diff in any language, and broken
+// code outright in Python, YAML, or anything else where indentation is syntax.
+//
+// The correction is a single uniform delta, taken from the first line that is
+// non-blank on BOTH sides, so the replacement keeps its own internal nesting
+// and only its base indentation moves. When the two indents are not a prefix
+// of one another (spaces on one side, tabs on the other) nothing is guessed —
+// the replacement is left exactly as written, which is the previous behaviour.
+function reindentReplacement(searchLines, matchedLines, replaceLines) {
+  const leading = (s) => (s.match(/^[ \t]*/) || [''])[0];
+  let fileIndent = null, searchIndent = null;
+  for (let i = 0; i < searchLines.length; i++) {
+    if (!searchLines[i].trim() || !matchedLines[i] || !matchedLines[i].trim()) continue;
+    searchIndent = leading(searchLines[i]);
+    fileIndent = leading(matchedLines[i]);
+    break;
+  }
+  if (fileIndent === null || fileIndent === searchIndent) return replaceLines;
+
+  if (fileIndent.startsWith(searchIndent)) {
+    const add = fileIndent.slice(searchIndent.length);
+    return replaceLines.map(l => (l.trim() ? add + l : l));
+  }
+  if (searchIndent.startsWith(fileIndent)) {
+    const drop = searchIndent.length - fileIndent.length;
+    return replaceLines.map(l => {
+      if (!l.trim()) return l;
+      // Only ever remove whitespace — never a real character, however
+      // shallowly the line happens to be indented.
+      const removable = Math.min(drop, leading(l).length);
+      return l.slice(removable);
+    });
+  }
+  return replaceLines; // mixed tabs/spaces — do not guess
+}
+
 function literalReplace(original, search, replace) {
   // 1. Exact match.
   const first = original.indexOf(search);
@@ -349,7 +374,9 @@ function literalReplace(original, search, replace) {
   if (bestScore >= 0.85 && !ambiguous && bestIdx !== -1) {
     const before = origLines.slice(0, bestIdx).join('\n');
     const after  = origLines.slice(bestIdx + sLen).join('\n');
-    return restoreEol((before ? before + '\n' : '') + normReplace + (after ? '\n' + after : ''));
+    const matched = origLines.slice(bestIdx, bestIdx + sLen);
+    const indented = reindentReplacement(searchLines, matched, normReplace.split('\n')).join('\n');
+    return restoreEol((before ? before + '\n' : '') + indented + (after ? '\n' + after : ''));
   }
 
   return null;
@@ -512,6 +539,13 @@ class Session {
     this.bgWorkers   = new Map(); // taskId → { ctrl: AbortController }
     this.bgWorkerId  = 0;
     this.sessionDigest = '';
+    // Learned chars-per-token for THIS conversation, and the previous call's
+    // (chars, promptTokens) pair the next delta is measured against. In memory
+    // only: it re-learns within a turn or two, and persisting a stale ratio
+    // from a conversation whose content mix has since changed would be worse
+    // than starting from the default. See _observeTokenRatio.
+    this.charsPerToken = 0;
+    this._cptSample = null;
     this._updated = ''; // ISO timestamp of the last save to this chat's own file — used to pick the most-recent chat when reactivating a project
     // Token usage from delegate_research sub-agent calls made DURING the
     // current turn — reset at the start of each turn, folded into that
@@ -667,6 +701,10 @@ class NavyCoderViewProvider {
   // for that same file/editor.
   get editedRanges() { return this._proj.editedRanges || (this._proj.editedRanges = new Map()); }
   set editedRanges(v) { this._proj.editedRanges = v; }
+  get charsPerToken() { return this._session.charsPerToken; }
+  set charsPerToken(v) { this._session.charsPerToken = v; }
+  get _cptSample() { return this._session._cptSample; }
+  set _cptSample(v) { this._session._cptSample = v; }
   get sessionDigest() { return this._session.sessionDigest; }
   set sessionDigest(v) { this._session.sessionDigest = v; }
   get subAgentTokens() { return this._session.subAgentTokens; }
@@ -1332,6 +1370,8 @@ class NavyCoderViewProvider {
     this.messages = [];
     this.lastReply = '';
     this.sessionDigest = '';
+    this.charsPerToken = 0;
+    this._cptSample = null;
     this.checkpoints = [];
     this.redoStack = [];
     this.view?.webview.postMessage({ type: 'redoState', count: 0 });
@@ -2619,10 +2659,16 @@ class NavyCoderViewProvider {
   // Navy treats the chat as full"). Deriving from the max instead would ignore
   // a deliberate choice, and re-applying the clamp here would duplicate logic
   // that already lives in _applyContextWindow and could drift from it.
+  // navy.modelPricing, read at the call site rather than baked into
+  // estimateCost, which stays pure. See src/providers/pricing.js.
+  _modelPricingOverrides() {
+    return vscode.workspace.getConfiguration('navy').get('modelPricing', {});
+  }
+
   _contextCharCaps() {
     const tokens = Number(this.modelContextLength) || 0;
     const compact = tokens
-      ? Math.min(Math.floor(tokens * CHARS_PER_TOKEN * CONTEXT_FILL), CONTEXT_CHARS_CEILING)
+      ? Math.min(Math.floor(tokens * this._charsPerToken() * CONTEXT_FILL), CONTEXT_CHARS_CEILING)
       : CONTEXT_CHARS_FLOOR;
     return { compact, history: Math.floor(compact * HISTORY_CAP_FRACTION) };
   }
@@ -3420,6 +3466,9 @@ class NavyCoderViewProvider {
         resetWatchdog();
         // Keep the request within the context window on long multi-step tasks.
         if (iteration > 0) this._compactMessages(messages);
+        // Measured BEFORE the call, so the sample pairs the exact text sent
+        // with the token count the provider reports back for it.
+        const promptCharsSent = assembledCharSize(messages);
         const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = await this._streamWithFallback(
           host, model, messages, temperature,
           reducedTools && !extraToolsUnlocked ? TOOLS_API_CORE : null);
@@ -3431,6 +3480,7 @@ class NavyCoderViewProvider {
 
         // Send token usage and context fill level after each model call.
         const totalTokens = tokenCounts.prompt + tokenCounts.completion;
+        if (tokenCounts.prompt > 0) this._observeTokenRatio(promptCharsSent, tokenCounts.prompt);
         if (totalTokens > 0) {
           turnTokens.prompt += tokenCounts.prompt;
           turnTokens.completion += tokenCounts.completion;
@@ -3452,7 +3502,7 @@ class NavyCoderViewProvider {
           // already-existing one-provider-per-turn assumption predating
           // navy.providerFallbacks, not something this feature makes worse
           // in a new way).
-          const liveCost = estimateCost(lastUsedProvider, lastUsedModel, turnPromptSoFar, turnCompletionSoFar);
+          const liveCost = estimateCost(lastUsedProvider, lastUsedModel, turnPromptSoFar, turnCompletionSoFar, this._modelPricingOverrides());
           const estimatedCost = liveCost === null ? null : persisted.cost + liveCost;
           const costKnown = persisted.costKnown && liveCost !== null;
           this.view?.webview.postMessage({
@@ -4014,10 +4064,54 @@ class NavyCoderViewProvider {
       if (!t) continue;
       prompt += t.prompt || 0;
       completion += t.completion || 0;
-      const c = estimateCost(m.meta.provider, m.meta.model, t.prompt || 0, t.completion || 0);
+      const c = estimateCost(m.meta.provider, m.meta.model, t.prompt || 0, t.completion || 0, this._modelPricingOverrides());
       if (c === null) costKnown = false; else cost += c;
     }
     return { prompt, completion, cost, costKnown };
+  }
+
+  // What one character of THIS conversation actually costs in tokens.
+  //
+  // CHARS_PER_TOKEN is 4 — the English-prose figure. Code tokenizes nearer
+  // 3–3.5, CJK far lower, base64 and minified JS lower still, so a fixed 4
+  // over-states how much text fits and CONTEXT_FILL has been quietly absorbing
+  // the error for every language that is not English prose.
+  //
+  // The provider already tells us the true prompt-token count on every call.
+  // The trap is that it counts things the message array does not contain — the
+  // tool schemas (~36 of them), and whatever the provider adds itself — so
+  // dividing total chars by total tokens measures that fixed overhead as much
+  // as it measures the text.
+  //
+  // Taking the DELTA between two consecutive calls in the same turn cancels the
+  // overhead exactly: the schemas and the system prompt are byte-identical
+  // between iterations, so whatever grew is only the conversation.
+  //
+  //     chars-per-token ≈ (chars[i+1] - chars[i]) / (tokens[i+1] - tokens[i])
+  //
+  // Samples that cannot mean anything are dropped rather than smoothed: a
+  // shrinking prompt (compaction just ran), a non-positive token delta, or a
+  // change too small to survive integer rounding. Prompt caching does not
+  // distort this — a cache hit changes what is BILLED, not what is counted.
+  _observeTokenRatio(chars, promptTokens) {
+    const prev = this._cptSample;
+    this._cptSample = { chars, promptTokens };
+    if (!prev) return;
+    const dChars = chars - prev.chars;
+    const dTokens = promptTokens - prev.promptTokens;
+    if (dChars < CPT_MIN_DELTA_CHARS || dTokens <= 0) return;
+    const observed = dChars / dTokens;
+    if (!Number.isFinite(observed)) return;
+    const clamped = Math.min(Math.max(observed, CHARS_PER_TOKEN_MIN), CHARS_PER_TOKEN_MAX);
+    const current = this.charsPerToken || CHARS_PER_TOKEN;
+    this.charsPerToken = current + (clamped - current) * CPT_SMOOTHING;
+  }
+
+  // The ratio the budget is currently derived from — the learned one once this
+  // conversation has produced a usable sample, the English-prose default until
+  // then, so a first turn behaves exactly as it always did.
+  _charsPerToken() {
+    return this.charsPerToken || CHARS_PER_TOKEN;
   }
 
   // Mid-turn context compaction: when the accumulated conversation gets too large,
@@ -4027,9 +4121,9 @@ class NavyCoderViewProvider {
   _compactMessages(messages) {
     const MAX_CHARS = this._contextCharCaps().compact; // scales with the active model's window
     const KEEP_RECENT = 6;      // never touch the N most recent tool results
+    const KEEP_RECENT_ASSISTANT = 3; // ditto for the model's own recent reasoning
     const sizeOf = (m) => typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
-    let total = 0;
-    for (const m of messages) total += sizeOf(m);
+    let total = assembledCharSize(messages);
     if (total <= MAX_CHARS) return;
 
     // Pasted images dominate the budget (megabytes of base64) — once we're over,
@@ -4060,6 +4154,42 @@ class NavyCoderViewProvider {
       if (before < 300) continue; // already small — pruning gains nothing
       const note = '[Old tool output pruned to keep the conversation within the context window. Re-run the tool if you need this data again.]';
       m.content = m.role === 'tool' ? note : `<tool_result name="pruned">\n${note}\n</tool_result>`;
+      total -= before - sizeOf(m);
+    }
+    if (total <= MAX_CHARS) return;
+
+    // Tool output is gone and it still does not fit. What is left is the
+    // model's OWN accumulated text: a turn is allowed up to maxToolIterations
+    // (50 by default) model calls, and every one of them can leave a paragraph
+    // of reasoning behind. Nothing used to bound that — the compactor pruned
+    // tool results and then had nothing else it was willing to touch, so a
+    // single long turn could walk into the ceiling with no way back.
+    //
+    // Only the TEXT is trimmed, never tool_calls: those pair with the
+    // tool_result messages that follow them, and dropping one strands the
+    // other on every provider that validates the pairing.
+    //
+    // Messages carrying _rawBlocks are skipped deliberately. That field is the
+    // verbatim Anthropic thinking/tool_use or Gemini thought/functionCall
+    // payload, replayed exactly because those providers require it; trimming
+    // .content would not shrink what is actually sent for them, and dropping
+    // the blocks to make it shrink risks the signature errors the field exists
+    // to prevent. Those providers keep the tool-result pruning above, and
+    // prompt caching blunts the rest.
+    const assistantIdxs = [];
+    messages.forEach((m, i) => { if (m.role === 'assistant' && !m._rawBlocks) assistantIdxs.push(i); });
+    const trimmable = assistantIdxs.slice(0, Math.max(0, assistantIdxs.length - KEEP_RECENT_ASSISTANT));
+    for (const idx of trimmable) {
+      if (total <= MAX_CHARS) break;
+      const m = messages[idx];
+      if (typeof m.content !== 'string') continue;
+      const before = sizeOf(m);
+      if (before < 400) continue; // already small — trimming gains nothing
+      // Keep the opening sentence or so: it is usually the model stating what
+      // it is about to do, which is the part a later step actually refers back
+      // to. The rest is working-out that the tool results already record.
+      m.content = m.content.slice(0, 200).trimEnd()
+        + '\n[…earlier reasoning trimmed to stay within the context window.]';
       total -= before - sizeOf(m);
     }
   }
@@ -7161,7 +7291,7 @@ function deactivate() {}
 // sessionContext is exported so tests can directly verify that code running
 // inside it stays bound to the session it started with, independent of
 // mocking a full turn's model/tool call chain.
-module.exports = { activate, deactivate, NavyCoderViewProvider, sessionContext, estimateCost, resolveModelContext, contextWindowOptions,
+module.exports = { activate, deactivate, NavyCoderViewProvider, sessionContext, estimateCost, PRICING_AS_OF, resolveModelContext, contextWindowOptions,
   // Exported for the session-restore tests: what a card record keeps, and what
   // it deliberately drops, is what decides both how a reopened chat looks and
   // how large .navy/chats/<id>.json gets.
