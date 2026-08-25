@@ -32,11 +32,45 @@ const MAX_STEP_CHARS = 120;
 
 const STATUSES = new Set(['pending', 'in_progress', 'done']);
 
+// Where a step's text might be. "step" is what the schema asks for; the rest
+// are what models send instead, constantly, and "description" most of all.
+// This file already accepts a bare string as a step and an unknown status as
+// pending, on the principle that a weak model gets the shape wrong and being
+// strict just spends a round-trip — the key name is the MOST likely thing to
+// vary, and it was the one thing not covered. The result was a plan that could
+// never be accepted and an error that did not say why, so the model re-sent the
+// identical call until the turn ran out.
+const STEP_KEYS = ['step', 'description', 'title', 'text', 'task', 'content', 'name', 'label', 'action'];
+
+function stepText(raw) {
+  if (typeof raw === 'string') return raw;
+  if (!raw || typeof raw !== 'object') return '';
+  for (const k of STEP_KEYS) {
+    if (typeof raw[k] === 'string' && raw[k].trim()) return raw[k];
+  }
+  // Last resort: an object carrying exactly one non-status string is
+  // unambiguous whatever it called the key — {"1": "Read the file"} and
+  // {"todo": "Read the file"} both mean one thing. `status` is excluded so a
+  // step of {status: 'done'} cannot become a step titled "done".
+  const strings = Object.entries(raw)
+    .filter(([k, v]) => k !== 'status' && typeof v === 'string' && v.trim());
+  return strings.length === 1 ? strings[0][1] : '';
+}
+
 // Normalises whatever the model sent into a plan, or explains what was wrong.
 // Pure, so it is directly testable and cannot depend on turn state.
 function normalizePlan(rawSteps) {
+  // Double-encoded arguments are common enough to be worth unwrapping rather
+  // than refusing: some models JSON-encode every parameter value, so `steps`
+  // arrives as the STRING "[{...}]" instead of an array.
+  if (typeof rawSteps === 'string') {
+    try { rawSteps = JSON.parse(rawSteps); } catch { /* fall through to the error below */ }
+  }
+  // A single step sent unwrapped is a plan of one, not a malformed call.
+  if (rawSteps && !Array.isArray(rawSteps) && typeof rawSteps === 'object') rawSteps = [rawSteps];
+
   if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
-    return { error: 'steps must be a non-empty array of { step, status } objects.' };
+    return { error: 'steps must be a non-empty array, e.g. [{"step": "Read the file", "status": "pending"}].' };
   }
   if (rawSteps.length > MAX_PLAN_STEPS) {
     return { error: `A plan may have at most ${MAX_PLAN_STEPS} steps — this one has ${rawSteps.length}. Group the small ones together; a plan is a summary of the work, not the work itself.` };
@@ -45,12 +79,14 @@ function normalizePlan(rawSteps) {
   const steps = [];
   for (let i = 0; i < rawSteps.length; i++) {
     const raw = rawSteps[i];
-    // A bare string is accepted as a pending step. Models emit that constantly
-    // whatever the schema says, and rejecting it would spend a whole round-trip
-    // teaching a lesson with no benefit to anyone.
-    const text = typeof raw === 'string' ? raw : (raw && typeof raw === 'object' ? raw.step : '');
-    if (typeof text !== 'string' || !text.trim()) {
-      return { error: `Step ${i + 1} has no text. Each step needs a short description of what it does.` };
+    const text = stepText(raw);
+    if (!text.trim()) {
+      // Say what arrived, not just what is missing. An error that describes the
+      // requirement without showing the input gives the model nothing to change,
+      // so it re-sends the same call — which is exactly what happened.
+      let seen;
+      try { seen = JSON.stringify(raw); } catch { seen = String(raw); }
+      return { error: `Step ${i + 1} has no text — received ${String(seen).slice(0, 120)}. Put the text under "step": [{"step": "Read the file", "status": "pending"}].` };
     }
     const status = typeof raw === 'object' && raw && STATUSES.has(raw.status) ? raw.status : 'pending';
     steps.push({ step: text.trim().slice(0, MAX_STEP_CHARS), status });

@@ -7847,6 +7847,30 @@ async function planSuite() {
     check('plan: a non-array is refused', Boolean(normalizePlan('read the file').error));
     check('plan: a step with no text is refused and says which one',
       /Step 2/.test(normalizePlan(['ok', { status: 'done' }]).error));
+
+    // ── Reported from real use: every update_plan call failed with "Step 1
+    //    has no text", five times in a row, until the turn ran out. The plan
+    //    was fine; the reader only accepted the key "step", and models
+    //    substitute a synonym constantly. The error named the requirement but
+    //    not the input, so the model had nothing to change and re-sent it.
+    for (const key of ['description', 'title', 'text', 'task', 'content', 'name', 'label', 'action']) {
+      const r = normalizePlan([{ [key]: 'Read the auth module', status: 'pending' }]);
+      check(`plan: a step keyed "${key}" is understood, not refused`,
+        r.steps?.[0]?.step === 'Read the auth module', r.error);
+    }
+    check('plan: an object with one unambiguous string is understood whatever the key',
+      normalizePlan([{ '1': 'Read the auth module' }]).steps?.[0]?.step === 'Read the auth module');
+    check('plan: …but a step carrying only a status is still refused — nothing to name it',
+      Boolean(normalizePlan([{ status: 'done' }]).error));
+    check('plan: the refusal shows what actually arrived, so the model can correct it',
+      /received \{"status":"done"\}/.test(normalizePlan([{ status: 'done' }]).error),
+      normalizePlan([{ status: 'done' }]).error);
+    check('plan: a double-encoded steps string is parsed rather than refused',
+      normalizePlan('[{"step":"Read the file"}]').steps?.[0]?.step === 'Read the file');
+    check('plan: a single step sent unwrapped is a plan of one',
+      normalizePlan({ step: 'Read the file' }).steps?.length === 1);
+    check('plan: status still survives a synonym key',
+      normalizePlan([{ description: 'a', status: 'done' }]).steps[0].status === 'done');
     check('plan: too many steps is refused with the limit named',
       new RegExp('at most ' + MAX_PLAN_STEPS).test(
         normalizePlan(Array.from({ length: MAX_PLAN_STEPS + 1 }, (_, i) => 'step ' + i)).error));
@@ -7916,6 +7940,43 @@ async function planSuite() {
     check('turn: a fresh turn starts with no plan', provider.plan.length === 0);
     const second = provider.messages[provider.messages.length - 1];
     check('turn: …and does not inherit the previous turn incomplete note', !/Plan incomplete/.test(second.text));
+
+    // ── A tool that fails identically must not be allowed to spin. ───────
+    // The screenshot that prompted this showed five identical failures; only
+    // run_command and run_tests were ever guarded against repeat-on-failure.
+    provider._resetPlan();
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { text: 'I could not set a plan.' },
+    ]);
+    await provider.askNavy('plan something, badly', false, null, [], []);
+    const planResults = posted.filter(m => m.type === 'toolResult' && m.tool === 'update_plan');
+    check('loop guard: a third identical failure is blocked, not attempted',
+      planResults.some(m => /^\[Blocked/.test(m.result)), planResults.map(m => m.result?.slice(0, 40)).join(' | '));
+    check('loop guard: the block quotes the error it kept getting',
+      planResults.some(m => /^\[Blocked/.test(m.result) && /has no text/.test(m.result)));
+    check('loop guard: …and tells the model to change something or stop',
+      planResults.some(m => /change the arguments|explain to the user/.test(m.result || '')));
+
+    // Success must clear the record — an intermittent failure cannot
+    // accumulate into a block.
+    provider._resetPlan();
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: ['a good step'] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ status: 'done' }] } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: ['another good step'] } }] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('alternate good and bad plans', false, null, [], []);
+    const mixed = posted.filter(m => m.type === 'toolResult' && m.tool === 'update_plan');
+    check('loop guard: an intermittent failure never accumulates into a block',
+      !mixed.some(m => /^\[Blocked/.test(m.result)), mixed.map(m => m.result?.slice(0, 30)).join(' | '));
 
     // ── Wiring the model depends on. ─────────────────────────────────────
     const toolsMod = require('../src/providers/tools.js');

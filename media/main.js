@@ -5043,6 +5043,7 @@ const TOOL_VERB = {
   list_files: 'Listing', search_files: 'Searching', search_codebase: 'Searching',
   fetch_url: 'Fetching', web_search: 'Web searching',
   run_command: 'Running', run_tests: 'Running tests',
+  update_plan: 'Planning',
   start_process: 'Starting', read_process_output: 'Reading output', kill_process: 'Stopping process',
   git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_blame: 'Git blame',
   get_diagnostics: 'Checking diagnostics',

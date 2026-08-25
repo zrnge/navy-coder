@@ -3462,6 +3462,15 @@ class NavyCoderViewProvider {
       const seenReadCalls = new Set();
       let consecutiveReadOnlyIters = 0;
       const failedCommands = new Map(); // key → consecutive fail count for run_command/run_tests
+      // key → consecutive fail count for EVERY OTHER tool. run_command and
+      // run_tests have been guarded against repeat-on-failure since 0.2.x, on
+      // the reasoning that re-running a failing command without changing
+      // anything accomplishes nothing. That reasoning was never specific to
+      // commands: any tool called with identical arguments that returns the
+      // identical error will do so again, and the model has no way to notice it
+      // is looping. A malformed update_plan span five identical failures before
+      // the turn ran out of iterations.
+      const failedTools = new Map();
       const fileEditCounts = new Map(); // path → successful-write count this turn (loop-of-edits guard)
       // stop feeding fresh diagnostics + nudge to wrap up / refuse further
       // writes to this file for the rest of the turn. Configurable because a
@@ -3764,6 +3773,21 @@ class NavyCoderViewProvider {
               if (d) taskChanges.reads.push(d);
             }
           }
+          // Same tool, same arguments, same error, twice already — a third
+          // attempt cannot go differently. Say what is stuck rather than
+          // letting it run out the iteration budget in silence.
+          if (!COMMAND_TOOLS.has(tool.name)) {
+            const key = tool.name + ':' + JSON.stringify(tool.args || {}).slice(0, 400);
+            const prior = failedTools.get(key);
+            if (prior && prior.count >= 2) {
+              const r = `[Blocked: ${tool.name} has already failed ${prior.count} times this turn with these exact arguments, each time with: ${String(prior.error).slice(0, 200)}\n\nCalling it again unchanged will fail again. Either change the arguments in response to that error, use a different tool, or explain to the user what you cannot do and stop.]`;
+              const callId = this.generateId();
+              postToolCall(tool.name, tool.args, callId);
+              postToolResult(tool.name, tool.args, r, callId);
+              toolResults.push(makeToolResult(tool, r));
+              continue;
+            }
+          }
           // Block retrying a persistently-failing command (≥2 consecutive failures with same args).
           if (COMMAND_TOOLS.has(tool.name)) {
             const cmdKey = tool.name + ':' + (tool.args?.command || tool.args?.filter || '');
@@ -3843,6 +3867,20 @@ class NavyCoderViewProvider {
             }
 
             let result = await this.executeTool(tool);
+
+            // Track non-command failures the same way. An "Error:"-prefixed
+            // result is the convention every tool here returns for a refusal or
+            // a bad argument; anything else counts as progress and clears the
+            // record, so an intermittent failure never accumulates into a block.
+            if (!COMMAND_TOOLS.has(tool.name)) {
+              const key = tool.name + ':' + JSON.stringify(tool.args || {}).slice(0, 400);
+              if (typeof result === 'string' && /^(\[Refused|Error:)/.test(result)) {
+                const prior = failedTools.get(key);
+                failedTools.set(key, { count: (prior?.count || 0) + 1, error: result });
+              } else {
+                failedTools.delete(key);
+              }
+            }
 
             // Track command failures so we can block infinite retry loops.
             if (COMMAND_TOOLS.has(tool.name)) {
