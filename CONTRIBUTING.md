@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,760 tests, no network, no API keys
+npm test             # 1,792 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -60,6 +60,7 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/providers/llm.js` | ~780 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
 | `src/providers/endpoints.js` | ~90 | **Single source of truth** for every provider base URL |
 | `src/providers/pricing.js` | ~105 | The cost table, its ordering invariant, and `navy.modelPricing` overrides |
+| `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
 | `src/providers/mcp.js` | ~300 | MCP client, stdio and streamable HTTP |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
@@ -134,6 +135,13 @@ Two more run on demand, deliberately outside `npm test`:
 - **`npm run test:endpoints`** — real network calls confirming every shipped
   provider base URL is still live, using a deliberately invalid key so no
   secrets are needed. Run it before cutting a release; CI runs it weekly.
+- **`npm run eval`** — the real-model harness (`eval/README.md`). CI runs it
+  weekly too, against one cheap model, gating on `--fail-on-regression`: a task
+  that passed in `eval/results/baseline.json` and now fails. Deliberately not a
+  PR gate — it spends money per push, fork PRs cannot read the secret, and a
+  nondeterministic model would go red at random until everyone ignored it. It
+  skips itself with a notice when `NAVY_EVAL_API_KEY` is unset, because a
+  permanently red scheduled job is the same as no job.
 
 
 **`npm run check`** (`test/check-syntax.js`) parses every JS file under `src/`,

@@ -35,6 +35,7 @@
 - **Code Lens** — "Ask Navy" buttons above functions in the editor
 - **Read aloud & dictation** — a speaker button reads any message out as prose (not punctuation), and a microphone button transcribes speech into the prompt box, where you review and send it yourself. VS Code webviews cannot reach the microphone ([microsoft/vscode#250568](https://github.com/microsoft/vscode/issues/250568)), so dictation runs in your browser via a token-gated loopback page and streams the words back — see [Privacy](#privacy)
 - **No telemetry, zero runtime dependencies** — nothing is sent anywhere except to the AI provider you configure; the shipped extension has no npm packages bundled in besides the code in this repo
+- **Diagnostics you choose to share** — `Navy Coder: Export Diagnostics` assembles what a bug report needs (versions, provider, resolved shell, both approval gates, recent errors) into an *unsaved* editor tab. Nothing is written to disk and nothing is transmitted; API keys are never read into it, and paths, home directory and anything credential-shaped are redacted on the way in. You read it, then decide
 
 ---
 

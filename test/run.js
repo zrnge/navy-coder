@@ -7523,6 +7523,116 @@ async function pricingSuite() {
     decl?.type === 'object' && JSON.stringify(decl.default) === '{}');
 }
 
+
+// Navy transmits nothing, and that stays true. The cost is that a bug report
+// reduces to "it didn't work" — so the diagnostics bundle assembles what a
+// maintainer would otherwise ask for, locally, and lets the user decide whether
+// to share it. Which makes what it CANNOT contain the important part.
+async function diagnosticsSuite() {
+  console.log('\ndiagnostics bundle (local, redacted, never sent):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    const { LOG_RING_MAX } = require('../src/diagnostics.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-diag-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // ── Redaction, which happens on the way IN. ────────────────────────────
+    const secrets = [
+      ['sk-abcdefghijklmnopqrstuvwxyz012345', 'sk-'],
+      ['sk-ant-api03-abcdefghijklmnopqrstuvwxyz', 'sk-ant-'],
+      ['gsk_abcdefghijklmnopqrstuvwxyz012345', 'gsk_'],
+      ['xai-abcdefghijklmnopqrstuvwxyz012345', 'xai-'],
+      ['AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234', 'AIza'],
+    ];
+    for (const [key, prefix] of secrets) {
+      const out = provider._redactForReport('calling with key=' + key);
+      check(`redaction: a ${prefix}… key never survives`, !out.includes(key), out);
+    }
+    check('redaction: an Authorization header is scrubbed',
+      !provider._redactForReport('Authorization: Bearer hunter2hunter2').includes('hunter2'));
+    check('redaction: any long token-shaped run is scrubbed even if unrecognised',
+      provider._redactForReport('tok ' + 'a'.repeat(50)).includes('<redacted-long-token>'));
+
+    check('redaction: the project path is replaced',
+      provider._redactForReport('failed at ' + tmp + '/src/a.js') === 'failed at <project>/src/a.js');
+    check('redaction: the project path is replaced in forward-slash form too',
+      provider._redactForReport('failed at ' + tmp.replace(/\\/g, '/') + '/src/a.js') === 'failed at <project>/src/a.js');
+    check('redaction: the home directory is replaced',
+      provider._redactForReport('read ' + os.homedir() + '/.navy/x').includes('~/'));
+    check('redaction: survives a null line without throwing', provider._redactForReport(null) === '');
+
+    // ── The ring is bounded and scrubbed at the door. ─────────────────────
+    provider._logRing = null;
+    provider._recordLogLine('key=sk-abcdefghijklmnopqrstuvwxyz012345');
+    check('log ring: the STORED line is already scrubbed, not scrubbed at render time',
+      !provider._logRing[0].includes('sk-abcdefghijklmnopqrstuvwxyz012345'));
+    for (let i = 0; i < LOG_RING_MAX + 50; i++) provider._recordLogLine('line ' + i);
+    check('log ring: bounded', provider._logRing.length === LOG_RING_MAX, provider._logRing.length);
+    check('log ring: keeps the MOST RECENT lines',
+      provider._logRing[provider._logRing.length - 1] === 'line ' + (LOG_RING_MAX + 49));
+
+    // ── The report. ───────────────────────────────────────────────────────
+    ctrl.config.provider = 'anthropic';
+    ctrl.config.model = 'some-unreleased-model';
+    provider._diagnosticsKeyState = false;
+    provider._logRing = ['turn failed: ECONNREFUSED'];
+    const report = provider.buildDiagnosticsReport();
+
+    check('report: says plainly that nothing was transmitted', /has not been sent anywhere/.test(report));
+    check('report: names the provider and model', /anthropic/.test(report) && /some-unreleased-model/.test(report));
+    check('report: reports a MISSING key without ever printing one',
+      /API key\s+MISSING/.test(report) && !/sk-/.test(report));
+    check('report: flags a model the pricing table cannot cost',
+      /Cost estimate\s+UNAVAILABLE/.test(report) && /navy\.modelPricing/.test(report));
+    check('report: dates the pricing snapshot so a stale estimate reads as stale',
+      /Pricing checked\s+\d{4}-\d{2}-\d{2}/.test(report));
+    check('report: states both approval gates separately',
+      /File approval/.test(report) && /Command approval/.test(report));
+    check('report: states the resolved shell', /Shell\s+\w/.test(report));
+    check('report: includes the recent log', /ECONNREFUSED/.test(report));
+
+    ctrl.config.provider = 'ollama';
+    check('report: a local provider is described as free, not as uncosted',
+      /Cost estimate\s+n\/a — local models are free/.test(provider.buildDiagnosticsReport()));
+
+    provider._logRing = [];
+    check('report: an empty log says so rather than rendering an empty block',
+      /Nothing logged yet/.test(provider.buildDiagnosticsReport()));
+
+    // A report that cannot be built when things are badly broken is worthless,
+    // and "badly broken" is exactly when it gets used.
+    provider.projectRoot = '';
+    let built = null;
+    try { built = provider.buildDiagnosticsReport(); } catch { built = null; }
+    check('report: still builds with no project open', typeof built === 'string' && /Project open\s+NO/.test(built));
+
+    // ── The command has to be declared, or it does not exist. ─────────────
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    check('navy.exportDiagnostics is declared in the manifest',
+      manifest.contributes.commands.some(c => c.command === 'navy.exportDiagnostics'));
+
+    // ── The weekly eval must stay weekly. ─────────────────────────────────
+    const wf = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'eval.yml'), 'utf8');
+    check('eval workflow: runs on a schedule and on demand',
+      /schedule:/.test(wf) && /workflow_dispatch:/.test(wf));
+    check('eval workflow: is NOT a pull-request gate — forks have no secrets and models are nondeterministic',
+      !/^on:[\s\S]*?pull_request:/m.test(wf.split('jobs:')[0]));
+    check('eval workflow: gates on regression, not on any failure', /--fail-on-regression/.test(wf));
+    check('eval workflow: skips cleanly when no key is configured', /NAVY_EVAL_API_KEY is not set/.test(wf));
+    const evalSrc = fs.readFileSync(path.join(__dirname, '..', 'eval', 'run.js'), 'utf8');
+    check('eval harness: supports --fail-on-regression', /--fail-on-regression/.test(evalSrc));
+    check('eval harness: a missing baseline is not treated as a regression', /baselineMissing/.test(evalSrc));
+  } finally {
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -7570,6 +7680,7 @@ undoRedoSuite()
   .then(shellSelectionSuite)
   .then(contextBudgetLearningSuite)
   .then(pricingSuite)
+  .then(diagnosticsSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

@@ -1,0 +1,91 @@
+name: Eval
+
+# Is Navy still any good at coding?
+#
+# `npm test` mocks the model everywhere. That is the right call for a suite that
+# has to run on every push with no keys and no cost — but it means the whole
+# suite can stay green while Navy gets steadily worse at the only thing it is
+# for. eval/README.md says so in its opening paragraph, and until now nothing
+# automated did anything about it.
+#
+# Deliberately NOT a pull-request gate, for three reasons that are all fatal on
+# their own: it spends real money on every push; a fork PR cannot read secrets,
+# so every external contribution would fail; and a real model is
+# nondeterministic, so unrelated changes would go red at random and the job
+# would be ignored within a fortnight.
+#
+# Weekly instead, gating only on REGRESSION — a task that passed in the
+# committed baseline and now fails. A drop from 19/22 to 18/22 is signal. 22/22
+# was never the bar.
+on:
+  schedule:
+    - cron: '41 6 * * 1' # Mondays, 06:41 UTC — after the endpoint probe at 06:17
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Provider id (overrides the EVAL_PROVIDER variable)'
+        required: false
+        type: string
+      model:
+        description: 'Model id (overrides the EVAL_MODEL variable)'
+        required: false
+        type: string
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # A repository with no eval key configured is not broken — it just cannot
+      # run this. Skipping loudly beats a permanently red scheduled job, which
+      # is the same as no job at all.
+      - name: Check the eval key is configured
+        id: gate
+        env:
+          NAVY_EVAL_API_KEY: ${{ secrets.NAVY_EVAL_API_KEY }}
+        run: |
+          if [ -z "$NAVY_EVAL_API_KEY" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NAVY_EVAL_API_KEY is not set — skipping. Add it in repository secrets to enable the weekly eval."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --fail-on-regression compares against the committed baseline and exits
+      # non-zero ONLY for a task that used to pass. A missing baseline is not a
+      # regression: the first run uploads its results so a maintainer can
+      # promote them to eval/results/baseline.json.
+      - name: Run the eval
+        if: steps.gate.outputs.run == 'true'
+        env:
+          NAVY_EVAL_API_KEY: ${{ secrets.NAVY_EVAL_API_KEY }}
+          EVAL_PROVIDER: ${{ inputs.provider || vars.EVAL_PROVIDER || 'anthropic' }}
+          EVAL_MODEL: ${{ inputs.model || vars.EVAL_MODEL || 'claude-haiku-4-5-20251001' }}
+        run: |
+          node eval/run.js \
+            --provider "$EVAL_PROVIDER" \
+            --model "$EVAL_MODEL" \
+            --label ci \
+            --compare eval/results/baseline.json \
+            --fail-on-regression
+
+      # Kept whether the run passed or failed: a regression is exactly when
+      # someone wants to read the results, and a green run is the candidate for
+      # the next baseline.
+      - name: Keep the results
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval/results/
+          if-no-files-found: warn
+          retention-days: 90

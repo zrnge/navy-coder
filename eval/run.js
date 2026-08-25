@@ -39,6 +39,7 @@ function parseArgs(argv) {
     else if (a === '--task')     out.task = argv[++i];
     else if (a === '--category') out.category = argv[++i];
     else if (a === '--compare')  out.compare = argv[++i];
+    else if (a === '--fail-on-regression') out.failOnRegression = true;
     else if (a === '--timeout')  out.timeout = parseInt(argv[++i], 10) * 1000;
     else if (a === '--host')     out.host = argv[++i];
     else if (a === '--keep')     out.keep = true;
@@ -68,6 +69,9 @@ Navy eval runner
   npm run eval -- --task <id>                    run one task
   npm run eval -- --category edit-precision      run one category
   npm run eval -- --compare <results.json>       diff against a previous run
+  npm run eval -- --fail-on-regression           exit non-zero ONLY for a task that
+                                                 used to pass and now doesn't (needs
+                                                 --compare; for scheduled CI)
   npm run eval -- --timeout 240                  per-task timeout in seconds
   npm run eval -- --keep                         keep temp repos for inspection
   npm run eval -- --config <key>=<value>         set any navy.* setting for the run (repeatable)
@@ -301,7 +305,13 @@ function report(results, cfg) {
 function compare(current, baselinePath) {
   let baseline;
   try { baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf8')); }
-  catch (e) { console.log(`\n  (could not read baseline ${baselinePath}: ${e.message})`); return; }
+  catch (e) {
+    console.log(`\n  (could not read baseline ${baselinePath}: ${e.message})`);
+    // No baseline is not a regression. A first scheduled run has nothing to
+    // compare against and must not be red for it — it uploads its results so a
+    // maintainer can promote them to the baseline.
+    return { regressed: [], fixed: [], baselineMissing: true };
+  }
 
   const prev = new Map((baseline.results || []).map(r => [r.id, r.status]));
   const regressed = [], fixed = [];
@@ -319,6 +329,7 @@ function compare(current, baselinePath) {
     for (const r of fixed)     console.log(`    ✓ FIXED      ${r.id}`);
     for (const r of regressed) console.log(`    ✗ REGRESSED  ${r.id}\n                 ${r.reason}`);
   }
+  return { regressed, fixed, baselineMissing: false };
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -426,7 +437,7 @@ async function main() {
   }
 
   const summary = report(results, cfg);
-  if (args.compare) compare(results, args.compare);
+  const comparison = args.compare ? compare(results, args.compare) : null;
 
   // Persist so the next run can diff against this one.
   const outDir = path.join(__dirname, 'results');
@@ -447,6 +458,21 @@ async function main() {
   // Errors mean the run didn't actually measure anything reliable — surface that
   // in the exit code so CI can't treat an all-errored run as a green result.
   if (summary.error) process.exitCode = 2;
+  else if (args.failOnRegression) {
+    // Scheduled-CI mode. A real model is nondeterministic and the baseline
+    // itself carries known failures, so failing on `summary.fail` would make
+    // the job permanently red and therefore ignored. Only a task that USED to
+    // pass and now doesn't is a signal worth waking someone for.
+    if (!args.compare) {
+      console.error('\n  --fail-on-regression needs --compare <baseline.json> to compare against.');
+      process.exitCode = 2;
+    } else if (comparison?.regressed?.length) {
+      console.error(`\n  REGRESSION: ${comparison.regressed.length} task(s) that passed in the baseline now fail.`);
+      process.exitCode = 1;
+    } else if (comparison?.baselineMissing) {
+      console.log('\n  No baseline yet — nothing to regress against. Promote this run to establish one.');
+    }
+  }
   else if (summary.fail) process.exitCode = 1;
 }
 

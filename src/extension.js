@@ -13,6 +13,7 @@ const { BACKGROUND_METHODS } = require('./background.js');
 const { NET_SAFETY_METHODS } = require('./net-safety.js');
 const { UNDO_METHODS } = require('./undo.js');
 const { WEB_SEARCH_METHODS } = require('./web-search.js');
+const { DIAGNOSTICS_METHODS } = require('./diagnostics.js');
 const { SLASH_COMMAND_METHODS } = require('./slash-commands.js');
 const { SKILL_METHODS } = require('./skills.js');
 const vscode = require('vscode');
@@ -7044,7 +7045,13 @@ function activate(context) {
   // MCP server chatter, provider errors) — View → Output → "Navy Coder".
   const outputChannel = vscode.window.createOutputChannel('Navy Coder');
   context.subscriptions.push(outputChannel);
-  provider.log = (line) => outputChannel.appendLine(new Date().toISOString().slice(11, 19) + '  ' + line);
+  provider.log = (line) => {
+    const stamped = new Date().toISOString().slice(11, 19) + '  ' + line;
+    outputChannel.appendLine(stamped);
+    provider._recordLogLine(stamped);
+  };
+  // The manifest is the only place the version is not a guess.
+  provider._diagnosticsVersion = context.extension?.packageJSON?.version || '';
   // Reveal the channel (without stealing focus) the first time the webview
   // reports a stall — a randomly-freezing panel is only diagnosable if the
   // evidence surfaces on its own rather than waiting to be looked for.
@@ -7229,6 +7236,7 @@ function activate(context) {
     vscode.commands.registerCommand('navy.exportConversation', () => provider.view?.webview.postMessage({ type: 'requestExport' })),
     vscode.commands.registerCommand('navy.reviewPR', () => provider.generatePRReview()),
     vscode.commands.registerCommand('navy.testProvider', () => provider.testProviderConnection()),
+    vscode.commands.registerCommand('navy.exportDiagnostics', () => provider.exportDiagnostics()),
     vscode.commands.registerCommand('navy.newSlashCommand', () => provider.createSlashCommand()),
     vscode.commands.registerCommand('navy.openSlashCommands', () => provider.openSlashCommandsFolder()),
     vscode.window.onDidChangeActiveTextEditor(editor => {
@@ -7281,6 +7289,7 @@ mixinPrototype(NavyCoderViewProvider.prototype, BACKGROUND_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, NET_SAFETY_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, UNDO_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, WEB_SEARCH_METHODS);
+mixinPrototype(NavyCoderViewProvider.prototype, DIAGNOSTICS_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SLASH_COMMAND_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SKILL_METHODS);
 

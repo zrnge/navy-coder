@@ -483,6 +483,10 @@
         "title": "Navy Coder: Test Provider Connection"
       },
       {
+        "command": "navy.exportDiagnostics",
+        "title": "Navy Coder: Export Diagnostics"
+      },
+      {
         "command": "navy.newSlashCommand",
         "title": "Navy Coder: New Slash Command"
       },
