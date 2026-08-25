@@ -217,6 +217,26 @@ const SLASH_COMMAND_METHODS = {
         if (!taken.has(skill.cmd)) commands.push(skill);
       }
     } catch (e) { this.log?.('skill commands: ' + e.message); }
+    // MCP prompts are templates a PERSON invokes, which is what a slash command
+    // is — so that is where they go, rather than being handed to the model as
+    // tools. Unlike every other entry here they carry no `prompt` text: the
+    // template lives on the server and takes arguments, so the text only exists
+    // once it has been asked for. They travel with an `mcp` descriptor instead,
+    // and the composer routes them back here to be expanded (see runMcpPrompt).
+    try {
+      const taken = new Set(commands.map(c => c.cmd));
+      for (const p of this.mcp?.listPrompts?.() || []) {
+        const cmd = '/' + p.command;
+        if (taken.has(cmd)) continue;
+        commands.push({
+          cmd,
+          description: `[MCP:${p.server}] ${p.description}`,
+          prompt: '',
+          mcp: { server: p.server, name: p.name, arguments: p.arguments },
+        });
+      }
+    } catch (e) { this.log?.('mcp prompts: ' + e.message); }
+
     // `file` and `prompt` both travel: the composer expands the prompt itself
     // (so what is sent, shown and persisted are the same text), and the file
     // path is what makes an entry in the dropdown openable for editing.

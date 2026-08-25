@@ -2261,6 +2261,9 @@ function expandSlashCommand(text, commands) {
   if (!m) return text;
   const command = (commands || []).find(c => c.cmd === '/' + m[1]);
   if (!command) return text;
+  // An MCP prompt's text lives on the server and depends on the arguments, so
+  // there is nothing here to expand. Left verbatim for sendPrompt to route.
+  if (command.mcp) return text;
   const args = (m[2] || '').trim();
   const template = String(command.prompt || '');
   if (template.includes('$ARGUMENTS')) return template.split('$ARGUMENTS').join(args);
@@ -2608,6 +2611,29 @@ function sendPrompt() {
   // Checked after expansion because /bg's own template is the literal `/bg `,
   // so a custom command may expand INTO a background task, but a custom command
   // named `bg` cannot take this route away from it.
+  // An MCP prompt: the server owns the text, so ask the extension to fetch it
+  // and run the turn. Checked before /bg for the same reason /bg is checked
+  // after expansion — this is a route, not a template.
+  const mcpCmd = (() => {
+    const m = prompt.match(/^\/([\w:-]+)(?:[ \t]+([\s\S]*))?$/);
+    if (!m) return null;
+    const c = allSlashCommands().find(x => x.cmd === '/' + m[1]);
+    return c?.mcp ? { mcp: c.mcp, args: (m[2] || '').trim() } : null;
+  })();
+  if (mcpCmd) {
+    promptInput.value = '';
+    promptInput.style.height = 'auto';
+    updateSendButton();
+    vscode.postMessage({
+      type: 'runMcpPrompt',
+      server: mcpCmd.mcp.server,
+      name: mcpCmd.mcp.name,
+      args: mcpCmd.args,
+      includeContext: includeContext ? includeContext.checked : true,
+    });
+    return;
+  }
+
   if (prompt.startsWith('/bg ')) {
     const taskPrompt = prompt.slice(4).trim();
     if (!taskPrompt) return;

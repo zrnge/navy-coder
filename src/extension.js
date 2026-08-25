@@ -240,6 +240,9 @@ const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files',
   // TELLS the model to do is gated as it always was — see src/skills.js.
   'activate_skill',
   'web_search','fetch_url','get_terminal_output','read_process_output',
+  // MCP resources are data a server exposes for reading. Nothing about
+  // listing or reading one changes anything, here or on the server.
+  'list_mcp_resources','read_mcp_resource',
   // A sub-agent only ever reads, so delegating is parallel-safe: two
   // investigations of different questions share nothing but the filesystem
   // they are both reading. This is what lets a model fan out — "how does auth
@@ -1024,6 +1027,27 @@ class NavyCoderViewProvider {
           }
           await vscode.workspace.getConfiguration('navy').update(key, message.mode, vscode.ConfigurationTarget.Global);
           this.sendApprovalMode();
+          break;
+        }
+        case 'runMcpPrompt': {
+          // The server's template becomes the user's message. Deliberately a
+          // normal turn from there on: an MCP prompt is a shortcut for typing
+          // something, not a different kind of request, and everything
+          // downstream — history, approval, undo — should treat it that way.
+          const p = this.mcp?.listPrompts?.().find(x => x.server === message.server && x.name === message.name);
+          const argNames = (p?.arguments || []).map(a => a.name).filter(Boolean);
+          // MCP prompt arguments are named, and a slash command gives us one
+          // string. The first named argument takes the whole of it, which is
+          // what nearly every prompt in the ecosystem expects; anything more
+          // structured is a job for the server's own tool.
+          const args = {};
+          if (argNames.length && message.args) args[argNames[0]] = message.args;
+          const text = await this.mcp.getPrompt(message.server, message.name, args);
+          if (typeof text === 'string' && text.startsWith('Error:')) {
+            this.view?.webview.postMessage({ type: 'error', message: text });
+            break;
+          }
+          await this.askNavy(text, message.includeContext !== false, null, [], []);
           break;
         }
         case 'rewindTo':
@@ -4550,6 +4574,8 @@ class NavyCoderViewProvider {
         case 'web_search': return await this.toolWebSearch(tool.args.query, tool.args.maxResults);
         case 'delegate_research': return await this.toolDelegateResearch(tool.args.task, tool.args.maxSteps);
         case 'update_plan': return await this.toolUpdatePlan(tool.args.steps);
+        case 'list_mcp_resources': return this.toolListMcpResources();
+        case 'read_mcp_resource': return await this.toolReadMcpResource(tool.args.uri);
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
@@ -6531,6 +6557,36 @@ class NavyCoderViewProvider {
     } finally {
       this.bgWorkers.delete(taskId);
     }
+  }
+
+  // Both are reads against a server the user configured, so they are gated
+  // exactly like any other MCP call — see the isMcpTool branch above, which
+  // covers server tools; these are Navy's own and are covered here.
+  toolListMcpResources() {
+    const items = this.mcp?.listResources?.() || [];
+    if (!items.length) {
+      return 'No MCP resources are available. Either no server is connected, or none of the connected servers exposes resources (see navy.mcpServers).';
+    }
+    const lines = items.map(r => {
+      const bits = [r.uri];
+      if (r.name && r.name !== r.uri) bits.push(r.name);
+      if (r.mimeType) bits.push(r.mimeType);
+      return `- [${r.server}] ${bits.join('  |  ')}${r.description ? '\n    ' + r.description : ''}`;
+    });
+    return `${items.length} MCP resource${items.length === 1 ? '' : 's'}:\n${lines.join('\n')}`;
+  }
+
+  async toolReadMcpResource(uri) {
+    if (!uri || typeof uri !== 'string') return 'Error: a resource uri is required — call list_mcp_resources first.';
+    if (!this._commandsAutoApproved()) {
+      const id = this.generateId();
+      this.view?.webview.postMessage({
+        type: 'pendingCommand', id, command: `MCP: read resource ${uri.slice(0, 200)}`,
+      });
+      const approved = await new Promise((resolve) => { this.pendingCommandApprovals.set(id, { resolve }); });
+      if (!approved) return 'MCP resource read rejected by user.';
+    }
+    return await this.mcp.readResource(uri);
   }
 
   async toolGitBlame(filePath, startLine, endLine) {

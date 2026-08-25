@@ -7056,8 +7056,11 @@ async function approvalScopeSuite() {
     const cmdGates = (extSrc.match(/_commandsAutoApproved\(\)/g) || []).length;
     // 1 definition + 5 call sites (write, delete, rename, rename_symbol, applyCode).
     check('file gates route through _editsAutoApproved', editGates === 6, 'found ' + editGates);
-    // 1 definition + 4 call sites (MCP, _approveCommand, run_project, start_process).
-    check('execution gates route through _commandsAutoApproved', cmdGates === 5, 'found ' + cmdGates);
+    // 1 definition + 5 call sites (MCP tools, MCP resource reads, _approveCommand,
+    // run_project, start_process). Reading an MCP resource reaches a server the
+    // user configured, so it is gated like every other call to one — it is not a
+    // file read, and the file gate has nothing to say about it.
+    check('execution gates route through _commandsAutoApproved', cmdGates === 6, 'found ' + cmdGates);
 
     // ── The manifest must ship the safe default, whatever the file gate says. ──
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
@@ -8137,6 +8140,145 @@ async function rewindSuite() {
   }
 }
 
+
+// MCP was tools-only. Resources and prompts are the other two things a server
+// can offer, and they are surfaced differently on purpose: resources are DATA
+// the model may want (two tools between all of them, because a server can
+// expose hundreds and one schema each would cost more than the data is worth),
+// prompts are templates a PERSON invokes (slash commands). Flattening either
+// into the other is what makes an MCP integration feel wrong.
+async function mcpExtrasSuite() {
+  console.log('\nMCP resources and prompts:');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    const { McpManager } = require('../src/providers/mcp.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-mcpx-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => { posted.push(m); return Promise.resolve(true); } } };
+
+    const mgr = new McpManager(() => {});
+    provider.mcp = mgr;
+    const started = await mgr.start({
+      mock: { command: process.execPath, args: [path.join(__dirname, 'mock-mcp-server.js')] },
+    });
+    check('mcp: the server connected', started[0]?.tools >= 3, JSON.stringify(started));
+
+    // ── Resources. ────────────────────────────────────────────────────────
+    const resources = mgr.listResources();
+    check('resources: discovered and qualified by server',
+      resources.length === 2 && resources.every(r => r.server === 'mock'), JSON.stringify(resources));
+    check('resources: hasResources reflects that', mgr.hasResources() === true);
+
+    ctrl.config.commandApproval = 'auto-approve';
+    const listed = provider.toolListMcpResources();
+    check('list_mcp_resources: reports each uri the model needs',
+      /mock:\/\/doc\.txt/.test(listed) && /mock:\/\/pic\.png/.test(listed), listed);
+    check('list_mcp_resources: names the server each came from', /\[mock\]/.test(listed));
+
+    const doc = await provider.toolReadMcpResource('mock://doc.txt');
+    check('read_mcp_resource: returns the text', /the document body/.test(doc), doc);
+
+    // Binary must be DESCRIBED. A base64 image pasted into a model's context as
+    // text is thousands of tokens of nothing.
+    const pic = await provider.toolReadMcpResource('mock://pic.png');
+    check('read_mcp_resource: binary is described, never decoded into context',
+      /binary image\/png omitted/.test(pic) && !/QUJDRA/.test(pic), pic);
+
+    check('read_mcp_resource: a missing uri is refused before any call',
+      /^Error: a resource uri is required/.test(await provider.toolReadMcpResource('')));
+    const bogus = await provider.toolReadMcpResource('mock://nope');
+    check('read_mcp_resource: an unknown uri fails with something actionable',
+      /no connected MCP server|resource read failed/i.test(bogus), bogus);
+
+    // ── The two tools are offered only when there is something to point them
+    //    at, and they ride the dynamic MCP schema list. ────────────────────
+    const api = mgr.getToolsApi();
+    const names = api.map(t => t.function.name);
+    check('the resource tools are offered when a server has resources',
+      names.includes('list_mcp_resources') && names.includes('read_mcp_resource'), names.join(', '));
+    check('…alongside the server tools, not instead of them',
+      names.some(n => n === 'mcp__mock__echo'));
+    const empty = new McpManager(() => {});
+    check('…and not offered at all when nothing has resources',
+      empty.getToolsApi().length === 0 && empty.hasResources() === false);
+
+    // They read, so they may run concurrently and a research sub-agent may use
+    // them — that is what READ_ONLY means here.
+    const extSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
+    const readOnlyBlock = extSrc.split('const READ_ONLY')[1].split(']);')[0];
+    check('the resource tools are read-only',
+      /'list_mcp_resources'/.test(readOnlyBlock) && /'read_mcp_resource'/.test(readOnlyBlock));
+
+    // Reading from a server the user configured is a call OUT, so it is gated
+    // like every other one — by navy.commandApproval, not the file gate.
+    ctrl.config.commandApproval = 'ask-always';
+    posted.length = 0;
+    const gated = provider.toolReadMcpResource('mock://doc.txt');
+    await new Promise(r => setImmediate(r));
+    check('read_mcp_resource: gated by commandApproval, not the file gate',
+      posted.some(m => m.type === 'pendingCommand' && /read resource/.test(m.command)));
+    for (const [id] of provider.pendingCommandApprovals) provider.resolveCommandApproval(id, false);
+    check('read_mcp_resource: a rejected read does not happen', /rejected by user/.test(await gated));
+    ctrl.config.commandApproval = 'auto-approve';
+
+    // ── Prompts. ──────────────────────────────────────────────────────────
+    const prompts = mgr.listPrompts();
+    check('prompts: discovered, with their arguments',
+      prompts.length === 2 && prompts.find(p => p.name === 'summarize')?.arguments?.length === 1,
+      JSON.stringify(prompts));
+    check('prompts: named so a slash command can address them',
+      prompts.every(p => p.command === 'mcp:mock:' + p.name));
+
+    const text = await mgr.getPrompt('mock', 'summarize', { subject: 'the auth module' });
+    check('prompts: get returns flattened text, ready to send as a message',
+      text === 'Please summarize the auth module', JSON.stringify(text));
+    check('prompts: a prompt with no arguments works too',
+      (await mgr.getPrompt('mock', 'plain', {})) === 'A prompt with no arguments.');
+    check('prompts: an unknown server is refused',
+      /is not connected/.test(await mgr.getPrompt('nope', 'plain', {})));
+    check('prompts: an unknown prompt fails without throwing',
+      /failed|Error/.test(await mgr.getPrompt('mock', 'nope', {})));
+
+    // They reach the composer as slash commands, behind everything the user
+    // wrote themselves.
+    posted.length = 0;
+    await provider.sendSlashCommands();
+    const sent = posted.find(m => m.type === 'slashCommands');
+    const mcpCmds = (sent?.commands || []).filter(c => c.mcp);
+    check('prompts: reach the composer as slash commands',
+      mcpCmds.length === 2 && mcpCmds.every(c => c.cmd.startsWith('/mcp:mock:')), JSON.stringify(mcpCmds.map(c => c.cmd)));
+    check('prompts: carry no local prompt text — the server owns it',
+      mcpCmds.every(c => c.prompt === '' && c.mcp.server === 'mock'));
+    check('prompts: are labelled as coming from MCP', mcpCmds.every(c => /^\[MCP:mock\]/.test(c.description)));
+
+    // ── A server that declares nothing extra is never asked. ─────────────
+    const bare = new McpManager(() => {});
+    await bare.start({ bare: { command: process.execPath, args: ['-e', `
+      let b='';process.stdin.on('data',d=>{b+=d;let i;while((i=b.indexOf('\\n'))!==-1){const l=b.slice(0,i).trim();b=b.slice(i+1);if(!l)continue;const m=JSON.parse(l);
+      if(m.method==='initialize')process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'bare',version:'1'}}})+'\\n');
+      else if(m.method==='tools/list')process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{tools:[]}})+'\\n');
+      else if(m.id)process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'method not found: '+m.method}})+'\\n');}});
+    `] } });
+    check('capability gating: a tools-only server yields no resources or prompts',
+      bare.listResources().length === 0 && bare.listPrompts().length === 0);
+    check('capability gating: …and is still perfectly usable', bare.servers.has('bare'));
+    bare.stop();
+
+    mgr.stop();
+    empty.stop();
+  } finally {
+    try { provider?.mcp?.stop?.(); } catch {}
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -8189,6 +8331,7 @@ undoRedoSuite()
   .then(settingsDefaultsSuite)
   .then(planSuite)
   .then(rewindSuite)
+  .then(mcpExtrasSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

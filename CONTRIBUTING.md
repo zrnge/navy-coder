@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,935 tests, no network, no API keys
+npm test             # 1,961 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -63,7 +63,7 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
 | `src/plan.js` | ~130 | Task plans: validation, the block the model reads back, the incomplete-plan note |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
-| `src/providers/mcp.js` | ~300 | MCP client, stdio and streamable HTTP |
+| `src/providers/mcp.js` | ~420 | MCP client, stdio and streamable HTTP: tools, resources and prompts |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
 | `src/dictation-bridge.js` | ~400 | Loopback server + browser page for voice input. No pause control — see the file header for why |
 | `src/webview-html.js` | ~380 | Builds the webview markup |
