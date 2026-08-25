@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,872 tests, no network, no API keys
+npm test             # 1,910 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -46,7 +46,7 @@ diff has to stay reviewable.
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
 | `src/sandbox.js` | ~230 | Docker sandboxing (`navy.sandboxMode`) |
-| `src/undo.js` | ~220 | Transactional undo/redo and checkpoints |
+| `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
 | `src/slash-commands.js` | ~290 | Custom slash commands: the markdown format, where they load from, precedence and the trust gate |

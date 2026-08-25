@@ -21,6 +21,11 @@ const projectSelect = document.querySelector('#projectSelect');
 const CATALOG_OPTION_PREFIX = '__catalog__:';
 const approvalQueue = document.querySelector('#approvalQueue');
 const approvalModeSelect = document.querySelector('#approvalModeSelect');
+// Index of the next message to be added, mirroring the extension's own
+// this.messages array — it is what a rewind request names. Reset wherever the
+// transcript is rebuilt, and only user and assistant messages count, because
+// only those two are persisted.
+let messageIndex = 0;
 const commandApprovalSelect = document.querySelector('#commandApprovalSelect');
 const thinkingLevelSelect = document.querySelector('#thinkingLevelSelect');
 const contextSelect = document.querySelector('#contextSelect');
@@ -1613,6 +1618,20 @@ window.addEventListener('message', (event) => {
     }
   }
 
+  if (message.type === 'rewound') {
+    // renderHistory has already redrawn the transcript from the truncated
+    // history; this only reports what happened and offers the prompt back, so
+    // re-asking a question you are rewinding to does not mean retyping it.
+    addSystemMessage(
+      `Rewound — ${message.files ? message.files + ' file' + (message.files === 1 ? '' : 's') + ' restored, ' : ''}` +
+      'the discarded turns are gone.');
+    if (message.prompt && promptInput && !promptInput.value.trim()) {
+      promptInput.value = message.prompt;
+      autoResize();
+      updateSendButton();
+    }
+  }
+
   if (message.type === 'planUpdate') {
     planIsAuthoritative = true;
     renderAuthoritativePlan(message.steps);
@@ -2810,6 +2829,7 @@ function renderHistoryItem(item) {
 }
 
 function renderHistory(history) {
+  messageIndex = 0;
   messagesEl.innerHTML = '';
   messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — keep it in the DOM
   if (!Array.isArray(history) || !history.length) { updateWelcome(); return; }
@@ -3216,6 +3236,27 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
   // a "Show N more lines" toggle, so the visible text is not the whole thing
   // and reading it off the DOM would silently truncate. `text` is the original
   // input, so it is used directly.
+  // Rewind. Offered on your own messages only: rewinding is defined as "put me
+  // back to just before I said this", which has no meaning for a reply. The
+  // extension asks for confirmation and owns the file question — the panel
+  // never decides either.
+  if (role === 'user') {
+    const myIndex = messageIndex;
+    const rewindBtn = document.createElement('button');
+    rewindBtn.type = 'button';
+    rewindBtn.className = 'msg-rewind-btn';
+    rewindBtn.title = 'Rewind the conversation to just before this message';
+    rewindBtn.setAttribute('aria-label', rewindBtn.title);
+    // Text rather than an icon: there is no sprite glyph that means rewind, and
+    // a destructive action reads better named than guessed at.
+    rewindBtn.textContent = 'Rewind';
+    rewindBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'rewindTo', index: myIndex });
+    });
+    article.appendChild(rewindBtn);
+  }
+  if (role === 'user' || role === 'assistant') messageIndex++;
+
   if (role === 'assistant' || role === 'user') {
     const copyBtn = document.createElement('button');
     copyBtn.type = 'button';
@@ -3491,6 +3532,12 @@ function resetPlanCard() {
   planIsAuthoritative = false;
 }
 
+// Clearing the chat empties this.messages on the extension side too, so the
+// panel's idea of the next index has to go back to zero with it.
+function resetMessageIndex() {
+  messageIndex = 0;
+}
+
 // Resets everything tied to the currently-displayed conversation THREAD —
 // shared by the 'cleared' message handler and by switching session tabs
 // (soft-clearing before the target tab's sessionLoaded/restore repopulates
@@ -3502,6 +3549,9 @@ function resetThreadDisplay() {
   // A reply being read aloud is about to leave the screen; its audio should go
   // with it rather than narrating a conversation that is no longer shown.
   stopSpeaking();
+  // The extension side empties (or replaces) this.messages whenever the thread
+  // is reset, so the panel index that names a rewind target resets with it.
+  resetMessageIndex();
   activeAssistantMessage = null;
   activeAssistantBubble = null;
   activeAssistantContent = '';

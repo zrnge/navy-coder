@@ -7999,6 +7999,144 @@ async function planSuite() {
   }
 }
 
+
+// Undoing a bad turn's FILES was always possible; the conversation it happened
+// in was not. That left the worst of the three states — the files back where
+// they were, and the model still holding every wrong assumption that produced
+// them, including its own confident account of edits that no longer exist.
+async function rewindSuite() {
+  console.log('\nconversation rewind (transcript, digest, files):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rewind-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => { posted.push(m); return Promise.resolve(true); } } };
+    provider._wslCache = { available: false };
+    ctrl.config.approvalMode = 'auto-approve';
+
+    const target = path.join(tmp, 'thing.js');
+    fs.writeFileSync(target, 'original');
+
+    // Three turns, the middle one writing a file.
+    global.fetch = queueOllamaFetch([{ text: 'First answer.' }]);
+    await provider.askNavy('question one', false, null, [], []);
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'thing.js', content: 'rewritten by turn two' } }] },
+      { text: 'I rewrote it.' },
+    ]);
+    await provider.askNavy('question two', false, null, [], []);
+    global.fetch = queueOllamaFetch([{ text: 'Third answer.' }]);
+    await provider.askNavy('question three', false, null, [], []);
+
+    check('setup: six messages, three turns', provider.messages.length === 6);
+    check('setup: the file was actually changed', fs.readFileSync(target, 'utf8') === 'rewritten by turn two');
+
+    // ── Every user message records what a rewind to it would restore. ─────
+    check('rewind: user messages carry a rewind point',
+      provider.messages.filter(m => m.role === 'user').every(m => typeof m.rewind?.digest === 'string'));
+    check('rewind: assistant messages carry the turn id that maps to their file changes',
+      provider.messages.filter(m => m.role === 'assistant').every(m => typeof m.meta?.turnId === 'string'));
+
+    // ── What a rewind would cost, before anything is done. ───────────────
+    const impact = provider._rewindImpact(2); // index 2 = "question two"
+    check('rewind: impact counts the turns that would be discarded', impact.turns === 2, impact.turns);
+    check('rewind: impact names the files those turns changed',
+      impact.files.length === 1 && /thing\.js$/.test(impact.files[0]), JSON.stringify(impact.files));
+
+    // ── Rewinding without touching files. ────────────────────────────────
+    posted.length = 0;
+    const kept = await provider.rewindToMessage(2, false);
+    check('rewind: the transcript is truncated to the chosen message', provider.messages.length === 2);
+    check('rewind: …and the discarded turns are really gone',
+      !provider.messages.some(m => /question two|question three/.test(m.text || '')));
+    check('rewind: the earlier turns are untouched', provider.messages[0].text === 'question one');
+    check('rewind: keeping files leaves the file as the turn left it',
+      fs.readFileSync(target, 'utf8') === 'rewritten by turn two' && kept.files === 0);
+    check('rewind: the panel is told to redraw from the truncated history',
+      posted.some(m => m.type === 'restore' && m.messages.length === 2));
+    check('rewind: …and told what happened, with the prompt handed back',
+      posted.some(m => m.type === 'rewound' && m.prompt === 'question two'));
+
+    // ── Rewinding WITH files. ────────────────────────────────────────────
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'thing.js', content: 'rewritten again' } }] },
+      { text: 'Rewrote it again.' },
+    ]);
+    await provider.askNavy('question four', false, null, [], []);
+    check('setup: the file changed again', fs.readFileSync(target, 'utf8') === 'rewritten again');
+
+    const before = provider.checkpoints.length;
+    const undone = await provider.rewindToMessage(2, true);
+    check('rewind with files: the file is restored to what it was before the turn',
+      fs.readFileSync(target, 'utf8') === 'rewritten by turn two', fs.readFileSync(target, 'utf8'));
+    check('rewind with files: it reports how many it restored', undone.files === 1);
+    check('rewind with files: the turn checkpoints are consumed', provider.checkpoints.length < before);
+    check('rewind with files: …and the restore is redoable', provider.redoStack.length > 0);
+
+    // ── Refusals. ────────────────────────────────────────────────────────
+    ctrl.shown.warning.length = 0;
+    check('rewind: an out-of-range index is refused', (await provider.rewindToMessage(99, false)) === null);
+    check('rewind: a negative index is refused', (await provider.rewindToMessage(-1, false)) === null);
+    check('rewind: targeting an assistant message is refused — rewind means "before I said this"',
+      (await provider.rewindToMessage(1, false)) === null);
+    provider.isBusy = true;
+    check('rewind: refused mid-turn rather than truncating under a running turn',
+      (await provider.rewindToMessage(0, false)) === null);
+    provider.isBusy = false;
+    check('rewind: every refusal told the user why', ctrl.shown.warning.length === 4, ctrl.shown.warning.length);
+
+    // ── The digest goes back with the transcript. ────────────────────────
+    provider.messages = [
+      { role: 'user', text: 'early', rewind: { digest: 'DIGEST AS OF EARLY' } },
+      { role: 'assistant', text: 'ok', meta: { turnId: 'ta' } },
+      { role: 'user', text: 'later', rewind: { digest: 'DIGEST AS OF LATER' } },
+      { role: 'assistant', text: 'ok', meta: { turnId: 'tb' } },
+    ];
+    provider.sessionDigest = 'DIGEST AS OF NOW';
+    await provider.rewindToMessage(2, false);
+    check('rewind: the session digest is restored to what it was at that point',
+      provider.sessionDigest === 'DIGEST AS OF LATER', provider.sessionDigest);
+
+    // ── A plan cannot outlive the turn it belonged to. ───────────────────
+    await provider.toolUpdatePlan(['a step']);
+    await provider.rewindToMessage(0, false);
+    check('rewind: the plan is cleared with the turns that made it', provider.plan.length === 0);
+
+    // ── Chats saved before rewind existed still rewind. ──────────────────
+    provider.messages = [
+      { role: 'user', text: 'old question' },                       // no rewind point
+      { role: 'assistant', text: 'old answer', meta: { files: ['x.js'] } }, // no turnId
+      { role: 'user', text: 'new question', rewind: { digest: 'D' } },
+      { role: 'assistant', text: 'new answer', meta: { turnId: 'tc' } },
+    ];
+    const legacy = await provider.rewindToMessage(0, true);
+    check('rewind: a chat saved before 0.3.1 still rewinds', legacy !== null && provider.messages.length === 0);
+    check('rewind: …and reports no files, because none can be matched to it', legacy.files === 0);
+
+    // ── The manifest command. ────────────────────────────────────────────
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    check('navy.rewindConversation is declared',
+      manifest.contributes.commands.some(c => c.command === 'navy.rewindConversation'));
+
+    // undoLastTurn and rewind must share one implementation: two copies of the
+    // newest-to-oldest replay rule would be a very quiet divergence.
+    const undoSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'undo.js'), 'utf8');
+    check('undoLastTurn and rewind share _undoTurns',
+      /_undoTurns\(\[lastTurnId\]\)/.test(undoSrc) && (undoSrc.match(/for \(const cp of toUndo\)/g) || []).length === 1);
+  } finally {
+    global.fetch = realFetch;
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -8050,6 +8188,7 @@ undoRedoSuite()
   .then(delegationFanOutSuite)
   .then(settingsDefaultsSuite)
   .then(planSuite)
+  .then(rewindSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

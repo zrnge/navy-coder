@@ -2253,6 +2253,69 @@ function fileChipSuite() {
 // counter — "approximate, not a guarantee" in its own comment. update_plan
 // makes both of those unnecessary when the model declares a plan, and these pin
 // that the real thing wins while the guesses survive for models that don't.
+
+// Rewind names a message by its index in the extension's own history array, so
+// the panel has to keep a count that agrees with it exactly. An off-by-one here
+// discards the wrong turn, which is the one bug this feature must not have.
+function rewindControlSuite() {
+  console.log('\nrewind control (indexes the panel must get exactly right):');
+
+  const w = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'question one' },
+    { role: 'assistant', text: 'answer one' },
+    { role: 'user', text: 'question two' },
+    { role: 'assistant', text: 'answer two' },
+  ] }]);
+  const d = w.document;
+
+  const buttons = [...d.querySelectorAll('.msg-rewind-btn')];
+  check('every one of your messages offers a rewind', buttons.length === 2, buttons.length);
+  check('replies do not — rewind means "before I said this"',
+    [...d.querySelectorAll('.message.assistant .msg-rewind-btn')].length === 0);
+
+  buttons[0].click();
+  buttons[1].click();
+  const sent = w.sent.filter(m => m.type === 'rewindTo').map(m => m.index);
+  check('the indexes match the history array the extension holds',
+    JSON.stringify(sent) === '[0,2]', JSON.stringify(sent));
+
+  // The panel decides nothing: no confirmation, no file question, no local
+  // truncation. It asks, and the extension owns the consequences.
+  check('the panel does not truncate anything itself',
+    d.querySelectorAll('.message.user').length === 2);
+
+  // Live messages continue the same count, or a rewind after a fresh turn
+  // would name the wrong message.
+  w.post({ type: 'start', model: 'test' });
+  w.post({ type: 'chunk', text: 'streamed reply' });
+  w.post({ type: 'done' });
+  const w2 = run([{ type: 'restore', messages: [{ role: 'user', text: 'only one' }] }]);
+  const only = [...w2.document.querySelectorAll('.msg-rewind-btn')];
+  only[0].click();
+  check('a rebuilt transcript restarts the count at zero',
+    w2.sent.filter(m => m.type === 'rewindTo')[0].index === 0);
+
+  // The report, and the prompt handed back so re-asking is not retyping.
+  const w3 = run([
+    { type: 'restore', messages: [{ role: 'user', text: 'kept question' }] },
+    { type: 'rewound', index: 0, files: 2, prompt: 'the question I rewound to' },
+  ]);
+  check('a rewind reports what happened', /Rewound/.test(w3.document.body.textContent));
+  check('…including how many files were restored',
+    /2 files restored/.test(w3.document.body.textContent), w3.document.body.textContent.slice(0, 200));
+  check('the prompt is handed back to the composer, so re-asking is not retyping',
+    w3.document.querySelector('#prompt').value === 'the question I rewound to');
+
+  // …but never over something already typed.
+  const w4 = run([{ type: 'restore', messages: [{ role: 'user', text: 'x' }] }]);
+  w4.document.querySelector('#prompt').value = 'something I was already writing';
+  w4.post({ type: 'rewound', index: 0, files: 0, prompt: 'the old question' });
+  check('a draft in progress is never overwritten by the returned prompt',
+    w4.document.querySelector('#prompt').value === 'something I was already writing');
+  check('a rewind with no files says so without a file count',
+    !/files restored/.test(w4.document.body.textContent.split('Rewound')[1] || ''));
+}
+
 function planCardSuite() {
   console.log('\nplan card (declared beats inferred):');
   const w = run([{ type: 'start', model: 'test-model' }]);
@@ -2866,6 +2929,7 @@ scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
 planCardSuite();
+rewindControlSuite();
 iconSuite();
 taskDockSuite();
 queueCancelSuite();

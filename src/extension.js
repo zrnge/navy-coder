@@ -1026,6 +1026,9 @@ class NavyCoderViewProvider {
           this.sendApprovalMode();
           break;
         }
+        case 'rewindTo':
+          await this.confirmAndRewind(Number(message.index));
+          break;
         case 'copy':
           await vscode.env.clipboard.writeText(message.text || '');
           break;
@@ -3431,6 +3434,9 @@ class NavyCoderViewProvider {
       text: prompt,
       ...(attachedNames.length ? { attachments: attachedNames } : {}),
       ...(images?.length ? { images: images.length } : {}),
+      // See rewindToMessage in src/undo.js. Small and per-turn: a string that
+      // is usually empty and never larger than the digest cap.
+      rewind: { digest: this.sessionDigest || '' },
     });
     // Tab titles are drawn from the first user message (see
     // _sessionSummaries) — refresh now so a "New Chat" tab picks up its
@@ -3987,6 +3993,10 @@ class NavyCoderViewProvider {
         // is handed the CURRENT plan directly by _planForPrompt, and replaying
         // every past turn's finished plan into its context would be noise.
         if (this._session.plan?.length) meta.plan = this._session.plan;
+        // Ties this turn to the checkpoints it produced — see _turnIdsFrom.
+        // Model-facing code ignores unknown meta keys, and _turnLedgerParts
+        // never reads it, so this costs the context window nothing.
+        if (this.currentTurnId) meta.turnId = this.currentTurnId;
 
         // Fallback notices ride along in the persisted text so a reloaded
         // session still shows that a different provider (and a different
@@ -7355,6 +7365,7 @@ function activate(context) {
     vscode.commands.registerCommand('navy.reviewPR', () => provider.generatePRReview()),
     vscode.commands.registerCommand('navy.testProvider', () => provider.testProviderConnection()),
     vscode.commands.registerCommand('navy.exportDiagnostics', () => provider.exportDiagnostics()),
+    vscode.commands.registerCommand('navy.rewindConversation', () => provider.rewindConversation()),
     vscode.commands.registerCommand('navy.newSlashCommand', () => provider.createSlashCommand()),
     vscode.commands.registerCommand('navy.openSlashCommands', () => provider.openSlashCommandsFolder()),
     vscode.window.onDidChangeActiveTextEditor(editor => {

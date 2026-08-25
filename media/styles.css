@@ -3551,6 +3551,32 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .msg-copy-btn:focus-visible {
   opacity: 1;
 }
+/* Rewind sits furthest left on the row: it is the least-used and the only
+   destructive one, so it should not be the button under the cursor. */
+.msg-rewind-btn {
+  position: absolute;
+  top: 2px;
+  right: 76px;
+  padding: var(--space-1) 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.message.user:hover .msg-rewind-btn,
+.msg-rewind-btn:focus-visible {
+  opacity: 1;
+}
+.msg-rewind-btn:hover {
+  color: var(--red);
+  border-color: var(--red);
+}
+
 /* Read-aloud sits to the left of the copy button on the same row. */
 .msg-speak-btn {
   position: absolute;

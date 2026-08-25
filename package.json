@@ -487,6 +487,10 @@
         "title": "Navy Coder: Export Diagnostics"
       },
       {
+        "command": "navy.rewindConversation",
+        "title": "Navy Coder: Rewind Conversation"
+      },
+      {
         "command": "navy.newSlashCommand",
         "title": "Navy Coder: New Slash Command"
       },
