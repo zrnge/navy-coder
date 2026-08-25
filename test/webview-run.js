@@ -2316,6 +2316,86 @@ function rewindControlSuite() {
     !/files restored/.test(w4.document.body.textContent.split('Rewound')[1] || ''));
 }
 
+
+// Row 1 was carrying the brand, the live status and nine controls, and had been
+// wrapping to two lines on a normal-width sidebar for a while. The four that
+// moved are the four that were never about the chat as a whole: they decide how
+// the NEXT message is handled, which is a thing you settle beside the box you
+// type it in.
+//
+// What this pins is the DIVISION, not the pixels — jsdom does not paint. A
+// control drifting back to the title bar is the regression worth catching.
+function composerModesSuite() {
+  console.log('\ncomposer modes: per-turn controls sit with the composer:');
+
+  const w = createWebview();
+  const d = w.document;
+
+  const TURN_CONTROLS = ['#contextSelect', '#thinkingLevelSelect', '#approvalModeSelect', '#commandApprovalSelect'];
+  for (const sel of TURN_CONTROLS) {
+    const el = d.querySelector(sel);
+    check(`${sel} exists`, Boolean(el));
+    check(`${sel} sits in the composer, not the title bar`,
+      Boolean(el?.closest('.composer-modes')) && !el?.closest('.topbar-row'), sel);
+  }
+
+  // Everything that stayed up top is either identity, live status, or an action
+  // on the conversation as a whole — none of it changes what the next turn does.
+  const CHAT_LEVEL = ['#memoryButton', '#undoButton', '#redoButton', '#newChatButton', '#settingsButton'];
+  for (const sel of CHAT_LEVEL) {
+    const el = d.querySelector(sel);
+    if (!el) continue; // not every build has every one; absence is not this test's business
+    check(`${sel} stays in the title bar`, Boolean(el.closest('.topbar-row')), sel);
+  }
+  check('the token counter stays up top — it is status, not a control',
+    Boolean(d.querySelector('#tokenCounter')?.closest('.topbar-info')));
+
+  // Reading order: how much it may read, how hard to think, then what it may do
+  // without asking — with the separator marking the point where the choices
+  // start having consequences.
+  const inGroup = [...d.querySelectorAll('.composer-modes > *')].map(e => e.id || e.className);
+  check('the modes read in the order you would decide them',
+    JSON.stringify(inGroup) === JSON.stringify([
+      'contextSelect', 'thinkingLevelSelect', 'composer-modes-sep',
+      'approvalModeSelect', 'commandApprovalSelect']), JSON.stringify(inGroup));
+  check('a separator divides the two approval gates from the rest',
+    d.querySelectorAll('.composer-modes-sep').length === 1);
+
+  // The group sits between the file chips and the send controls — the gap that
+  // was already empty in that row.
+  const meta = d.querySelector('.input-meta');
+  const order = [...meta.children].map(e => e.className.split(' ')[0]);
+  check('the modes take the empty middle of the composer row',
+    JSON.stringify(order) === JSON.stringify(['file-chips', 'composer-modes', 'composer-actions']),
+    JSON.stringify(order));
+
+  // Both rows have to survive a narrow sidebar by wrapping. Nothing here can be
+  // allowed to clip off an edge, where it becomes unreachable rather than ugly.
+  const css = readSource('media', 'styles.css');
+  const metaRule = /\.input-meta\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('the composer row wraps rather than crushing the send button',
+    /flex-wrap:\s*wrap/.test(metaRule), metaRule.trim());
+  const modesRule = /\.composer-modes\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('the modes group wraps too', /flex-wrap:\s*wrap/.test(modesRule));
+  check('…and yields space before the file chips do',
+    /flex:\s*0 1 auto/.test(modesRule) && /flex:\s*0 1 auto/.test(/\.file-chips\s*\{([^}]*)\}/.exec(css)?.[1] || ''));
+  check('row 1 still wraps, having lost four controls but not the rest',
+    /\.topbar-row1\s*\{[^}]*flex-wrap:\s*wrap/.test(css));
+
+  // Still wired: moving an element must not detach its handler.
+  const w2 = createWebview();
+  w2.document.querySelector('#thinkingLevelSelect').value = 'fast';
+  w2.document.querySelector('#thinkingLevelSelect').dispatchEvent(new w2.window.Event('change'));
+  check('a moved control still reaches the extension',
+    w2.sent.some(m => m.type === 'setThinkingLevel' && m.level === 'fast'),
+    JSON.stringify(w2.sent.slice(-3)));
+
+  w2.post({ type: 'approvalMode', mode: 'auto-approve', commandMode: 'ask-always' });
+  check('…and still receives state from it',
+    w2.document.querySelector('#approvalModeSelect').value === 'auto-approve'
+    && w2.document.querySelector('#commandApprovalSelect').value === 'ask-always');
+}
+
 function planCardSuite() {
   console.log('\nplan card (declared beats inferred):');
   const w = run([{ type: 'start', model: 'test-model' }]);
@@ -2928,6 +3008,7 @@ msgStepSuite();
 scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
+composerModesSuite();
 planCardSuite();
 rewindControlSuite();
 iconSuite();

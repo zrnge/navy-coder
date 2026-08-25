@@ -1381,6 +1381,51 @@ textarea:focus {
   justify-content: space-between;
   gap: 10px;
   min-height: 28px;
+  flex-wrap: wrap;
+  row-gap: var(--space-2);
+}
+
+/* How the next turn behaves: context window, thinking depth, and the two
+   approval gates. These lived in the title bar until 0.3.1, where they were
+   four of the nine controls competing for row 1 and the only four that had
+   nothing to do with the chat as a whole. Beside the composer they read as
+   what they are — settings for the message you are about to send.
+
+   Ordered as you would decide them: how much it may read, how hard it should
+   think, then what it may do without asking. The separator marks that break,
+   because the last two are the only ones with consequences. */
+.composer-modes {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  /* Yields before the file chips do — a filename is content, a mode is a
+     control that can wrap to the next line without anything being lost. */
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.composer-modes-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 var(--space-1);
+  background: var(--border);
+  flex: 0 0 auto;
+}
+
+/* Quieter than the topbar copy: four controls sitting under the transcript
+   should not compete with the text above them until they are looked at. */
+.composer-modes .select-compact {
+  height: 22px;
+  font-size: 10px;
+  border-color: transparent;
+  background-color: transparent;
+}
+.composer-modes .select-compact:hover {
+  border-color: var(--border-hover);
+}
+.composer-modes .select-compact:focus {
+  border-color: var(--gold);
 }
 
 .file-chips {
@@ -1388,7 +1433,10 @@ textarea:focus {
   align-items: center;
   gap: var(--space-3);
   flex-wrap: wrap;
-  flex: 1 1 auto;
+  /* Was flex:1 back when it had the row's middle to itself. It now shares that
+     space with .composer-modes, and shrinking to zero is correct for it: with
+     no attachments it holds one button, and its chips wrap on their own. */
+  flex: 0 1 auto;
   min-width: 0;
 }
 
@@ -2036,8 +2084,6 @@ textarea:focus {
    renderContextWindowSelect) whenever no window is known for the active
    model — an empty picker is worse than none. */
 .context-select {
-  height: 20px;
-  font-size: 10px;
   font-weight: 500;
   max-width: 130px;
 }
@@ -3863,8 +3909,10 @@ textarea:focus-visible,
 }
 
 /* ── Resize robustness ─────────────────────────────────────────────────────── */
-/* Row 1 holds ~9 fixed controls; on a narrow sidebar they must WRAP to a second
-   line, never clip off the edge where they become unreachable. */
+/* Row 1 holds the brand, the live status and the chat-level actions; the four
+   per-turn selects moved down to .composer-modes in 0.3.1. On a narrow sidebar
+   what remains must still WRAP to a second line, never clip off the edge where
+   it becomes unreachable. */
 .topbar-row1 {
   flex-wrap: wrap;
   height: auto;

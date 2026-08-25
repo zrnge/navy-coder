@@ -58,30 +58,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
           <span id="queuedBadge" class="queued-badge" style="display:none"></span>
           <span id="statusText" class="status-text"></span>
           <span id="rulesBadge" class="rules-badge" title="Project rules active">RULES</span>
-          <!-- Populated from whatever window the ACTIVE model actually reports
-               (see resolveModelContext / fetchModelContext) — the options are
-               built per model, not a fixed list, so a 1M-token model offers
-               sizes an 8k one never will. Hidden entirely while no window is
-               known, rather than offering a guess. -->
-          <select id="contextSelect" class="select-compact context-select" title="Context window" aria-label="Context window"></select>
           <span id="tokenCounter" class="token-counter" title="Tokens used"></span>
           <span id="inlineEditBadge" class="inline-edit-badge"></span>
         </div>
-        <!-- Mode selects + icon buttons -->
+        <!-- Chat-level actions. The controls that decide how the next TURN
+             behaves live down by the composer instead — see .composer-modes. -->
         <div class="topbar-actions">
-          <select id="thinkingLevelSelect" title="Thinking depth" aria-label="Thinking depth" class="select-compact">
-            <option value="fast">Fast</option>
-            <option value="medium" selected>Med</option>
-            <option value="high">High</option>
-          </select>
-          <select id="approvalModeSelect" title="Approval for file changes — writes, deletes and renames" aria-label="Approval for file changes" class="select-compact">
-            <option value="ask-always">Edits: Ask</option>
-            <option value="auto-approve">Edits: Auto</option>
-          </select>
-          <select id="commandApprovalSelect" title="Approval for running commands, background processes and MCP tools" aria-label="Approval for running commands" class="select-compact">
-            <option value="ask-always">Cmds: Ask</option>
-            <option value="auto-approve">Cmds: Auto</option>
-          </select>
           <button id="memoryButton" type="button" class="icon-button memory-button" title="Project memory" aria-label="Project memory">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
               <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
@@ -480,6 +462,32 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
           <div class="input-meta">
             <div class="file-chips" id="fileChips">
               <button type="button" id="addContextButton" class="chip chip-add" title="Add current file to context">+ Add file</button>
+            </div>
+            <!-- How the next message will be handled: how much context it may
+                 use, how hard to think, and what Navy may do without asking.
+                 One group, in the empty middle of a row that already existed,
+                 reading left to right in the order you would decide them. -->
+            <div class="composer-modes">
+              <!-- Populated from whatever window the ACTIVE model actually
+                   reports (see resolveModelContext / fetchModelContext) — the
+                   options are built per model, not a fixed list, so a 1M-token
+                   model offers sizes an 8k one never will. Hidden entirely
+                   while no window is known, rather than offering a guess. -->
+              <select id="contextSelect" class="select-compact context-select" title="Context window" aria-label="Context window"></select>
+              <select id="thinkingLevelSelect" title="Thinking depth" aria-label="Thinking depth" class="select-compact">
+                <option value="fast">Fast</option>
+                <option value="medium" selected>Med</option>
+                <option value="high">High</option>
+              </select>
+              <span class="composer-modes-sep" aria-hidden="true"></span>
+              <select id="approvalModeSelect" title="Approval for file changes — writes, deletes and renames" aria-label="Approval for file changes" class="select-compact">
+                <option value="ask-always">Edits: Ask</option>
+                <option value="auto-approve">Edits: Auto</option>
+              </select>
+              <select id="commandApprovalSelect" title="Approval for running commands, background processes and MCP tools" aria-label="Approval for running commands" class="select-compact">
+                <option value="ask-always">Cmds: Ask</option>
+                <option value="auto-approve">Cmds: Auto</option>
+              </select>
             </div>
             <div class="composer-actions">
               <label class="context-toggle" title="Include current editor context">
