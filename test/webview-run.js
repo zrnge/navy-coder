@@ -2273,6 +2273,20 @@ function rewindControlSuite() {
   check('replies do not — rewind means "before I said this"',
     [...d.querySelectorAll('.message.assistant .msg-rewind-btn')].length === 0);
 
+  // It sits with copy and read-aloud and looks like them: an icon from the same
+  // sprite, not a text label breaking the row. It was text, anchored right,
+  // which on a user bubble (whose buttons mirror to the LEFT) put it on top of
+  // the message.
+  check('rewind is an icon from the sprite, like its two siblings',
+    /<svg[^>]*class="icon"/.test(buttons[0].innerHTML) && /#i-rewind/.test(buttons[0].innerHTML),
+    buttons[0].innerHTML.slice(0, 80));
+  check('rewind carries a label for anyone not reading the glyph',
+    /rewind/i.test(buttons[0].getAttribute('aria-label') || ''));
+  const css = readSource('media', 'styles.css');
+  const rewindRule = /\.msg-rewind-btn\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('rewind is anchored on the same side as copy and read-aloud',
+    /left:\s*64px/.test(rewindRule) && !/(^|[^-])right:/.test(rewindRule), rewindRule.trim());
+
   buttons[0].click();
   buttons[1].click();
   const sent = w.sent.filter(m => m.type === 'rewindTo').map(m => m.index);

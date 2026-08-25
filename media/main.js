@@ -3247,9 +3247,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     rewindBtn.className = 'msg-rewind-btn';
     rewindBtn.title = 'Rewind the conversation to just before this message';
     rewindBtn.setAttribute('aria-label', rewindBtn.title);
-    // Text rather than an icon: there is no sprite glyph that means rewind, and
-    // a destructive action reads better named than guessed at.
-    rewindBtn.textContent = 'Rewind';
+    rewindBtn.innerHTML = icon('rewind');
     rewindBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'rewindTo', index: myIndex });
     });

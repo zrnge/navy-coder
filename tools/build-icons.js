@@ -65,6 +65,10 @@ const ICON_MAP = {
   attachment: 'paperclip',
   image: 'image',
   speak: 'volume-high',
+  // Conversation rewind. rotate-left is the canonical undo arrow, and reads as
+  // "go back" rather than "run again" — which arrows-rotate (Navy's refactor)
+  // does, and is why the two are not shared.
+  rewind: 'rotate-left',
   'speak-stop': 'circle-stop',
 };
 

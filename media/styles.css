@@ -3597,13 +3597,18 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .msg-copy-btn:focus-visible {
   opacity: 1;
 }
-/* Rewind sits furthest left on the row: it is the least-used and the only
-   destructive one, so it should not be the button under the cursor. */
+/* Third in the row of message actions, after copy and read-aloud. It exists
+   only on your own messages, and user bubbles mirror their buttons to the LEFT
+   — copy at 4, read-aloud at 34 — so this continues that run at 64 rather than
+   anchoring right, where it sat on top of the message text.
+
+   Furthest from the cursor on purpose: it is the least-used of the three and
+   the only destructive one. */
 .msg-rewind-btn {
   position: absolute;
   top: 2px;
-  right: 76px;
-  padding: var(--space-1) 7px;
+  left: 64px;
+  padding: var(--space-1) var(--space-3);
   font-size: 11px;
   line-height: 1.4;
   color: var(--muted);
@@ -3618,6 +3623,8 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .msg-rewind-btn:focus-visible {
   opacity: 1;
 }
+/* Red only on hover: the row should read as three equal affordances until you
+   are actually pointing at the one that throws work away. */
 .msg-rewind-btn:hover {
   color: var(--red);
   border-color: var(--red);
@@ -4077,7 +4084,7 @@ textarea:focus-visible,
      one of the few things forced-colors leaves alone — but a control revealed
      only on hover is invisible until then, which is worse under high contrast
      where users often navigate by keyboard. Show them all. */
-  .msg-copy-btn, .msg-speak-btn, .term-copy-btn, .slash-remove { opacity: 1; }
+  .msg-copy-btn, .msg-speak-btn, .msg-rewind-btn, .term-copy-btn, .slash-remove { opacity: 1; }
 
   /* Focus must stay visible: the system colour is guaranteed, ours is not. */
   button:focus-visible,
