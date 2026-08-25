@@ -116,7 +116,42 @@ Two suites, both run by `npm test`:
   against a mock `vscode` API (`test/vscode-mock.js`) and a real temp
   filesystem. Some tests extract a single function out of the source and eval it
   in isolation; if you turn a standalone function into one that reads `this`,
-  those need a host object (see the `compactMessages` suite).
+  those need a host object (see the `compactMessages` suite). A function that
+  starts calling a new module-level helper trips the same wire — the extracted
+  copy cannot see it, so pull the real helper into the eval scope rather than
+  writing a second one (see `literalReplace` and `_compactMessages`).
+
+  `run.js` is now the running **order** and nothing else. The assertions live in
+  `test/suite-*.js`, one file per domain, and the shared machinery — the
+  assertion counter, `extractFunction`, the vscode-mock lifecycle, and the fetch
+  fakes that stand in for a model — is in `test/harness.js`. It was one 495KB
+  file with 54 suites in it, which is the same problem `src/extension.js` has and
+  just as unreviewable.
+
+  | File | Covers |
+  | --- | --- |
+  | `suite-pure.js` | Pure functions and the jsdom DOM checks — no mock, no temp fs |
+  | `suite-files.js` | Undo/redo, checkpoints, rewind, syntax checking, path hints |
+  | `suite-retrieval.js` | Lexical + semantic retrieval, the embedding index, context budget |
+  | `suite-process.js` | Sandboxing, persistent background processes, shell selection |
+  | `suite-session.js` | Projects, chats, caches, the global catalog, file watching |
+  | `suite-turn.js` | The agent loop: tool batching, plans, ledgers, loop guards, delegation |
+  | `suite-providers.js` | Streaming shapes, fallbacks, pricing, endpoint defaults |
+  | `suite-mcp.js` | MCP over stdio and HTTP, and its resources and prompts |
+  | `suite-approval.js` | Both approval gates, settings defaults, the diagnostics bundle |
+  | `suite-ui.js` | Dictation, slash commands, skills, the review regressions |
+
+  The files sit flat in `test/` rather than in a subdirectory on purpose: every
+  suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a
+  subdirectory would have meant rewriting all of them — dozens of edits, each a
+  chance to break something, in a change whose whole value is that it changes
+  nothing.
+
+  **Adding a suite.** Put it in the file for its domain, export it, and add it to
+  the chain in `run.js`. Order is load-bearing in one respect: `sharedMock` hands
+  every suite the same mock and resets it between them, so a suite that leaves
+  state behind is felt by whichever runs next — keep new ones at the end unless
+  there is a reason not to.
 - **`test/webview-run.js`** — the webview. Loads the **real** `media/main.js`
   into jsdom against the **real** webview HTML, and drives it by posting the same
   messages the extension sends. Nothing is reimplemented, so a passing test means
