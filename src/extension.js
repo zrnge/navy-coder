@@ -3655,8 +3655,26 @@ class NavyCoderViewProvider {
           toolsToRun.push(tool);
         }
 
-        if (toolsToRun.length > 1 && toolsToRun.every(t => READ_ONLY.has(t.name))) {
-          const parallel = await Promise.all(toolsToRun.map(async tool => {
+        // Concurrency is safe for exactly the LEADING run of read-only calls,
+        // and that boundary is a real one rather than a convenience. Those calls
+        // are provably independent of every write in this batch, because no
+        // write has happened yet. A read that comes AFTER a write in the same
+        // response usually exists to observe that write — reading back what was
+        // just written, re-checking diagnostics on it — so hoisting it into a
+        // concurrent group would race it against the thing it is there to check.
+        //
+        // The previous rule was all-or-nothing: one write anywhere in the batch
+        // forced every read in it to run serially too. Reads-then-act is the
+        // shape a model actually emits, so that surrendered the concurrency in
+        // precisely the case worth having it.
+        let leadingReads = 0;
+        while (leadingReads < toolsToRun.length && READ_ONLY.has(toolsToRun[leadingReads].name)) leadingReads++;
+        if (leadingReads < 2) leadingReads = 0; // one call is not a batch — leave it to the serial path, which tracks more
+        const parallelGroup = toolsToRun.slice(0, leadingReads);
+        const serialGroup = toolsToRun.slice(leadingReads);
+
+        if (parallelGroup.length > 1) {
+          const parallel = await Promise.all(parallelGroup.map(async tool => {
             // Each call gets its own id so results — which can complete out of
             // order relative to each other since they run concurrently — always
             // update the card that actually belongs to them.
@@ -3667,8 +3685,10 @@ class NavyCoderViewProvider {
             return makeToolResult(tool, result);
           }));
           toolResults.push(...parallel);
-        } else {
-          for (const tool of toolsToRun) {
+        }
+
+        if (serialGroup.length) {
+          for (const tool of serialGroup) {
             // Stop pressed mid-iteration — don't execute the remaining tools (a write
             // tool would still hit disk after the user asked everything to halt).
             if (this.abortController.signal.aborted) break;

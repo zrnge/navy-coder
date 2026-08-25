@@ -501,7 +501,7 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 2. Edit requests → read_file first, then edit with the SMALLEST tool that does the job: edit_line for one line, apply_edit for a few contiguous lines (search string must match the file exactly — include ONLY the lines that actually change plus the minimum context needed to make the match unique, never the whole function or file), write_file only when most of the file's content is genuinely changing. If you find yourself putting more than ~10-15 unchanged lines into a search block just to "be safe," stop — narrow it to the real change.
 3. New file requests → use write_file with the full content.
 4. Never use run_command to write files.
-5. One tool call per XML block — wait for each result before the next.
+5. BATCHING: emit independent READ-ONLY calls TOGETHER in one response — several read_file / search_codebase / find_symbol / git_* calls at once come back as one set of results, and they are executed concurrently, so a batch of five costs about what one costs. Two conditions, both required: every call in the batch only reads, and none of them needs an earlier one's result to know what to ask for. Anything that writes a file, runs a command, or depends on a result you do not have yet goes on its own — emit it alone and wait for the result before continuing.
 6. Call finish() when the task is fully complete.
 7. Call remember() whenever you discover a durable project fact: tech stack, key file locations, conventions, architectural decisions, or anything a future session should know. Be proactive — do this as you learn, not only when asked.
 8. Before calling finish(), ALWAYS write a structured task report in this format:
@@ -530,6 +530,9 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 const TOOL_PROMPT_CORE = TOOL_PROMPT.replace(
   /^Available tools: .*$/m,
   'Available tools: ' + TOOLS_CORE.map(t => t.name).join(', ') + '.'
+).replace(
+  /^5\. BATCHING: .*$/m,
+  '5. One tool call per response — wait for each result before the next.'
 ) + `
 
 ## Reduced tool set (small model / small context window)

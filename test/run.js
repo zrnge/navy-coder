@@ -7036,6 +7036,123 @@ async function approvalScopeSuite() {
 // all-or-nothing — a single write anywhere in the batch forced every read in it
 // onto the serial path. These pin both halves of the fix, and the ordering
 // guarantee that makes the concurrency safe.
+async function toolBatchingSuite() {
+  console.log('\ntool batching (concurrent reads, ordered writes):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-batching-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider.view = { webview: { postMessage: () => {} } };
+    provider._wslCache = { available: false }; // skip the real wsl.exe spawn in tests
+    ctrl.config.approvalMode = 'auto-approve';
+    for (const name of ['a.txt', 'b.txt', 'c.txt']) fs.writeFileSync(path.join(tmp, name), 'body of ' + name);
+
+    // Instrument executeTool so overlap is observable: every call announces
+    // itself, yields to the event loop, then announces completion. Concurrent
+    // calls interleave their markers; serial ones cannot.
+    const events = [];
+    const realExecuteTool = provider.executeTool.bind(provider);
+    provider.executeTool = async (tool, turnIdOverride) => {
+      events.push('start:' + tool.name + ':' + (tool.args?.path || ''));
+      await new Promise(r => setTimeout(r, 15));
+      const out = await realExecuteTool(tool, turnIdOverride);
+      events.push('end:' + tool.name + ':' + (tool.args?.path || ''));
+      return out;
+    };
+    const bothStartedFirst = (evts, one, two) =>
+      evts.indexOf('start:' + one) < evts.indexOf('end:' + two) &&
+      evts.indexOf('start:' + two) < evts.indexOf('end:' + one);
+
+    // ── Reads-then-write: the reads overlap, the write waits for both. ──────
+    events.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [
+        { name: 'read_file', args: { path: 'a.txt' } },
+        { name: 'read_file', args: { path: 'b.txt' } },
+        { name: 'write_file', args: { path: 'c.txt', content: 'rewritten' } },
+      ] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('read a and b, then rewrite c', false, null, [], []);
+
+    check('mixed batch: the leading reads run concurrently',
+      bothStartedFirst(events, 'read_file:a.txt', 'read_file:b.txt'), events.join(' | '));
+    check('mixed batch: the write starts only after both reads finish',
+      events.indexOf('start:write_file:c.txt') > events.indexOf('end:read_file:a.txt') &&
+      events.indexOf('start:write_file:c.txt') > events.indexOf('end:read_file:b.txt'), events.join(' | '));
+    check('mixed batch: the write still actually happened',
+      fs.readFileSync(path.join(tmp, 'c.txt'), 'utf8') === 'rewritten');
+
+    // ── A read AFTER a write is never hoisted: it usually exists to observe
+    //    that write, so racing it against the write would defeat the point. ──
+    events.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [
+        { name: 'write_file', args: { path: 'c.txt', content: 'second pass' } },
+        { name: 'read_file', args: { path: 'c.txt' } },
+        { name: 'read_file', args: { path: 'a.txt' } },
+      ] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('rewrite c then read it back', false, null, [], []);
+
+    const trailingSerial =
+      events.indexOf('end:write_file:c.txt') < events.indexOf('start:read_file:c.txt') &&
+      events.indexOf('end:read_file:c.txt') < events.indexOf('start:read_file:a.txt');
+    check('write-first batch: nothing is hoisted — every call stays serial and ordered', trailingSerial, events.join(' | '));
+
+    // ── All-read batches keep the concurrency they always had. ──────────────
+    events.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [
+        { name: 'read_file', args: { path: 'a.txt' } },
+        { name: 'read_file', args: { path: 'b.txt' } },
+        { name: 'read_file', args: { path: 'c.txt' } },
+      ] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('read all three', false, null, [], []);
+    check('all-read batch: still fully concurrent',
+      events.slice(0, 3).every(e => e.startsWith('start:')), events.join(' | '));
+
+    // ── A lone read is not a batch — it must not lose the serial path's
+    //    bookkeeping just because it happens to be read-only. ───────────────
+    events.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'a.txt' } }] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('read a', false, null, [], []);
+    check('single read: runs, and on the serial path', events.length === 2 && events[0] === 'start:read_file:a.txt');
+
+    provider.executeTool = realExecuteTool;
+
+    // ── The prompt has to permit what the loop now does, and the reduced tier
+    //    has to keep the strict contract small models cope with. ────────────
+    const toolsMod = require('../src/providers/tools.js');
+    check('TOOL_PROMPT: rule 5 asks for batched read-only calls',
+      /^5\. BATCHING: /m.test(toolsMod.TOOL_PROMPT) && /executed concurrently/.test(toolsMod.TOOL_PROMPT));
+    check('TOOL_PROMPT: batching is gated on independence, not just read-only',
+      /needs an earlier one's result/.test(toolsMod.TOOL_PROMPT));
+    // The swap is a regex against TOOL_PROMPT's literal text — a silent miss
+    // would ship small models the batching advice, so pin that it landed.
+    check('TOOL_PROMPT_CORE: small models keep one-call-at-a-time',
+      /^5\. One tool call per response/m.test(toolsMod.TOOL_PROMPT_CORE) &&
+      !/BATCHING/.test(toolsMod.TOOL_PROMPT_CORE.split('## Reduced tool set')[0]));
+  } finally {
+    global.fetch = realFetch;
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+
 // navy.shell. Windows used to mean cmd.exe with no way out, even though VS
 // Code's own default terminal there is PowerShell — the cost showed up as a
 // whole system-prompt rule arguing the model out of the syntax it reasonably
@@ -7085,6 +7202,7 @@ undoRedoSuite()
   .then(reviewRegressionSuite)
   .then(approvalCancelSuite)
   .then(approvalScopeSuite)
+  .then(toolBatchingSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);
