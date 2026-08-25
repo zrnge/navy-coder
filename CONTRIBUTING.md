@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,482 tests, no network, no API keys
+npm test             # 1,714 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -41,7 +41,7 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~6,600 | The agent loop, the tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,160 | The agent loop, the tool implementations, session persistence, and the webview host |
 | `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
@@ -54,8 +54,8 @@ diff has to stay reviewable.
 | `src/paths.js`, `src/workspace.js`, `src/exec.js`, `src/session-context.js` | ~20 each | Small shared pieces several of the above need, extracted so no module has to import its own importer |
 
 Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.prototype`** — the methods still use `this`, so the extraction changed no call site and no signature.
-| `media/main.js` | ~4,200 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
-| `media/styles.css` | ~2,900 | Webview styling, themed off VS Code's own CSS variables |
+| `media/main.js` | ~5,840 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
+| `media/styles.css` | ~4,060 | Webview styling, themed off VS Code's own CSS variables |
 | `src/providers/tools.js` | ~450 | Tool schemas (`TOOLS`), the API-shaped copy (`TOOLS_API`), and the system prompt (`TOOL_PROMPT`) |
 | `src/providers/llm.js` | ~780 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
 | `src/providers/endpoints.js` | ~90 | **Single source of truth** for every provider base URL |
@@ -200,13 +200,24 @@ Add a case to `providerEndpointSuite` in `test/run.js` pinning the new default.
 2. **`src/extension.js`** — add the `case` to the tool dispatch switch and write
    the `toolX` implementation.
 3. **`READ_ONLY`** in `src/extension.js` — add the name if the tool cannot
-   change anything. This gates parallel execution and approval, so getting it
-   wrong is a safety bug, not a performance one.
-4. If the tool touches the filesystem, resolve paths through the existing
+   change anything. It decides whether the tool can be run concurrently with
+   others in the same batch, so getting it wrong is a safety bug, not a
+   performance one. Only the *leading* run of read-only calls in a batch is
+   hoisted into a concurrent group; a read after a write stays where the model
+   put it, because it usually exists to observe that write.
+4. **Pick the right approval gate.** A tool that changes files is gated by
+   `_editsAutoApproved()` (`navy.approvalMode`); a tool that *executes*
+   anything — a command, a process, an MCP call — is gated by
+   `_commandsAutoApproved()` (`navy.commandApproval`). Never read either
+   setting directly: `approvalScopeSuite` fails the build if any site outside
+   the two helpers does, because wiring a new tool to the wrong one is exactly
+   how execution came to be governed by a setting labelled "file edits".
+5. If the tool touches the filesystem, resolve paths through the existing
    containment helper rather than using the argument directly, and if it spawns
    a process, route it through `_maybeWrapForSandbox` so `navy.sandboxMode`
-   covers it too.
-5. Add a test to `test/run.js` that exercises it against the temp filesystem.
+   covers it too — and build its command through `_shellSpec`/`_shellEscapeArg`
+   rather than assuming a dialect, since `navy.shell` decides which one.
+6. Add a test to `test/run.js` that exercises it against the temp filesystem.
 
 ## Adding a built-in slash command
 

@@ -28,6 +28,7 @@
 - **Dev server management** — start, monitor, and stop your dev server from the chat, with live server-URL detection
 - **Git integration** — status, diff, log, and blame tools available to the agent
 - **Independent syntax verification** (`check_syntax`) — real parsers/toolchains (JSON, `node --check`, and Python/Go/Rust/TS/Ruby/PHP/Bash when installed), not just whatever language extensions happen to be installed
+- **Your shell, not an assumed one** (`navy.shell`) — commands run through `cmd.exe` on Windows and `sh` elsewhere by default, and `powershell`, `pwsh`, `sh` or `bash` can be selected explicitly. The choice reaches all three things that have to agree: what gets spawned, how Navy quotes arguments it builds, and which dialect the model is told to write — so picking PowerShell stops Navy telling the model to write `cmd.exe` syntax
 - **Multi-root workspace aware** — search and file tools can target a sibling folder explicitly in a multi-root workspace, not just the active project root
 - **Rename & delete are undoable** — transactional undo/redo across edits, renames, and file deletions; structural `rename_symbol` uses the real language server when one's available
 - **Inline completions** — ghost-text suggestions as you type (opt-in, can use a separate faster model via `navy.completionModel`), with real fill-in-middle context from both sides of the cursor
@@ -205,6 +206,7 @@ Open via **File → Preferences → Settings** and search for `navy`, or click t
 | `navy.temperature` | `0.2` | Sampling temperature (0 = deterministic, 2 = creative) |
 | `navy.approvalMode` | `ask-always` | Files only. `ask-always` shows a diff before every write, delete or rename; `auto-approve` applies them immediately |
 | `navy.commandApproval` | `ask-always` | Execution only. `ask-always` confirms every shell command, background process and MCP tool call; `auto-approve` runs them unattended |
+| `navy.shell` | `auto` | Shell for `run_command`/`run_tests`/`run_project`, and the dialect Navy writes for: `auto`, `cmd`, `powershell`, `pwsh`, `sh`, `bash`. Ignored under Docker sandboxing, which always targets `sh` |
 | `navy.editFormat` | `search-replace` | `search-replace` for surgical edits; `whole-file` to rewrite the entire file |
 | `navy.maxToolIterations` | `100` | Maximum agent loop iterations per turn |
 | `navy.fileEditSoftCap` | `5` | Writes to the same file in one turn before Navy stops feeding back fresh diagnostics and nudges the model to wrap up |

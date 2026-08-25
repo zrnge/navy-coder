@@ -258,6 +258,46 @@ const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files',
   'activate_skill',
   'web_search','fetch_url','get_terminal_output','read_process_output']);
 
+// Every shell Navy can run a command STRING through (navy.shell). Three
+// properties matter and they are not interchangeable:
+//
+//   posix    — which escaping dialect _shellEscapeArg must use, AND which
+//              syntax the model is told to write. Getting it wrong produces
+//              commands that fail in a way that reads as the model not knowing
+//              its own OS, when it was really handed the wrong dialect.
+//   verbatim — a cmd.exe-only quoting mode. See _shellSpec for why cmd needs
+//              it and why nothing else may have it.
+//   args     — how the command string is handed to that shell.
+//
+// PowerShell needs three flags cmd.exe does not. -NoProfile, or every command
+// pays for the user's profile script and inherits whatever it redefined.
+// -NonInteractive, so a cmdlet that wants to prompt fails instead of hanging a
+// turn forever behind a prompt nobody can see. And an explicit exit, because
+// powershell.exe otherwise reports 0 after a native program that failed —
+// while the whole tool loop reads "Exit code:" to decide whether a command
+// worked, so a silent 0 would tell the model a broken build succeeded. It goes
+// on its own LINE rather than after a semicolon: a command ending in a "#"
+// comment would swallow the semicolon form.
+const PS_ARGS = (command) => ['-NoProfile', '-NonInteractive', '-Command', command + '\nexit $LASTEXITCODE'];
+
+const SHELLS = {
+  sh:   { bin: 'sh',   label: 'sh',      posix: true,  verbatim: false, args: (c) => ['-c', c],
+          probe: 'command -v <tool>',
+          dialect: 'POSIX sh/bash-compatible syntax.' },
+  bash: { bin: 'bash', label: 'bash',    posix: true,  verbatim: false, args: (c) => ['-c', c],
+          probe: 'command -v <tool>',
+          dialect: 'bash syntax (POSIX-compatible).' },
+  cmd:  { bin: 'cmd',  label: 'cmd.exe', posix: false, verbatim: true,  args: (c) => ['/c', c],
+          probe: 'where <tool>',
+          dialect: 'cmd.exe syntax — NOT PowerShell: %VAR% for env vars, & or && to chain, "dir" not "Get-ChildItem", "del" not "Remove-Item".' },
+  powershell: { bin: 'powershell', label: 'Windows PowerShell (powershell.exe)', posix: false, verbatim: false, args: PS_ARGS,
+          probe: 'Get-Command <tool>',
+          dialect: 'PowerShell syntax — NOT cmd.exe: $env:VAR for env vars, ; or && to chain, Get-ChildItem/ls not "dir /b", Remove-Item/rm not "del". Native programs (git, node, npm) are invoked normally.' },
+  pwsh: { bin: 'pwsh', label: 'PowerShell 7 (pwsh)', posix: false, verbatim: false, args: PS_ARGS,
+          probe: 'Get-Command <tool>',
+          dialect: 'PowerShell syntax — NOT cmd.exe: $env:VAR for env vars, ; or && to chain, Get-ChildItem/ls not "dir /b", Remove-Item/rm not "del". Native programs (git, node, npm) are invoked normally.' },
+};
+
 // Shared by _collectRelevance (keyword search) and _listCodeFiles (embedding
 // index) — both walk the same repo the same way, so a single definition
 // keeps their notion of "a code file worth looking at" from drifting apart.
@@ -3085,16 +3125,18 @@ class NavyCoderViewProvider {
     const osPlatform = sandboxed
       ? `${hostPlatform} host, but commands run inside a Linux container (navy.sandboxMode is "docker")`
       : hostPlatform;
-    // The exact shell run_command executes through — NOT just the OS family.
-    // A model that only hears "Windows" reasonably assumes PowerShell (the
-    // modern default terminal); run_command always shells out via cmd.exe, so
-    // PowerShell-style syntax (Get-ChildItem, $env:VAR, semicolon chaining)
-    // fails in a way that looks like "doesn't know its own OS" but is really
-    // just the wrong shell dialect for what it's actually running through.
-    const shellName = isWinShell ? 'cmd.exe' : 'sh';
-    const shellNote = isWinShell
-      ? 'cmd.exe syntax — NOT PowerShell: %VAR% for env vars, & or && to chain, "dir" not "Get-ChildItem", "del" not "Remove-Item".'
-      : 'POSIX sh/bash-compatible syntax.';
+    // The exact shell run_command executes through — NOT just the OS family,
+    // and NOT inferable from it either: navy.shell can name any of them, and
+    // Docker sandboxing overrides that in turn. A model told only "Windows"
+    // reasonably assumes PowerShell (the modern default terminal), so if the
+    // command is really bound for cmd.exe its syntax fails in a way that
+    // looks like the model not knowing its own OS, when it was handed the
+    // wrong dialect. Both halves come from _resolveShell, which is also what
+    // _shellSpec and _shellEscapeArg read — the name, the spawn and the
+    // quoting cannot disagree.
+    const activeShell = this._resolveShell();
+    const shellName = activeShell.label;
+    const shellNote = activeShell.dialect;
     const nowStr = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
     // Cached after the first check (see _detectWsl) — a Unix-only tool (gcc,
     // make, …) that isn't on the Windows PATH may still exist inside WSL.
@@ -3715,7 +3757,7 @@ class NavyCoderViewProvider {
                 // and fix the code" nudge, which doesn't apply here.
                 const notFound = /is not recognized as an internal or external command|command not found|No such file or directory.*(?:PATH|command)/i.test(result);
                 result += notFound
-                  ? `\n\n[SYSTEM: This command failed because the program isn't installed or isn't on PATH — this is NOT a code bug. Verify with "where <tool>" (cmd.exe) or "command -v <tool>" (sh) before trying again, and use an alternative if it's genuinely unavailable.]`
+                  ? `\n\n[SYSTEM: This command failed because the program isn't installed or isn't on PATH — this is NOT a code bug. Verify with "${this._resolveShell().probe}" before trying again, and use an alternative if it's genuinely unavailable.]`
                   : '\n\n[SYSTEM: This command failed. Do NOT run it again without first diagnosing the error and fixing the code. Analyze the output above, find the root cause, apply a fix, then retry.]';
               } else if (typeof result === 'string' && result.startsWith('Exit code: 0')) {
                 failedCommands.delete(cmdKey);
@@ -5094,7 +5136,17 @@ class NavyCoderViewProvider {
   // _commandTargetIsPosix. A sandboxed command on Windows is bound for `sh`
   // inside a container, so cmd.exe's caret rules would corrupt it.
   _shellEscapeArg(s) {
-    if (!this._commandTargetIsPosix()) {
+    const shell = this._resolveShell();
+    if (shell.id === 'powershell' || shell.id === 'pwsh') {
+      // PowerShell is the easy one, for once. A single-quoted string is
+      // literal and the only escape inside it is a doubled quote — no caret
+      // stage and no CRT stage, because powershell.exe parses its own command
+      // line with ordinary CRT rules, so Node's default quoting already
+      // delivers -Command intact. That is exactly why verbatim is off for it
+      // in SHELLS: turning it on would hand PowerShell an unquoted line.
+      return "'" + s.replace(/'/g, "''") + "'";
+    }
+    if (!shell.posix) {
       // The same string is parsed TWICE on Windows, by two parsers with
       // different rules, so escaping has to happen in two ordered stages:
       //
@@ -5140,9 +5192,39 @@ class NavyCoderViewProvider {
   // break it — see _maybeWrapForSandbox, which clears the flag when it rewrites
   // the spawn target.
   _shellSpec(command) {
-    return this._commandTargetIsPosix()
-      ? { bin: 'sh', args: ['-c', command], verbatim: false }
-      : { bin: 'cmd', args: ['/c', command], verbatim: true };
+    const shell = this._resolveShell();
+    return { bin: shell.bin, args: shell.args(command), verbatim: shell.verbatim };
+  }
+
+  // The one place that decides which shell a command is bound for. Everything
+  // downstream — the spawn, the escaping dialect, and what the model is told to
+  // write — reads it here so the three can never disagree.
+  //
+  // navy.shell exists because this used to be `process.platform === 'win32'`
+  // and nothing else: Windows meant cmd.exe with no way out, while VS Code's
+  // own default terminal there is PowerShell. The cost showed up in the system
+  // prompt, which had to spend a whole rule arguing the model out of the
+  // PowerShell syntax it reasonably assumed — prompt text compensating for a
+  // missing setting.
+  _resolveShell() {
+    const config = vscode.workspace.getConfiguration('navy');
+    // The container wins over the setting, always. A sandboxed command runs
+    // inside Linux whatever the host is, so honouring a navy.shell of
+    // "powershell" here would splice powershell.exe into a `docker run` for an
+    // image that has no such thing — the identical bug that shipped sandboxing
+    // broken on Windows, one layer up. _maybeWrapForSandbox either wraps the
+    // spec or refuses it, so this can never leak sh onto a Windows host.
+    if (config.get('sandboxMode', 'off') === 'docker') return { id: 'sh', ...SHELLS.sh };
+
+    const choice = config.get('shell', 'auto');
+    const id = choice === 'auto' ? (process.platform === 'win32' ? 'cmd' : 'sh') : choice;
+    // An unrecognised id can only come from a hand-edited settings file. Fall
+    // back to the platform default rather than spawning something that is not
+    // there, which would fail every command with a confusing ENOENT.
+    const spec = SHELLS[id];
+    if (spec) return { id, ...spec };
+    const fallbackId = process.platform === 'win32' ? 'cmd' : 'sh';
+    return { id: fallbackId, ...SHELLS[fallbackId] };
   }
 
   // Which shell dialect a model-authored command has to be written in, and run
@@ -5161,8 +5243,7 @@ class NavyCoderViewProvider {
   // _maybeWrapForSandbox either wraps the spec or refuses it — it never hands
   // an unwrapped one back, so `sh -c` can't escape onto a Windows host.
   _commandTargetIsPosix() {
-    if (process.platform !== 'win32') return true;
-    return vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off') === 'docker';
+    return this._resolveShell().posix;
   }
 
   // Spawn options shared by every process-launching site here, so the verbatim

@@ -7159,6 +7159,140 @@ async function toolBatchingSuite() {
 // assumed. These pin that the setting really reaches all three things that have
 // to agree (the spawn, the escaping dialect, and what the model is told), that
 // "auto" changes nothing, and that the sandbox still overrides all of it.
+async function shellSelectionSuite() {
+  console.log('\nnavy.shell (which shell, which dialect):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  const isWin = process.platform === 'win32';
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-shell-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider.view = { webview: { postMessage: () => {} } };
+    provider._wslCache = { available: false };
+    ctrl.config.commandApproval = 'auto-approve';
+    ctrl.config.sandboxMode = 'off';
+
+    // ── "auto" is the platform default, unchanged. ─────────────────────────
+    ctrl.config.shell = 'auto';
+    const autoSpec = provider._shellSpec('echo hi');
+    check('shell auto: the platform default, exactly as before',
+      isWin ? (autoSpec.bin === 'cmd' && autoSpec.args[0] === '/c' && autoSpec.verbatim === true)
+            : (autoSpec.bin === 'sh' && autoSpec.args[0] === '-c' && autoSpec.verbatim === false), autoSpec.bin);
+    check('shell auto: posix-ness matches the platform', provider._commandTargetIsPosix() === !isWin);
+
+    // ── PowerShell: its own spawn shape, and NOT cmd.exe's verbatim mode. ──
+    ctrl.config.shell = 'powershell';
+    const psSpec = provider._shellSpec('npm test');
+    check('shell powershell: spawns powershell', psSpec.bin === 'powershell');
+    check('shell powershell: -NoProfile and -NonInteractive are not optional',
+      psSpec.args.includes('-NoProfile') && psSpec.args.includes('-NonInteractive'));
+    check('shell powershell: the command is passed to -Command',
+      psSpec.args[psSpec.args.indexOf('-Command') + 1].startsWith('npm test'));
+    // The subtle one: without this, powershell.exe reports 0 after a native
+    // program that failed, and the tool loop reads "Exit code:" to decide
+    // whether to tell the model its command worked.
+    check('shell powershell: the exit code of the last native command is propagated',
+      /\nexit \$LASTEXITCODE$/.test(psSpec.args[psSpec.args.indexOf('-Command') + 1]));
+    check('shell powershell: verbatim (a cmd.exe-only mode) stays off', psSpec.verbatim === false);
+    check('shell powershell: escaping switches to PowerShell quoting',
+      provider._shellEscapeArg("it's") === "'it''s'", provider._shellEscapeArg("it's"));
+    check('shell powershell: is not treated as POSIX', provider._commandTargetIsPosix() === false);
+
+    ctrl.config.shell = 'pwsh';
+    check('shell pwsh: spawns pwsh, same flags', provider._shellSpec('x').bin === 'pwsh' && provider._shellSpec('x').args.includes('-NoProfile'));
+
+    // The 'that program is not installed' nudge hands the model a probe command
+    // verbatim, so it has to follow navy.shell too — telling a PowerShell
+    // session to run 'where' wastes the retry the nudge exists to save.
+    ctrl.config.shell = 'powershell';
+    check('probe hint: PowerShell gets Get-Command', provider._resolveShell().probe === 'Get-Command <tool>');
+    ctrl.config.shell = 'cmd';
+    check('probe hint: cmd.exe gets where', provider._resolveShell().probe === 'where <tool>');
+    ctrl.config.shell = 'sh';
+    check('probe hint: sh gets command -v', provider._resolveShell().probe === 'command -v <tool>');
+
+    // ── bash is available as an explicit choice on every platform. ─────────
+    ctrl.config.shell = 'bash';
+    const bashSpec = provider._shellSpec('ls');
+    check('shell bash: sh-style invocation and POSIX escaping',
+      bashSpec.bin === 'bash' && bashSpec.args[0] === '-c' && bashSpec.verbatim === false &&
+      provider._shellEscapeArg("it's") === "'it'\\''s'");
+
+    // ── A hand-edited nonsense value must not spawn something that isn't
+    //    there — that would fail every command with a confusing ENOENT. ─────
+    ctrl.config.shell = 'fish-but-not-really';
+    check('shell unknown: falls back to the platform default',
+      provider._shellSpec('x').bin === (isWin ? 'cmd' : 'sh'));
+
+    // ── The container still wins over the setting. ─────────────────────────
+    ctrl.config.shell = 'powershell';
+    ctrl.config.sandboxMode = 'docker';
+    const sandboxed = provider._shellSpec('echo hi');
+    check('sandbox overrides navy.shell: the container gets sh, never powershell',
+      sandboxed.bin === 'sh' && sandboxed.args[0] === '-c' && sandboxed.verbatim === false, sandboxed.bin);
+    check('sandbox overrides navy.shell: escaping goes back to POSIX',
+      provider._shellEscapeArg("it's") === "'it'\\''s'");
+    ctrl.config.sandboxMode = 'off';
+
+    // ── The model is told which shell it is actually writing for. ──────────
+    const captured = [];
+    ctrl.config.shell = 'powershell';
+    global.fetch = queueOllamaFetch([{ text: 'Nothing to do.' }], captured);
+    await provider.askNavy('hello', false, null, [], []);
+    const psPrompt = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+    check('prompt: names PowerShell as the shell when that is what will run',
+      /run_command executes through: Windows PowerShell/.test(psPrompt) && /\$env:VAR/.test(psPrompt), psPrompt.slice(0, 0));
+    check('prompt: does not still insist on cmd.exe syntax under PowerShell',
+      !/NOT PowerShell/.test(psPrompt));
+
+    captured.length = 0;
+    ctrl.config.shell = 'auto';
+    global.fetch = queueOllamaFetch([{ text: 'Nothing to do.' }], captured);
+    await provider.askNavy('hello', false, null, [], []);
+    const autoPrompt = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
+    check('prompt: auto still describes the platform shell',
+      isWin ? /run_command executes through: cmd\.exe/.test(autoPrompt) && /NOT PowerShell/.test(autoPrompt)
+            : /run_command executes through: sh/.test(autoPrompt));
+    global.fetch = realFetch;
+
+    // ── Real execution through a non-default shell. Only where that shell
+    //    actually exists: PowerShell on Windows, bash on POSIX. ─────────────
+    const altShell = isWin ? 'powershell' : 'bash';
+    if (await provider._commandAvailable(altShell)) {
+      ctrl.config.shell = altShell;
+      const printer = path.join(tmp, 'print-argv.js');
+      fs.writeFileSync(printer, 'console.log("ARGV:" + JSON.stringify(process.argv.slice(2)));');
+
+      for (const value of ["it's here", 'foo bar', 'a;echo PWNED', '$(id)', 'x&y']) {
+        const out = await provider.toolRunCommand('node print-argv.js ' + provider._shellEscapeArg(value), 20000);
+        const m = out.match(/ARGV:(\[.*\])/);
+        let argv = null; try { argv = JSON.parse(m[1]); } catch {}
+        check(`shell ${altShell}: _shellEscapeArg round-trips ${JSON.stringify(value)} as one literal argument`,
+          Array.isArray(argv) && argv.length === 1 && argv[0] === value, out.slice(0, 200));
+      }
+
+      // A failing program has to be reported as failing. This is the whole
+      // reason PS_ARGS appends an explicit exit.
+      const failed = await provider.toolRunCommand('node -e "process.exit(3)"', 20000);
+      check(`shell ${altShell}: a non-zero exit code survives the shell wrapper`,
+        /^Exit code: 3/.test(failed), failed.slice(0, 200));
+      const ok = await provider.toolRunCommand('node -e "process.exit(0)"', 20000);
+      check(`shell ${altShell}: a successful command still reports 0`, /^Exit code: 0/.test(ok), ok.slice(0, 200));
+    } else {
+      console.log(`  SKIP ${altShell} round-trip — not installed on this machine`);
+    }
+  } finally {
+    global.fetch = realFetch;
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -7203,6 +7337,7 @@ undoRedoSuite()
   .then(approvalCancelSuite)
   .then(approvalScopeSuite)
   .then(toolBatchingSuite)
+  .then(shellSelectionSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

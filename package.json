@@ -274,6 +274,27 @@
           "default": true,
           "description": "Show 'Ask Navy' code lens buttons above functions in the editor."
         },
+        "navy.shell": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "cmd",
+            "powershell",
+            "pwsh",
+            "sh",
+            "bash"
+          ],
+          "enumDescriptions": [
+            "cmd.exe on Windows, sh elsewhere — the platform default",
+            "Windows cmd.exe",
+            "Windows PowerShell 5.1 (powershell.exe)",
+            "PowerShell 7+ (pwsh)",
+            "POSIX sh",
+            "bash — including Git Bash on Windows"
+          ],
+          "description": "The shell run_command, run_tests and run_project execute through, and the dialect Navy tells the model to write commands in. \"auto\" keeps the platform default. Ignored while navy.sandboxMode is \"docker\": a sandboxed command runs inside a Linux container and always targets sh."
+        },
         "navy.sandboxMode": {
           "type": "string",
           "default": "off",
