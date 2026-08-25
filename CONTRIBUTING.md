@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 1,792 tests, no network, no API keys
+npm test             # 1,854 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -61,6 +61,7 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/providers/endpoints.js` | ~90 | **Single source of truth** for every provider base URL |
 | `src/providers/pricing.js` | ~105 | The cost table, its ordering invariant, and `navy.modelPricing` overrides |
 | `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
+| `src/plan.js` | ~130 | Task plans: validation, the block the model reads back, the incomplete-plan note |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
 | `src/providers/mcp.js` | ~300 | MCP client, stdio and streamable HTTP |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |

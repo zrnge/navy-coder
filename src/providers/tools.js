@@ -398,6 +398,28 @@ const TOOLS = [
     }
   },
   {
+    name: 'update_plan',
+    description: 'Record or revise your plan for the current task, as structured steps the user can see progress against. Send the WHOLE plan every time — this replaces the previous one, it does not patch it. Call it once before you start any task needing three or more tool calls, then again each time a step finishes or the plan changes. Exactly one step may be "in_progress". Do NOT use it for a one-step task, and do not write the plan out in your reply as well — the user already sees it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        steps: {
+          type: 'array',
+          description: 'The complete plan, in order. 3-6 steps is usually right; 20 is the maximum.',
+          items: {
+            type: 'object',
+            properties: {
+              step: { type: 'string', description: 'What this step does, in one short line.' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'done'], description: 'Defaults to "pending".' }
+            },
+            required: ['step']
+          }
+        }
+      },
+      required: ['steps']
+    }
+  },
+  {
     name: 'delegate_research',
     description: 'Delegate a focused, READ-ONLY investigation to an isolated sub-agent and get back only its written summary — use this for a broad question that would otherwise take many read/search calls and fill up YOUR OWN context with detail you only need the CONCLUSION of (e.g. "how does authentication work in this codebase", "find every place X is called and summarize the pattern", "investigate why Y might be failing"). The sub-agent has no memory of this conversation (describe the task fully) and can read, search, and browse the codebase, but cannot write, delete, rename, run commands, or delegate further — for making changes, do that yourself directly, do not delegate it. INDEPENDENT investigations can be issued together in ONE response (max 4) and run concurrently, so two unrelated questions cost about what one does — only do this when neither depends on the result of the other.',
     parameters: {
@@ -461,6 +483,10 @@ const TOOLS_API = toApiSchema(TOOLS);
 // call away, and the withheld names are listed in the prompt so the model knows
 // what it can ask for rather than concluding the capability doesn't exist.
 const CORE_TOOL_NAMES = new Set([
+  // Small models drift on long tasks more than large ones do, and this is the
+  // tool that pulls them back — its schema is small enough that withholding it
+  // would save almost nothing.
+  'update_plan',
   'read_file', 'read_lines', 'write_file', 'list_files', 'apply_edit', 'edit_line',
   'search_codebase', 'find_relevant_files', 'run_command', 'run_tests',
   'get_diagnostics', 'check_syntax', 'git_status', 'git_diff',
@@ -494,7 +520,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, delegate_research, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
@@ -513,7 +539,7 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 10. Never read the same file more than once per task. Once read, use that content. If you have read 3 or more files without making any change, you have enough context — stop reading and act now.
 11. If a command fails (non-zero exit code), NEVER run the same command again immediately. Read the error output, identify the root cause, fix the code, THEN retry once. Repeating a failing command without a fix accomplishes nothing.
 12. NEVER call run_project if the project is already running — it will report "already running". Only call run_project once per session; use the existing server for all subsequent testing.
-13. PLANNING: For any task that will need 3 or more tool calls, START your first response with a short numbered plan (3-6 one-line steps) under a "**Plan:**" heading, BEFORE the first tool call. Then execute the steps in order. If the plan must change mid-task, state the revised step in one line before continuing. Simple one-tool questions need no plan.
+13. PLANNING: For any task that will need 3 or more tool calls, call update_plan FIRST — before the first real tool call — with 3-6 one-line steps. Then work through them in order, calling update_plan again each time you start a step (status "in_progress") and each time one finishes ("done"). Send the whole plan every time; it replaces the previous one. The user sees this as live progress, so do NOT also write the plan out in your reply, and do not leave a finished step marked pending. If the plan turns out to be wrong, replace it — a stale plan is worse than none. Simple one-tool questions need no plan at all.
 14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors. IMPORTANT: an empty/absent diagnostics report does NOT prove the file is valid — it usually means the user has no language extension installed for that file type. When a write reports "[SYNTAX UNVERIFIED]", or you edited a JSON/config file, or you need certainty before finishing, call check_syntax on the file: it runs a real parser and tells you definitively "valid", "syntax error at line N", or "could not verify". Never claim a file is correct on the basis of silence alone.
 15. CRITICAL — DO NOT HALLUCINATE FILE ACTIONS: Writing code in your reply text does NOT save it anywhere — it only appears in the chat. If the user asked you to create, write, save, or edit a file, you MUST call the write_file or apply_edit tool and see its result before saying it succeeded. NEVER say "created", "saved", "written", "done", or similar unless you actually called that tool THIS turn and it returned success. If you are only showing an example or discussing code without being asked to save it, say so explicitly instead of claiming completion.
 16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.

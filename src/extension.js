@@ -14,6 +14,7 @@ const { NET_SAFETY_METHODS } = require('./net-safety.js');
 const { UNDO_METHODS } = require('./undo.js');
 const { WEB_SEARCH_METHODS } = require('./web-search.js');
 const { DIAGNOSTICS_METHODS } = require('./diagnostics.js');
+const { PLAN_METHODS } = require('./plan.js');
 const { SLASH_COMMAND_METHODS } = require('./slash-commands.js');
 const { SKILL_METHODS } = require('./skills.js');
 const vscode = require('vscode');
@@ -584,6 +585,10 @@ class Session {
     // a model can fan several investigations out at once — this is what keeps
     // that bounded. See MAX_CONCURRENT_DELEGATIONS.
     this._activeDelegations = 0;
+    // The current task plan: [{ step, status }]. Belongs to a chat, persists
+    // with it, and is reset at the start of each turn — see src/plan.js.
+    this.plan = [];
+    this.planTurnId = null;
     // The model the currently-running turn was invoked with (the picker's
     // choice arrives per-request, so it can differ from navy.model). Read by
     // tools that make their own model calls — see toolDelegateResearch.
@@ -731,6 +736,10 @@ class NavyCoderViewProvider {
   // for that same file/editor.
   get editedRanges() { return this._proj.editedRanges || (this._proj.editedRanges = new Map()); }
   set editedRanges(v) { this._proj.editedRanges = v; }
+  get plan() { return this._session.plan; }
+  set plan(v) { this._session.plan = v; }
+  get planTurnId() { return this._session.planTurnId; }
+  set planTurnId(v) { this._session.planTurnId = v; }
   get charsPerToken() { return this._session.charsPerToken; }
   set charsPerToken(v) { this._session.charsPerToken = v; }
   get _cptSample() { return this._session._cptSample; }
@@ -3081,6 +3090,7 @@ class NavyCoderViewProvider {
     this._sendSessionList(); // tab strip's busy spinner reflects this session's turn starting
     if (this.statusBarItem) this.statusBarItem.text = '$(sync~spin) Navy';
     this.currentTurnId = this.generateId();
+    this._resetPlan();
     // Liveness beacon: the webview only declares Navy dead after 4 minutes of
     // silence, so beat every 30s for the whole turn (model calls, tools, and
     // approval waits included). Cleared in finally.
@@ -3496,6 +3506,14 @@ class NavyCoderViewProvider {
         resetWatchdog();
         // Keep the request within the context window on long multi-step tasks.
         if (iteration > 0) this._compactMessages(messages);
+        // The plan is re-stated on every iteration, replacing the previous
+        // copy rather than accumulating: a long turn that only saw the plan
+        // once at the start is exactly the drift the prose version suffered
+        // from, and a plan repeated ten times is ten copies of the same text
+        // in the context window.
+        if (messages[0]?.role === 'system') {
+          messages[0].content = systemContent + this._planForPrompt();
+        }
         // Measured BEFORE the call, so the sample pairs the exact text sent
         // with the token count the provider reports back for it.
         const promptCharsSent = assembledCharSize(messages);
@@ -3926,13 +3944,24 @@ class NavyCoderViewProvider {
           meta.provider = lastUsedProvider;
           meta.model = lastUsedModel;
         }
+        // The plan as it stood when the turn ended, so reopening the chat shows
+        // the same progress it showed live. Display-only, like cards: the model
+        // is handed the CURRENT plan directly by _planForPrompt, and replaying
+        // every past turn's finished plan into its context would be noise.
+        if (this._session.plan?.length) meta.plan = this._session.plan;
+
         // Fallback notices ride along in the persisted text so a reloaded
         // session still shows that a different provider (and a different
         // account) served this turn — see _announceFallback.
         const notices = this._session.fallbackNotices;
-        const persistedText = notices.length
+        // A plan with steps still open is a fact about what happened, not an
+        // error — the user may have pressed Stop, or the task may genuinely be
+        // partial. Stating it beats a progress display that simply stopped.
+        const planNote = this._planCompletionNote();
+        const persistedText = (notices.length
           ? notices.map(n => `_[${n}]_`).join('\n') + '\n\n' + lastAssistantText
-          : lastAssistantText;
+          : lastAssistantText) + planNote;
+        if (planNote) this.view?.webview.postMessage({ type: 'planIncomplete', note: planNote.trim() });
         this.messages.push({
           role: 'assistant',
           text: persistedText,
@@ -4472,6 +4501,7 @@ class NavyCoderViewProvider {
         case 'find_references': return await this.toolFindReferences(tool.args.name);
         case 'web_search': return await this.toolWebSearch(tool.args.query, tool.args.maxResults);
         case 'delegate_research': return await this.toolDelegateResearch(tool.args.task, tool.args.maxSteps);
+        case 'update_plan': return await this.toolUpdatePlan(tool.args.steps);
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
@@ -7340,6 +7370,7 @@ mixinPrototype(NavyCoderViewProvider.prototype, NET_SAFETY_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, UNDO_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, WEB_SEARCH_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, DIAGNOSTICS_METHODS);
+mixinPrototype(NavyCoderViewProvider.prototype, PLAN_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SLASH_COMMAND_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SKILL_METHODS);
 

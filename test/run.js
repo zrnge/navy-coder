@@ -7810,6 +7810,134 @@ async function settingsDefaultsSuite() {
     !/maxToolIterations', 50\)/.test(extSrc) && declared['navy.maxToolIterations'].default === 100);
 }
 
+
+// Navy has always asked for a plan, and the panel has always drawn one — by
+// scraping a numbered list out of prose and mapping tool-loop iterations onto
+// the steps, which its own comment called approximate. update_plan replaces
+// both guesses with state the model declares: what the steps are, and which one
+// is actually running.
+async function planSuite() {
+  console.log('\ntask plans (declared, not inferred):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  const { normalizePlan, renderPlan, MAX_PLAN_STEPS } = require('../src/plan.js');
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-plan-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => { posted.push(m); return Promise.resolve(true); } } };
+    provider._wslCache = { available: false };
+
+    // ── normalizePlan is where a weak model's output gets made safe. ──────
+    check('plan: bare strings are accepted as pending steps — models emit them whatever the schema says',
+      JSON.stringify(normalizePlan(['read it', 'fix it']).steps) ===
+      JSON.stringify([{ step: 'read it', status: 'pending' }, { step: 'fix it', status: 'pending' }]));
+    check('plan: an unknown status falls back to pending rather than being rejected',
+      normalizePlan([{ step: 'a', status: 'halfway' }]).steps[0].status === 'pending');
+    check('plan: two in_progress steps are refused — that is two plans, not one',
+      /Only one step/.test(normalizePlan([
+        { step: 'a', status: 'in_progress' }, { step: 'b', status: 'in_progress' }]).error));
+    check('plan: one in_progress step is fine',
+      normalizePlan([{ step: 'a', status: 'in_progress' }, { step: 'b' }]).steps.length === 2);
+    check('plan: an empty plan is refused', Boolean(normalizePlan([]).error));
+    check('plan: a non-array is refused', Boolean(normalizePlan('read the file').error));
+    check('plan: a step with no text is refused and says which one',
+      /Step 2/.test(normalizePlan(['ok', { status: 'done' }]).error));
+    check('plan: too many steps is refused with the limit named',
+      new RegExp('at most ' + MAX_PLAN_STEPS).test(
+        normalizePlan(Array.from({ length: MAX_PLAN_STEPS + 1 }, (_, i) => 'step ' + i)).error));
+    check('plan: a very long step is truncated, not rejected',
+      normalizePlan(['x'.repeat(500)]).steps[0].step.length === 120);
+    check('plan: rendering marks done, running and pending distinctly',
+      renderPlan([{ step: 'a', status: 'done' }, { step: 'b', status: 'in_progress' }, { step: 'c', status: 'pending' }])
+        === '[x] 1. a\n[>] 2. b\n[ ] 3. c');
+
+    // ── The tool. ─────────────────────────────────────────────────────────
+    posted.length = 0;
+    const res = await provider.toolUpdatePlan([
+      { step: 'Read the auth module', status: 'done' },
+      { step: 'Patch the retry', status: 'in_progress' },
+      { step: 'Run the tests' },
+    ]);
+    check('update_plan: reports progress back to the model', /1\/3 done/.test(res), res);
+    check('update_plan: hands the plan back so it need not re-send it unchanged', /\[>\] 2\. Patch the retry/.test(res));
+    check('update_plan: tells the webview', posted.some(m => m.type === 'planUpdate' && m.steps.length === 3));
+    check('update_plan: stores it on the session', provider.plan.length === 3);
+    check('update_plan: a bad plan is an error string, not a thrown exception',
+      /^Error: /.test(await provider.toolUpdatePlan([])));
+    check('update_plan: …and a refused plan leaves the previous one intact', provider.plan.length === 3);
+
+    const again = await provider.toolUpdatePlan([
+      { step: 'Read the auth module', status: 'done' },
+      { step: 'Patch the retry', status: 'in_progress' },
+      { step: 'Run the tests' },
+    ]);
+    check('update_plan: an unchanged resend is reported as unchanged', /Plan unchanged/.test(again));
+
+    // ── The model gets its own plan back every iteration. ─────────────────
+    const forPrompt = provider._planForPrompt();
+    check('plan: the prompt block states progress and every step',
+      /1\/3 done/.test(forPrompt) && /Run the tests/.test(forPrompt));
+    check('plan: the prompt block tells the model to keep it current', /update_plan as you go/.test(forPrompt));
+    provider._resetPlan();
+    check('plan: no plan means no prompt block at all', provider._planForPrompt() === '');
+
+    // ── A turn that ends mid-plan says so. ───────────────────────────────
+    await provider.toolUpdatePlan([{ step: 'a', status: 'done' }, { step: 'b' }, { step: 'c' }]);
+    const note = provider._planCompletionNote();
+    check('plan: an unfinished plan produces a note naming what is left',
+      /1\/3 steps done/.test(note) && /b/.test(note) && /c/.test(note), note);
+    await provider.toolUpdatePlan([{ step: 'a', status: 'done' }, { step: 'b', status: 'done' }]);
+    check('plan: a finished plan produces no note', provider._planCompletionNote() === '');
+    provider._resetPlan();
+    check('plan: no plan produces no note', provider._planCompletionNote() === '');
+
+    // ── End to end through a real turn. ──────────────────────────────────
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'look', status: 'in_progress' }, { step: 'act' }] } }] },
+      { text: 'Stopping before the second step.' },
+    ]);
+    await provider.askNavy('do a two-step thing', false, null, [], []);
+
+    const turn = provider.messages[provider.messages.length - 1];
+    check('turn: the plan is persisted with the turn it belonged to', turn.meta?.plan?.length === 2);
+    check('turn: an unfinished plan is stated in the reply, not left to be noticed',
+      /Plan incomplete/.test(turn.text), turn.text.slice(-160));
+    check('turn: …and the webview is told separately', posted.some(m => m.type === 'planIncomplete'));
+
+    // A new turn must not inherit the last one's plan.
+    global.fetch = queueOllamaFetch([{ text: 'Nothing to do.' }]);
+    await provider.askNavy('unrelated question', false, null, [], []);
+    check('turn: a fresh turn starts with no plan', provider.plan.length === 0);
+    const second = provider.messages[provider.messages.length - 1];
+    check('turn: …and does not inherit the previous turn incomplete note', !/Plan incomplete/.test(second.text));
+
+    // ── Wiring the model depends on. ─────────────────────────────────────
+    const toolsMod = require('../src/providers/tools.js');
+    check('update_plan is offered to the model', toolsMod.TOOLS_API.some(t => t.function.name === 'update_plan'));
+    check('update_plan is in the core tier — small models drift most on long tasks',
+      toolsMod.CORE_TOOL_NAMES.has('update_plan'));
+    check('rule 13 asks for update_plan, not a prose heading',
+      /13\. PLANNING: .*update_plan FIRST/.test(toolsMod.TOOL_PROMPT) && !/\*\*Plan:\*\* heading/.test(toolsMod.TOOL_PROMPT));
+    check('update_plan is listed among the available tools', /web_search, update_plan, delegate_research/.test(toolsMod.TOOL_PROMPT));
+
+    // A sub-agent must not be able to rewrite the delegating turn's plan.
+    const extSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'extension.js'), 'utf8');
+    check('update_plan is NOT read-only, so a sub-agent cannot touch the plan',
+      !/'update_plan'/.test(extSrc.split('const READ_ONLY')[1].split(']);')[0]));
+  } finally {
+    global.fetch = realFetch;
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -7860,6 +7988,7 @@ undoRedoSuite()
   .then(diagnosticsSuite)
   .then(delegationFanOutSuite)
   .then(settingsDefaultsSuite)
+  .then(planSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

@@ -2247,6 +2247,92 @@ function fileChipSuite() {
 // Free paths bundled as an inline sprite. The failure mode of a sprite is a
 // silent one — a mistyped name renders nothing at all — so what these tests
 // pin above all is that every name actually resolves.
+
+// The panel has drawn a plan card since 0.2.x, built by scraping a numbered
+// list out of the streamed prose and advancing it from the tool-loop iteration
+// counter — "approximate, not a guarantee" in its own comment. update_plan
+// makes both of those unnecessary when the model declares a plan, and these pin
+// that the real thing wins while the guesses survive for models that don't.
+function planCardSuite() {
+  console.log('\nplan card (declared beats inferred):');
+  const w = run([{ type: 'start', model: 'test-model' }]);
+  const d = w.document;
+
+  const steps = (s) => [...d.querySelectorAll('.plan-step')].map(li => ({
+    text: li.querySelector('.plan-step-text').textContent,
+    state: li.classList.contains('done') ? 'done' : li.classList.contains('active') ? 'active' : 'pending',
+  }));
+
+  w.post({ type: 'planUpdate', steps: [
+    { step: 'Read the auth module', status: 'done' },
+    { step: 'Patch the retry', status: 'in_progress' },
+    { step: 'Run the tests', status: 'pending' },
+  ] });
+
+  check('a declared plan renders one card', d.querySelectorAll('.plan-card').length === 1);
+  check('…with every step in its declared state',
+    JSON.stringify(steps()) === JSON.stringify([
+      { text: 'Read the auth module', state: 'done' },
+      { text: 'Patch the retry', state: 'active' },
+      { text: 'Run the tests', state: 'pending' },
+    ]), JSON.stringify(steps()));
+  check('…and a header that counts progress rather than just steps',
+    /1\/3 done/.test(d.querySelector('.plan-card-header').textContent));
+
+  // A revised plan updates in place. A trail of superseded copies down the
+  // transcript is exactly what makes a plan card useless.
+  w.post({ type: 'planUpdate', steps: [
+    { step: 'Read the auth module', status: 'done' },
+    { step: 'Patch the retry', status: 'done' },
+    { step: 'Run the tests', status: 'in_progress' },
+  ] });
+  check('a revised plan updates the same card, it does not append another',
+    d.querySelectorAll('.plan-card').length === 1);
+  check('…and moves the steps to their new states',
+    steps()[1].state === 'done' && steps()[2].state === 'active');
+  check('…and the header follows', /2\/3 done/.test(d.querySelector('.plan-card-header').textContent));
+
+  // The iteration counter must not overwrite what the model actually said.
+  w.post({ type: 'stepProgress', step: 2, max: 100 });
+  check('the tool-iteration guess no longer moves a declared plan',
+    steps()[1].state === 'done' && steps()[2].state === 'active', JSON.stringify(steps()));
+
+  // Nor may the prose scraper.
+  w.post({ type: 'chunk', text: '**Plan:**\n1. something else entirely\n2. and another\n\n' });
+  check('the prose scraper no longer replaces a declared plan',
+    d.querySelectorAll('.plan-card').length === 1 && steps().length === 3);
+
+  // An incomplete plan is stated in the panel too.
+  w.post({ type: 'planIncomplete', note: 'Plan incomplete — 2/3 steps done. Still open: Run the tests.' });
+  const sys = [...d.querySelectorAll('.system-message, .message.system')].map(e => e.textContent).join(' ');
+  check('an incomplete plan is stated in the panel', /Plan incomplete/.test(sys + d.body.textContent));
+
+  // A new turn starts clean — the previous turn's plan must not look like this
+  // one's, which is the whole reason resetPlanCard exists.
+  w.post({ type: 'start', model: 'test-model' });
+  w.post({ type: 'stepProgress', step: 3, max: 100 });
+  check('a new turn does not inherit the previous plan card as authoritative',
+    d.querySelectorAll('.plan-card').length === 1);
+
+  // Models that never call update_plan keep the old behaviour rather than
+  // losing the card entirely.
+  w.post({ type: 'chunk', text: '**Plan:**\n1. read it\n2. fix it\n\n' });
+  check('a model that only writes prose still gets a card', d.querySelectorAll('.plan-card').length === 2);
+  const latest = [...d.querySelectorAll('.plan-card')].pop();
+  check('…scraped from its prose', /read it/.test(latest.textContent) && /fix it/.test(latest.textContent));
+
+  // Restoring a chat replays the plan the turn ended with.
+  const w2 = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'do the thing' },
+    { role: 'assistant', text: 'Done.', meta: { plan: [
+      { step: 'first', status: 'done' }, { step: 'second', status: 'done' }] } },
+  ] }]);
+  const restored = w2.document.querySelectorAll('.plan-card');
+  check('a restored chat replays the plan its turn ended with', restored.length === 1, restored.length);
+  check('…with the states it ended in',
+    [...w2.document.querySelectorAll('.plan-step')].every(li => li.classList.contains('done')));
+}
+
 function iconSuite() {
   console.log('\nicons: bundled SVG, theme-following, no emoji left:');
 
@@ -2779,6 +2865,7 @@ msgStepSuite();
 scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
+planCardSuite();
 iconSuite();
 taskDockSuite();
 queueCancelSuite();

@@ -1613,6 +1613,16 @@ window.addEventListener('message', (event) => {
     }
   }
 
+  if (message.type === 'planUpdate') {
+    planIsAuthoritative = true;
+    renderAuthoritativePlan(message.steps);
+    scrollToBottom();
+  }
+
+  if (message.type === 'planIncomplete') {
+    addSystemMessage(message.note.replace(/^_|_$/g, ''));
+  }
+
   if (message.type === 'stepProgress') {
     if (statusText) statusText.textContent = `Working… (step ${message.step})`;
     if (stepBadgeEl) {
@@ -1621,7 +1631,7 @@ window.addEventListener('message', (event) => {
     }
     // Best-effort mapping of tool-loop iteration → plan step (message.step starts
     // at 2 on the loop's second iteration; see extension.js).
-    if (planCardEl && planStepCount > 0) {
+    if (!planIsAuthoritative && planCardEl && planStepCount > 0) {
       const activeIdx = Math.min(Math.max(message.step - 2, 0), planStepCount - 1);
       updatePlanProgress(activeIdx, false);
     }
@@ -2779,6 +2789,15 @@ function renderHistoryItem(item) {
     addMessage('user', item.text, item.attachments || [], item.images || 0);
   } else if (item.role === 'assistant') {
     renderAssistantTurn(item);
+    // The plan as it stood when the turn ended. Rendered before the change
+    // summary so it reads in the order it happened: what was planned, then what
+    // it did. Rebuilt from scratch for each restored turn, so the card belongs
+    // to its own message rather than to whichever turn was last drawn.
+    if (item.meta?.plan?.length) {
+      planCardEl = null;
+      renderAuthoritativePlan(item.meta.plan, messagesEl.lastElementChild || messagesEl);
+      planCardEl = null;
+    }
     // Restore the change summary for this turn (live footer isn't persisted).
     if (item.meta) {
       const bits = [];
@@ -3369,11 +3388,18 @@ function parsePlanSteps(text) {
 
 let planCardEl = null;
 let planStepCount = 0;
+// Set once the model calls update_plan. From then on the card is driven by real
+// state and the two guesses below are switched off: the regex that scrapes a
+// plan out of prose, and the iteration counter that pretends to know which step
+// is running. Both stay for models that never call the tool — a worse plan card
+// is better than none — but neither may overwrite the real thing.
+let planIsAuthoritative = false;
 
 // Builds the checklist once per turn, as soon as a parseable plan appears in the
 // streamed text. Best-effort/visual only — a wrong step count or a model that
 // never states a plan just means no card appears; nothing else depends on it.
 function maybeBuildPlanCard() {
+  if (planIsAuthoritative) return; // the model told us; stop guessing
   if (planCardEl || !activeAssistantContent) return;
   const steps = parsePlanSteps(activeAssistantContent);
   if (!steps.length) return;
@@ -3418,9 +3444,51 @@ function updatePlanProgress(activeIdx, allDone) {
   });
 }
 
+// Renders a plan the model actually declared. Replaces the card's contents in
+// place so a plan revised mid-turn updates where it already is, rather than
+// leaving a trail of superseded copies down the transcript.
+function renderAuthoritativePlan(steps, container) {
+  if (!Array.isArray(steps) || !steps.length) return;
+  const host = container || activeAssistantMessage || messagesEl;
+  if (!planCardEl || !planCardEl.isConnected || planCardEl.parentElement !== host) {
+    const card = document.createElement('div');
+    card.className = 'plan-card';
+    const header = document.createElement('div');
+    header.className = 'plan-card-header';
+    card.appendChild(header);
+    const list = document.createElement('ol');
+    list.className = 'plan-card-list';
+    card.appendChild(list);
+    host.appendChild(card);
+    planCardEl = card;
+  }
+  planStepCount = steps.length;
+  const done = steps.filter(s => s.status === 'done').length;
+  planCardEl.querySelector('.plan-card-header').textContent =
+    `Plan — ${done}/${steps.length} done`;
+  const list = planCardEl.querySelector('.plan-card-list');
+  list.innerHTML = '';
+  for (const s of steps) {
+    const li = document.createElement('li');
+    // 'active' is the existing class for the running step; the tool calls it
+    // in_progress. Mapped here so the CSS does not have to learn a new name.
+    const cls = s.status === 'done' ? 'done' : s.status === 'in_progress' ? 'active' : 'pending';
+    li.className = 'plan-step ' + cls;
+    const icon = document.createElement('span');
+    icon.className = 'plan-step-icon';
+    const label = document.createElement('span');
+    label.className = 'plan-step-text';
+    label.textContent = s.step;
+    li.appendChild(icon);
+    li.appendChild(label);
+    list.appendChild(li);
+  }
+}
+
 function resetPlanCard() {
   planCardEl = null;
   planStepCount = 0;
+  planIsAuthoritative = false;
 }
 
 // Resets everything tied to the currently-displayed conversation THREAD —
