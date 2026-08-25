@@ -4161,7 +4161,7 @@ class NavyCoderViewProvider {
 
     // Tool output is gone and it still does not fit. What is left is the
     // model's OWN accumulated text: a turn is allowed up to maxToolIterations
-    // (50 by default) model calls, and every one of them can leave a paragraph
+    // (100 by default) model calls, and every one of them can leave a paragraph
     // of reasoning behind. Nothing used to bound that — the compactor pruned
     // tool results and then had nothing else it was willing to touch, so a
     // single long turn could walk into the ceiling with no way back.

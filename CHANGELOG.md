@@ -1,6 +1,167 @@
 # Changelog
 
-## [Unreleased] - 0.3.0
+## [Unreleased] - 0.3.1
+
+This one started as an audit rather than a bug report, and the first thing it
+found was a setting that did considerably more than its own description said.
+
+`navy.approvalMode` was documented as *"How Navy Coder should handle file
+edits"*. The dropdown in the topbar was labelled **Edit approval mode**. It also
+governed every shell command, every test run, every dev server, every background
+process and every third-party MCP tool call — stored globally, so it followed you
+into every workspace including a repository cloned five minutes ago. Turning off
+diff prompts because you were tired of clicking them also granted unattended
+arbitrary command execution, and nothing anywhere said so.
+
+The rest is smaller and shares a shape: things that were quietly costing
+something and had stopped being questioned. A prompt rule forbidding what the
+tool loop could already do. A shell nobody could choose, and a whole system-prompt
+rule spent arguing the model out of assuming otherwise. A chars-per-token constant
+that is right for English prose and wrong for everything else. A fuzzy edit that
+matched correctly and then destroyed the file's indentation. And a no-telemetry
+promise — which stays — with no way for anyone to report what went wrong.
+
+### Security
+
+- **The approval gate is two gates, and only one of them is about files.**
+  `navy.approvalMode` now covers changes to files and nothing else: writes,
+  edits, deletes, renames. The new `navy.commandApproval` covers execution —
+  shell commands, test runs, dev servers, background processes, and MCP tool
+  calls — and defaults to `ask-always`.
+
+  They were never the same decision. A file change is contained to the workspace,
+  shown to you as a diff, checkpointed for undo, and visible in `git diff`
+  afterwards. Navy cannot know what a command will do before it runs and cannot
+  take it back afterwards. One switch for both meant the safer, more reversible
+  action was the one people turned off, and the irreversible one came along
+  silently.
+
+  **If you had `auto-approve` set before upgrading**, file edits stay automatic
+  and commands go back to asking. Nothing to do; the new setting simply is not
+  set for you, and that is the safe direction. Turn it off separately if you
+  want it, and read what the confirmation says — it now describes the gate you
+  are actually flipping instead of listing both.
+
+  Internally there is now exactly one way to ask each question, and the test
+  suite fails the build if any code reads either setting directly. Wiring a new
+  tool to the wrong gate is a safety bug, not something to catch in review.
+
+### Added
+
+- **`navy.shell` — commands run in the shell you actually use.** Windows meant
+  `cmd.exe`, with no way out, while VS Code's own default terminal on Windows is
+  PowerShell. The cost of that was visible in Navy's own system prompt, which
+  spent an entire rule plus an environment block arguing the model out of the
+  PowerShell syntax it had every reason to assume. That is prompt text paying for
+  a missing setting.
+
+  Choose `auto` (the default, and exactly the old behaviour), `cmd`,
+  `powershell`, `pwsh`, `sh` or `bash`. The choice reaches all three things
+  that have to agree — what gets spawned, how Navy quotes arguments it builds
+  itself, and which dialect the model is told to write — so picking PowerShell
+  stops Navy insisting on `dir` and `%VAR%`. Docker sandboxing still overrides
+  it entirely: a sandboxed command runs inside Linux whatever the host is.
+
+  PowerShell runs with `-NoProfile -NonInteractive` and an explicit exit, because
+  `powershell.exe` otherwise reports success after a native program that failed —
+  and Navy reads the exit code to decide whether to tell the model its command
+  worked.
+
+- **Independent read-only tool calls now run together.** Navy's tool loop has
+  always been able to execute reads concurrently, and every provider can return
+  several tool calls at once. Two things stopped that being worth anything: the
+  system prompt told the model to emit one call at a time, and the concurrency
+  required *every* call in a batch to be read-only, so a single write forced the
+  reads onto the serial path too — giving it up in exactly the read-then-act
+  shape a model actually produces.
+
+  Both are fixed. Reads that lead a batch are provably independent of any write
+  in it, because no write has happened yet, so they run concurrently; a read that
+  comes *after* a write stays where the model put it, because it usually exists
+  to check that write. Small local models keep the strict one-at-a-time contract:
+  emitting several well-formed calls at once is what they are worst at, and a
+  malformed batch costs a whole round-trip to recover.
+
+- **`Navy Coder: Export Diagnostics`.** Navy still transmits nothing, and that
+  is not changing. What it could not do was help you report a problem: no crash
+  reports, no way to know which of eleven providers is currently broken for
+  people, and a bug report that came down to "it didn't work".
+
+  The command assembles what a maintainer would otherwise ask for one question at
+  a time — versions, provider, whether a key *exists*, the resolved shell, both
+  approval gates, context window, whether your model can even be costed, and the
+  recent error log — and opens it in an **unsaved editor tab**. Nothing is
+  written to disk and nothing is sent. Keys are never read into it; paths, home
+  directory and anything credential-shaped are redacted before they are even
+  stored. You read it, then decide whether to share it.
+
+- **`navy.modelPricing` — price a model Navy has never heard of.** The cost
+  estimate has always returned nothing rather than a guess for an unrecognised
+  model, which is the right failure but meant every new model shipped uncosted
+  until someone edited the table and cut a release. Map a substring of the model
+  id to its input/output prices and the running estimate covers it today.
+  Malformed entries are ignored rather than half-applied — a confident wrong
+  number is worse than none in the one place that touches real money.
+
+- **A weekly regression gate on real coding ability.** The test suite mocks the
+  model everywhere, which is the right call for something that runs on every push
+  with no keys and no cost — and it means the whole suite can stay green while
+  Navy gets steadily worse at the only thing it is for. The eval harness now runs
+  weekly against one cheap model and fails only on a *regression*: a task that
+  passed in the committed baseline and now does not. Deliberately not a
+  pull-request gate — it spends real money per push, fork PRs cannot read
+  secrets, and a nondeterministic model would go red on unrelated changes until
+  everyone ignored it.
+
+### Changed
+
+- **Navy learns how many characters a token is worth, per conversation.** The
+  budget was derived from a fixed 4 characters per token — the English-prose
+  figure. Code runs nearer 3–3.5 and CJK far lower, so the headroom factor had
+  been quietly absorbing the error for every language that is not English prose.
+
+  The provider already reports the true token count on every call; the difficulty
+  is that it counts the tool schemas too, which the conversation does not contain.
+  Taking the difference between two consecutive calls in a turn cancels that
+  overhead exactly, because the schemas are identical between them. The result is
+  smoothed, clamped to a sane range, and reset when you clear the chat. A first
+  turn behaves exactly as it always did.
+
+- **The pricing table now fails the build instead of the estimate.** Its ordering
+  is load-bearing and silent when wrong — a single `gemini-.*flash` rule once
+  billed 2.5-flash turns at 1.5-flash rates and nothing anywhere noticed. Every
+  entry now names the model it exists for, and adding a broader rule above it
+  breaks the build rather than someone's cost estimate.
+
+### Fixed
+
+- **A fuzzy edit no longer destroys the file's indentation.** `apply_edit` has
+  always tolerated indentation drift when matching — a model reconstructing a
+  search block from memory gets the code right and the leading whitespace wrong
+  constantly, and refusing over that wastes a round-trip. But the *replacement*
+  was then inserted at whatever indentation the model happened to write, so a
+  match found four levels deep came back at column zero. Valid JavaScript, broken
+  Python or YAML, and an unreadable diff either way.
+
+  The replacement is now re-anchored to the region it replaces, keeping its own
+  internal nesting. Where the two indentations cannot be reconciled — spaces on
+  one side, tabs on the other — nothing is guessed.
+
+- **Long single turns can no longer run out of things to compact.** Mid-turn
+  compaction pruned old tool output and then stopped, but a turn is allowed up to
+  a hundred model calls and each can leave a paragraph of reasoning behind.
+  Nothing bounded that, so one long task could reach the context ceiling with
+  nothing left to drop. Older reasoning is now trimmable too, keeping the most
+  recent intact — and never the tool calls themselves, which pair with the
+  results that follow them.
+
+- **The model is told which shell it is really writing for.** The command-accuracy
+  rule hardcoded "cmd.exe on Windows, sh on macOS/Linux", and the "that program
+  isn't installed" hint always suggested `where` or `command -v`. Both now follow
+  the shell that will actually run the command, so a PowerShell session is told
+  about `Get-Command` rather than being sent to check the wrong thing.
+
+## [0.3.0] - 2026-08-22
 
 It started with two bugs reported from real use, both in what Navy *says* rather
 than what it does — `read_file` printed as *readfile* with half the paragraph
