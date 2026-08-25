@@ -1639,7 +1639,7 @@ async function persistentBgProcessSuite() {
 
     // ── Real end-to-end: persist mode ON ──────────────────────────────────
     await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', true);
-    ctrl.config.approvalMode = 'auto-approve';
+    ctrl.config.commandApproval = 'auto-approve'; // start_process is an EXECUTION gate
     const marker = 'BGPERSIST_MARKER_' + Date.now();
     const startResult = await provider.toolStartProcess('logger', writeNodeScript('logger.js', `console.log('${marker}');`));
     check('toolStartProcess (persist on): reports detached + survives-reload', /detached/.test(startResult) && /survive a window reload/.test(startResult));
@@ -5893,7 +5893,7 @@ async function reviewRegressionSuite() {
 
       const printer = path.join(tmp, 'print-argv.js');
       fs.writeFileSync(printer, 'console.log("ARGV:" + JSON.stringify(process.argv.slice(2)));');
-      ctrl.config.approvalMode = 'auto-approve';
+      ctrl.config.commandApproval = 'auto-approve'; // run_command is an EXECUTION gate
       provider.projectRoot = tmp;
 
       const cases = ['%PATH%', '50%', 'foo bar', 'a&echo PWNED', 'it"s here', 'x^y', '$(id)', '!DELAYED!'];
@@ -6853,6 +6853,195 @@ async function skillSuite() {
   }
 }
 
+
+// navy.approvalMode (files) and navy.commandApproval (execution) are two
+// settings on purpose. They were one until 0.3.1, which meant a user who turned
+// off diff prompts also granted unattended shell execution and unattended
+// third-party MCP calls — while the setting's own description said it governed
+// file edits. These assertions exist so that can never quietly come back.
+async function approvalScopeSuite() {
+  console.log('\napproval scopes (files vs execution are separate gates):');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-approvalscope-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => { posted.push(m); return Promise.resolve(true); } } };
+
+    // ── The two helpers read two different keys, and nothing else. ─────────
+    const perms = [
+      ['ask-always', 'ask-always', false, false],
+      ['auto-approve', 'ask-always', true, false],
+      ['ask-always', 'auto-approve', false, true],
+      ['auto-approve', 'auto-approve', true, true],
+    ];
+    let permsOk = true;
+    for (const [edit, cmd, wantEdit, wantCmd] of perms) {
+      ctrl.config.approvalMode = edit;
+      ctrl.config.commandApproval = cmd;
+      if (provider._editsAutoApproved() !== wantEdit || provider._commandsAutoApproved() !== wantCmd) permsOk = false;
+    }
+    check('approval helpers: each reads its own key, independently', permsOk);
+
+    // ── The regression itself. Edits auto, commands ask: a file write goes
+    //    through untouched, and a COMMAND still stops for a human. ──────────
+    ctrl.config.approvalMode = 'auto-approve';
+    ctrl.config.commandApproval = 'ask-always';
+    posted.length = 0;
+    const cmdGate = provider._approveCommand('rm -rf /');
+    const settled = await Promise.race([cmdGate.then(() => 'resolved'), Promise.resolve('pending')]);
+    check('edits auto + commands ask: _approveCommand does NOT auto-approve', settled === 'pending');
+    check('edits auto + commands ask: a command approval card is raised', posted.some(m => m.type === 'pendingCommand' && m.command === 'rm -rf /'));
+    // Release the waiter so the suite can't leak a live promise.
+    for (const [id] of provider.pendingCommandApprovals) provider.resolveCommandApproval(id, false);
+    check('edits auto + commands ask: rejecting the card denies the command', (await cmdGate) === false);
+
+    // Same config, the file side: no prompt, the delete just happens.
+    fs.writeFileSync(path.join(tmp, 'gone.txt'), 'x');
+    ctrl.shown.warning.length = 0;
+    ctrl.nextWarning = undefined; // nothing would confirm a prompt if one were raised
+    const delResult = await provider.toolDeleteFile('gone.txt');
+    check('edits auto + commands ask: a file delete is NOT gated', /Deleted gone.txt/.test(delResult) && ctrl.shown.warning.length === 0);
+
+    // ── The mirror image: commands auto, edits ask. ────────────────────────
+    ctrl.config.approvalMode = 'ask-always';
+    ctrl.config.commandApproval = 'auto-approve';
+    check('commands auto + edits ask: _approveCommand approves immediately', (await provider._approveCommand('npm test')) === true);
+
+    fs.writeFileSync(path.join(tmp, 'kept.txt'), 'x');
+    ctrl.shown.warning.length = 0;
+    ctrl.nextWarning = undefined;   // user dismisses
+    const keptResult = await provider.toolDeleteFile('kept.txt');
+    check('commands auto + edits ask: a file delete IS gated', ctrl.shown.warning.length === 1 && /cancelled by user/.test(keptResult));
+    check('commands auto + edits ask: the dismissed delete did not happen', fs.existsSync(path.join(tmp, 'kept.txt')));
+
+    // ── The webview is told about both, so neither dropdown can drift. ─────
+    ctrl.config.approvalMode = 'auto-approve';
+    ctrl.config.commandApproval = 'ask-always';
+    posted.length = 0;
+    provider.sendApprovalMode();
+    const sent = posted.find(m => m.type === 'approvalMode');
+    check('sendApprovalMode: reports both scopes', sent?.mode === 'auto-approve' && sent?.commandMode === 'ask-always');
+
+    // ── setApprovalMode writes the key its scope names, and only that one. ──
+    let handler = null;
+    const fakeView = {
+      webview: {
+        postMessage: (m) => { posted.push(m); return Promise.resolve(true); },
+        asWebviewUri: (u) => u,
+        cspSource: 'test-csp',
+        onDidReceiveMessage: (h) => { handler = h; return { dispose() {} }; },
+      },
+      onDidDispose: () => {}, onDidChangeVisibility: () => {},
+    };
+    await provider.resolveWebviewView(fakeView);
+
+    ctrl.config.approvalMode = 'ask-always';
+    ctrl.config.commandApproval = 'ask-always';
+    ctrl.nextWarning = 'Enable';
+    await handler({ type: 'setApprovalMode', scope: 'command', mode: 'auto-approve' });
+    check('setApprovalMode scope=command: writes commandApproval only',
+      ctrl.config.commandApproval === 'auto-approve' && ctrl.config.approvalMode === 'ask-always');
+
+    ctrl.config.commandApproval = 'ask-always';
+    ctrl.nextWarning = 'Enable';
+    await handler({ type: 'setApprovalMode', scope: 'edit', mode: 'auto-approve' });
+    check('setApprovalMode scope=edit: writes approvalMode only',
+      ctrl.config.approvalMode === 'auto-approve' && ctrl.config.commandApproval === 'ask-always');
+
+    // A message with no scope is the pre-0.3.1 shape — it must mean FILES, not
+    // execution, or an old webview would silently switch commands on.
+    ctrl.config.approvalMode = 'ask-always';
+    ctrl.config.commandApproval = 'ask-always';
+    ctrl.nextWarning = 'Enable';
+    await handler({ type: 'setApprovalMode', mode: 'auto-approve' });
+    check('setApprovalMode without scope: defaults to the FILE gate',
+      ctrl.config.approvalMode === 'auto-approve' && ctrl.config.commandApproval === 'ask-always');
+
+    // Declining the modal must leave the setting alone.
+    ctrl.config.commandApproval = 'ask-always';
+    ctrl.nextWarning = undefined; // dismissed
+    await handler({ type: 'setApprovalMode', scope: 'command', mode: 'auto-approve' });
+    check('setApprovalMode: a declined confirmation does not change the setting', ctrl.config.commandApproval === 'ask-always');
+
+    // The warning has to describe the gate actually being flipped — the old
+    // single message named edits and commands together, which is now wrong
+    // whichever one you are changing.
+    ctrl.shown.warning.length = 0;
+    ctrl.nextWarning = undefined;
+    await handler({ type: 'setApprovalMode', scope: 'command', mode: 'auto-approve' });
+    const cmdWarn = ctrl.shown.warning[0] || '';
+    check('setApprovalMode: the command warning names execution, not edits', /COMMANDS/.test(cmdWarn) && /cannot be undone/.test(cmdWarn));
+    ctrl.shown.warning.length = 0;
+    ctrl.nextWarning = undefined;
+    await handler({ type: 'setApprovalMode', scope: 'edit', mode: 'auto-approve' });
+    const editWarn = ctrl.shown.warning[0] || '';
+    check('setApprovalMode: the edit warning says commands are unaffected', /FILE CHANGES/.test(editWarn) && /Commands are unaffected/.test(editWarn));
+
+    // ── Static guard. Wiring a new tool to the wrong gate is a safety bug,
+    //    not a style problem, so no site outside the two helpers and the
+    //    reporter may read either key directly. ──────────────────────────────
+    const srcDir = path.join(__dirname, '..', 'src');
+    const srcFiles = [];
+    (function walk(d) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) walk(full); else if (e.name.endsWith('.js')) srcFiles.push(full);
+      }
+    })(srcDir);
+
+    const rawRead = /\.get\('(approvalMode|commandApproval)'/g;
+    let rawTotal = 0;
+    const strays = [];
+    for (const file of srcFiles) {
+      const text = fs.readFileSync(file, 'utf8');
+      const hits = text.match(rawRead) || [];
+      rawTotal += hits.length;
+      if (hits.length && path.basename(file) !== 'extension.js') strays.push(path.basename(file));
+    }
+    check('approval keys: no module outside extension.js reads them directly', strays.length === 0, strays.join(', '));
+    // Two in the helpers, two in sendApprovalMode. Any other read is a gate
+    // that bypassed the helpers, which is exactly the bug this suite pins.
+    check('approval keys: exactly 4 raw reads, all in the helpers + reporter', rawTotal === 4, 'found ' + rawTotal);
+
+    const extSrc = fs.readFileSync(path.join(srcDir, 'extension.js'), 'utf8');
+    const editGates = (extSrc.match(/_editsAutoApproved\(\)/g) || []).length;
+    const cmdGates = (extSrc.match(/_commandsAutoApproved\(\)/g) || []).length;
+    // 1 definition + 5 call sites (write, delete, rename, rename_symbol, applyCode).
+    check('file gates route through _editsAutoApproved', editGates === 6, 'found ' + editGates);
+    // 1 definition + 4 call sites (MCP, _approveCommand, run_project, start_process).
+    check('execution gates route through _commandsAutoApproved', cmdGates === 5, 'found ' + cmdGates);
+
+    // ── The manifest must ship the safe default, whatever the file gate says. ──
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const decl = manifest.contributes.configuration.properties['navy.commandApproval'];
+    check('navy.commandApproval is declared and defaults to ask-always', decl?.default === 'ask-always');
+    check('navy.approvalMode no longer claims to cover commands',
+      !/run command/i.test(manifest.contributes.configuration.properties['navy.approvalMode'].description));
+  } finally {
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+
+// Tool batching. The loop has always been able to run read-only calls
+// concurrently, but two things stopped it being worth anything: the system
+// prompt forbade emitting more than one call at a time, and the concurrency was
+// all-or-nothing — a single write anywhere in the batch forced every read in it
+// onto the serial path. These pin both halves of the fix, and the ordering
+// guarantee that makes the concurrency safe.
+// navy.shell. Windows used to mean cmd.exe with no way out, even though VS
+// Code's own default terminal there is PowerShell — the cost showed up as a
+// whole system-prompt rule arguing the model out of the syntax it reasonably
+// assumed. These pin that the setting really reaches all three things that have
+// to agree (the spawn, the escaping dialect, and what the model is told), that
+// "auto" changes nothing, and that the sandbox still overrides all of it.
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
@@ -6895,6 +7084,7 @@ undoRedoSuite()
   .then(globalProjectCatalogSuite)
   .then(reviewRegressionSuite)
   .then(approvalCancelSuite)
+  .then(approvalScopeSuite)
   .then(() => {
     uninstallVscodeMock();
     console.log(`\n${passed} passed, ${failures.length} failed`);

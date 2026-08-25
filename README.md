@@ -107,7 +107,7 @@ Navy runs an autonomous tool-use loop. The full tool set:
 | Memory | `remember`, `forget` — project facts that persist across sessions |
 | External | Any MCP server tool you've configured, exposed as `mcp__<server>__<tool>` |
 
-Every file-mutating tool goes through the diff approval gate (unless `navy.approvalMode` is set to `auto-approve`), and every edit is undoable.
+Every file-mutating tool goes through the diff approval gate (unless `navy.approvalMode` is set to `auto-approve`), and every edit is undoable. Anything that *executes* — shell commands, test runs, dev servers, background processes, MCP tools — is gated separately by `navy.commandApproval`, which you have to turn off on its own.
 
 ---
 
@@ -182,7 +182,7 @@ Every skill is **also a slash command** — `/pdf-tools` loads it directly, no m
 
 - **Workspace trust** — in an untrusted workspace, Navy still reads files and answers questions, but every tool that executes code or sends data off the machine (shell commands, tests, dev servers, MCP servers, embedding upload) refuses at runtime. A repository's own slash commands and skills don't load there either: cloning something must not silently redefine what `/fix` means.
 - **The dictation port is treated as the security surface it is** — bound to `127.0.0.1` on an ephemeral port, every route gated on a 256-bit token compared in constant time, `Host` and `Origin` pinned against DNS rebinding, bodies capped, no CORS headers, a strict nonce CSP on the page, and the whole server torn down the moment dictation ends, the tab closes, the panel closes, or five idle minutes pass.
-- **Approval gate** — `navy.approvalMode` defaults to `ask-always`: every edit is a diff you approve, every shell command is a confirmation dialog. `auto-approve` removes that gate — use it deliberately.
+- **Two approval gates, not one** — `navy.approvalMode` covers changes to *files*: every edit is a diff you approve, and every change is contained to the workspace, checkpointed for undo, and visible in git afterwards. `navy.commandApproval` covers *execution*: shell commands, test runs, dev servers, background processes, and third-party MCP tool calls. Both default to `ask-always` and each has to be turned off on its own, because they are not the same decision — a file edit is bounded and reversible, whereas Navy cannot know what a command will do before it runs or take it back afterwards. Until 0.3.1 these were one setting, so switching off diff prompts also granted unattended command execution; if you had `auto-approve` set before upgrading, file edits stay automatic and commands go back to asking.
 - **Opt-in Docker sandboxing** (`navy.sandboxMode`) — a second, independent layer under the approval gate; refuses to guess at a generic container image if the project has no devcontainer/Dockerfile of its own. Works on Windows, macOS and Linux: when sandboxing is on, Navy targets the container rather than the host, so commands are written and run in POSIX `sh` even from a Windows host.
 - **Cross-provider failover is opt-in and narrow** — only ever triggers for a transient failure (rate limit, outage, network error), never for anything that would just fail again with the same account, and every attempt is announced in the chat before it runs since it can spend money on a different provider account.
 - **check_syntax runs in isolation** — checkers execute outside the project directory with hardened interpreter flags, so verifying a file can't execute code from the repository being inspected.
@@ -203,7 +203,8 @@ Open via **File → Preferences → Settings** and search for `navy`, or click t
 | `navy.providerFallbacks` | `[]` | Ordered backup providers to fall through to on a transient failure — see [Safety](#safety) |
 | `navy.thinkingLevel` | `medium` | Reasoning effort: `fast`, `medium`, or `high` |
 | `navy.temperature` | `0.2` | Sampling temperature (0 = deterministic, 2 = creative) |
-| `navy.approvalMode` | `ask-always` | `ask-always` shows a diff before every write; `auto-approve` writes immediately |
+| `navy.approvalMode` | `ask-always` | Files only. `ask-always` shows a diff before every write, delete or rename; `auto-approve` applies them immediately |
+| `navy.commandApproval` | `ask-always` | Execution only. `ask-always` confirms every shell command, background process and MCP tool call; `auto-approve` runs them unattended |
 | `navy.editFormat` | `search-replace` | `search-replace` for surgical edits; `whole-file` to rewrite the entire file |
 | `navy.maxToolIterations` | `100` | Maximum agent loop iterations per turn |
 | `navy.fileEditSoftCap` | `5` | Writes to the same file in one turn before Navy stops feeding back fresh diagnostics and nudges the model to wrap up |

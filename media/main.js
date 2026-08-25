@@ -21,6 +21,7 @@ const projectSelect = document.querySelector('#projectSelect');
 const CATALOG_OPTION_PREFIX = '__catalog__:';
 const approvalQueue = document.querySelector('#approvalQueue');
 const approvalModeSelect = document.querySelector('#approvalModeSelect');
+const commandApprovalSelect = document.querySelector('#commandApprovalSelect');
 const thinkingLevelSelect = document.querySelector('#thinkingLevelSelect');
 const contextSelect = document.querySelector('#contextSelect');
 // An icon, as markup. The path data lives once in the sprite the HTML shell
@@ -392,7 +393,11 @@ modelSelect.addEventListener('change', () => {
 });
 
 approvalModeSelect?.addEventListener('change', () => {
-  vscode.postMessage({ type: 'setApprovalMode', mode: approvalModeSelect.value });
+  vscode.postMessage({ type: 'setApprovalMode', scope: 'edit', mode: approvalModeSelect.value });
+});
+
+commandApprovalSelect?.addEventListener('change', () => {
+  vscode.postMessage({ type: 'setApprovalMode', scope: 'command', mode: commandApprovalSelect.value });
 });
 
 // Welcome chips insert a starter prompt into the composer (prompts ending in a
@@ -1482,6 +1487,9 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'approvalMode') {
     if (approvalModeSelect) approvalModeSelect.value = message.mode;
+    // commandMode is absent on messages from a pre-0.3.1 extension host; leave
+    // the dropdown showing its safe default rather than blanking the select.
+    if (commandApprovalSelect && message.commandMode) commandApprovalSelect.value = message.commandMode;
   }
 
   if (message.type === 'settings') {

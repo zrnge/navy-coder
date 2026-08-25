@@ -16,6 +16,7 @@ function createVscodeMock() {
   const ctrl = {
     config: {
       approvalMode: 'auto-approve',   // bypass the approval UI in write paths
+      commandApproval: 'auto-approve', // ditto for execution paths — a separate gate since 0.3.1
       model: 'test-model',
       host: 'http://localhost:11434',
       thinkingLevel: 'medium',

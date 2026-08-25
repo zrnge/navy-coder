@@ -886,16 +886,26 @@ class NavyCoderViewProvider {
           await this.setModel(message.model);
           break;
         case 'setApprovalMode': {
+          // Which gate is being changed. Defaults to the file-edit one so an
+          // older webview (or a test posting the pre-0.3.1 message shape) still
+          // means what it used to, rather than silently switching execution on.
+          const key = message.scope === 'command' ? 'commandApproval' : 'approvalMode';
           if (message.mode === 'auto-approve') {
-            // Auto removes every safety gate — make sure the switch is deliberate.
+            // Confirm against what THIS switch actually grants. The old single
+            // warning listed edits and commands together, which was accurate
+            // only because one setting really did control both — now that they
+            // are separate, saying "run commands" while flipping the file-edit
+            // gate would be the same conflation in the opposite direction.
             const pick = await vscode.window.showWarningMessage(
-              'Enable auto-approve? Navy will edit files, run commands, and delete files WITHOUT asking for confirmation.',
+              key === 'commandApproval'
+                ? 'Enable auto-approve for COMMANDS? Navy will run shell commands, start background processes, and call MCP tools WITHOUT asking. Their effects are not contained to the project and cannot be undone.'
+                : 'Enable auto-approve for FILE CHANGES? Navy will write, delete and rename files in this project WITHOUT showing you a diff first. Commands are unaffected — see navy.commandApproval.',
               { modal: true },
               'Enable'
             );
             if (pick !== 'Enable') { this.sendApprovalMode(); break; } // revert the dropdown
           }
-          await vscode.workspace.getConfiguration('navy').update('approvalMode', message.mode, vscode.ConfigurationTarget.Global);
+          await vscode.workspace.getConfiguration('navy').update(key, message.mode, vscode.ConfigurationTarget.Global);
           this.sendApprovalMode();
           break;
         }
@@ -1386,9 +1396,39 @@ class NavyCoderViewProvider {
     }
   }
 
+  // Approval is TWO independent decisions, and collapsing them into one was a
+  // real safety bug. navy.approvalMode covers changes to FILES: already
+  // contained to the workspace by resolveWorkspacePath, shown as a diff,
+  // recorded as an undo checkpoint, and visible in git afterwards. Turning it
+  // off is a statement about how much diff-clicking you want.
+  //
+  // navy.commandApproval covers EXECUTION — run_command, run_tests,
+  // run_project, start_process, and third-party MCP tools. None of that is
+  // contained, reviewable or undoable: Navy cannot know what a command does
+  // before it runs, and cannot take it back afterwards.
+  //
+  // Until 0.3.1 both read navy.approvalMode, whose own manifest description
+  // said "How Navy Coder should handle file edits" — so a user who flipped the
+  // topbar dropdown to stop reviewing diffs also granted unattended arbitrary
+  // shell execution and unattended third-party MCP calls, globally, in every
+  // workspace, without being told. Anything gating execution must read
+  // _commandsAutoApproved; anything gating a file change reads
+  // _editsAutoApproved. Never the other one, and never the raw setting.
+  _editsAutoApproved() {
+    return vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always') === 'auto-approve';
+  }
+
+  _commandsAutoApproved() {
+    return vscode.workspace.getConfiguration('navy').get('commandApproval', 'ask-always') === 'auto-approve';
+  }
+
   sendApprovalMode() {
-    const mode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-    this.view?.webview.postMessage({ type: 'approvalMode', mode });
+    const c = vscode.workspace.getConfiguration('navy');
+    this.view?.webview.postMessage({
+      type: 'approvalMode',
+      mode: c.get('approvalMode', 'ask-always'),
+      commandMode: c.get('commandApproval', 'ask-always'),
+    });
   }
 
   async sendSettings() {
@@ -4171,8 +4211,7 @@ class NavyCoderViewProvider {
       // External MCP tools: approval-gated in ask mode (their side effects are
       // unknown to Navy), then routed to the owning server.
       if (this.mcp?.isMcpTool(tool.name)) {
-        const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-        if (approvalMode !== 'auto-approve') {
+        if (!this._commandsAutoApproved()) {
           const id = this.generateId();
           const label = tool.name.replace(/^mcp__/, '').replace(/__/, ' → ');
           this.view?.webview.postMessage({
@@ -4594,8 +4633,7 @@ class NavyCoderViewProvider {
   async toolDeleteFile(inputPath) {
     const filePath = this.resolveWorkspacePath(inputPath);
     const basename = path.basename(filePath);
-    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-    if (approvalMode !== 'auto-approve') {
+    if (!this._editsAutoApproved()) {
       // Modal dialogs add their own Cancel button — only pass the confirm action.
       const choice = await vscode.window.showWarningMessage(
         `Navy wants to delete ${basename}. It will be moved to the Recycle Bin.`,
@@ -4629,8 +4667,7 @@ class NavyCoderViewProvider {
     const src = this.resolveWorkspacePath(fromPath);
     const dst = this.resolveWorkspacePath(toPath);
     const fromName = path.basename(src);
-    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-    if (approvalMode !== 'auto-approve') {
+    if (!this._editsAutoApproved()) {
       const choice = await vscode.window.showWarningMessage(
         `Navy wants to rename ${fromName} → ${toPath}`,
         { modal: true },
@@ -4691,8 +4728,7 @@ class NavyCoderViewProvider {
         }
       }
 
-      const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-      if (approvalMode !== 'auto-approve') {
+      if (!this._editsAutoApproved()) {
         const choice = await vscode.window.showWarningMessage(
           `Navy wants to rename "${name}" → "${newName}" across ${entries.length} file${entries.length !== 1 ? 's' : ''} (structural, all references).`,
           { modal: true }, 'Rename'
@@ -5431,7 +5467,6 @@ class NavyCoderViewProvider {
   // In auto-approve mode: writes immediately.
   // In ask-always mode: opens VS Code's native diff editor then asks the user.
   async requestWriteApproval(inputPath, filePath, oldText, newText) {
-    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
     const basename = path.basename(filePath);
     // Generate the id upfront so both paths use the same id in pendingDiff and diffResolved.
     const id = this.generateId();
@@ -5440,7 +5475,7 @@ class NavyCoderViewProvider {
       type: 'pendingDiff', id, path: inputPath, oldText, newText
     });
 
-    if (approvalMode === 'auto-approve') {
+    if (this._editsAutoApproved()) {
       try {
         this.createCheckpoint(filePath, oldText, newText);
         await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), Buffer.from(newText, 'utf8'));
@@ -5617,8 +5652,7 @@ class NavyCoderViewProvider {
   // whether the actual execution ends up going through a shell string or a
   // direct argv spawn. Returns whether the caller may proceed.
   async _approveCommand(displayCommand) {
-    const approvalMode = vscode.workspace.getConfiguration('navy').get('approvalMode', 'ask-always');
-    if (approvalMode === 'auto-approve') return true;
+    if (this._commandsAutoApproved()) return true;
     const id = this.generateId();
     this.view?.webview.postMessage({ type: 'pendingCommand', id, command: displayCommand });
     return await new Promise((resolve) => {
@@ -5766,8 +5800,7 @@ class NavyCoderViewProvider {
     const cmd = command || this.detectRunCommand();
     if (!cmd) return 'Error: Could not auto-detect how to run this project. Provide an explicit command (e.g. "npm start", "python app.py").';
 
-    const config2 = vscode.workspace.getConfiguration('navy');
-    if (config2.get('approvalMode', 'ask-always') !== 'auto-approve') {
+    if (!this._commandsAutoApproved()) {
       const choice = await vscode.window.showInformationMessage(
         `Navy wants to run: ${cmd}${this._sandboxLabelSuffix()}`, { modal: false }, 'Allow', 'Deny'
       );
@@ -5914,8 +5947,7 @@ class NavyCoderViewProvider {
     if (prior?.proc) return `Error: a process named "${id}" is already running.`;
     if (prior) this.bgProcesses.delete(id); // previous run exited — allow id reuse
 
-    const config = vscode.workspace.getConfiguration('navy');
-    if (config.get('approvalMode', 'ask-always') !== 'auto-approve') {
+    if (!this._commandsAutoApproved()) {
       const choice = await vscode.window.showInformationMessage(
         `Navy wants to start a background process:\n${command}${this._sandboxLabelSuffix()}`,
         { modal: false }, 'Allow', 'Deny'
@@ -6488,10 +6520,7 @@ ${task.trim()}`;
       targetPath = picked.fsPath;
     }
 
-    const config = vscode.workspace.getConfiguration('navy');
-    const approvalMode = config.get('approvalMode', 'ask-always');
-
-    if (approvalMode === 'auto-approve') {
+    if (this._editsAutoApproved()) {
       await this.writeWholeFile(targetPath, code);
       return;
     }

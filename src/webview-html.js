@@ -74,9 +74,13 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
             <option value="medium" selected>Med</option>
             <option value="high">High</option>
           </select>
-          <select id="approvalModeSelect" title="Edit approval mode" aria-label="Edit approval mode" class="select-compact">
-            <option value="ask-always">Ask</option>
-            <option value="auto-approve">Auto</option>
+          <select id="approvalModeSelect" title="Approval for file changes — writes, deletes and renames" aria-label="Approval for file changes" class="select-compact">
+            <option value="ask-always">Edits: Ask</option>
+            <option value="auto-approve">Edits: Auto</option>
+          </select>
+          <select id="commandApprovalSelect" title="Approval for running commands, background processes and MCP tools" aria-label="Approval for running commands" class="select-compact">
+            <option value="ask-always">Cmds: Ask</option>
+            <option value="auto-approve">Cmds: Auto</option>
           </select>
           <button id="memoryButton" type="button" class="icon-button memory-button" title="Project memory" aria-label="Project memory">
             <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">

@@ -119,10 +119,23 @@
             "ask-always"
           ],
           "enumDescriptions": [
-            "Apply file edits automatically without confirmation",
-            "Show every file edit in a diff view and ask for confirmation"
+            "Write, delete and rename files automatically without confirmation",
+            "Show every file change and ask for confirmation"
           ],
-          "description": "How Navy Coder should handle file edits."
+          "description": "Approval for changes to FILES only — writes, edits, deletes and renames. Every change is contained to the workspace, shown as a diff, and undoable. Running commands is governed separately by navy.commandApproval."
+        },
+        "navy.commandApproval": {
+          "type": "string",
+          "default": "ask-always",
+          "enum": [
+            "auto-approve",
+            "ask-always"
+          ],
+          "enumDescriptions": [
+            "Run commands, background processes and MCP tools without confirmation",
+            "Ask before every command, background process and MCP tool call"
+          ],
+          "description": "Approval for EXECUTION — shell commands, test runs, dev servers, background processes, and third-party MCP tool calls. Deliberately separate from navy.approvalMode: a file edit is bounded, reviewable and undoable, whereas a command's effects are unbounded and invisible to Navy. Leave this on \"ask-always\" unless commands also run inside a sandbox (see navy.sandboxMode)."
         },
         "navy.editFormat": {
           "type": "string",

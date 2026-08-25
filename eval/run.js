@@ -176,9 +176,12 @@ async function runTask(task, cfg, vscodeMock) {
     } } };
 
     // The turn must be able to finish on its own: auto-approve, or every write
-    // blocks forever waiting for a click that will never come.
+    // blocks forever waiting for a click that will never come. Both gates —
+    // navy.approvalMode covers the writes, navy.commandApproval the commands
+    // and processes the tasks run to verify their own work.
     Object.assign(vscodeMock.ctrl.config, {
       approvalMode: 'auto-approve',
+      commandApproval: 'auto-approve',
       provider: cfg.provider,
       model: cfg.model,
       host: cfg.host,
