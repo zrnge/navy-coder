@@ -1,5 +1,5 @@
 const {
-  fs, path, check, extractFunction, extSrc, makeContext, sharedMock,
+  fs, path, check, makeContext, sharedMock,
   queueOllamaFetch,
 } = require('./harness.js');
 
@@ -328,7 +328,11 @@ async function persistentBgProcessSuite() {
       const filler = 'x'.repeat(50000);
       const tailMarker = 'TAIL_MARKER_' + Date.now();
       fs.writeFileSync(bigLogPath, headMarker + filler + filler + filler + filler + tailMarker); // ~200KB, distinct markers at each end
-      const readFileTail = new Function('fs', extractFunction(extSrc, 'function readFileTail') + '\nreturn readFileTail;')(fs);
+      // Exported from src/commands.js since the extraction. No longer worth
+      // eval'ing out of source now that it lives in a module small enough to
+      // require directly — and requiring the real thing is stronger than
+      // reconstructing it.
+      const { readFileTail } = require('../src/commands.js');
       const tail = readFileTail(bigLogPath, 100);
       check('readFileTail: returns a bounded slice, not the whole (~200KB) file', tail.length <= 100);
       check('readFileTail: the slice is the REAL tail — contains the marker at the very end', tail.includes(tailMarker));

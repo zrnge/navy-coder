@@ -93,7 +93,9 @@ async function missingPathHintSuite() {
   // failure, not just cmd.exe's own errors — and clear negatives that must
   // NOT trigger it (a genuine compile/logic error, a bare non-zero exit).
   {
-    const looksLikeMissingPathError = eval('(' + extractFunction(extSrc, 'function looksLikeMissingPathError') + ')');
+    // Exported from src/commands.js since the extraction — required directly
+    // rather than eval'd out of source, which is both simpler and stronger.
+    const { looksLikeMissingPathError } = require('../src/commands.js');
     const positives = [
       'The system cannot find the file specified.',
       'The system cannot find the path specified.',

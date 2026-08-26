@@ -41,7 +41,9 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~7,160 | The agent loop, the tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,010 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
+| `src/commands.js` | ~560 | Command and process execution: WSL detection, the approval prompt, spawn-and-collect, `run_command`, `run_project`, and the background-process tools |
+| `src/trust.js` | ~20 | The one sentence an untrusted workspace refuses with, shared by the two files that need it |
 | `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
@@ -94,11 +96,26 @@ Two things that make a seam fail, both worth checking before you start:
   constants and the embedding chunker and got swept into `retrieval.js` on the
   first attempt; it belongs to `apply_edit`. Check what you actually caught.
 
-One seam that is **not** clean and shouldn't be forced: the 35 tool
-implementations. They run from roughly line 2,300 to 5,600 interleaved with
-their own private helpers, so lifting them wholesale would separate each tool
-from the code it calls. Do it by domain (file tools, git tools, process tools),
-moving each tool's helpers with it.
+One seam that is **not** clean and shouldn't be forced: the tool
+implementations as a whole. They are interleaved with their own private
+helpers, so lifting them wholesale would separate each tool from the code it
+calls. Do it by domain, moving each tool's helpers with it.
+
+The **process tools** were the first domain taken this way, and they are the
+model for the rest: `_detectWsl` through `toolKillProcess` turned out to be a
+genuinely contiguous run of eleven methods with nothing unrelated between them,
+so the whole block moved verbatim into `src/commands.js` along with the two
+module-level helpers only it used (`looksLikeMissingPathError`,
+`readFileTail`). `UNTRUSTED_REFUSAL` did **not** move with it — `run_tests`
+stayed behind and still needs it — so it became `src/trust.js`, which is the
+"shared module-level helpers" trap above, met in the wild.
+
+Two things that change when a helper stops being module-level in
+`extension.js`: a test that reached it with `extractFunction(extSrc, …)` now
+has to require the real module (better anyway), and any structural test that
+counted occurrences in `extension.js` has to count across `src/` instead —
+`approvalScopeSuite` read three gates moving to `commands.js` as three gates
+disappearing until it was widened.
 
 **Verifying a move.** The whole suite passing is necessary but not sufficient —
 also confirm nothing was lost or altered:

@@ -217,16 +217,23 @@ async function approvalScopeSuite() {
     // that bypassed the helpers, which is exactly the bug this suite pins.
     check('approval keys: exactly 4 raw reads, all in the helpers + reporter', rawTotal === 4, 'found ' + rawTotal);
 
-    const extSrc = fs.readFileSync(path.join(srcDir, 'extension.js'), 'utf8');
-    const editGates = (extSrc.match(/_editsAutoApproved\(\)/g) || []).length;
-    const cmdGates = (extSrc.match(/_commandsAutoApproved\(\)/g) || []).length;
-    // 1 definition + 5 call sites (write, delete, rename, rename_symbol, applyCode).
-    check('file gates route through _editsAutoApproved', editGates === 6, 'found ' + editGates);
-    // 1 definition + 5 call sites (MCP tools, MCP resource reads, _approveCommand,
-    // run_project, start_process). Reading an MCP resource reaches a server the
-    // user configured, so it is gated like every other call to one — it is not a
-    // file read, and the file gate has nothing to say about it.
-    check('execution gates route through _commandsAutoApproved', cmdGates === 6, 'found ' + cmdGates);
+    // Counted across ALL of src/, not just extension.js. The gates used to
+    // live in one file; _approveCommand, run_project and start_process moved
+    // to commands.js, and a guard that kept looking in one place would have
+    // read that as three gates disappearing.
+    const allSrc = srcFiles.map(f => fs.readFileSync(f, 'utf8')).join('\n');
+    const editGates = (allSrc.match(/_editsAutoApproved\(\)/g) || []).length;
+    const cmdGates = (allSrc.match(/_commandsAutoApproved\(\)/g) || []).length;
+    // 1 definition + 5 gates (write, delete, rename, rename_symbol, applyCode)
+    // + 1 read in the diagnostics report, which states the EFFECTIVE setting
+    // and goes through the helper for that reason rather than reading the key.
+    check('file gates route through _editsAutoApproved', editGates === 7, 'found ' + editGates);
+    // 1 definition + 5 gates (MCP tools, MCP resource reads, _approveCommand,
+    // run_project, start_process) + the same diagnostics read. Reading an MCP
+    // resource reaches a server the user configured, so it is gated like every
+    // other call to one — it is not a file read, and the file gate has nothing
+    // to say about it.
+    check('execution gates route through _commandsAutoApproved', cmdGates === 7, 'found ' + cmdGates);
 
     // ── The manifest must ship the safe default, whatever the file gate says. ──
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));

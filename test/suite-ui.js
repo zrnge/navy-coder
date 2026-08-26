@@ -1,5 +1,5 @@
 const {
-  fs, path, check, extractFunction, extSrc, makeContext, sharedMock,
+  fs, path, check, extractFunction, makeContext, sharedMock,
 } = require('./harness.js');
 
 // ── 8c. Dictation bridge ────────────────────────────────────────────────────
@@ -883,7 +883,8 @@ async function reviewRegressionSuite() {
       const f = path.join(tmp, 'utf8-tail.log');
       // 'é' is two bytes; asking for an odd byte count lands mid-character.
       fs.writeFileSync(f, 'aaaa' + 'é'.repeat(20));
-      const readFileTail = new Function('fs', extractFunction(extSrc, 'function readFileTail') + '\nreturn readFileTail;')(fs);
+      // Lives in src/commands.js since the process tools were extracted.
+      const { readFileTail } = require('../src/commands.js');
       const tail = readFileTail(f, 9); // 9 bytes = 4.5 'é' characters
       check('readFileTail never starts with a U+FFFD from a split character', !tail.startsWith('�'));
       check('readFileTail still returns the real tail', tail.endsWith('é'));
