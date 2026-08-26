@@ -23,11 +23,26 @@ const { spawn } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const { getWebviewHtml } = require(path.join(ROOT, 'src', 'webview-html.js'));
 
-// A conversation that exercises the things worth looking at: every slash-menu
-// icon, both message roles, a diff card, a terminal card, an activity log, a
-// queued prompt with its Cancel button, and the markdown shapes that have been
-// buggy — snake_case, globs, numbered steps around a code block, a table.
+// A conversation that exercises the things worth looking at: both message
+// roles, a diff card, a terminal card, an activity log, the task dock, the
+// composer's mode selects, a plan card, a command-approval card, and the
+// markdown shapes that have been buggy — snake_case, globs, numbered steps
+// around a code block, a table.
+//
+// The messages here ARE the coverage. A control the script never drives is a
+// control the preview shows in its empty state and nobody looks at twice: the
+// context-window select renders as a blank, zero-width box until a
+// 'contextWindow' message arrives, which made the composer row it sits in
+// impossible to judge. If you add a panel surface, add the message that lights
+// it up, or the one tool that can see the panel will not be showing it.
 const SCRIPT = [
+  // Sent by the extension as a session opens. Without these the composer's
+  // mode row is half empty and the token counter is blank.
+  { type: 'contextWindow', max: 256000, current: 0, options: [8192, 32768, 128000, 200000] },
+  { type: 'approvalMode', mode: 'ask-always', commandMode: 'ask-always' },
+  { type: 'tokenCount', prompt: 18420, completion: 1310, total: 19730,
+    sessionPrompt: 18420, sessionCompletion: 1310, sessionTotal: 19730,
+    estimatedCost: 0.0721, costKnown: true },
   { type: 'restore', messages: [
     { role: 'user', text: 'Refactor read_file and write_file, then delete *.log files' },
     { role: 'assistant', text: [
@@ -52,14 +67,30 @@ const SCRIPT = [
     ].join('\n') },
   ] },
   { type: 'start' },
+  // A declared plan. The scripted reply above also contains a numbered list,
+  // which is what the OLD prose scraper keyed on — driving update_plan here is
+  // what shows the card that actually ships now, in the state it ships in.
+  { type: 'planUpdate', steps: [
+    { step: 'Read src/app_main.js and check MAX_RETRIES', status: 'done' },
+    { step: 'Raise the retry ceiling', status: 'in_progress' },
+    { step: 'Run the test suite', status: 'pending' },
+  ] },
   { type: 'toolCall', tool: 'read_file', args: { path: 'src/app_main.js' }, callId: 'c1' },
   { type: 'toolResult', tool: 'read_file', result: 'ok, 240 lines', callId: 'c1' },
+  // The command-approval card: the surface of the approval split, and the one
+  // thing a user has to read and act on rather than just watch scroll past.
+  { type: 'pendingCommand', id: 'p1', command: 'npm test -- --grep "a_b" (sandboxed: native)' },
   { type: 'toolCall', tool: 'run_command', args: { command: 'npm test -- --grep "a_b"' }, callId: 'c2' },
   { type: 'toolResult', tool: 'run_command', result: 'Exit code: 0\n1194 passed', callId: 'c2' },
   { type: 'chunk', text: 'Tests pass. Applying the edit now.' },
   { type: 'pendingDiff', id: 'd1', path: 'src/app_main.js',
     oldText: 'const MAX_RETRIES = 3;\nconst DELAY = 100;\n',
     newText: 'const MAX_RETRIES = 5;\nconst DELAY = 100;\n' },
+  { type: 'planUpdate', steps: [
+    { step: 'Read src/app_main.js and check MAX_RETRIES', status: 'done' },
+    { step: 'Raise the retry ceiling', status: 'done' },
+    { step: 'Run the test suite', status: 'done' },
+  ] },
   { type: 'done' },
   // Left running on purpose: this is what puts the task dock on screen, which
   // is the whole point of looking at a preview rather than reading a test.
