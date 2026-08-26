@@ -292,6 +292,11 @@
           },
           "markdownDescription": "Price models Navy does not know, so the running cost estimate covers them. Each key is matched as a case-insensitive substring of the model id, longest key first, and overrides the built-in table. Example: `{ \"my-finetune\": { \"in\": 1.5, \"out\": 6 } }`. Local providers are always free and ignore this."
         },
+        "navy.sandboxImage": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Docker image to run sandboxed commands in when the project has no .devcontainer/devcontainer.json or Dockerfile of its own. Navy never guesses this — running commands in an image without the project's toolchain fails in ways that look like the code is broken — but naming one yourself is an answer, not a guess. A project's own devcontainer or Dockerfile always wins over this. Matters most on Windows, where Docker is the only sandbox available. Example: \"node:20\", \"python:3.12\", \"golang:1.22\"."
+        },
         "navy.shell": {
           "type": "string",
           "default": "auto",

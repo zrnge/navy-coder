@@ -210,7 +210,8 @@ Open via **File → Preferences → Settings** and search for `navy`, or click t
 | `navy.approvalMode` | `ask-always` | Files only. `ask-always` shows a diff before every write, delete or rename; `auto-approve` applies them immediately |
 | `navy.commandApproval` | `ask-always` | Execution only. `ask-always` confirms every shell command, background process and MCP tool call; `auto-approve` runs them unattended |
 | `navy.modelPricing` | `{}` | Price models Navy doesn't know so the cost estimate covers them, e.g. `{"my-finetune": {"in": 1.5, "out": 6}}` — USD per 1M tokens, matched as a substring of the model id |
-| `navy.sandboxMode` | `off` | `docker` (container, needs a devcontainer/Dockerfile), `native` (sandbox-exec / bubblewrap; macOS and Linux only — Windows has no drivable equivalent, see [Safety](#safety)), or `off` |
+| `navy.sandboxMode` | `off` | `docker` (container), `native` (sandbox-exec / bubblewrap; macOS and Linux only — Windows has no drivable equivalent, see [Safety](#safety)), or `off` |
+| `navy.sandboxImage` | `` | Docker image for sandboxed commands when the project has no devcontainer/Dockerfile of its own, e.g. `node:20`. The project's own config always wins. Matters most on Windows, where Docker is the only sandbox |
 | `navy.shell` | `auto` | Shell for `run_command`/`run_tests`/`run_project`, and the dialect Navy writes for: `auto`, `cmd`, `powershell`, `pwsh`, `sh`, `bash`. Ignored under Docker sandboxing, which always targets `sh` |
 | `navy.editFormat` | `search-replace` | `search-replace` for surgical edits; `whole-file` to rewrite the entire file |
 | `navy.maxToolIterations` | `100` | Maximum agent loop iterations per turn |

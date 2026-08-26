@@ -112,11 +112,16 @@ class SandboxMethods {
       statMtime(path.join(root, '.devcontainer', 'devcontainer.json')),
       statMtime(path.join(root, 'Dockerfile')),
     ]);
+    // navy.sandboxImage is part of the key: without it, setting the image would
+    // appear to do nothing until one of the two files happened to change.
+    const configured = this._configuredSandboxImage();
     const cached = cache.sandboxImageCache;
-    if (cached && cached.dcMtime === dcMtime && cached.dfMtime === dfMtime) return cached.result;
+    if (cached && cached.dcMtime === dcMtime && cached.dfMtime === dfMtime && cached.configured === configured) {
+      return cached.result;
+    }
 
     const result = await this._resolveSandboxImageUncached(root);
-    cache.sandboxImageCache = { dcMtime, dfMtime, result };
+    cache.sandboxImageCache = { dcMtime, dfMtime, configured, result };
     return result;
   }
 
@@ -156,7 +161,13 @@ class SandboxMethods {
     }
 
     if (directImage) return { image: directImage };
-    if (!dockerfilePath) return null;
+    if (!dockerfilePath) {
+      // Nothing in the project. An image the user named for this workspace is
+      // an answer, not a guess, so it is used — but only here, after every
+      // project-owned option has been tried.
+      const configured = this._configuredSandboxImage();
+      return configured ? { image: configured, fromSetting: true } : null;
+    }
 
     // Stable tag derived from the project root — repeated runs reuse Docker's
     // own layer cache (a rebuild with nothing changed is near-instant)
@@ -188,7 +199,11 @@ class SandboxMethods {
     }
     const resolved = await this._resolveSandboxImage(cwd);
     if (!resolved) {
-      return { refused: true, message: `Sandboxed execution requested (navy.sandboxMode is "docker") but no .devcontainer/devcontainer.json or Dockerfile was found in ${path.basename(cwd)} — Navy will not guess at a generic image that might not match this project's real toolchain. Add a devcontainer config or Dockerfile, or set navy.sandboxMode to "off".` };
+      // Docker is present and only the image is missing, which is a question
+      // with an answer rather than a wall. Asked once per session, and the
+      // command is still refused this time — the user has not answered yet.
+      this.offerSandboxImage(cwd).catch(() => {});
+      return { refused: true, message: `Sandboxed execution requested (navy.sandboxMode is "docker") but no .devcontainer/devcontainer.json or Dockerfile was found in ${path.basename(cwd)}, and navy.sandboxImage is not set — Navy will not guess at a generic image that might not match this project's real toolchain. Set navy.sandboxImage to the image this project builds in (e.g. "node:20"), add a devcontainer config or Dockerfile, or set navy.sandboxMode to "off".` };
     }
     // Docker Desktop accepts a drive-letter path in -v, but forward slashes are
     // the form its docs use and the one that survives every backend; a
@@ -350,6 +365,76 @@ class SandboxMethods {
     } else if (pick === 'Turn sandboxing off') {
       await vscode.workspace.getConfiguration('navy').update('sandboxMode', 'off', vscode.ConfigurationTarget.Global);
     }
+  }
+
+  // A project's own devcontainer/Dockerfile is always preferred, and Navy will
+  // still never GUESS an image — running `npm test` in an image with no node in
+  // it fails in a way that looks like the test suite broke. But "will not guess"
+  // and "will not accept an answer" are different things, and conflating them
+  // was the second barrier on Windows.
+  //
+  // Windows has no native backend, so Docker is the only sandbox available
+  // there — and it was reachable only by projects that already carried a
+  // devcontainer, which most do not. The user naming an image is not a guess.
+  // navy.sandboxImage is that answer, consulted only when the project has
+  // nothing of its own.
+  _configuredSandboxImage() {
+    const raw = vscode.workspace.getConfiguration('navy').get('sandboxImage', '');
+    const image = String(raw || '').trim();
+    // A tag with a space in it cannot be a real image reference and would be
+    // spliced straight into a `docker run` argv, so refuse rather than pass it
+    // through and produce an incomprehensible Docker error.
+    return image && !/\s/.test(image) ? image : '';
+  }
+
+  // What image a project of this shape would plausibly want. Used ONLY to
+  // populate the suggestion in the offer below — never applied on its own,
+  // because a wrong guess produces commands that fail for reasons that look
+  // nothing like a wrong image.
+  _suggestSandboxImage(root) {
+    const has = (f) => { try { return fs.existsSync(path.join(root, f)); } catch { return false; } };
+    if (has('package.json')) return 'node:20';
+    if (has('pyproject.toml') || has('requirements.txt') || has('manage.py')) return 'python:3.12';
+    if (has('go.mod')) return 'golang:1.22';
+    if (has('Cargo.toml')) return 'rust:1';
+    if (has('Gemfile')) return 'ruby:3.3';
+    if (has('pom.xml') || has('build.gradle') || has('build.gradle.kts')) return 'maven:3-eclipse-temurin-21';
+    return '';
+  }
+
+  // Shown once per session when sandboxing is on, Docker is there, and the only
+  // thing missing is an image. Offering beats refusing repeatedly: the refusal
+  // is correct but it is also a dead end, and on Windows it is the dead end
+  // every user without a devcontainer hits.
+  async offerSandboxImage(root) {
+    if (this._offeredSandboxImage) return;
+    this._offeredSandboxImage = true;
+    const suggestion = this._suggestSandboxImage(root);
+    const pick = await vscode.window.showWarningMessage(
+      `Navy: sandboxing is on, but ${path.basename(root)} has no .devcontainer or Dockerfile, so there is no image to run commands in.`
+      + (suggestion ? ` This looks like a project that would run in ${suggestion}.` : ''),
+      ...(suggestion ? [`Use ${suggestion}`] : []), 'Choose an image…', 'Turn sandboxing off');
+    if (!pick) return;
+    if (pick === 'Turn sandboxing off') {
+      await vscode.workspace.getConfiguration('navy').update('sandboxMode', 'off', vscode.ConfigurationTarget.Global);
+      return;
+    }
+    let image = suggestion;
+    if (pick === 'Choose an image…') {
+      image = await vscode.window.showInputBox({
+        prompt: 'Docker image to run sandboxed commands in',
+        placeHolder: suggestion || 'node:20',
+        value: suggestion,
+        validateInput: (v) => (!v || /\s/.test(v.trim()) ? 'An image reference, e.g. node:20' : undefined),
+      });
+    }
+    if (!image) return;
+    // Workspace-scoped: which image a project needs is a fact about THAT
+    // project, and storing it globally would apply a Node image to the next
+    // Python repo the user opens.
+    await vscode.workspace.getConfiguration('navy').update(
+      'sandboxImage', image.trim(),
+      vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global);
   }
 
   // Shown appended to every command-approval card so the user knows which

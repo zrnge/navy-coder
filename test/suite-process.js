@@ -810,4 +810,119 @@ async function nativeSandboxSuite() {
   }
 }
 
-module.exports = { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite };
+// Windows has no native backend, so Docker is its only sandbox — and Docker was
+// reachable only by projects that already carried a devcontainer, which most do
+// not. That second barrier was Navy's own rule, not the platform's: "will not
+// guess an image" and "will not accept an answer" are different things, and
+// conflating them left most Windows users with no sandbox available at all.
+async function sandboxImageSuite() {
+  console.log('\nnavy.sandboxImage (the second Windows barrier):');
+  const os = require('os');
+  const { vscode, ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-simg-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._dockerAvailable = async () => true;
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'docker');
+
+    // ── Still refuses when nothing is configured. The rule is intact. ──────
+    provider._offeredSandboxImage = true; // suppress the modal for this check
+    ctrl.config.sandboxImage = '';
+    let r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('no devcontainer and no setting: still refused, never guessed',
+      r.refused === true && /will not guess/.test(r.message));
+    check('…and the refusal now names the setting that fixes it',
+      /navy\.sandboxImage/.test(r.message), r.message);
+
+    // ── An image the user named is an answer, so it is used. ─────────────
+    ctrl.config.sandboxImage = 'node:20';
+    r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('a configured image is used when the project has none',
+      r.refused !== true && r.args.includes('node:20'), JSON.stringify(r).slice(0, 140));
+    check('…and the command still runs inside it',
+      r.bin === 'docker' && r.args.slice(-3).join(' ') === 'sh -c x');
+
+    // ── A project that carries its own config still wins. ────────────────
+    fs.mkdirSync(path.join(tmp, '.devcontainer'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.devcontainer', 'devcontainer.json'), '{ "image": "project-owned:1" }');
+    r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('the project\'s own devcontainer beats the setting',
+      r.args.includes('project-owned:1') && !r.args.includes('node:20'), JSON.stringify(r.args).slice(0, 160));
+    fs.rmSync(path.join(tmp, '.devcontainer'), { recursive: true, force: true });
+
+    // ── Changing the setting takes effect immediately. ───────────────────
+    // The resolution is cached on the two config files' mtimes; without the
+    // setting in that key, editing it would appear to do nothing until one of
+    // those files happened to change.
+    ctrl.config.sandboxImage = 'python:3.12';
+    r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('changing the setting is not masked by the resolution cache',
+      r.args.includes('python:3.12'), JSON.stringify(r.args).slice(0, 160));
+
+    // ── Malformed input must not reach a docker argv. ────────────────────
+    ctrl.config.sandboxImage = 'node 20';   // a space cannot be an image ref
+    r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('an image with whitespace is rejected, not spliced into the argv',
+      r.refused === true, JSON.stringify(r).slice(0, 120));
+    ctrl.config.sandboxImage = '   ';
+    r = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+    check('a blank setting is treated as unset', r.refused === true);
+
+    // ── The suggestion is derived from the project, and only suggested. ───
+    check('suggests nothing for a project it does not recognise',
+      provider._suggestSandboxImage(tmp) === '');
+    for (const [file, expected] of [
+      ['package.json', 'node:20'], ['requirements.txt', 'python:3.12'],
+      ['go.mod', 'golang:1.22'], ['Cargo.toml', 'rust:1'], ['Gemfile', 'ruby:3.3'],
+    ]) {
+      const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sugg-'));
+      fs.writeFileSync(path.join(probe, file), '');
+      check(`suggests ${expected} for a project with ${file}`,
+        provider._suggestSandboxImage(probe) === expected, provider._suggestSandboxImage(probe));
+      fs.rmSync(probe, { recursive: true, force: true });
+    }
+
+    // ── The offer: asked once, and its answer is stored per-workspace. ────
+    ctrl.config.sandboxImage = '';
+    fs.writeFileSync(path.join(tmp, 'package.json'), '{}');
+    provider._offeredSandboxImage = false;
+    ctrl.nextWarning = 'Use node:20';
+    await provider.offerSandboxImage(tmp);
+    check('the offer applies the suggestion the user accepted', ctrl.config.sandboxImage === 'node:20');
+    check('…scoped to the workspace, not globally — which image a project needs is that project\'s fact',
+      ctrl.scoped.sandboxImage?.workspaceValue === 'node:20', JSON.stringify(ctrl.scoped.sandboxImage));
+
+    ctrl.config.sandboxImage = '';
+    ctrl.shown.warning.length = 0;
+    await provider.offerSandboxImage(tmp);
+    check('the offer is made once per session, not once per command', ctrl.shown.warning.length === 0);
+
+    // Declining leaves everything as it was.
+    provider._offeredSandboxImage = false;
+    ctrl.nextWarning = undefined;
+    await provider.offerSandboxImage(tmp);
+    check('declining the offer changes nothing', !ctrl.config.sandboxImage);
+
+    // …and it offers a way out that is not "configure something".
+    provider._offeredSandboxImage = false;
+    ctrl.nextWarning = 'Turn sandboxing off';
+    await provider.offerSandboxImage(tmp);
+    check('the offer can also just turn sandboxing off', ctrl.config.sandboxMode === 'off');
+
+    // ── The manifest. ────────────────────────────────────────────────────
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const decl = manifest.contributes.configuration.properties['navy.sandboxImage'];
+    check('navy.sandboxImage is declared and defaults to unset', decl?.type === 'string' && decl.default === '');
+    check('…and its description says the project\'s own config wins',
+      /devcontainer or Dockerfile always wins/i.test(decl.markdownDescription));
+  } finally {
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite, sandboxImageSuite };
