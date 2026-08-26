@@ -6944,6 +6944,11 @@ function activate(context) {
     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.sendWorkspaceFolders()),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('navy.mcpServers')) provider.reloadMcpServers();
+      // navy.sandboxMode 'native' does nothing on Windows except refuse every
+      // command. Failing closed is correct, but finding out one command at a
+      // time — with the explanation attached to a command that just failed —
+      // is not: say it at the moment the setting is changed.
+      if (e.affectsConfiguration('navy.sandboxMode')) provider.warnIfSandboxUnavailable();
       // Navy no longer writes this setting, so a change to it is necessarily the
       // user's own edit — and therefore an instruction to switch project.
       if (e.affectsConfiguration('navy.projectRoot')) {

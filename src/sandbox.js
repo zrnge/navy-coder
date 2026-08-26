@@ -294,12 +294,62 @@ class SandboxMethods {
       };
     }
 
-    // Windows has no equivalent Navy can drive without shipping a helper:
-    // AppContainer needs a real launcher process, and job objects do not
-    // restrict the filesystem at all. Refusing is consistent with everything
-    // else here — the alternative is running unsandboxed while the setting
-    // says otherwise, which is the one outcome this file exists to prevent.
-    return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "native") but native sandboxing is only available on macOS (sandbox-exec) and Linux (bubblewrap). On Windows use navy.sandboxMode "docker", or set it to "off".' };
+  // Windows has no native backend, and this is the reasoning rather than an
+  // omission — everything below was looked at and rejected for a stated reason,
+  // so nobody has to re-derive it, and nobody ships a fake one:
+  //
+  //   Windows Sandbox (WindowsSandbox.exe) — present on Pro/Enterprise, absent
+  //     on Home, and not drivable. It takes a .wsb config and boots a full GUI
+  //     VM; there is no CLI that runs a command and returns its output. A
+  //     LogonCommand's output goes to the VM's screen, so capturing it means a
+  //     mapped folder and a polling loop, per command, behind a multi-second
+  //     boot. A tool loop runs dozens of commands.
+  //
+  //   AppContainer — the right primitive, and unreachable from here.
+  //     CreateAppContainerProfile plus CreateProcess with a security capability
+  //     needs a native addon or a shipped helper .exe, and this extension has
+  //     no runtime dependencies and no compiled artefacts on purpose.
+  //
+  //   Job objects — limit CPU, memory and process count, and do not restrict
+  //     the filesystem at all. They would constrain the two things that were
+  //     never the worry while leaving credentials readable.
+  //
+  //   runas /trustlevel — drops admin rights but still runs as the same user,
+  //     so every file that user owns stays readable and writable. That is not
+  //     the boundary this is defending.
+  //
+  //   WSL + bubblewrap — technically works, and quietly swaps the toolchain:
+  //     WSL's node/python/cargo are a different installation from the host's,
+  //     so `npm test` would run against a runtime the user never chose. A
+  //     sandbox that silently changes what is being tested is worse than none.
+  //
+  // Docker remains the Windows answer, and it genuinely works there now — the
+  // shell targeting bug that made every sandboxed command fail on Windows is
+  // fixed (see _commandTargetIsPosix). Saying "use docker" is not a brush-off.
+  //
+  // The asymmetry is real and worth stating plainly rather than glossing: on
+  // macOS and Linux you get some protection with nothing installed, and on
+  // Windows you get none unless you have Docker AND the project carries its own
+  // devcontainer or Dockerfile.
+    return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "native"), but Windows has no sandbox Navy can drive: Windows Sandbox boots a GUI VM with no way to return a command\'s output, and AppContainer needs a compiled helper this extension deliberately does not ship. Set navy.sandboxMode to "docker" (which does work on Windows, and needs a .devcontainer or Dockerfile in the project), or to "off" to run commands directly.' };
+  }
+
+  // Called when navy.sandboxMode changes, and once at activation. Warns rather
+  // than reverting: the setting is the user's, and silently rewriting it would
+  // be a worse surprise than a message.
+  async warnIfSandboxUnavailable() {
+    const mode = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off');
+    if (mode !== 'native' || process.platform === 'darwin' || process.platform === 'linux') return;
+    if (this._warnedSandboxUnavailable === mode) return;
+    this._warnedSandboxUnavailable = mode;
+    const pick = await vscode.window.showWarningMessage(
+      'Navy: navy.sandboxMode is "native", which Windows has no support for — every command will be refused until you change it. Docker sandboxing does work on Windows.',
+      'Use Docker', 'Turn sandboxing off');
+    if (pick === 'Use Docker') {
+      await vscode.workspace.getConfiguration('navy').update('sandboxMode', 'docker', vscode.ConfigurationTarget.Global);
+    } else if (pick === 'Turn sandboxing off') {
+      await vscode.workspace.getConfiguration('navy').update('sandboxMode', 'off', vscode.ConfigurationTarget.Global);
+    }
   }
 
   // Shown appended to every command-approval card so the user knows which

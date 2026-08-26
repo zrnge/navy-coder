@@ -719,8 +719,26 @@ async function nativeSandboxSuite() {
     const wrapped = await provider._maybeWrapForSandbox(spec);
     if (process.platform === 'win32') {
       check('native on Windows: refused, never run unsandboxed',
-        wrapped.refused === true && /only available on macOS/.test(wrapped.message), JSON.stringify(wrapped));
+        wrapped.refused === true && /Windows has no sandbox Navy can drive/.test(wrapped.message), JSON.stringify(wrapped));
       check('native on Windows: the refusal names the way out', /"docker"/.test(wrapped.message));
+      // A bare 'not supported' reads as Navy not having bothered. It names the
+      // two things that were actually considered and why each fails.
+      check('native on Windows: the refusal explains why, not just that',
+        /Windows Sandbox/.test(wrapped.message) && /AppContainer/.test(wrapped.message), wrapped.message);
+
+      // Failing closed is right; finding out one failed command at a time is
+      // not. Setting it must say so immediately, and offer the way out.
+      ctrl.nextWarning = 'Use Docker';
+      provider._warnedSandboxUnavailable = undefined;
+      ctrl.shown.warning.length = 0;
+      await provider.warnIfSandboxUnavailable();
+      check('native on Windows: warns when the setting is CHANGED, not per command',
+        ctrl.shown.warning.length === 1 && /no support for/.test(ctrl.shown.warning[0]), JSON.stringify(ctrl.shown.warning));
+      check('native on Windows: …and the offered fix is applied', ctrl.config.sandboxMode === 'docker');
+      ctrl.shown.warning.length = 0;
+      await provider.warnIfSandboxUnavailable();
+      check('native on Windows: does not nag once it has been said', ctrl.shown.warning.length === 0);
+      ctrl.config.sandboxMode = 'native';
     } else {
       const expected = process.platform === 'darwin' ? 'sandbox-exec' : 'bwrap';
       check(`native on ${process.platform}: wrapped with ${expected}, or refused if it is missing`,
