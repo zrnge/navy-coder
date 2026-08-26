@@ -1393,7 +1393,12 @@ textarea:focus {
 
    Ordered as you would decide them: how much it may read, how hard it should
    think, then what it may do without asking. The separator marks that break,
-   because the last two are the only ones with consequences. */
+   because the last two are the only ones with consequences.
+
+   Deliberately carries NO appearance rules of its own — only layout. The
+   selects are .select-compact and look exactly like the ones in the topbar;
+   a group that restyled them would be a second opinion about the same control,
+   and the two would drift. */
 .composer-modes {
   display: flex;
   align-items: center;
@@ -1415,18 +1420,6 @@ textarea:focus {
 
 /* Quieter than the topbar copy: four controls sitting under the transcript
    should not compete with the text above them until they are looked at. */
-.composer-modes .select-compact {
-  height: 22px;
-  font-size: 10px;
-  border-color: transparent;
-  background-color: transparent;
-}
-.composer-modes .select-compact:hover {
-  border-color: var(--border-hover);
-}
-.composer-modes .select-compact:focus {
-  border-color: var(--gold);
-}
 
 .file-chips {
   display: flex;

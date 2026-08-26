@@ -2389,6 +2389,19 @@ function composerModesSuite() {
   const metaRule = /\.input-meta\s*\{([^}]*)\}/.exec(css)?.[1] || '';
   check('the composer row wraps rather than crushing the send button',
     /flex-wrap:\s*wrap/.test(metaRule), metaRule.trim());
+  // The group may POSITION the controls and must not restyle them. It briefly
+  // did — overriding border-color without color, on top of a transparent
+  // resting border — and the result was three identical controls rendering as
+  // three different things depending on which happened to be hovered or
+  // focused: gold text on a gold border, bright text on a visible border, and
+  // muted text on no border at all. A second opinion about .select-compact is
+  // the bug; the specific values it disagreed on are incidental.
+  const modeOverrides = [...css.matchAll(/\.composer-modes\s+\.select-compact[^{]*\{([^}]*)\}/g)]
+    .map(m => m[1]).join(' ');
+  check('the composer modes do not restyle .select-compact — one control, one appearance',
+    !/(^|;|\s)(color|background|background-color|border|border-color|font-size|height)\s*:/.test(modeOverrides),
+    modeOverrides.trim() || '(no overrides, as intended)');
+
   const modesRule = /\.composer-modes\s*\{([^}]*)\}/.exec(css)?.[1] || '';
   check('the modes group wraps too', /flex-wrap:\s*wrap/.test(modesRule));
   check('…and yields space before the file chips do',
