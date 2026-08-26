@@ -15,7 +15,7 @@ const { uninstallVscodeMock, report } = require('./harness.js');
 const { pureSuites } = require('./suite-pure.js');
 const { undoRedoSuite, missingPathHintSuite, syntaxCheckSuite, cardRecordSuite, rewindSuite } = require('./suite-files.js');
 const { retrievalSuite, semanticSearchSuite, retrievalUpgradesSuite, embedIndexSuite, contextBudgetSuite, contextBudgetLearningSuite } = require('./suite-retrieval.js');
-const { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite } = require('./suite-process.js');
+const { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite } = require('./suite-process.js');
 const { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite } = require('./suite-session.js');
 const { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite } = require('./suite-turn.js');
 const { costEstimateSuite, providerFallbackSuite, cachingFallbackSuite, adaptiveThinkingFallbackSuite, geminiSuite, providerSelfTestSuite, providerEndpointSuite, pricingSuite } = require('./suite-providers.js');
@@ -72,6 +72,7 @@ undoRedoSuite()
   .then(approvalScopeSuite)
   .then(toolBatchingSuite)
   .then(shellSelectionSuite)
+  .then(nativeSandboxSuite)
   .then(contextBudgetLearningSuite)
   .then(pricingSuite)
   .then(diagnosticsSuite)

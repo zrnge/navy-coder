@@ -1,8 +1,20 @@
 // ── Command-execution sandboxing (navy.sandboxMode) ───────────────────────────
-// Off by default. When 'docker', every spawn site routes through
-// _maybeWrapForSandbox, so enabling it protects run_command, run_tests,
-// run_project and background processes uniformly — and never silently falls
-// back to unsandboxed execution when it cannot proceed.
+// Off by default. When on, every spawn site routes through
+// _maybeWrapForSandbox, so it protects run_command, run_tests, run_project and
+// background processes uniformly — and never silently falls back to
+// unsandboxed execution when it cannot proceed. Refusing is the whole design: a
+// sandbox that quietly switches itself off is worse than none, because by then
+// the user has stopped watching for it.
+//
+// Two backends, because Docker turned out to be too high a price for most
+// people to pay for any isolation at all:
+//
+//   'docker' — strongest isolation, and the only option on Windows. Needs
+//              Docker running AND the project to carry its own devcontainer or
+//              Dockerfile; Navy will not guess at an image.
+//   'native' — the OS's own sandbox, with nothing to install: sandbox-exec
+//              (Seatbelt) on macOS, bubblewrap on Linux. Weaker than a
+//              container, and _nativeDenyReadPaths says exactly how.
 //
 // Extracted from extension.js unchanged. These are still methods on
 // NavyCoderViewProvider — mixed into its prototype at the bottom of
@@ -14,6 +26,7 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const os = require('os');
 const { spawn } = require('child_process');
 const { CHECKER_CWD } = require('./exec.js');
 
@@ -167,6 +180,7 @@ class SandboxMethods {
   async _maybeWrapForSandbox(spec) {
     const { bin, args, cwd } = spec;
     const mode = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off');
+    if (mode === 'native') return await this._wrapNative(spec);
     if (mode !== 'docker') return { ...spec };
 
     if (!(await this._dockerAvailable())) {
@@ -196,13 +210,108 @@ class SandboxMethods {
     return { bin: 'docker', args: dockerArgs, cwd, verbatim: false };
   }
 
+  // Seatbelt (macOS) and bubblewrap (Linux) express the same policy in two
+  // different languages. Both are built from the SAME two facts — what may be
+  // written, and what may not be read — so the two platforms cannot drift into
+  // protecting different things.
+  //
+  // What this actually buys, stated plainly, because a sandbox nobody
+  // understands is a sandbox nobody can rely on:
+  //
+  //   * writes are confined to the project and the temp directory. A command
+  //     cannot rewrite your shell profile, install a git hook in another
+  //     checkout, or touch anything elsewhere on disk.
+  //   * a short list of credential stores cannot be READ, so a command cannot
+  //     quietly walk off with SSH or cloud keys.
+  //   * the network is NOT restricted. Blocking it would break npm install,
+  //     pip, cargo and go — the commands people most want to run — so this
+  //     does not pretend to stop a determined exfiltration. Use 'docker' with
+  //     a network-less image if that is the threat you care about.
+  //
+  // ~/.npmrc and ~/.gitconfig are deliberately NOT denied: package installs and
+  // git both need them, and a sandbox that breaks the build gets switched off,
+  // which protects nothing at all.
+  _nativeDenyReadPaths() {
+    const home = os.homedir();
+    return ['.ssh', '.aws', '.gnupg', '.kube', '.netrc', '.docker/config.json', '.config/gcloud']
+      .map(p => path.join(home, p));
+  }
+
+  // SBPL: later rules win, so this reads as "allow everything, then take writes
+  // away, then hand back the two places a build legitimately needs".
+  _seatbeltProfile(projectDir, tmpDir) {
+    const q = (p) => '"' + String(p).replace(/"/g, '\\"') + '"';
+    const denyRead = this._nativeDenyReadPaths().map(p => '(subpath ' + q(p) + ')').join(' ');
+    return [
+      '(version 1)',
+      '(allow default)',
+      '(deny file-write*)',
+      '(allow file-write* (subpath ' + q(projectDir) + ') (subpath ' + q(tmpDir) + ') (subpath "/dev"))',
+      denyRead ? '(deny file-read* ' + denyRead + ')' : '',
+    ].filter(Boolean).join(' ');
+  }
+
+  // Everything readable, the two writable places bound read-write, and each
+  // credential store masked with an empty tmpfs so a read finds nothing rather
+  // than failing in a way that reads as a bug.
+  _bubblewrapArgs(projectDir, tmpDir) {
+    const args = ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
+      '--bind', projectDir, projectDir, '--bind', tmpDir, tmpDir];
+    for (const p of this._nativeDenyReadPaths()) args.push('--tmpfs', p);
+    // --die-with-parent matters here: Navy's kill path targets the process it
+    // spawned, and without this a bwrap child could outlive it.
+    args.push('--die-with-parent');
+    return args;
+  }
+
+  async _wrapNative(spec) {
+    const { bin, args, cwd } = spec;
+    const tmpDir = os.tmpdir();
+
+    if (process.platform === 'darwin') {
+      if (!(await this._commandAvailable('sandbox-exec'))) {
+        return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "native") but sandbox-exec was not found — refusing to run unsandboxed. Set navy.sandboxMode to "docker", or to "off".' };
+      }
+      return {
+        bin: 'sandbox-exec',
+        args: ['-p', this._seatbeltProfile(cwd, tmpDir), bin, ...args],
+        cwd,
+        // A direct argv spawn: Node's own quoting is right here, and verbatim
+        // would join the profile's spaces into nonsense.
+        verbatim: false,
+      };
+    }
+
+    if (process.platform === 'linux') {
+      if (!(await this._commandAvailable('bwrap'))) {
+        return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "native") but bubblewrap (bwrap) is not installed — refusing to run unsandboxed. Install it (e.g. "apt install bubblewrap"), or set navy.sandboxMode to "docker" or "off".' };
+      }
+      return {
+        bin: 'bwrap',
+        args: [...this._bubblewrapArgs(cwd, tmpDir), bin, ...args],
+        cwd,
+        verbatim: false,
+      };
+    }
+
+    // Windows has no equivalent Navy can drive without shipping a helper:
+    // AppContainer needs a real launcher process, and job objects do not
+    // restrict the filesystem at all. Refusing is consistent with everything
+    // else here — the alternative is running unsandboxed while the setting
+    // says otherwise, which is the one outcome this file exists to prevent.
+    return { refused: true, message: 'Sandboxed execution requested (navy.sandboxMode is "native") but native sandboxing is only available on macOS (sandbox-exec) and Linux (bubblewrap). On Windows use navy.sandboxMode "docker", or set it to "off".' };
+  }
+
   // Shown appended to every command-approval card so the user knows which
   // mode is about to run — computed from the raw setting rather than the
   // resolution outcome, since resolution (Docker running? config present?)
   // only happens after approval; a refusal still surfaces plainly as the
   // tool's result if sandboxing was requested but couldn't proceed.
   _sandboxLabelSuffix() {
-    return vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off') === 'docker' ? ' (sandboxed)' : '';
+    const mode = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off');
+    if (mode === 'docker') return ' (sandboxed: docker)';
+    if (mode === 'native') return ' (sandboxed: native)';
+    return '';
   }
 
   // ── Persistent background processes (opt-in via navy.persistBackgroundProcesses) ─

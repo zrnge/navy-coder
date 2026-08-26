@@ -55,6 +55,14 @@ const { CHECKER_CWD } = require('./exec.js');
 // Cap what check_syntax will read — an unbounded readFile on the extension
 // host's heap is an OOM waiting to happen on a repo with a large data file.
 const CHECK_SYNTAX_MAX_BYTES = 2 * 1024 * 1024;
+
+// Bounds for search_files' JavaScript fallback, used only when VS Code's
+// bundled ripgrep cannot be found. Generous enough to cover a real project,
+// small enough that a monorepo cannot freeze the extension host — and whichever
+// one stops the walk is reported, because a truncated search that looks
+// complete is worse than a slow one.
+const SEARCH_FALLBACK_MAX_FILES = 4000;
+const SEARCH_FALLBACK_MAX_DEPTH = 8;
 // ── Conversation size budget ────────────────────────────────────────────────
 // Both the pre-turn history trim and mid-turn compaction used to be fixed
 // literals (240k/200k chars ≈ 60k/50k tokens), which was wrong in both
@@ -3232,6 +3240,8 @@ class NavyCoderViewProvider {
     // container. Telling a model on Windows to write cmd.exe syntax that then
     // executes in a container is the same bug as building `cmd /c` for it —
     // both have to follow the execution target. See _commandTargetIsPosix.
+    // Ditto: this drives the "commands run inside a Linux container" line in
+    // the prompt, which is true of 'docker' and false of 'native'.
     const sandboxed = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off') === 'docker';
     const isWinShell = !this._commandTargetIsPosix();
     const hostPlatform = process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
@@ -4898,31 +4908,64 @@ class NavyCoderViewProvider {
         if (code === 1) return 'No matches';
         // code 2 / -1 → rg failed, fall through to the JS walk
       }
+      // Slow path. Worth being precise about what this is, because its answer
+      // is NOT equivalent to ripgrep's: it walks the tree in JavaScript, and a
+      // negative result from it is much weaker evidence.
+      const scan = { files: 0, capped: false, deepened: false };
+      const ignored = await this._gitIgnoredSet(root).catch(() => new Set());
       const results = [];
-      await this.searchDirectory(root, query, results, 0, root);
-      return results.slice(0, 20).join('\n') || 'No matches';
+      await this.searchDirectory(root, query, results, 0, root, scan, ignored);
+
+      // The important half. "No matches" from a bounded, gitignore-blind walk
+      // reads exactly like "no matches" from a full-tree search, and the model
+      // has no way to tell them apart — so it concludes the string is absent
+      // and reasons from that. Every answer on this path is labelled.
+      const limits = [];
+      if (scan.capped) limits.push(`stopped after ${SEARCH_FALLBACK_MAX_FILES} files`);
+      if (scan.deepened) limits.push(`stopped at ${SEARCH_FALLBACK_MAX_DEPTH} directories deep`);
+      const how = `[ripgrep unavailable — searched ${scan.files} file(s) in JavaScript instead${limits.length ? ', ' + limits.join(' and ') : ''}.`;
+      if (results.length) {
+        return results.slice(0, 20).join('\n') + `\n\n${how} There may be matches this pass did not reach.]`;
+      }
+      return `No matches found.\n\n${how} This is NOT proof the text is absent — if it matters, narrow the search with search_codebase, or read the likely file directly.]`;
     } catch (error) {
       return 'Error: ' + error.message;
     }
   }
 
-  async searchDirectory(dir, query, results, depth, root) {
-    if (depth > 2) return;
+  // `scan` accumulates what was actually covered so the caller can describe the
+  // search honestly; `ignored` is the repo's own gitignore set.
+  async searchDirectory(dir, query, results, depth, root, scan = { files: 0 }, ignored = new Set()) {
+    // Was 2, which is shallower than it sounds: src/providers/tools.js is
+    // already at the limit, and anything below it was reported as "no matches"
+    // rather than as unsearched. Bounded by FILES now, which is what actually
+    // costs time — depth is only a backstop against a pathological tree.
+    if (depth > SEARCH_FALLBACK_MAX_DEPTH) { scan.deepened = true; return; }
     if (results.length >= 20) return; // caller shows 20 — stop reading files past that
-    const SKIP = new Set(['node_modules', '.git', 'dist', 'out', '__pycache__', '.venv']);
+    if (scan.files >= SEARCH_FALLBACK_MAX_FILES) { scan.capped = true; return; }
     const entries = await fs.promises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
       if (results.length >= 20) return;
+      if (scan.files >= SEARCH_FALLBACK_MAX_FILES) { scan.capped = true; return; }
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP.has(entry.name)) {
-          await this.searchDirectory(full, query, results, depth + 1, root);
+        // The same skip list the retrieval walk uses, rather than a shorter one
+        // that let build/, target/, vendor/ and coverage/ through — those are
+        // usually the biggest directories in the repo and never the answer.
+        if (!RELEVANCE_SKIP_DIRS.has(entry.name)) {
+          await this.searchDirectory(full, query, results, depth + 1, root, scan, ignored);
         }
       } else {
         try {
+          if (ignored.has(path.relative(root, full).replace(/\\/g, '/'))) continue;
           const stat = await fs.promises.stat(full);
           if (stat.size > 512 * 1024) continue; // skip files larger than 512 KB
           const text = await fs.promises.readFile(full, 'utf8');
+          // A binary read as utf8 is a haystack of replacement characters that
+          // can still contain the query by accident, and reporting a "line" of
+          // it helps nobody. One null byte in the first KB is enough to tell.
+          if (text.slice(0, 1024).includes('\u0000')) continue;
+          scan.files++;
           if (text.includes(query)) {
             const lines = text.split('\n');
             for (let i = 0; i < lines.length; i++) {
@@ -5478,6 +5521,10 @@ class NavyCoderViewProvider {
     // image that has no such thing — the identical bug that shipped sandboxing
     // broken on Windows, one layer up. _maybeWrapForSandbox either wraps the
     // spec or refuses it, so this can never leak sh onto a Windows host.
+    // 'docker' only, and deliberately not 'native': a native sandbox wraps the
+    // HOST's own shell in place, so the dialect the model must write is
+    // whatever the host uses. Only a container replaces the execution
+    // environment, and only then does the shell target have to follow it.
     if (config.get('sandboxMode', 'off') === 'docker') return { id: 'sh', ...SHELLS.sh };
 
     const choice = config.get('shell', 'auto');

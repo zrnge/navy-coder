@@ -318,11 +318,13 @@
           "default": "off",
           "enum": [
             "off",
-            "docker"
+            "docker",
+            "native"
           ],
           "enumDescriptions": [
             "Commands run directly on your machine (current behavior)",
-            "Commands run inside a Docker container built from the project's own .devcontainer/Dockerfile, with only the project folder mounted"
+            "Commands run inside a Docker container built from the project's own .devcontainer/Dockerfile, with only the project folder mounted",
+            "Commands run under the OS's own sandbox — sandbox-exec on macOS, bubblewrap on Linux, nothing to install. Writes are confined to the project and temp; SSH and cloud credential stores cannot be read. The network is NOT restricted. Not available on Windows"
           ],
           "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a Docker container instead of running them directly on your machine. Requires Docker to be installed and running, and the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` — Navy refuses to guess at a generic image, since a container that doesn't actually match the project's real toolchain would be a false sense of safety. This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\nWorks on Windows, macOS and Linux. With sandboxing on, Navy targets the container rather than the host: commands are written for and run through POSIX `sh` even from a Windows host, since that is what the container actually provides."
         },

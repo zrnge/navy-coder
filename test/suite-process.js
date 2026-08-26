@@ -161,7 +161,10 @@ async function sandboxSuite() {
     await vscode.workspace.getConfiguration().update('sandboxMode', 'off');
     check('_sandboxLabelSuffix: empty when off', provider._sandboxLabelSuffix() === '');
     await vscode.workspace.getConfiguration().update('sandboxMode', 'docker');
-    check('_sandboxLabelSuffix: shown when docker mode is set', provider._sandboxLabelSuffix() === ' (sandboxed)');
+    // Names the BACKEND now, not just the fact. With two of them, and one
+    // materially weaker than the other, a card that said only 'sandboxed'
+    // would be telling the user less than they need to approve the command.
+    check('_sandboxLabelSuffix: names the backend when docker mode is set', provider._sandboxLabelSuffix() === ' (sandboxed: docker)');
   } catch (e) {
     check('sandbox suite ran', false, e.stack || e.message);
   } finally {
@@ -656,4 +659,133 @@ async function shellSelectionSuite() {
   }
 }
 
-module.exports = { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite };
+// Two limitations that turned out to be scope decisions rather than facts of
+// nature: sandboxing was Docker-or-nothing, and search_files' fallback was a
+// shallow walk that reported "No matches" in a voice indistinguishable from
+// ripgrep's.
+async function nativeSandboxSuite() {
+  console.log('\nnative sandboxing + honest search fallback:');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-native-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+
+    // ── The policy, which is the part worth pinning: it is built once and
+    //    rendered twice, so macOS and Linux cannot protect different things. ──
+    const denied = provider._nativeDenyReadPaths();
+    for (const store of ['.ssh', '.aws', '.gnupg', '.kube', '.netrc']) {
+      check(`native: ${store} is unreadable`, denied.some(p => p.endsWith(store) || p.includes(store + path.sep)), store);
+    }
+    // A sandbox that breaks the build gets switched off, which protects
+    // nothing — so these two stay readable on purpose.
+    check('native: ~/.npmrc is NOT denied — package installs need it',
+      !denied.some(p => p.endsWith('.npmrc')));
+    check('native: ~/.gitconfig is NOT denied — git needs it',
+      !denied.some(p => p.endsWith('.gitconfig')));
+
+    const profile = provider._seatbeltProfile('/proj', '/tmp/x');
+    check('seatbelt: allows by default, then takes writes away',
+      /\(allow default\)/.test(profile) && /\(deny file-write\*\)/.test(profile));
+    check('seatbelt: hands back the project and temp, in that order after the deny',
+      profile.indexOf('(deny file-write*)') < profile.indexOf('(allow file-write* (subpath "/proj")'), profile);
+    check('seatbelt: /dev stays writable, or nothing can print',
+      /\(subpath "\/dev"\)/.test(profile));
+    check('seatbelt: the credential stores are denied for READ, not just write',
+      /\(deny file-read\*/.test(profile) && /\.ssh/.test(profile));
+    check('seatbelt: a quote in a path cannot break out of the profile',
+      /\\"/.test(provider._seatbeltProfile('/a"b', '/tmp')), provider._seatbeltProfile('/a"b', '/tmp'));
+
+    const bwrap = provider._bubblewrapArgs('/proj', '/tmp/x');
+    check('bubblewrap: everything readable, nothing writable by default',
+      bwrap.join(' ').includes('--ro-bind / /'));
+    check('bubblewrap: the project and temp are bound read-write',
+      bwrap.join(' ').includes('--bind /proj /proj') && bwrap.join(' ').includes('--bind /tmp/x /tmp/x'));
+    check('bubblewrap: credential stores are masked with an empty tmpfs',
+      denied.every(p => bwrap.includes(p) && bwrap[bwrap.indexOf(p) - 1] === '--tmpfs'));
+    check('bubblewrap: dies with its parent, so a sandboxed child cannot outlive Navy',
+      bwrap.includes('--die-with-parent'));
+
+    // ── Never silently unsandboxed. ──────────────────────────────────────
+    ctrl.config.sandboxMode = 'native';
+    const spec = { bin: 'sh', args: ['-c', 'echo hi'], cwd: tmp, verbatim: false };
+    const wrapped = await provider._maybeWrapForSandbox(spec);
+    if (process.platform === 'win32') {
+      check('native on Windows: refused, never run unsandboxed',
+        wrapped.refused === true && /only available on macOS/.test(wrapped.message), JSON.stringify(wrapped));
+      check('native on Windows: the refusal names the way out', /"docker"/.test(wrapped.message));
+    } else {
+      const expected = process.platform === 'darwin' ? 'sandbox-exec' : 'bwrap';
+      check(`native on ${process.platform}: wrapped with ${expected}, or refused if it is missing`,
+        wrapped.refused === true || wrapped.bin === expected, JSON.stringify(wrapped).slice(0, 160));
+      if (!wrapped.refused) {
+        check('native: the original command survives at the end of the argv',
+          wrapped.args.slice(-2).join(' ') === '-c echo hi', wrapped.args.slice(-3).join(' '));
+        check('native: verbatim stays off — this is a direct argv spawn', wrapped.verbatim === false);
+      }
+    }
+
+    // Native wraps the HOST's shell, so unlike docker it must NOT rewrite the
+    // dialect the model is told to write.
+    //
+    // navy.shell is set explicitly rather than assumed: ctrl.reset() does not
+    // clear ctrl.config, so shellSelectionSuite — which runs just before this
+    // one — leaves its last choice behind. That is the cross-suite leakage the
+    // runner's header warns about, felt from the inside.
+    ctrl.config.shell = 'auto';
+    check('native does not pretend the command is bound for Linux',
+      provider._resolveShell().id === (process.platform === 'win32' ? 'cmd' : 'sh'));
+    check('native is labelled distinctly on the approval card',
+      provider._sandboxLabelSuffix() === ' (sandboxed: native)');
+    ctrl.config.sandboxMode = 'docker';
+    check('docker is still labelled too', provider._sandboxLabelSuffix() === ' (sandboxed: docker)');
+    ctrl.config.sandboxMode = 'off';
+    check('off is labelled not at all', provider._sandboxLabelSuffix() === '');
+
+    // The manifest has to offer it, or the mode is unreachable.
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const decl = manifest.contributes.configuration.properties['navy.sandboxMode'];
+    check('navy.sandboxMode offers native', decl.enum.includes('native'));
+    check('…and every mode is described', decl.enum.length === decl.enumDescriptions.length);
+    check('…and the description admits the network is not restricted',
+      /network is NOT restricted/i.test(decl.enumDescriptions[decl.enum.indexOf('native')]));
+
+    // ── The search fallback tells the truth about itself. ────────────────
+    // Forced onto the JS path by making ripgrep unfindable.
+    provider._rgPath = null;
+    fs.mkdirSync(path.join(tmp, 'a', 'b', 'c', 'd', 'e'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'a', 'b', 'c', 'd', 'e', 'deep.js'), 'const NEEDLE = 1;');
+    fs.writeFileSync(path.join(tmp, 'shallow.js'), 'const NEEDLE = 2;');
+
+    const found = await provider.toolSearchFiles('NEEDLE');
+    check('fallback: reaches past the old depth-2 ceiling', /deep\.js/.test(found), found.slice(0, 300));
+    check('fallback: says it was not ripgrep', /ripgrep unavailable/.test(found));
+    check('fallback: warns that it may have missed matches', /may be matches this pass did not reach/.test(found));
+
+    const none = await provider.toolSearchFiles('STRING_THAT_IS_NOT_THERE_ANYWHERE');
+    check('fallback: a miss is explicitly NOT proof of absence',
+      /NOT proof the text is absent/.test(none), none.slice(0, 200));
+    check('fallback: …and suggests what to do instead', /search_codebase|read the likely file/.test(none));
+
+    // Binary content must not be searched as text.
+    fs.writeFileSync(path.join(tmp, 'blob.bin'), Buffer.from([0x00, 0x01, 0x02, 0x4e, 0x45, 0x45, 0x44, 0x4c, 0x45]));
+    const afterBinary = await provider.toolSearchFiles('NEEDLE');
+    check('fallback: binary files are skipped, not reported as line matches',
+      !/blob\.bin/.test(afterBinary), afterBinary.slice(0, 200));
+
+    // The bigger skip list is the shared one, so build output is not searched.
+    fs.mkdirSync(path.join(tmp, 'target'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'target', 'gen.js'), 'const NEEDLE = 3;');
+    const afterBuildDir = await provider.toolSearchFiles('NEEDLE');
+    check('fallback: build output directories are skipped', !/target/.test(afterBuildDir), afterBuildDir.slice(0, 200));
+  } finally {
+    ctrl.reset?.();
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite };
