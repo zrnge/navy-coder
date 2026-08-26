@@ -4523,7 +4523,7 @@ function renderInline(text) {
   // A slash before the CLOSING delimiter only means "glob" for a single star —
   // `src/*.ts`, where the star is the wildcard. For a `**` run it means the
   // bolded text simply ended in a slash, which is what every URL does:
-  // "running at **http://localhost:5173/Vidz/**" rendered with its asterisks
+  // "running at **http://localhost:5173/my-app/**" rendered with its asterisks
   // showing, because the closing run was refused. The glob shapes `**` has to
   // survive (`**/*.spec.js`) are already stopped by OPENED, which refuses a run
   // followed by a slash.

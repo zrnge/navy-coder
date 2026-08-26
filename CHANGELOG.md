@@ -207,7 +207,7 @@ could miss. Both now sit above the chat input for as long as they are running.
 
 - **Every background task now has a path, and survives a restart with it.**
   Navy records what it launches under `navy/<project>/<task>` — a dev server is
-  `navy/Vidz/dev-server`, a watcher is `navy/Vidz/tsc-watch`. A pid was never an
+  `navy/my-app/dev-server`, a watcher is `navy/my-app/tsc-watch`. A pid was never an
   identity: it is recycled, it means nothing once the window is gone, and nobody
   recognises one. A task path names the project and the job, reads the same in
   every window, and is what a stop request refers to.

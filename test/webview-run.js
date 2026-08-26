@@ -354,12 +354,12 @@ function snakeCaseSuite() {
 
   // Bold whose CONTENT ends in a slash — which every URL does. The first
   // version of the glob guard refused any closing run preceded by `/`, so
-  // "running at **http://localhost:5173/Vidz/**" rendered with its asterisks
+  // "running at **http://localhost:5173/my-app/**" rendered with its asterisks
   // showing. The glob shapes are stopped by the OPENING guard instead: `**/`
   // starts a path, `/**` merely ends one.
-  h = render('running at **http://localhost:5173/Vidz/**.');
+  h = render('running at **http://localhost:5173/my-app/**.');
   check('bold around a URL ending in a slash still renders',
-    /<strong>http:\/\/localhost:5173\/Vidz\/<\/strong>/.test(h), h);
+    /<strong>http:\/\/localhost:5173\/my-app\/<\/strong>/.test(h), h);
   h = render('see **src/lib/** now');
   check('…and bold around a directory path does too',
     /<strong>src\/lib\/<\/strong>/.test(h), h);
@@ -2609,8 +2609,8 @@ function taskDockSuite() {
 
   check('the dock is out of the way when nothing is running', el.hidden === true);
 
-  w.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
-  check('a starting dev server appears in the dock', el.hidden === false && names().join() === 'Vidz');
+  w.post({ type: 'runProjectStart', projectName: 'my-app', command: 'npm run dev' });
+  check('a starting dev server appears in the dock', el.hidden === false && names().join() === 'my-app');
   check('…showing the command it is running',
     rows()[0].querySelector('.task-dock-detail').textContent === 'npm run dev');
   check('…and marked as not yet up',
@@ -2618,15 +2618,15 @@ function taskDockSuite() {
   check('…with its own Stop button',
     rows()[0].querySelector('.task-dock-stop').title === 'Stop server');
 
-  w.post({ type: 'runProjectReady', url: 'http://localhost:5173/Vidz/' });
+  w.post({ type: 'runProjectReady', url: 'http://localhost:5173/my-app/' });
   check('once live, the dock shows the URL rather than the command',
-    rows()[0].querySelector('.task-dock-detail').textContent === 'http://localhost:5173/Vidz/');
+    rows()[0].querySelector('.task-dock-detail').textContent === 'http://localhost:5173/my-app/');
   check('…and the status light turns',
     rows()[0].querySelector('.task-dock-dot').classList.contains('ready'));
 
   // A second kind of running thing shares the dock.
   w.post({ type: 'bgProcessOutput', id: 'watcher', chunk: 'building…' });
-  check('a background process joins it', names().join() === 'Vidz,watcher');
+  check('a background process joins it', names().join() === 'my-app,watcher');
   check('…with the stop action that belongs to a process',
     rows()[1].querySelector('.task-dock-stop').title === 'Stop process');
 
@@ -2651,7 +2651,7 @@ function taskDockSuite() {
   // been doing" — the card is the log, the dock is only the handle.
   const w2 = createWebview();
   const d2 = w2.document;
-  w2.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
+  w2.post({ type: 'runProjectStart', projectName: 'my-app', command: 'npm run dev' });
   d2.querySelector('.task-dock-label').click();
   check('clicking the row marks the card it belongs to',
     d2.querySelectorAll('.run-project-card.outline-target').length === 1);
@@ -2661,7 +2661,7 @@ function taskDockSuite() {
   // them, so a row left behind would scroll nowhere at all.
   const w3 = createWebview();
   const d3 = w3.document;
-  w3.post({ type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' });
+  w3.post({ type: 'runProjectStart', projectName: 'my-app', command: 'npm run dev' });
   w3.post({ type: 'restore', messages: [{ role: 'user', text: 'different chat' }] });
   check('switching chats empties the dock rather than stranding a row',
     d3.querySelector('#taskDock').hidden === true);
@@ -2675,10 +2675,10 @@ function taskDockSuite() {
   // dev server was still up.
   const w4 = createWebview();
   const d4 = w4.document;
-  w4.post({ type: 'restoredProcesses', root: 'E:/Vidz', processes: [
-    { taskPath: 'navy/Vidz/dev-server', id: '__run_project__', label: 'Vidz',
+  w4.post({ type: 'restoredProcesses', root: 'E:/my-app', processes: [
+    { taskPath: 'navy/my-app/dev-server', id: '__run_project__', label: 'my-app',
       command: 'npm run dev', url: 'http://localhost:5173/', pid: 123 },
-    { taskPath: 'navy/Vidz/tsc-watch', id: 'tsc-watch', label: 'tsc-watch',
+    { taskPath: 'navy/my-app/tsc-watch', id: 'tsc-watch', label: 'tsc-watch',
       command: 'tsc -w', url: '', pid: 456 },
   ] });
   const r4 = () => [...d4.querySelectorAll('.task-dock-row')];
@@ -2705,14 +2705,14 @@ function taskDockSuite() {
   r4()[0].querySelector('.task-dock-stop').click();
   const stopMsg = w4.sent.find(m => m.type === 'stopRestoredProcess');
   check('Stop asks by task path, not by pid',
-    stopMsg && stopMsg.taskPath === 'navy/Vidz/dev-server' && stopMsg.pid === undefined,
+    stopMsg && stopMsg.taskPath === 'navy/my-app/dev-server' && stopMsg.pid === undefined,
     JSON.stringify(stopMsg));
-  check('…and names the project it belongs to', stopMsg.root === 'E:/Vidz');
+  check('…and names the project it belongs to', stopMsg.root === 'E:/my-app');
   r4()[0].querySelector('.task-dock-log').click();
   check('Log asks for that task path too',
-    w4.sent.some(m => m.type === 'showRestoredLog' && m.taskPath === 'navy/Vidz/dev-server'));
+    w4.sent.some(m => m.type === 'showRestoredLog' && m.taskPath === 'navy/my-app/dev-server'));
 
-  w4.post({ type: 'restoredProcesses', root: 'E:/Vidz', processes: [] });
+  w4.post({ type: 'restoredProcesses', root: 'E:/my-app', processes: [] });
   check('once the extension confirms none are left, the dock goes',
     d4.querySelector('#taskDock').hidden === true);
   w4.close();

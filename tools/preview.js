@@ -94,8 +94,8 @@ const SCRIPT = [
   { type: 'done' },
   // Left running on purpose: this is what puts the task dock on screen, which
   // is the whole point of looking at a preview rather than reading a test.
-  { type: 'runProjectStart', projectName: 'Vidz', command: 'npm run dev' },
-  { type: 'runProjectReady', url: 'http://localhost:5173/Vidz/' },
+  { type: 'runProjectStart', projectName: 'my-app', command: 'npm run dev' },
+  { type: 'runProjectReady', url: 'http://localhost:5173/my-app/' },
   { type: 'bgProcessOutput', id: 'tsc-watch', chunk: 'Watching for file changes.\n' },
 ];
 
