@@ -17,8 +17,25 @@
   --green:        var(--vscode-charts-green, #3fb950);
   --red:          var(--vscode-charts-red, #f47067);
   --amber:        var(--vscode-charts-yellow, #d29922);
+  /* Radii. Four steps, and they describe what the stylesheet actually does:
+     small controls, cards, panels, pills. The previous pair said 8px and 5px
+     while the file used 2, 3, 4, 5, 6, 8 and 999 — so the tokens described
+     nothing and only a third of the uses adopted them. */
+  --radius-sm:    4px;
+  --radius-md:    6px;
   --radius:       8px;
-  --radius-sm:    5px;
+  --radius-pill:  999px;
+
+  /* Type scale. Six steps, already in use 155 times between them before they
+     had names — this changes no pixel, it just stops the next size being
+     picked by eye. 16px and 22px remain raw: one use each, and a token used
+     once is noise rather than a scale. */
+  --fs-2xs:        9px;
+  --fs-xs:        10px;
+  --fs-sm:        11px;
+  --fs-md:        12px;
+  --fs-lg:        13px;
+  --fs-xl:        14px;
   /* Aliases some rules reference under a different name than the canonical
      variable above — kept in sync with it rather than duplicating values. */
   --accent:       var(--gold);
@@ -104,7 +121,7 @@ body {
   color: var(--text);
   background: var(--bg);
   font-family: system-ui, var(--vscode-font-family), 'Segoe UI', sans-serif;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   line-height: 1.5;
 }
 
@@ -197,14 +214,14 @@ select {
 
 .brand-title {
   font-weight: 700;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   letter-spacing: 0.3px;
   color: var(--text);
   flex-shrink: 0;
 }
 
 .status-text {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -240,8 +257,8 @@ select option:hover {
   color: var(--text);
   background-color: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-md);
   cursor: pointer;
   transition: border-color 0.15s;
   height: 24px;
@@ -257,8 +274,8 @@ select option:hover {
   color: var(--text);
   background-color: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-md);
   font-weight: 600;
   cursor: pointer;
   transition: border-color 0.15s;
@@ -273,12 +290,12 @@ select option:hover {
   appearance: none;
   flex: 0 0 auto;
   padding: 0 7px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--muted);
   background-color: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   height: 24px;
   transition: color 0.12s, border-color 0.12s;
@@ -300,7 +317,7 @@ select option:hover {
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: color 0.12s, background 0.12s, border-color 0.12s;
   flex-shrink: 0;
@@ -317,26 +334,6 @@ select option:hover {
   cursor: default;
 }
 
-/* Stop button — shown while Navy is generating */
-.stop-button {
-  width: auto;
-  padding: 0 var(--space-4);
-  gap: 5px;
-  color: var(--muted);
-  border-color: var(--border);
-  background: transparent;
-}
-.stop-button:hover {
-  color: var(--red);
-  background: var(--red-wash);
-  border-color: var(--red-line-strong);
-}
-.stop-button-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
 /* New chat button — shown while idle */
 .new-chat-button {
   width: auto;
@@ -351,7 +348,7 @@ select option:hover {
   border-color: var(--gold);
 }
 .new-chat-label {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -363,7 +360,7 @@ select option:hover {
   background: var(--red-wash);
   border-bottom: 1px solid var(--red-line);
   color: var(--red);
-  font-size: 12px;
+  font-size: var(--fs-md);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 120px;
@@ -375,7 +372,7 @@ select option:hover {
   display: block;
   margin: var(--space-3) auto var(--space-2);
   padding: var(--space-3) var(--space-6);
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 500;
   color: var(--gold);
   background: var(--accent-wash);
@@ -450,7 +447,7 @@ select option:hover {
 
 .welcome-tagline {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   color: var(--muted);
   font-style: italic;
 }
@@ -469,7 +466,7 @@ select option:hover {
   align-items: center;
   gap: 5px;
   padding: var(--space-2) 10px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   border-radius: var(--radius);
   border: 1px solid var(--border);
@@ -489,7 +486,7 @@ select option:hover {
 
 .welcome-hint {
   margin: var(--space-3) 0 0;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
 }
 .welcome-hint code {
@@ -497,7 +494,7 @@ select option:hover {
   font-size: 0.95em;
   background: var(--surface);
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--gold);
 }
 
@@ -516,13 +513,13 @@ select option:hover {
 .welcome-problem[hidden] { display: none; }
 .welcome-problem-title {
   margin: 0 0 var(--space-2);
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 700;
   color: var(--amber);
 }
 .welcome-problem-detail {
   margin: 0 0 var(--space-5);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--text);
   /* A provider error can be one long unbroken string (a URL, a request id). */
@@ -535,7 +532,7 @@ select option:hover {
 }
 .welcome-problem-btn {
   padding: var(--space-3) var(--space-5);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
@@ -576,14 +573,14 @@ select option:hover {
   z-index: 1;
 }
 .outline-title {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.6px;
   color: var(--gold);
 }
 .outline-count {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   margin-right: auto;
 }
@@ -600,7 +597,7 @@ select option:hover {
   background: none;
   color: var(--text);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-md);
   text-align: left;
   cursor: pointer;
 }
@@ -611,7 +608,7 @@ select option:hover {
 .outline-num {
   flex: 0 0 auto;
   min-width: 16px;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -630,7 +627,7 @@ select option:hover {
 .outline-empty {
   margin: 0;
   padding: var(--space-6) 14px var(--space-7);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--muted);
   text-align: center;
@@ -660,7 +657,7 @@ select option:hover {
   margin: 0;
   padding: var(--card-pad-y) var(--card-pad-x);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--text);
   background: var(--sunken);
@@ -772,12 +769,12 @@ select option:hover {
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-5);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--gold-text);
   background: var(--gold);
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
   cursor: pointer;
   white-space: nowrap;
@@ -791,7 +788,7 @@ select option:hover {
   margin: var(--space-7) auto;
   max-width: 300px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.6;
   color: var(--muted);
 }
@@ -864,7 +861,7 @@ select option:hover {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--muted);
   padding: 0;
@@ -879,7 +876,7 @@ select option:hover {
 
 /* Base bubble */
 .message-bubble {
-  font-size: 13px;
+  font-size: var(--fs-lg);
   line-height: 1.65;
   max-width: 100%;
   word-break: break-word;
@@ -927,7 +924,7 @@ select option:hover {
   white-space: pre-wrap;
   word-break: break-word;
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
 }
 .message-bubble .streaming-pre {
   font-family: var(--vscode-font-family), sans-serif;
@@ -957,7 +954,7 @@ select option:hover {
   padding: var(--space-1) 5px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 
 .message-bubble a {
@@ -1038,7 +1035,7 @@ select option:hover {
 .message-bubble table {
   border-collapse: collapse;
   width: 100%;
-  font-size: 12px;
+  font-size: var(--fs-md);
 }
 .message-bubble th,
 .message-bubble td {
@@ -1086,7 +1083,7 @@ select option:hover {
 }
 
 .code-language {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--gold);
   text-transform: uppercase;
@@ -1094,7 +1091,7 @@ select option:hover {
 }
 
 .code-path {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -1111,10 +1108,10 @@ select option:hover {
 
 .code-actions button {
   padding: 3px var(--space-4);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s, opacity 0.15s;
   white-space: nowrap;
@@ -1133,13 +1130,11 @@ select option:hover {
   background: var(--border-hover);
 }
 
-.code-actions .insert-button,
 .code-actions .apply-button {
   color: var(--gold-text);
   background: var(--gold);
 }
 
-.code-actions .insert-button:hover,
 .code-actions .apply-button:hover {
   background: var(--gold-hover);
 }
@@ -1164,7 +1159,7 @@ select option:hover {
   border-radius: 0;
   color: var(--text);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.55;
 }
 
@@ -1262,7 +1257,7 @@ select option:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 /* The command or URL. First to give up space on a narrow sidebar, because the
@@ -1273,7 +1268,7 @@ select option:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
 }
@@ -1285,14 +1280,14 @@ select option:hover {
 .task-dock-row.restored .task-dock-dot { background: var(--amber); animation: none; }
 .task-dock-tag {
   flex-shrink: 0;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: uppercase;
   color: var(--amber);
   background: var(--amber-soft);
   border: 1px solid var(--amber-line);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   padding: 1px 4px;
   white-space: nowrap;
 }
@@ -1304,7 +1299,7 @@ select option:hover {
   align-items: center;
   gap: var(--space-1);
   padding: var(--space-1) var(--space-3);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--muted);
   background: var(--surface);
@@ -1321,7 +1316,7 @@ select option:hover {
   align-items: center;
   gap: var(--space-1);
   padding: var(--space-1) var(--space-3);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--red);
   background: var(--red-soft);
@@ -1363,7 +1358,7 @@ textarea {
   color: var(--text);
   background: transparent;
   border: 0;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   line-height: 1.6;
 }
 
@@ -1438,9 +1433,9 @@ textarea:focus {
   align-items: center;
   gap: var(--space-2);
   padding: 3px var(--space-4);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--muted);
@@ -1479,7 +1474,7 @@ textarea:focus {
   border: 0;
   color: var(--muted);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1;
 }
 
@@ -1504,7 +1499,7 @@ textarea:focus {
   gap: 5px;
   padding: var(--space-2) var(--space-4);
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   cursor: pointer;
   border-radius: var(--radius-sm);
@@ -1576,20 +1571,20 @@ textarea:focus {
 }
 
 .diff-card.is-approved .diff-filename {
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--muted);
   font-weight: 500;
 }
 .diff-card.is-approved .diff-filepath { display: none; }
 .diff-card.is-rejected .diff-filename {
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--muted);
   font-weight: 500;
 }
 .diff-card.is-rejected .diff-filepath { display: none; }
 
 .diff-card.is-approved .diff-status {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--green);
   background: transparent;
@@ -1598,7 +1593,7 @@ textarea:focus {
 }
 
 .diff-card.is-rejected .diff-status {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--muted);
   background: transparent;
@@ -1606,72 +1601,7 @@ textarea:focus {
   padding: 0;
 }
 
-/* ── Tool card layout ─────────────────────────────────────────────────────── */
-.tool-header {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--card-gap);
-  padding: var(--card-pad-y) var(--card-pad-x);
-  background: var(--bg);
-}
-
 .tool-call  { border-left: 3px solid var(--gold); }
-.tool-result{ border-left: 3px solid var(--blue); }
-
-.tool-done  { border-left-color: var(--blue); opacity: 0.82; }
-.tool-error { border-left-color: var(--red); opacity: 1; }
-
-.tool-icon-wrap {
-  flex-shrink: 0;
-  color: var(--gold);
-  margin-top: 1px;
-  display: flex;
-}
-.tool-done  .tool-icon-wrap { color: var(--blue); }
-.tool-error .tool-icon-wrap { color: var(--red); }
-
-.tool-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.tool-verb {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  line-height: 1.3;
-}
-
-.tool-filename {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
-  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  word-break: break-all;
-  line-height: 1.4;
-}
-
-.tool-dir {
-  font-size: 11px;
-  color: var(--muted);
-  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  word-break: break-all;
-  line-height: 1.3;
-}
-
-.tool-spinner {
-  color: var(--gold);
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  will-change: transform;
-  animation: spin-wheel 1.4s linear infinite;
-}
 @keyframes spin-wheel { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
 /* ── Inline tool-progress row (ship-wheel spinner) ───────────────────────── */
@@ -1684,7 +1614,7 @@ textarea:focus {
   overflow-x: hidden;
   overflow-y: auto;
   max-height: 160px; /* ~5 rows at 32px each */
-  font-size: 12px;
+  font-size: var(--fs-md);
 }
 
 .activity-log-collapsed {
@@ -1700,7 +1630,7 @@ textarea:focus {
   display: flex;
   align-items: center;
   gap: var(--space-4);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   padding: 0 var(--space-5);
   height: 32px;
@@ -1741,14 +1671,14 @@ textarea:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: var(--fs-lg);
 }
 .act-check { color: var(--green); font-weight: 700; }
 .act-x     { color: var(--red);   font-weight: 700; }
 
 .act-verb {
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -1759,7 +1689,7 @@ textarea:focus {
 
 .act-target {
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 500;
   color: var(--text);
   max-width: 240px;
@@ -1776,7 +1706,7 @@ textarea:focus {
 
 .act-result {
   margin-left: auto;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text);
   opacity: 0.55;
   max-width: 200px;
@@ -1806,45 +1736,6 @@ textarea:focus {
   color: var(--gold);
 }
 
-.tool-error-text {
-  padding: var(--space-3) var(--space-5) var(--space-4) 36px;
-  font-size: 11px;
-  color: var(--red);
-  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  white-space: pre-wrap;
-  word-break: break-word;
-  border-top: 1px solid var(--red-line);
-}
-
-/* Collapsible result preview */
-.tool-preview { border-top: 1px solid var(--border); }
-.tool-preview-toggle {
-  width: 100%;
-  text-align: left;
-  padding: 5px var(--space-5);
-  font-size: 11px;
-  color: var(--muted);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-}
-.tool-preview-toggle:hover { color: var(--text); background: var(--surface-hover); }
-.tool-preview-body {
-  display: none;
-  margin: 0;
-  padding: var(--space-3) var(--space-5) 10px;
-  max-height: 200px;
-  overflow-y: auto;
-  font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.tool-preview.expanded .tool-preview-body { display: block; }
-
 /* ── Diff card ───────────────────────────────────────────────────────────── */
 .diff-header {
   display: flex;
@@ -1864,7 +1755,7 @@ textarea:focus {
 }
 
 .diff-filename {
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 700;
   color: var(--gold);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
@@ -1873,21 +1764,21 @@ textarea:focus {
 }
 
 .diff-filepath {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
   word-break: break-all;
 }
 
 .diff-status {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--amber);
   white-space: nowrap;
   flex-shrink: 0;
   background: var(--amber-soft);
   padding: var(--space-1) var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--amber-line);
 }
 
@@ -1896,7 +1787,7 @@ textarea:focus {
   max-height: 380px;
   overflow-y: auto;
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.55;
   background: var(--bg);
 }
@@ -1907,7 +1798,7 @@ textarea:focus {
   padding: var(--space-3) var(--space-5);
   background: var(--bg);
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
 }
 
@@ -1917,7 +1808,7 @@ textarea:focus {
 }
 
 .diff-ln {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   text-align: right;
   width: 32px;
@@ -1960,7 +1851,7 @@ textarea:focus {
 
 .diff-skip {
   padding: 3px 10px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   background: var(--sunken);
   border-top: 1px dashed var(--border);
@@ -1986,7 +1877,7 @@ textarea:focus {
   flex: 1 1 auto;
   min-width: 0;
   padding: var(--space-4) 20px;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 700;
   border: 0;
   border-radius: var(--radius-sm);
@@ -2031,7 +1922,7 @@ textarea:focus {
 /* ── Approval mode select ─────────────────────────────────────────────────── */
 #approvalModeSelect {
   padding: 3px var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   color: var(--gold);
   background: transparent;
@@ -2056,12 +1947,12 @@ textarea:focus {
 /* ── Thinking level select ───────────────────────────────────────────────── */
 #thinkingLevelSelect {
   padding: 3px var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   background: transparent;
   color: var(--gold);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   letter-spacing: 0.3px;
   transition: border-color 0.15s;
@@ -2094,9 +1985,9 @@ textarea:focus {
   right: -5px;
   background: var(--gold);
   color: var(--gold-text);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 800;
-  border-radius: 8px;
+  border-radius: var(--radius);
   min-width: 14px;
   height: 14px;
   line-height: 14px;
@@ -2109,7 +2000,7 @@ textarea:focus {
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   padding: 10px 14px;
-  font-size: 12px;
+  font-size: var(--fs-md);
   max-height: 220px;
   overflow-y: auto;
 }
@@ -2122,7 +2013,7 @@ textarea:focus {
 }
 
 .memory-panel-title {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -2138,9 +2029,9 @@ textarea:focus {
   background: none;
   border: 1px solid var(--border);
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   padding: var(--space-1) 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s;
 }
@@ -2152,7 +2043,7 @@ textarea:focus {
 }
 .memory-content ul { padding-left: 16px; margin: 0; }
 .memory-content li { margin: var(--space-1) 0; }
-.memory-empty { color: var(--muted); font-style: italic; font-size: 12px; }
+.memory-empty { color: var(--muted); font-style: italic; font-size: var(--fs-md); }
 
 /* ── Settings panel ──────────────────────────────────────────────────────── */
 .settings-panel {
@@ -2175,7 +2066,7 @@ textarea:focus {
 }
 
 .settings-title {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -2202,7 +2093,7 @@ textarea:focus {
 }
 .setting-legend {
   padding: 0 var(--space-3) 0 0;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.7px;
@@ -2212,7 +2103,7 @@ textarea:focus {
 /* Pointer to VS Code's own settings UI for everything this panel omits. */
 .settings-more {
   margin: 0 0 var(--space-5);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--muted);
 }
@@ -2245,7 +2136,7 @@ textarea:focus {
 
 .setting-label {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--muted);
   text-transform: uppercase;
@@ -2260,9 +2151,9 @@ textarea:focus {
   border: 1px solid var(--border);
   color: var(--text);
   font-family: var(--vscode-font-family);
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 5px var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   outline: none;
   transition: border-color 0.15s;
 }
@@ -2276,9 +2167,9 @@ textarea:focus {
   border: 1px solid var(--border);
   color: var(--text);
   font-family: var(--vscode-font-family);
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: 5px var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   outline: none;
   -webkit-appearance: none;
   appearance: none;
@@ -2295,9 +2186,9 @@ textarea:focus {
   border: 1px solid var(--border);
   color: var(--text);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-md);
   padding: var(--space-3) var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   outline: none;
   resize: vertical;
   line-height: 1.5;
@@ -2307,7 +2198,7 @@ textarea:focus {
 
 .setting-hint {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   margin-top: 4px;
   line-height: 1.4;
@@ -2327,10 +2218,10 @@ textarea:focus {
   background: var(--gold);
   color: var(--gold-text);
   border: none;
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 700;
   padding: var(--space-3) var(--space-6);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s;
 }
@@ -2381,12 +2272,12 @@ textarea:focus {
 
 /* ── Queued message badge ─────────────────────────────────────────────────── */
 .queued-badge {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--gold);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: var(--space-1) 5px;
   white-space: nowrap;
 }
@@ -2402,7 +2293,7 @@ textarea:focus {
   align-items: center;
   gap: var(--space-3);
   margin-top: calc(var(--space-1) * -1);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 .msg-queue-tag {
   font-weight: 700;
@@ -2410,12 +2301,12 @@ textarea:focus {
   color: var(--gold);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: var(--space-1) 5px;
   white-space: nowrap;
 }
 .msg-queue-cancel {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--muted);
   background: var(--surface);
@@ -2461,7 +2352,7 @@ textarea:focus {
 /* ── System notice ────────────────────────────────────────────────────────── */
 .system-notice {
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   padding: var(--space-2) var(--space-5);
   font-style: italic;
@@ -2476,7 +2367,7 @@ textarea:focus {
   background: transparent;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: var(--fs-md);
   cursor: pointer;
   transition: border-color 0.15s;
 }
@@ -2507,11 +2398,11 @@ textarea:focus {
   min-width: 20px;
   height: 20px;
   padding: 0 5px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   color: var(--gold-text);
   background: var(--gold);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
@@ -2540,7 +2431,7 @@ textarea:focus {
 
 .approval-item {
   padding: 5px var(--space-5);
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
@@ -2605,7 +2496,7 @@ textarea:focus {
 
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -2639,7 +2530,7 @@ textarea:focus {
   border-bottom: 2px solid transparent;
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1;
   cursor: pointer;
   white-space: nowrap;
@@ -2682,9 +2573,9 @@ textarea:focus {
   border: none;
   background: transparent;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   line-height: 1;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   flex-shrink: 0;
 }
 .session-tab-close:hover {
@@ -2702,7 +2593,7 @@ textarea:focus {
   border: none;
   background: transparent;
   color: var(--muted);
-  font-size: 14px;
+  font-size: var(--fs-xl);
   border-radius: var(--radius-sm);
 }
 .session-tab-add:hover {
@@ -2721,7 +2612,7 @@ textarea:focus {
   height: 100%;
   width: 0%;
   transition: width 0.4s ease, background 0.4s ease;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
 }
 .context-bar-fill.ok     { background: linear-gradient(90deg, var(--green), #2ea043); }
 .context-bar-fill.warn   { background: linear-gradient(90deg, var(--amber), #b08800); }
@@ -2729,12 +2620,12 @@ textarea:focus {
 
 /* ── Token counter badge ──────────────────────────────────────────────────── */
 .token-counter {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   white-space: nowrap;
   padding: var(--space-1) 5px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: default;
   flex-shrink: 0;
   display: none;
@@ -2743,12 +2634,12 @@ textarea:focus {
 
 /* ── Rules active indicator ───────────────────────────────────────────────── */
 .rules-badge {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 800;
   color: var(--blue);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 1px var(--space-2);
   white-space: nowrap;
   flex-shrink: 0;
@@ -2758,7 +2649,7 @@ textarea:focus {
 
 /* ── Step progress badge ──────────────────────────────────────────────────── */
 .step-badge {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--muted);
   white-space: nowrap;
@@ -2788,7 +2679,7 @@ textarea:focus {
   gap: var(--space-4);
   padding: 7px var(--space-5);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-md);
   transition: background 0.1s;
 }
 .at-dropdown-item:hover,
@@ -2806,7 +2697,7 @@ textarea:focus {
   max-width: 160px;
 }
 .at-file-dir {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
   white-space: nowrap;
@@ -2818,12 +2709,12 @@ textarea:focus {
 
 /* ── Inline edit status chip ──────────────────────────────────────────────── */
 .inline-edit-badge {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--gold);
   background: var(--accent-wash);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: var(--space-1) 5px;
   white-space: nowrap;
   display: none;
@@ -2832,10 +2723,10 @@ textarea:focus {
 
 /* ── Diagnostics badge ────────────────────────────────────────────────────── */
 .diag-badge {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   padding: 1px var(--space-3);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -2880,19 +2771,19 @@ textarea:focus {
   background: var(--surface-hover);
 }
 .slash-icon {
-  font-size: 14px;
+  font-size: var(--fs-xl);
   width: 20px;
   flex-shrink: 0;
 }
 .slash-label {
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-weight: 700;
   color: var(--gold);
   min-width: 60px;
   flex-shrink: 0;
 }
 .slash-desc {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2904,11 +2795,11 @@ textarea:focus {
   margin-left: auto;
   padding: 1px var(--space-3);
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.3px;
   color: var(--muted);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 }
 /* Remove a custom command. Deliberately faint until the row is hovered: it
    deletes a file, and a delete control competing for attention with the command
@@ -2926,7 +2817,7 @@ textarea:focus {
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--muted);
-  font-size: 14px;
+  font-size: var(--fs-xl);
   line-height: 1;
   cursor: pointer;
   opacity: 0;
@@ -2969,7 +2860,7 @@ textarea:focus {
 .image-preview-chip {
   position: relative;
   display: inline-flex;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   overflow: hidden;
   border: 1px solid var(--accent-line);
 }
@@ -2989,7 +2880,7 @@ textarea:focus {
   width: 16px;
   height: 16px;
   padding: 0;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   line-height: 1;
   background: rgba(0, 0, 0, 0.7);
   color: #fff;
@@ -3011,7 +2902,7 @@ textarea:focus {
   gap: 3px;
 }
 .image-chip-label {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   color: var(--muted);
   max-width: 70px;
   overflow: hidden;
@@ -3031,7 +2922,7 @@ textarea:focus {
   padding: 0;
   background: none;
   border: 1px solid var(--muted-line);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   color: var(--muted);
   cursor: pointer;
   flex-shrink: 0;
@@ -3052,17 +2943,17 @@ textarea:focus {
   gap: var(--space-2);
   background: var(--surface);
   border: 1px solid var(--accent-line);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 3px var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--fg);
 }
 .text-chip-ext {
   background: var(--accent-soft);
   color: var(--accent);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   padding: 1px var(--space-2);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   letter-spacing: 0.03em;
 }
@@ -3077,7 +2968,7 @@ textarea:focus {
   border: none;
   color: var(--muted);
   cursor: pointer;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   padding: 0 0 0 var(--space-1);
   line-height: 1;
 }
@@ -3088,10 +2979,10 @@ textarea:focus {
   display: inline-block;
   margin-top: 5px;
   padding: var(--space-1) var(--space-4);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--accent);
   cursor: pointer;
 }
@@ -3106,10 +2997,10 @@ textarea:focus {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: var(--space-1) 7px;
   color: var(--gold);
 }
@@ -3135,7 +3026,7 @@ textarea:focus {
   max-width: 90vw;
   max-height: 88vh;
   object-fit: contain;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.7);
   cursor: default;
   z-index: 1;
@@ -3152,7 +3043,7 @@ textarea:focus {
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 50%;
   color: #fff;
-  font-size: 14px;
+  font-size: var(--fs-xl);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -3178,16 +3069,16 @@ textarea:focus {
   border: none;
   outline: none;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-md);
   font-family: inherit;
 }
-.search-count { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.search-count { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; }
 .search-close {
   background: none;
   border: none;
   color: var(--muted);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-xl);
   line-height: 1;
   padding: 0 var(--space-1);
 }
@@ -3214,8 +3105,8 @@ textarea:focus {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.shell-panel-title { font-size: 11px; color: var(--muted); font-family: monospace; }
-.shell-panel-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 0 var(--space-1); }
+.shell-panel-title { font-size: var(--fs-sm); color: var(--muted); font-family: monospace; }
+.shell-panel-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: var(--fs-lg); padding: 0 var(--space-1); }
 .shell-panel-close:hover { color: var(--text); }
 .shell-output {
   flex: 1;
@@ -3223,7 +3114,7 @@ textarea:focus {
   padding: var(--space-3) 10px;
   margin: 0;
   font-family: 'Consolas', 'Menlo', monospace;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--vscode-terminal-foreground, #b8d7a3);
   white-space: pre-wrap;
   word-break: break-all;
@@ -3240,18 +3131,18 @@ textarea:focus {
 .think-summary {
   padding: 5px var(--space-4);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--muted);
   -webkit-user-select: none;
   user-select: none;
   list-style: none;
 }
 .think-summary::-webkit-details-marker { display: none; }
-.think-toggle-hint { font-size: 10px; opacity: 0.6; margin-left: 4px; }
+.think-toggle-hint { font-size: var(--fs-xs); opacity: 0.6; margin-left: 4px; }
 .think-content {
   margin: 0;
   padding: var(--space-4) 10px;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.5;
   color: var(--muted);
   border-top: 1px solid var(--border);
@@ -3260,7 +3151,7 @@ textarea:focus {
   overflow-x: auto;
 }
 .think-streaming {
-  font-size: 12px;
+  font-size: var(--fs-md);
   color: var(--muted);
   font-style: italic;
   padding: var(--space-2) 0;
@@ -3276,11 +3167,11 @@ textarea:focus {
 
 /* ── Symbol mention kind badge ──────────────────────────────────────────────── */
 .at-symbol-kind {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
   background: var(--surface-hover);
   border: 1px solid var(--border);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   padding: 1px var(--space-2);
   color: var(--muted);
   margin-right: 4px;
@@ -3340,12 +3231,12 @@ textarea:focus {
   margin-bottom: 2px;
 }
 .rp-name {
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text);
 }
 .rp-status {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--amber);
 }
@@ -3355,7 +3246,7 @@ textarea:focus {
 
 .rp-command {
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   margin-bottom: 6px;
 }
@@ -3386,7 +3277,7 @@ textarea:focus {
 }
 .rp-link {
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 13px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--gold);
   text-decoration: none;
@@ -3398,11 +3289,11 @@ textarea:focus {
 
 .rp-open-btn {
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   padding: var(--space-1) var(--space-4);
   background: var(--accent-soft);
   border: 1px solid var(--accent-line);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   color: var(--gold);
   cursor: pointer;
 }
@@ -3412,18 +3303,18 @@ textarea:focus {
   margin-top: 4px;
 }
 .rp-log-toggle {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
   list-style: none;
 }
-.rp-log-toggle::before { content: '▶ '; font-size: 9px; }
+.rp-log-toggle::before { content: '▶ '; font-size: var(--fs-2xs); }
 details[open] .rp-log-toggle::before { content: '▼ '; }
 .rp-log {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
   color: var(--muted);
   max-height: 160px;
@@ -3432,7 +3323,7 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   word-break: break-all;
   background: var(--bg);
   padding: var(--space-3) var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
 }
 
 /* Actions column: stop button */
@@ -3441,12 +3332,12 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   padding: var(--space-2) var(--space-4);
   background: var(--red-wash);
   border: 1px solid var(--red);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   color: var(--red);
   cursor: pointer;
   white-space: nowrap;
@@ -3461,7 +3352,7 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   border: 1px solid var(--border);
   border-left: 3px solid var(--amber);
   border-radius: var(--radius);
-  font-size: 13px;
+  font-size: var(--fs-lg);
 }
 .bg-task-header {
   display: flex;
@@ -3470,11 +3361,11 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   margin-bottom: 6px;
 }
 .bg-task-badge {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   letter-spacing: 0.04em;
   padding: var(--space-1) var(--space-3);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   background: var(--amber);
   color: var(--bg);
   flex-shrink: 0;
@@ -3485,13 +3376,13 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
 .bg-task-prompt {
   flex: 1;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-md);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .bg-task-status {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   flex-shrink: 0;
 }
@@ -3504,9 +3395,9 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   border: 1px solid var(--border);
   color: var(--muted);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   padding: var(--space-1) var(--space-3);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
   flex-shrink: 0;
 }
 .bg-task-abort:hover { border-color: var(--red); color: var(--red); }
@@ -3515,18 +3406,18 @@ details[open] .rp-log-toggle::before { content: '▼ '; }
   margin-bottom: 6px;
 }
 .bg-task-summary {
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
   list-style: none;
 }
-.bg-task-summary::before { content: '▶ '; font-size: 9px; }
+.bg-task-summary::before { content: '▶ '; font-size: var(--fs-2xs); }
 details[open] .bg-task-summary::before { content: '▼ '; }
 .bg-task-log {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-family: var(--mono);
   color: var(--muted);
   max-height: 120px;
@@ -3545,7 +3436,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 
 .bg-process-output {
   margin: var(--space-2) 0 0;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-family: var(--mono);
   max-height: 180px;
   overflow-y: auto;
@@ -3554,13 +3445,13 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   color: var(--text);
   background: var(--bg);
   padding: var(--space-3) var(--space-4);
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
 }
 
 /* ── Restore note (shown at top of a restored session) ─────────────────────── */
 .restore-note {
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   padding: var(--space-3) var(--space-5);
   margin: var(--space-2) 0;
@@ -3575,7 +3466,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   top: 2px;
   right: 4px;
   padding: var(--space-1) 7px;
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.4;
   color: var(--muted);
   background: var(--surface);
@@ -3602,7 +3493,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   top: 2px;
   left: 64px;
   padding: var(--space-1) var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.4;
   color: var(--muted);
   background: var(--surface);
@@ -3629,7 +3520,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   top: 2px;
   right: 34px;
   padding: var(--space-1) var(--space-3);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.4;
   color: var(--muted);
   background: var(--surface);
@@ -3659,7 +3550,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
    buttons rather than push them off. It shrinks to an ellipsis and keeps the
    full text on its tooltip. */
 .mic-status {
-  font-size: 10px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   white-space: nowrap;
   align-self: center;
@@ -3692,7 +3583,7 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .setting-optional {
   font-weight: 400;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 /* ── Keyboard focus visibility ─────────────────────────────────────────────── */
@@ -3737,10 +3628,10 @@ textarea:focus-visible,
   margin-left: 4px;
   padding: 0 5px;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 18px;
   cursor: pointer;
   opacity: 0;
@@ -3773,31 +3664,31 @@ textarea:focus-visible,
   display: block;
   margin: var(--space-2) auto 10px;
   padding: 3px 10px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   cursor: pointer;
 }
 .history-more-btn:hover { color: var(--text); border-color: var(--border-hover); }
 .term-out-row { border-top: 1px solid var(--border); }
 .term-label {
-  font-size: 9px; font-weight: 700; letter-spacing: 0.08em;
+  font-size: var(--fs-2xs); font-weight: 700; letter-spacing: 0.08em;
   color: var(--muted); width: 26px; flex-shrink: 0; padding-top: 3px;
   -webkit-user-select: none; user-select: none;
 }
 .term-in, .term-out {
   margin: 0; flex: 1; min-width: 0;
   font-family: var(--vscode-editor-font-family), 'SFMono-Regular', Consolas, monospace;
-  font-size: 12px; line-height: 1.5;
+  font-size: var(--fs-md); line-height: 1.5;
   white-space: pre-wrap; word-break: break-word;
   background: none; color: var(--text);
 }
 .term-out { max-height: 240px; overflow-y: auto; }
 .term-out.collapsed { max-height: 110px; overflow: hidden; }
 .term-stderr { color: var(--red); }
-.term-status { margin-left: auto; font-size: 10px; font-weight: 600; flex-shrink: 0; padding-top: 2px; }
+.term-status { margin-left: auto; font-size: var(--fs-xs); font-weight: 600; flex-shrink: 0; padding-top: 2px; }
 .term-status.running { color: var(--gold); }
 .term-status.ok   { color: var(--green); }
 .term-status.fail { color: var(--red); }
@@ -3806,7 +3697,7 @@ textarea:focus-visible,
 .expand-btn {
   display: block; width: 100%;
   padding: 3px var(--space-4);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--muted);
   background: transparent;
   border: none; border-top: 1px dashed var(--border);
@@ -3890,7 +3781,6 @@ textarea:focus-visible,
      it — which is why the original one-line `.spin-wheel { animation: none }`
      silently missed both. */
   .spin-wheel,
-  .tool-spinner,
   .session-tab-spinner,
   .app.is-thinking .brand-icon,
   .activity-row.running .act-icon,
@@ -3947,11 +3837,11 @@ textarea:focus-visible,
   min-width: 0;
   height: 24px;
   padding: 0 7px;
-  font-size: 11px;
+  font-size: var(--fs-sm);
   color: var(--text);
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 .model-filter:focus { outline: none; border-color: var(--gold); }
 
@@ -3967,7 +3857,7 @@ textarea:focus-visible,
 }
 .plan-card-header {
   padding: 7px var(--space-5);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   letter-spacing: 0.3px;
   color: var(--muted);
@@ -3984,7 +3874,7 @@ textarea:focus-visible,
   align-items: flex-start;
   gap: var(--space-4);
   padding: 5px var(--space-5);
-  font-size: 12px;
+  font-size: var(--fs-md);
   line-height: 1.5;
 }
 .plan-step-icon {
@@ -4059,8 +3949,6 @@ textarea:focus-visible,
     border-left-style: double;
   }
   .tool-call   { border-left-style: solid; }
-  .tool-result { border-left-style: dashed; }
-  .tool-error  { border-left-style: double; border-left-width: 5px; }
 
   /* A gradient is dropped; a border and a system fill are not. */
   .context-bar { border: 1px solid CanvasText; }

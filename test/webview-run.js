@@ -2339,6 +2339,61 @@ function rewindControlSuite() {
 //
 // What this pins is the DIVISION, not the pixels — jsdom does not paint. A
 // control drifting back to the title bar is the regression worth catching.
+// The stylesheet is 4,000 lines maintained by hand beside a 6,000-line renderer,
+// and nothing connected the two. It had accumulated 173 lines of rules for a
+// tool-card design replaced by .activity-row, an eight-value border-radius
+// "scale" whose two tokens (8px and 5px) described none of the values actually
+// used, and 157 font-size literals against a single token. None of that is
+// visible in a screenshot; all of it is why controls stopped matching.
+function designSystemSuite() {
+  console.log('\ndesign system: one scale, and nothing rendering-dead:');
+  const css = readSource('media', 'styles.css');
+  const rendered = readSource('media', 'main.js') + readSource('src', 'webview-html.js');
+
+  // ── No rule may target a class the panel never renders. ────────────────
+  // The catch is that some class names are BUILT — the syntax highlighter emits
+  // '<span class="tok-' + kind + '">', so "tok-string" appears nowhere as a
+  // literal while being entirely live. A class counts as rendered if its own
+  // name appears, or if a prefix of it appears as a quoted fragment.
+  const cssClasses = [...new Set([...css.matchAll(/\.([a-z][\w-]*)/g)].map(m => m[1]))];
+  const builtPrefixes = [...new Set([...rendered.matchAll(/['"`]([a-z][\w-]*-)['"`+]/g)].map(m => m[1]))];
+  const isLive = (cls) => rendered.includes(cls)
+    || builtPrefixes.some(p => cls.startsWith(p) && cls.length > p.length);
+  const dead = cssClasses.filter(c => !isLive(c));
+  check('every CSS class targets something the panel can actually render',
+    dead.length === 0, dead.slice(0, 12).join(', '));
+
+  // ── The scales are named, and describe what is really used. ────────────
+  const rawFont = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(m => m[1] + 'px');
+  // 16px and 22px are one use each: a token used once is noise, not a scale.
+  const unexpectedFont = rawFont.filter(v => !['16px', '22px'].includes(v));
+  check('font sizes come from the scale, not from eye',
+    unexpectedFont.length === 0, [...new Set(unexpectedFont)].join(', '));
+
+  const rawRadius = [...css.matchAll(/border-radius:\s*(\d+)px/g)].map(m => m[1] + 'px');
+  const unexpectedRadius = rawRadius.filter(v => v !== '16px');
+  check('corner radii come from the scale',
+    unexpectedRadius.length === 0, [...new Set(unexpectedRadius)].join(', '));
+
+  // A token nobody uses is drift waiting to happen, and a token used once is
+  // not a scale — both were true of the pair this replaced.
+  for (const tok of ['--fs-2xs', '--fs-xs', '--fs-sm', '--fs-md', '--fs-lg', '--fs-xl',
+                     '--radius-sm', '--radius-md', '--radius', '--radius-pill']) {
+    const declared = new RegExp('^\\s*' + tok + ':', 'm').test(css);
+    const uses = (css.match(new RegExp('var\\(' + tok + '\\)', 'g')) || []).length;
+    check(`${tok} is declared and actually used`, declared && uses > 0, `declared=${declared} uses=${uses}`);
+  }
+
+  // ── The one that started this: controls sharing a row share a radius. ──
+  const radiusOf = (sel) => {
+    const body = new RegExp('(^|\\})\\s*\\' + sel + '\\s*\\{([^}]*)\\}', 'm').exec(css)?.[2] || '';
+    return /border-radius:\s*var\((--[\w-]+)\)/.exec(body)?.[1] || '(none)';
+  };
+  check('the chip and the mode selects in the composer row share one radius',
+    radiusOf('.chip') === radiusOf('.select-compact') && radiusOf('.chip') !== '(none)',
+    `chip=${radiusOf('.chip')} select=${radiusOf('.select-compact')}`);
+}
+
 function composerModesSuite() {
   console.log('\ncomposer modes: per-turn controls sit with the composer:');
 
@@ -3035,6 +3090,7 @@ msgStepSuite();
 scrollArrowInsetSuite();
 commandApprovalSuite();
 fileChipSuite();
+designSystemSuite();
 composerModesSuite();
 planCardSuite();
 rewindControlSuite();
