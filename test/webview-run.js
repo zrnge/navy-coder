@@ -2400,7 +2400,10 @@ function composerModesSuite() {
   const w = createWebview();
   const d = w.document;
 
-  const TURN_CONTROLS = ['#contextSelect', '#thinkingLevelSelect', '#approvalModeSelect', '#commandApprovalSelect'];
+  // The context window moved back up beside the model: it is a property OF the
+  // model, populated from whatever window the active one reports, so "Max ·
+  // 256k ctx" is meaningless without the model it is the max for.
+  const TURN_CONTROLS = ['#thinkingLevelSelect', '#approvalModeSelect', '#commandApprovalSelect'];
   for (const sel of TURN_CONTROLS) {
     const el = d.querySelector(sel);
     check(`${sel} exists`, Boolean(el));
@@ -2410,7 +2413,9 @@ function composerModesSuite() {
 
   // Everything that stayed up top is either identity, live status, or an action
   // on the conversation as a whole — none of it changes what the next turn does.
-  const CHAT_LEVEL = ['#memoryButton', '#undoButton', '#redoButton', '#newChatButton', '#settingsButton'];
+  const CHAT_LEVEL = ['#memoryButton', '#undoButton', '#redoButton', '#newChatButton', '#settingsButton',
+    // What you are working on, with what, and how much of it — one row.
+    '#projectSelect', '#modelSelect', '#contextSelect'];
   for (const sel of CHAT_LEVEL) {
     const el = d.querySelector(sel);
     if (!el) continue; // not every build has every one; absence is not this test's business
@@ -2425,10 +2430,14 @@ function composerModesSuite() {
   const inGroup = [...d.querySelectorAll('.composer-modes > *')].map(e => e.id || e.className);
   check('the modes read in the order you would decide them',
     JSON.stringify(inGroup) === JSON.stringify([
-      'contextSelect', 'thinkingLevelSelect', 'composer-modes-sep',
+      'thinkingLevelSelect', 'composer-modes-sep',
       'approvalModeSelect', 'commandApprovalSelect']), JSON.stringify(inGroup));
   check('a separator divides the two approval gates from the rest',
     d.querySelectorAll('.composer-modes-sep').length === 1);
+  // The pairing that was split and is now not: a window size means nothing
+  // without the model whose window it is.
+  check('the context window sits with the model, not away from it',
+    d.querySelector('#contextSelect')?.parentElement === d.querySelector('#modelSelect')?.parentElement);
 
   // The group sits between the file chips and the send controls — the gap that
   // was already empty in that row.

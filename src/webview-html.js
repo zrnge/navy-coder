@@ -124,6 +124,13 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
       <div class="topbar-row topbar-row2">
         <select id="projectSelect" title="Project directory" aria-label="Project directory" class="select-project"></select>
         <select id="modelSelect" title="Model" class="select-model" aria-label="Model"></select>
+        <!-- Next to the model because it is a property OF the model: populated
+             from whatever window the ACTIVE one reports (see
+             resolveModelContext / fetchModelContext), rebuilt when the model
+             changes, and hidden entirely while no window is known rather than
+             offering a guess. "Max · 256k ctx" is meaningless without the model
+             it is the max for. -->
+        <select id="contextSelect" class="select-compact context-select" title="Context window" aria-label="Context window"></select>
       </div>
       <!-- Row 3: session tabs — one per open project. A background tab's turn
            keeps running (see its spinner) but only the active tab's
@@ -468,12 +475,6 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                  One group, in the empty middle of a row that already existed,
                  reading left to right in the order you would decide them. -->
             <div class="composer-modes">
-              <!-- Populated from whatever window the ACTIVE model actually
-                   reports (see resolveModelContext / fetchModelContext) — the
-                   options are built per model, not a fixed list, so a 1M-token
-                   model offers sizes an 8k one never will. Hidden entirely
-                   while no window is known, rather than offering a guess. -->
-              <select id="contextSelect" class="select-compact context-select" title="Context window" aria-label="Context window"></select>
               <select id="thinkingLevelSelect" title="Thinking depth" aria-label="Thinking depth" class="select-compact">
                 <option value="fast">Fast</option>
                 <option value="medium" selected>Med</option>

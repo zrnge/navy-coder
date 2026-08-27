@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,033 tests, no network, no API keys
+npm test             # 2,035 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
