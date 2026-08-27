@@ -3257,40 +3257,37 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
     attachCodeBlockActions(bubble);
   }
 
-  // Hover copy button. Assistant replies copy their markdown source; a user
-  // message copies exactly what was typed — long prompts are collapsed behind
-  // a "Show N more lines" toggle, so the visible text is not the whole thing
-  // and reading it off the DOM would silently truncate. `text` is the original
-  // input, so it is used directly.
-  // Rewind. Offered on your own messages only: rewinding is defined as "put me
-  // back to just before I said this", which has no meaning for a reply. The
-  // extension asks for confirmation and owns the file question — the panel
-  // never decides either.
-  if (role === 'user') {
-    const myIndex = messageIndex;
-    const rewindBtn = document.createElement('button');
-    rewindBtn.type = 'button';
-    rewindBtn.className = 'msg-rewind-btn';
-    rewindBtn.title = 'Rewind the conversation to just before this message';
-    rewindBtn.setAttribute('aria-label', rewindBtn.title);
-    rewindBtn.innerHTML = icon('rewind');
-    rewindBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'rewindTo', index: myIndex });
-    });
-    article.appendChild(rewindBtn);
-  }
-  if (role === 'user' || role === 'assistant') messageIndex++;
-
+  // Message actions: one row, in the flow, below the message.
+  //
+  // These used to be three buttons positioned absolutely over the bubble and
+  // revealed on hover. That put them on top of the text — a third one on a user
+  // message landed in the middle of it — and hover-only meant nobody found
+  // them. The row takes real layout space; .msg-actions carries `order` so it
+  // stays last however the article is assembled, which matters because an
+  // assistant turn keeps appending bubbles and cards while it streams.
   if (role === 'assistant' || role === 'user') {
-    const copyBtn = document.createElement('button');
-    copyBtn.type = 'button';
-    copyBtn.className = 'msg-copy-btn';
-    copyBtn.title = role === 'user' ? 'Copy your message' : 'Copy message';
-    copyBtn.setAttribute('aria-label', copyBtn.title);
-    copyBtn.innerHTML = icon('copy');
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+
+    const mkAction = (cls, label, glyph) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'msg-action ' + cls;
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      b.innerHTML = icon(glyph);
+      actions.appendChild(b);
+      return b;
+    };
+
+    // Assistant replies copy their markdown SOURCE; a user message copies
+    // exactly what was typed — a long prompt is collapsed behind a "Show N more
+    // lines" toggle, so reading the visible text off the DOM would silently
+    // truncate it. `text` is the original input, so it is used directly.
+    const copyBtn = mkAction('msg-copy-btn', role === 'user' ? 'Copy your message' : 'Copy message', 'copy');
     copyBtn.addEventListener('click', () => {
-      // Prefer the article: a reply split across several bubbles by tool activity
-      // records its full markdown there, so copy still yields the whole reply.
+      // Prefer the article: a reply split across several bubbles by tool
+      // activity records its full markdown there, so copy still yields all of it.
       const payload = role === 'user'
         ? text
         : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
@@ -3298,17 +3295,11 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
       copyBtn.innerHTML = icon('check');
       setTimeout(() => { copyBtn.innerHTML = icon('copy'); }, 1200);
     });
-    article.appendChild(copyBtn);
 
     // Read aloud. Only offered when the renderer actually provides speech
     // synthesis — a button that can only fail is worse than no button.
     if (SPEECH_AVAILABLE) {
-      const speakBtn = document.createElement('button');
-      speakBtn.type = 'button';
-      speakBtn.className = 'msg-speak-btn';
-      speakBtn.title = 'Read aloud';
-      speakBtn.setAttribute('aria-label', 'Read aloud');
-      speakBtn.innerHTML = icon('speak');
+      const speakBtn = mkAction('msg-speak-btn', 'Read aloud', 'speak');
       speakBtn.addEventListener('click', () => {
         // Clicking the button that is already speaking stops it — the same
         // control both starts and cancels, so there is never a reading you
@@ -3319,9 +3310,27 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
           : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
         speakText(speakableText(source), speakBtn);
       });
-      article.appendChild(speakBtn);
     }
+
+    // Edit, on your own messages only — editing a reply has no meaning.
+    //
+    // Named for the intent, not the mechanism. It rewinds: the extension
+    // discards this message and everything after it, and hands the prompt back
+    // to the composer so you can change it and send again. That IS editing, and
+    // "Rewind" described the machinery to a user who only wanted to reword a
+    // question. The protocol keeps the accurate name — the extension really
+    // does rewind, and the confirmation says plainly what is discarded.
+    if (role === 'user') {
+      const myIndex = messageIndex;
+      const editBtn = mkAction('msg-edit-btn', 'Edit this message — discards it and everything after', 'edit');
+      editBtn.addEventListener('click', () => {
+        vscode.postMessage({ type: 'rewindTo', index: myIndex });
+      });
+    }
+
+    article.appendChild(actions);
   }
+  if (role === 'user' || role === 'assistant') messageIndex++;
 
   article.appendChild(bubble);
   messagesEl.appendChild(article);

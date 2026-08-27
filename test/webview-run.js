@@ -2268,24 +2268,48 @@ function rewindControlSuite() {
   ] }]);
   const d = w.document;
 
-  const buttons = [...d.querySelectorAll('.msg-rewind-btn')];
-  check('every one of your messages offers a rewind', buttons.length === 2, buttons.length);
-  check('replies do not — rewind means "before I said this"',
-    [...d.querySelectorAll('.message.assistant .msg-rewind-btn')].length === 0);
+  const buttons = [...d.querySelectorAll('.msg-edit-btn')];
+  check('every one of your messages offers Edit', buttons.length === 2, buttons.length);
+  check('replies do not — editing a reply has no meaning',
+    [...d.querySelectorAll('.message.assistant .msg-edit-btn')].length === 0);
 
-  // It sits with copy and read-aloud and looks like them: an icon from the same
-  // sprite, not a text label breaking the row. It was text, anchored right,
-  // which on a user bubble (whose buttons mirror to the LEFT) put it on top of
-  // the message.
-  check('rewind is an icon from the sprite, like its two siblings',
-    /<svg[^>]*class="icon"/.test(buttons[0].innerHTML) && /#i-rewind/.test(buttons[0].innerHTML),
+  // Named for the intent, not the machinery. It rewinds — the extension
+  // discards this message and everything after it and hands the prompt back —
+  // but "Rewind" described the mechanism to a user who only wanted to reword a
+  // question. The protocol below keeps the accurate name.
+  check('the control is called Edit, not Rewind',
+    /edit/i.test(buttons[0].getAttribute('aria-label') || '') &&
+    !/rewind/i.test(buttons[0].getAttribute('aria-label') || ''),
+    buttons[0].getAttribute('aria-label'));
+  check('…and says what it costs, since it discards work',
+    /discards/i.test(buttons[0].getAttribute('title') || ''), buttons[0].getAttribute('title'));
+  check('Edit is an icon from the sprite, like its siblings',
+    /<svg[^>]*class="icon"/.test(buttons[0].innerHTML) && /#i-edit/.test(buttons[0].innerHTML),
     buttons[0].innerHTML.slice(0, 80));
-  check('rewind carries a label for anyone not reading the glyph',
-    /rewind/i.test(buttons[0].getAttribute('aria-label') || ''));
+
+  // ── The row, which is the point. These were three absolutely-positioned
+  //    buttons stacked by hand at 4px, 34px and 64px, sitting ON the message
+  //    text — a third one on a user bubble landed in the middle of it. ──────
+  const rows = [...d.querySelectorAll('.msg-actions')];
+  check('every message carries exactly one actions row', rows.length === 4, rows.length);
+  check('every action lives inside that row, not floating over the message',
+    [...d.querySelectorAll('.msg-action')].every(b => b.closest('.msg-actions')));
+  check('copy, read-aloud and Edit share one class rather than three near-copies',
+    [...d.querySelectorAll('.msg-copy-btn, .msg-speak-btn, .msg-edit-btn')]
+      .every(b => b.classList.contains('msg-action')));
+
   const css = readSource('media', 'styles.css');
-  const rewindRule = /\.msg-rewind-btn\s*\{([^}]*)\}/.exec(css)?.[1] || '';
-  check('rewind is anchored on the same side as copy and read-aloud',
-    /left:\s*64px/.test(rewindRule) && !/(^|[^-])right:/.test(rewindRule), rewindRule.trim());
+  const rowRule = /\.msg-actions\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('the row takes real layout space rather than being positioned over the text',
+    !/position:\s*absolute/.test(rowRule), rowRule.trim());
+  // An assistant turn keeps appending bubbles and cards while it streams, so a
+  // row inserted at creation time would end up mid-turn without this.
+  check('…and orders itself last, however the article was assembled',
+    /order:\s*\d/.test(rowRule), rowRule.trim());
+  check('the actions are visible at rest, not hover-only — an action nobody finds is not a feature',
+    /opacity:\s*0?\.[1-9]/.test(rowRule), rowRule.trim());
+  check('no rule still positions the old floating buttons',
+    !/msg-(copy|speak|rewind)-btn\s*\{/.test(css));
 
   buttons[0].click();
   buttons[1].click();
@@ -2304,7 +2328,7 @@ function rewindControlSuite() {
   w.post({ type: 'chunk', text: 'streamed reply' });
   w.post({ type: 'done' });
   const w2 = run([{ type: 'restore', messages: [{ role: 'user', text: 'only one' }] }]);
-  const only = [...w2.document.querySelectorAll('.msg-rewind-btn')];
+  const only = [...w2.document.querySelectorAll('.msg-edit-btn')];
   only[0].click();
   check('a rebuilt transcript restarts the count at zero',
     w2.sent.filter(m => m.type === 'rewindTo')[0].index === 0);

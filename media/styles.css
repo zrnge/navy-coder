@@ -3461,84 +3461,77 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .message.assistant {
   position: relative;
 }
-.msg-copy-btn {
-  position: absolute;
-  top: 2px;
-  right: 4px;
-  padding: var(--space-1) 7px;
-  font-size: var(--fs-md);
-  line-height: 1.4;
-  color: var(--muted);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  opacity: 0;
+/* ── Message actions ────────────────────────────────────────────────────────
+   A real row, in the flow, below the message it belongs to.
+
+   These were three near-identical blocks of absolutely-positioned buttons,
+   revealed on hover and stacked by hand at right/left 4px, 34px and 64px.
+   Three costs to that: the buttons sat ON TOP of the message text (a third one
+   added to a user bubble landed squarely in the middle of it), each new action
+   meant another copy of the same fifteen declarations plus another magic
+   offset, and hover-only meant nobody found them.
+
+   .message is already a flex column with per-role alignment, so `order` pins
+   this last however the article was assembled — which matters because an
+   assistant turn keeps appending bubbles and cards while it streams, and a row
+   inserted at creation time would otherwise end up in the middle of one. That
+   same alignment gives user rows right-alignment and assistant rows left, for
+   free.
+
+   Visible but quiet rather than hidden: an action nobody can find is not a
+   feature, and full opacity on every message would compete with the reading. */
+.msg-actions {
+  order: 99;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  opacity: 0.55;
   transition: opacity 0.12s;
 }
-.message.assistant:hover .msg-copy-btn,
-.message.user:hover .msg-copy-btn,
-.msg-copy-btn:focus-visible {
+.message:hover .msg-actions,
+.msg-actions:focus-within {
   opacity: 1;
 }
-/* Third in the row of message actions, after copy and read-aloud. It exists
-   only on your own messages, and user bubbles mirror their buttons to the LEFT
-   — copy at 4, read-aloud at 34 — so this continues that run at 64 rather than
-   anchoring right, where it sat on top of the message text.
 
-   Furthest from the cursor on purpose: it is the least-used of the three and
-   the only destructive one. */
-.msg-rewind-btn {
-  position: absolute;
-  top: 2px;
-  left: 64px;
+.msg-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: var(--space-1) var(--space-3);
   font-size: var(--fs-sm);
   line-height: 1.4;
   color: var(--muted);
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
 }
-.message.user:hover .msg-rewind-btn,
-.msg-rewind-btn:focus-visible {
-  opacity: 1;
+.msg-action:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
+  background: var(--surface);
 }
-/* Red only on hover: the row should read as three equal affordances until you
-   are actually pointing at the one that throws work away. */
-.msg-rewind-btn:hover {
+.msg-action:focus-visible {
+  outline: none;
+  color: var(--gold);
+  border-color: var(--gold);
+}
+
+/* Edit throws work away, so it earns a colour — but only once the pointer is
+   actually on it. At rest it is one of three equal affordances. */
+.msg-edit-btn:hover {
   color: var(--red);
   border-color: var(--red);
 }
 
-/* Read-aloud sits to the left of the copy button on the same row. */
-.msg-speak-btn {
-  position: absolute;
-  top: 2px;
-  right: 34px;
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--fs-sm);
-  line-height: 1.4;
-  color: var(--muted);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s;
+/* While speaking, the control stays lit without hover: it is the stop button,
+   and hunting for it mid-sentence would be exasperating. */
+.msg-action[data-speaking="true"] {
+  color: var(--gold);
+  border-color: var(--gold);
+  opacity: 1;
 }
-.message.assistant:hover .msg-speak-btn,
-.message.user:hover .msg-speak-btn,
-.msg-speak-btn:focus-visible { opacity: 1; }
-.msg-speak-btn:hover { color: var(--text); border-color: var(--border-hover); }
-/* While speaking the control stays visible even without hover — it is the stop
-   button, and hunting for it mid-sentence would be exasperating. */
-.msg-speak-btn[data-speaking="true"] { opacity: 1; color: var(--gold); border-color: var(--gold); }
-/* User bubbles put their buttons on the left, so the order mirrors. */
-.message.user .msg-speak-btn { right: auto; left: 34px; }
 
 /* ── Dictation controls ──────────────────────────────────────────────────── */
 .mic-button.recording {
@@ -3567,18 +3560,6 @@ details[open] .bg-task-summary::before { content: '▼ '; }
 .message.user {
   position: relative;
 }
-/* A user bubble is right-aligned and up to 88% wide, so the assistant's
-   top-right placement would sit on top of the text. Anchor it on the free
-   space to the left instead. */
-.message.user .msg-copy-btn {
-  right: auto;
-  left: 4px;
-}
-.msg-copy-btn:hover {
-  color: var(--text);
-  border-color: var(--border-hover);
-}
-
 /* ── Optional-field label hint in settings ─────────────────────────────────── */
 .setting-optional {
   font-weight: 400;
@@ -3965,7 +3946,7 @@ textarea:focus-visible,
      one of the few things forced-colors leaves alone — but a control revealed
      only on hover is invisible until then, which is worse under high contrast
      where users often navigate by keyboard. Show them all. */
-  .msg-copy-btn, .msg-speak-btn, .msg-rewind-btn, .term-copy-btn, .slash-remove { opacity: 1; }
+  .msg-actions, .term-copy-btn, .slash-remove { opacity: 1; }
 
   /* Focus must stay visible: the system colour is guaranteed, ours is not. */
   button:focus-visible,
