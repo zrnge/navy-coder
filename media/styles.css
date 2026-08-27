@@ -3493,6 +3493,16 @@ details[open] .bg-task-summary::before { content: '▼ '; }
   opacity: 1;
 }
 
+/* A caption on the message, not another control: no border, no hover state,
+   and it must never look clickable. Sits first in the row so it reads before
+   the actions do. */
+.msg-time {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+  padding: 0 var(--space-1);
+}
+
 .msg-action {
   display: flex;
   align-items: center;

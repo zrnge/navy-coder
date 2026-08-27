@@ -2257,6 +2257,71 @@ function fileChipSuite() {
 // Rewind names a message by its index in the extension's own history array, so
 // the panel has to keep a count that agrees with it exactly. An off-by-one here
 // discards the wrong turn, which is the one bug this feature must not have.
+// The panel had no timestamps anywhere — not live, not after restoring a chat.
+// In a long session there was no way to tell whether something happened two
+// minutes ago or yesterday, which is the one thing a transcript is uniquely
+// placed to answer.
+function messageTimeSuite() {
+  console.log('\nmessage timestamps:');
+
+  const now = Date.now();
+  const w = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'asked just now', ts: now },
+    { role: 'assistant', text: 'answered' },
+    { role: 'user', text: 'asked last week', ts: now - 7 * 24 * 3600 * 1000 },
+    { role: 'assistant', text: 'answered again' },
+  ] }]);
+  const d = w.document;
+
+  const times = [...d.querySelectorAll('.msg-time')];
+  check('a persisted timestamp is shown', times.length === 2, times.length);
+
+  // One per exchange, on the message that started it. Stamping the reply too
+  // would print two near-identical times per turn for no information.
+  check('replies carry no timestamp of their own',
+    d.querySelectorAll('.message.assistant .msg-time').length === 0);
+
+  // Today is the time alone; older needs the date, or "3:04" is ambiguous
+  // across days.
+  check('something from today shows the time only',
+    /^\d{1,2}[:.]\d{2}/.test(times[0].textContent.trim()), times[0].textContent);
+  check('something older shows the date as well',
+    times[1].textContent.length > times[0].textContent.length
+    && /\d/.test(times[1].textContent), times[1].textContent);
+  check('the exact moment is available on hover', Boolean(times[0].getAttribute('title')));
+
+  // It is a caption, not a control — it sits in the actions row but must not
+  // read as another button.
+  check('the timestamp lives in the actions row', Boolean(times[0].closest('.msg-actions')));
+  check('…first in it, so it reads before the actions',
+    times[0].parentElement.firstElementChild === times[0]);
+  check('…and is not a button', times[0].tagName !== 'BUTTON' && !times[0].classList.contains('msg-action'));
+
+  // A chat saved before this existed has no ts. Showing nothing is right;
+  // showing an epoch-zero date or an empty gap is not.
+  const old = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'from an older chat' },
+    { role: 'assistant', text: 'answered' },
+  ] }]);
+  check('a chat saved before timestamps existed shows none, rather than a wrong one',
+    old.document.querySelectorAll('.msg-time').length === 0);
+  check('…and still renders its messages and actions normally',
+    old.document.querySelectorAll('.message.user').length === 1
+    && old.document.querySelectorAll('.msg-actions').length === 2);
+
+  // A malformed value must not render "Invalid Date".
+  const bad = run([{ type: 'restore', messages: [{ role: 'user', text: 'x', ts: 'not-a-time' }] }]);
+  const badTime = bad.document.querySelector('.msg-time');
+  check('a malformed timestamp renders nothing rather than "Invalid Date"',
+    !badTime || !/invalid/i.test(badTime.textContent), badTime && badTime.textContent);
+
+  // And the extension has to actually record one, or none of the above ever
+  // has anything to show.
+  const extSrc = readSource('src', 'extension.js');
+  check('the extension stamps the user message it persists',
+    /role: 'user',[\s\S]{0,80}ts: Date\.now\(\)/.test(extSrc));
+}
+
 function rewindControlSuite() {
   console.log('\nrewind control (indexes the panel must get exactly right):');
 
@@ -3126,6 +3191,7 @@ fileChipSuite();
 designSystemSuite();
 composerModesSuite();
 planCardSuite();
+messageTimeSuite();
 rewindControlSuite();
 iconSuite();
 taskDockSuite();

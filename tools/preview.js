@@ -44,7 +44,7 @@ const SCRIPT = [
     sessionPrompt: 18420, sessionCompletion: 1310, sessionTotal: 19730,
     estimatedCost: 0.0721, costKnown: true },
   { type: 'restore', messages: [
-    { role: 'user', text: 'Refactor read_file and write_file, then delete *.log files' },
+    { role: 'user', text: 'Refactor read_file and write_file, then delete *.log files', ts: Date.now() - 9 * 60 * 1000 },
     { role: 'assistant', text: [
       'Here is the plan.',
       '',

@@ -3406,6 +3406,7 @@ class NavyCoderViewProvider {
     this.messages.push({
       role: 'user',
       text: prompt,
+      ts: Date.now(),
       ...(attachedNames.length ? { attachments: attachedNames } : {}),
       ...(images?.length ? { images: images.length } : {}),
       // See rewindToMessage in src/undo.js. Small and per-turn: a string that

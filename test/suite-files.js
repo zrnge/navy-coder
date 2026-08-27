@@ -570,6 +570,13 @@ async function rewindSuite() {
     check('setup: the file was actually changed', fs.readFileSync(target, 'utf8') === 'rewritten by turn two');
 
     // ── Every user message records what a rewind to it would restore. ─────
+    const stamped = provider.messages.filter(m => m.role === 'user');
+    check('turns record WHEN they were asked, in epoch ms',
+      stamped.every(m => Number.isFinite(m.ts) && Math.abs(Date.now() - m.ts) < 60000),
+      JSON.stringify(stamped.map(m => m.ts)));
+    check('replies are not stamped — one timestamp per exchange',
+      provider.messages.filter(m => m.role === 'assistant').every(m => m.ts === undefined));
+
     check('rewind: user messages carry a rewind point',
       provider.messages.filter(m => m.role === 'user').every(m => typeof m.rewind?.digest === 'string'));
     check('rewind: assistant messages carry the turn id that maps to their file changes',

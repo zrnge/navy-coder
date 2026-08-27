@@ -2655,7 +2655,7 @@ function sendPrompt() {
     finalPrompt = blocks + '\n\n' + prompt;
   }
 
-  const article = addMessage('user', prompt, attachedTexts.map(f => f.name), pastedImages.length);
+  const article = addMessage('user', prompt, attachedTexts.map(f => f.name), pastedImages.length, Date.now());
   promptInput.value = '';
   promptInput.style.height = 'auto';
   updateSendButton();
@@ -2831,7 +2831,7 @@ function renderHistoryItem(item) {
   if (item.role === 'user') {
     // Attachment/image badges are part of what the question WAS — replayed
     // from the persisted message rather than dropped on restore.
-    addMessage('user', item.text, item.attachments || [], item.images || 0);
+    addMessage('user', item.text, item.attachments || [], item.images || 0, item.ts || null);
   } else if (item.role === 'assistant') {
     renderAssistantTurn(item);
     // The plan as it stood when the turn ended. Rendered before the change
@@ -3166,7 +3166,23 @@ function createMessageHeader(role) {
   return header;
 }
 
-function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
+// Epoch ms -> what a person wants to read in a narrow sidebar: the time alone
+// for something from today, the date as well once it is older. Locale-aware, so
+// a 24-hour clock stays a 24-hour clock and the month is in the reader's own
+// language — this is one of the few places a hand-rolled format would be
+// actively wrong for most of the world.
+function formatMessageTime(ts) {
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return '';
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth()
+    && d.getDate() === now.getDate();
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return sameDay ? time : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ', ' + time;
+}
+
+function addMessage(role, text, attachedFileNames = [], imageCount = 0, ts = null) {
   const article = document.createElement('article');
   article.className = `message ${role}`;
   // The outline reads this rather than the rendered bubble: a long prompt is
@@ -3268,6 +3284,19 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0) {
   if (role === 'assistant' || role === 'user') {
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
+
+    // First in the row, so it reads as a caption on the message rather than as
+    // another control. Only on your own messages — see the note in extension.js
+    // about not stamping both halves of one exchange. Absent entirely for a
+    // chat saved before timestamps existed, rather than showing a wrong time or
+    // an empty gap.
+    if (role === 'user' && ts) {
+      const when = document.createElement('span');
+      when.className = 'msg-time';
+      when.textContent = formatMessageTime(ts);
+      when.title = new Date(ts).toLocaleString();
+      actions.appendChild(when);
+    }
 
     const mkAction = (cls, label, glyph) => {
       const b = document.createElement('button');
