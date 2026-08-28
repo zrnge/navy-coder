@@ -1638,6 +1638,37 @@ window.addEventListener('message', (event) => {
     scrollToBottom();
   }
 
+  if (message.type === 'auditResult') {
+    const card = document.createElement('div');
+    card.className = 'audit-card' + (message.counts && message.counts.high ? ' audit-high' : (message.total === 0 || !(message.findings || []).length ? ' audit-clean' : ''));
+    const head = document.createElement('div');
+    head.className = 'audit-head';
+    head.innerHTML = icon('security') + ' <span>Supply-chain scan</span>';
+    card.appendChild(head);
+    const line = document.createElement('div');
+    line.className = 'audit-headline';
+    line.textContent = message.headline || '';
+    card.appendChild(line);
+    for (const f of (message.findings || []).slice(0, 40)) {
+      const row = document.createElement('div');
+      row.className = 'audit-row';
+      row.classList.add('audit-sev-' + (f.severity || 'low'));
+      const sev = document.createElement('span');
+      sev.className = 'audit-sev';
+      sev.textContent = (f.severity || 'low').toUpperCase();
+      const file = document.createElement('span');
+      file.className = 'audit-file';
+      file.textContent = f.file + (f.changed ? '  · changed' : '');
+      const id = document.createElement('span');
+      id.className = 'audit-id';
+      id.textContent = f.id;
+      row.appendChild(sev); row.appendChild(file); row.appendChild(id);
+      card.appendChild(row);
+    }
+    messagesEl.appendChild(card);
+    scrollToBottom();
+  }
+
   if (message.type === 'planIncomplete') {
     addSystemMessage(message.note.replace(/^_|_$/g, ''));
   }
@@ -2195,6 +2226,7 @@ const SLASH_COMMANDS = [
   { cmd: '/test',            label: 'Test',          iconName: 'test', desc: 'Run tests and fix failures',               prompt: 'Run the test suite, show the results, and fix any failing tests.' },
   { cmd: '/generate-tests',  label: 'Gen Tests',     iconName: 'gen-tests', desc: 'Generate unit tests for this file',        prompt: 'Generate comprehensive unit tests for the active file. First read_file to see its full content. Cover the happy path, edge cases, and error paths. Use the existing test framework — check package.json and any existing test files first to match conventions.' },
   { cmd: '/optimize',        label: 'Optimize',      iconName: 'optimize', desc: 'Optimize code performance',               prompt: 'Analyze the active file for performance bottlenecks. First read_file to see its full content. Identify the most impactful issues (unnecessary re-renders, redundant I/O, O(n²) loops, etc.) and apply optimizations without changing observable behaviour. Explain each change.' },
+  { cmd: '/audit',           label: 'Audit',         iconName: 'security', desc: 'Scan the project for supply-chain risk (deps, install hooks, backdoors)', prompt: '' },
   { cmd: '/security',        label: 'Security',      iconName: 'security', desc: 'Security audit this code',                 prompt: 'Perform a thorough security audit of this project. Use list_files then read_file on the relevant source files. Check for OWASP Top 10 issues: injection (SQL, command, XSS), broken authentication, insecure deserialization, security misconfiguration, sensitive data exposure, and access control flaws. For each issue found: quote the vulnerable line, explain the risk and attack vector, then show the corrected code.' },
   { cmd: '/commit',          label: 'Commit',        iconName: 'commit', desc: 'Generate a git commit message',            prompt: 'Generate a conventional commit message for the current staged changes.' },
   { cmd: '/pr',              label: 'PR',            iconName: 'pr', desc: 'Generate a PR description',               prompt: 'Generate a pull request title and description for the changes in this branch compared to main.' },
@@ -2662,6 +2694,16 @@ function sendPrompt() {
       args: mcpCmd.args,
       includeContext: includeContext ? includeContext.checked : true,
     });
+    return;
+  }
+
+  // /audit runs Navy's own project scan first, then a triage turn — it is not
+  // a prompt template, so it cannot be a normal expansion. Same shape as /bg.
+  if (prompt === '/audit' || prompt.startsWith('/audit ')) {
+    promptInput.value = '';
+    promptInput.style.height = 'auto';
+    updateSendButton();
+    vscode.postMessage({ type: 'runProjectAudit' });
     return;
   }
 

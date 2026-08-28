@@ -36,6 +36,7 @@
 - **Inline completions** — ghost-text suggestions as you type (opt-in, can use a separate faster model via `navy.completionModel`), with real fill-in-middle context from both sides of the cursor
 - **Code Lens** — "Ask Navy" buttons above functions in the editor
 - **Read aloud & dictation** — a speaker button reads any message out as prose (not punctuation), and a microphone button transcribes speech into the prompt box, where you review and send it yourself. VS Code webviews cannot reach the microphone ([microsoft/vscode#250568](https://github.com/microsoft/vscode/issues/250568)), so dictation runs in your browser via a token-gated loopback page and streams the words back — see [Privacy](#privacy)
+- **`/audit` — a supply-chain scan of your own project** — run it any time to check the repository for the things a supply-chain attack actually looks like: a `postinstall` hook that pipes `curl | sh`, a dependency resolved from a git URL instead of the registry, code that reads `~/.ssh` or `~/.aws/credentials`, an `eval(atob(...))` payload, a `fetch` to a hardcoded external host. Navy's own code does the scan deterministically — same files, same findings, every run — and only then hands the *hits* to the model to judge and explain, so you get a short list of real signals rather than a wall of pattern noise or whatever the model happened to read. Recently-changed files are flagged first, because an attack that just landed is the one that matters
 - **No telemetry, zero runtime dependencies** — nothing is sent anywhere except to the AI provider you configure; the shipped extension has no npm packages bundled in besides the code in this repo
 - **Diagnostics you choose to share** — `Navy Coder: Export Diagnostics` assembles what a bug report needs (versions, provider, resolved shell, both approval gates, recent errors) into an *unsaved* editor tab. Nothing is written to disk and nothing is transmitted; API keys are never read into it, and paths, home directory and anything credential-shaped are redacted on the way in. You read it, then decide
 
@@ -117,7 +118,7 @@ Every file-mutating tool goes through the diff approval gate (unless `navy.appro
 
 ## Slash Commands
 
-Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/security`, `/commit` and a dozen more.
+Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/security`, `/audit` (supply-chain scan), `/commit` and a dozen more.
 
 **You can add your own.** A command is a markdown file: the filename is what you type, the body is the prompt.
 

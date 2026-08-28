@@ -3849,6 +3849,48 @@ textarea:focus-visible,
 .model-filter:focus { outline: none; border-color: var(--gold); }
 
 /* ── Plan checklist card ───────────────────────────────────────────────────── */
+/* Supply-chain scan result. A fact card above the model's triage: the counts
+   are deterministic, so they read as data, not opinion. */
+.audit-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-4);
+  margin: var(--space-2) 0;
+  background: var(--surface);
+  font-size: var(--fs-sm);
+}
+.audit-card.audit-high { border-left-color: var(--red); }
+.audit-card.audit-clean { border-left-color: var(--gold); }
+.audit-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 600;
+  color: var(--text);
+}
+.audit-headline {
+  color: var(--muted);
+  margin: var(--space-1) 0 var(--space-2);
+}
+.audit-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 1px 0;
+  font-size: var(--fs-xs);
+}
+.audit-sev {
+  flex-shrink: 0;
+  width: 52px;
+  font-weight: 600;
+}
+.audit-sev-high .audit-sev { color: var(--red); }
+.audit-sev-medium .audit-sev { color: var(--gold); }
+.audit-sev-low .audit-sev { color: var(--muted); }
+.audit-file { color: var(--text); word-break: break-all; }
+.audit-id { color: var(--muted); margin-left: auto; white-space: nowrap; }
+
 .plan-card {
   margin: var(--space-3) 0;
   padding: 0;

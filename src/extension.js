@@ -977,6 +977,9 @@ class NavyCoderViewProvider {
           this.sendApprovalMode();
           break;
         }
+        case 'runProjectAudit':
+          await this.runProjectAudit();
+          break;
         case 'reviewSlashCommand': {
           // Approving runs it immediately: the user typed the command, read the
           // prompt and said yes, and making them type it a second time would
@@ -6990,6 +6993,115 @@ function activate(context) {
 // verbatim. They are still methods on this class — `this` means what it always
 // did — so no call site, signature or behaviour changed in the move.
 //
+// ── /audit: scan the project for supply-chain risk ───────────────────────────
+// Walks the project (Navy's own code, not the model), scans each file through
+// the pure scanners in src/supply-chain.js, then hands ONLY the findings to the
+// model to triage. Built as one method returning a summary so a later trigger —
+// on project open, or when a lockfile changes — can call it without the command
+// plumbing. See src/supply-chain.js for why the deterministic/AI split is the
+// whole point.
+class SupplyChainScanMethods {
+  // Files newer than the last audit, plus anything git reports as changed.
+  // "Recently changed" is not a finding on its own, but an attack that just
+  // landed is the one worth reading closely, so the scan marks them.
+  async _recentlyChangedFiles(root) {
+    const changed = new Set();
+    try {
+      const out = await this.runGit(['status', '--porcelain']);
+      for (const line of String(out || '').split(/\r?\n/)) {
+        const rel = line.slice(3).trim();
+        if (rel) changed.add(rel.replace(/\\/g, '/'));
+      }
+    } catch { /* not a repo — the mtime pass below still runs */ }
+    return changed;
+  }
+
+  // The walk. Bounded the same way search_files' fallback is: a skip list for
+  // the directories that are always huge and never the answer, a per-file size
+  // cap, and a ceiling on how many files one audit will read.
+  async _walkForAudit(root) {
+    const supply = require('./supply-chain.js');
+    const MAX_FILES = 6000;
+    const ignored = await this._gitIgnoredSet(root).catch(() => new Set());
+    const changedSet = await this._recentlyChangedFiles(root);
+
+    const findings = [];
+    let scanned = 0;
+    let capped = false;
+
+    const walk = async (dir, depth) => {
+      if (capped || depth > 12) return;
+      let entries;
+      try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+      catch { return; }
+      for (const entry of entries) {
+        if (capped) return;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!RELEVANCE_SKIP_DIRS.has(entry.name)) await walk(full, depth + 1);
+          continue;
+        }
+        if (!supply.classifyForScan(entry.name)) continue;
+        const rel = path.relative(root, full).replace(/\\/g, '/');
+        if (ignored.has(rel)) continue;
+        try {
+          const stat = await fs.promises.stat(full);
+          if (stat.size > supply.SCAN_MAX_BYTES) continue;
+          const content = await fs.promises.readFile(full, 'utf8');
+          if (content.slice(0, 1024).includes(' ')) continue; // binary
+          scanned++;
+          if (scanned >= MAX_FILES) capped = true;
+          const hits = supply.scanFile({ name: entry.name, rel, content, changed: changedSet.has(rel) });
+          for (const h of hits) findings.push(h);
+        } catch { /* unreadable — skip, never fail the whole audit for one file */ }
+      }
+    };
+    await walk(root, 0);
+    return { findings, scanned, capped };
+  }
+
+  // The command entry point. Runs the scan, tells the user what was found, and
+  // then — only if there is something to reason about — asks the model to
+  // triage it as an ordinary turn, so the answer lands in the transcript with
+  // history, approval and the rest exactly as any other reply does.
+  async runProjectAudit() {
+    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      this.view?.webview.postMessage({ type: 'error', message: 'Navy: open a folder before running /audit — there is nothing to scan.' });
+      return null;
+    }
+    const supply = require('./supply-chain.js');
+    this.view?.webview.postMessage({ type: 'statusText', text: 'Scanning the project for supply-chain risk…' });
+
+    let walkResult;
+    try { walkResult = await this._walkForAudit(root); }
+    catch (e) {
+      this.view?.webview.postMessage({ type: 'error', message: 'Navy: the audit scan failed — ' + e.message });
+      return null;
+    }
+    const summary = supply.summarizeScan(walkResult.findings, { scanned: walkResult.scanned, root });
+
+    // Nothing flagged: say so and stop. Spending a model call to have it
+    // confirm an empty list would be theatre, and worse, would invite it to
+    // manufacture a concern to look useful.
+    if (!summary.total) {
+      this.view?.webview.postMessage({ type: 'auditResult', headline: summary.headline, findings: [], counts: summary.counts });
+      return summary;
+    }
+
+    this.view?.webview.postMessage({
+      type: 'auditResult', headline: summary.headline, counts: summary.counts,
+      findings: summary.findings.map(f => ({ file: f.file, severity: f.severity, id: f.id, changed: Boolean(f.changed) })),
+    });
+
+    // The model triages the FINDINGS, not the repo. It is told, in
+    // supply-chain.js, not to invent anything beyond the list.
+    await this.askNavy(supply.scanTriagePrompt(summary), false, null, [], []);
+    return summary;
+  }
+}
+
+
 // Class-prototype methods are non-enumerable, so Object.assign skips them: the
 // descriptors are copied instead. That is what lets a block move as a class
 // body with no retyping, which is the only way a move of this size stays
@@ -7011,6 +7123,7 @@ mixinPrototype(NavyCoderViewProvider.prototype, WEB_SEARCH_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, DIAGNOSTICS_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, COMMAND_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, PLAN_METHODS);
+mixinPrototype(NavyCoderViewProvider.prototype, SupplyChainScanMethods.prototype);
 Object.assign(NavyCoderViewProvider.prototype, SLASH_COMMAND_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SKILL_METHODS);
 
