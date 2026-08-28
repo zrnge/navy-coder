@@ -2791,6 +2791,18 @@ textarea:focus {
 }
 /* Where a custom command came from. A project's command can shadow a built-in,
    so which definition is being offered has to be visible without opening it. */
+/* Repository command that has not been reviewed. Uses the warning colour so it
+   reads as a caution, not a category. */
+.slash-review {
+  font-size: var(--fs-2xs);
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .slash-origin {
   margin-left: auto;
   padding: 1px var(--space-3);

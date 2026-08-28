@@ -38,6 +38,7 @@ function createVscodeMock() {
     nextDocumentSymbols: null,        // [{name,kind}] for every file, or a Map<fsPath, [...]> for per-file control
     executedCommands: [],             // [{ command, args }] — lets tests assert vscode.openFolder etc.
     shown: { warning: [], info: [], error: [] },
+    shownDocuments: [],
     shownInfoCalls: [],               // [{ msg, options, items }] — full showInformationMessage calls, see the mock above
     applyEditFails: false,
     reset() {
@@ -48,6 +49,7 @@ function createVscodeMock() {
       this.executedCommands = [];
       this.scoped = {};
       this.shown = { warning: [], info: [], error: [] };
+      this.shownDocuments = [];
       this.shownInfoCalls = [];
     },
   };
@@ -151,7 +153,11 @@ function createVscodeMock() {
         return w;
       },
       asRelativePath: (p) => (p && p.fsPath) || p,
-      openTextDocument: async () => ({ getText: () => '' }),
+      openTextDocument: async (arg) => {
+        const content = arg && typeof arg === 'object' ? (arg.content || '') : '';
+        if (content) ctrl.shownDocuments.push(content);
+        return { getText: () => content };
+      },
       // Applies a fake structural-rename WorkspaceEdit to the temp filesystem.
       // Set ctrl.applyEditFails = true to simulate the editor rejecting the edit.
       applyEdit: async (edit) => {
@@ -175,6 +181,7 @@ function createVscodeMock() {
         return ctrl.nextInfo;
       },
       showOpenDialog: async () => (ctrl.nextOpenDialog ? ctrl.nextOpenDialog.map(uri) : undefined),
+      showTextDocument: async () => ({ }),
       showErrorMessage: async (msg) => { ctrl.shown.error.push(msg); return undefined; },
       createStatusBarItem: () => ({ show() {}, dispose() {}, text: '', tooltip: '', command: '', name: '' }),
       onDidChangeActiveTextEditor: () => ({ dispose() {} }),
@@ -236,10 +243,17 @@ function makeContext(tmp) {
   // wrote .vscode/settings.json into the user's repo), so tests that exercise
   // "reopen and remember" need it to actually retain values.
   const ws = new Map();
+  // Real Maps, not stubs: the remembered project root lives in workspaceState,
+  // and reviewed-command fingerprints (src/supply-chain.js) live in globalState,
+  // so both must actually retain what is written.
+  const gs = new Map();
   return {
     secrets: { get: async () => '', store: async () => {} },
     subscriptions: [],
-    globalState: { get: () => undefined, update: async () => {} },
+    globalState: {
+      get: (k, d) => (gs.has(k) ? gs.get(k) : d),
+      update: async (k, v) => { gs.set(k, v); },
+    },
     workspaceState: {
       get: (k, d) => (ws.has(k) ? ws.get(k) : d),
       update: async (k, v) => { ws.set(k, v); },

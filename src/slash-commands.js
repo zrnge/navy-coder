@@ -33,6 +33,7 @@
 const path = require('path');
 const vscode = require('vscode');
 const { workspaceIsTrusted } = require('./workspace.js');
+const { fingerprintPrompt, auditPrompt, riskSummary, reviewReport } = require('./supply-chain.js');
 
 // Caps. A commands directory is meant to hold a handful of prompts; these exist
 // so a directory that has become something else can't stall the panel or push a
@@ -114,6 +115,44 @@ const SLASH_COMMAND_METHODS = {
   // Highest precedence LAST — the loader lets a later directory shadow an
   // earlier one, so a project's own definition wins over your personal one,
   // which wins over the built-in of the same name.
+  // Approved prompt fingerprints, keyed by project root. Global rather than
+  // workspace state on purpose: this is a record of what YOU have read, and it
+  // must not live in a file the repository being reviewed can write.
+  _reviewKey() {
+    return 'navy.reviewedCommands:' + (this.projectRoot || '');
+  },
+
+  _reviewedFingerprints() {
+    const raw = this.context.globalState.get(this._reviewKey(), []);
+    return new Set(Array.isArray(raw) ? raw : []);
+  },
+
+  async _recordCommandReview(fingerprint) {
+    const seen = this._reviewedFingerprints();
+    seen.add(fingerprint);
+    // Bounded: a project with a churning commands directory should not grow an
+    // unbounded list in global state. Oldest out — an approval that far back is
+    // for a version of the file nobody is running now.
+    const kept = [...seen].slice(-200);
+    await this.context.globalState.update(this._reviewKey(), kept);
+  },
+
+  // Marks every repository-supplied command with whether it has been reviewed,
+  // and what a review would flag. Personal commands are skipped entirely: you
+  // wrote them, and asking about your own prompts is how a review becomes a
+  // dialog people dismiss without reading.
+  _markCommandReviews(commands) {
+    const reviewed = this._reviewedFingerprints();
+    for (const command of commands) {
+      if (!command || command.origin === 'personal' || !command.prompt) continue;
+      command.fingerprint = fingerprintPrompt(command.prompt);
+      command.risks = auditPrompt(command.prompt);
+      command.riskSummary = riskSummary(command.risks);
+      command.unreviewed = !reviewed.has(command.fingerprint);
+    }
+    return commands;
+  },
+
   _slashCommandDirs() {
     const dirs = [{ dir: this._personalCommandsDir(), origin: 'personal' }];
     const root = this.projectRoot;
@@ -237,10 +276,67 @@ const SLASH_COMMAND_METHODS = {
       }
     } catch (e) { this.log?.('mcp prompts: ' + e.message); }
 
+    // Anything that arrived with the repository is fingerprinted here, so the
+    // panel knows which commands it must route back for review instead of
+    // expanding. See src/supply-chain.js for why the description shown in the
+    // menu is not evidence of what the prompt says.
+    this._markCommandReviews(commands);
+
     // `file` and `prompt` both travel: the composer expands the prompt itself
     // (so what is sent, shown and persisted are the same text), and the file
     // path is what makes an entry in the dropdown openable for editing.
     this.view?.webview.postMessage({ type: 'slashCommands', commands, sessionId: this.activeSessionId });
+  },
+
+  // Opens the prompt for reading, then asks. Deliberately shows the text in an
+  // editor rather than summarising it in a dialog: a modal that scrolls is a
+  // modal nobody reads, and the whole point is that the prompt itself gets
+  // looked at.
+  async reviewSlashCommand(cmd) {
+    const commands = this._markCommandReviews(await this.loadSlashCommands());
+    const command = commands.find(c => c.cmd === cmd);
+    if (!command) {
+      vscode.window.showWarningMessage(`Navy: ${cmd} is no longer available.`);
+      return null;
+    }
+    if (command.origin === 'personal' || !command.unreviewed) return command;
+
+    // "Changed" and "new" read very differently, so the report says which: a
+    // command you already approved that no longer matches its fingerprint is
+    // the case worth alarming about, and the names list is what distinguishes
+    // it from one you have simply never run.
+    const approvedNames = this.context.globalState.get(this._reviewKey() + ':names', []);
+    const previouslyApproved = Array.isArray(approvedNames) && approvedNames.includes(command.cmd);
+
+    const doc = await vscode.workspace.openTextDocument({
+      language: 'markdown',
+      content: reviewReport({
+        cmd: command.cmd, origin: command.origin, file: command.file,
+        prompt: command.prompt, findings: command.risks || [], previouslyApproved,
+      }),
+    });
+    await vscode.window.showTextDocument(doc, { preview: false });
+
+    const high = (command.risks || []).some(f => f.severity === 'high');
+    const choice = await vscode.window.showWarningMessage(
+      `Run ${command.cmd}? It came with this repository and you have not approved this version${high ? ', and it contains high-risk findings' : ''}.`,
+      { modal: true, detail: 'The full prompt is open in the editor behind this dialog. Approving records a fingerprint of it — you will not be asked again unless the file changes.' },
+      'Approve and run', 'Approve once');
+    if (!choice) return null;
+    // Both answers run it now; only one is remembered. "Approve once" exists
+    // for the command you want this time and want to be asked about again —
+    // without it the only way to stay cautious is to decline and lose the work.
+    if (choice === 'Approve and run') {
+      await this._recordCommandReview(command.fingerprint);
+      if (!approvedNames.includes(command.cmd)) {
+        await this.context.globalState.update(this._reviewKey() + ':names', [...approvedNames, command.cmd].slice(-200));
+      }
+    }
+    // Cleared on the object being returned, not just in storage: the caller
+    // decides whether to run from THIS value, and it was marked unreviewed
+    // before the human answered.
+    command.unreviewed = false;
+    return command;
   },
 
   // Where a new command should go. Asked rather than assumed: "everyone on this

@@ -21,7 +21,7 @@ const { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSu
 const { costEstimateSuite, providerFallbackSuite, cachingFallbackSuite, adaptiveThinkingFallbackSuite, geminiSuite, providerSelfTestSuite, providerEndpointSuite, pricingSuite } = require('./suite-providers.js');
 const { mcpSuite, mcpHttpSuite, mcpExtrasSuite } = require('./suite-mcp.js');
 const { approvalCancelSuite, approvalScopeSuite, settingsDefaultsSuite, diagnosticsSuite } = require('./suite-approval.js');
-const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite } = require('./suite-ui.js');
+const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite } = require('./suite-ui.js');
 
 // The pure-function and jsdom checks first: they need no mock and no temp
 // filesystem, so a failure there is the cheapest possible signal.
@@ -30,6 +30,7 @@ pureSuites();
 undoRedoSuite()
   .then(cardRecordSuite)
   .then(slashCommandSuite)
+  .then(supplyChainSuite)
   .then(skillSuite)
   .then(retrievalSuite)
   .then(semanticSearchSuite)

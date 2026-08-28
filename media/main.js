@@ -2222,6 +2222,16 @@ function allSlashCommands() {
   return [...CUSTOM_COMMANDS, ...SLASH_COMMANDS.filter(c => !seen.has(c.cmd))];
 }
 
+// A repository-supplied command that has not been reviewed says so in the
+// menu. The point is that you find out BEFORE typing it, not in a dialog after
+// — a warning that only appears once you have committed to running something
+// is a warning people click through.
+function commandReviewNote(cmd) {
+  if (!cmd || !cmd.unreviewed) return '';
+  const high = (cmd.risks || []).some(f => f.severity === 'high');
+  return high ? 'unreviewed · high-risk findings' : 'unreviewed';
+}
+
 function setCustomCommands(list) {
   CUSTOM_COMMANDS = (Array.isArray(list) ? list : [])
     .filter(c => c && typeof c.cmd === 'string' && c.cmd.startsWith('/') && typeof c.prompt === 'string');
@@ -2264,6 +2274,11 @@ function expandSlashCommand(text, commands) {
   // An MCP prompt's text lives on the server and depends on the arguments, so
   // there is nothing here to expand. Left verbatim for sendPrompt to route.
   if (command.mcp) return text;
+  // A repository-supplied command whose prompt has not been reviewed is not
+  // expanded either. Expanding it here would put the unread text straight into
+  // the transcript and then into the model, which is the entire thing the
+  // review exists to prevent.
+  if (command.unreviewed) return text;
   const args = (m[2] || '').trim();
   const template = String(command.prompt || '');
   if (template.includes('$ARGUMENTS')) return template.split('$ARGUMENTS').join(args);
@@ -2295,6 +2310,7 @@ function showSlashDropdown(query) {
       <span class="slash-label">${escapeHtml(c.label || c.cmd.slice(1))}</span>
       <span class="slash-desc">${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}</span>
       ${c.custom ? `<span class="slash-origin">${escapeHtml(ORIGIN_LABEL[c.origin] || 'custom')}</span>` : ''}
+      ${commandReviewNote(c) ? `<span class="slash-review" title="This command came with the repository and has not been reviewed. Running it opens the prompt for you to read first.">${escapeHtml(commandReviewNote(c))}</span>` : ''}
       ${c.removable ? `<button type="button" class="slash-remove" tabindex="-1"
         title="Remove ${escapeHtml(c.cmd)}" aria-label="Remove the ${escapeHtml(c.cmd)} command">${icon('close')}</button>` : ''}
     </div>`
@@ -2620,6 +2636,21 @@ function sendPrompt() {
     const c = allSlashCommands().find(x => x.cmd === '/' + m[1]);
     return c?.mcp ? { mcp: c.mcp, args: (m[2] || '').trim() } : null;
   })();
+  // Unreviewed and from the repository: ask the extension to show it first.
+  // The panel deliberately does not render the prompt or the findings itself —
+  // it has no way to know they were not tampered with in transit, and the
+  // review has to happen where the file was actually read.
+  const unreviewed = (() => {
+    const m = prompt.match(/^\/([\w:-]+)(?:[ \t]+([\s\S]*))?$/);
+    if (!m) return null;
+    const c = allSlashCommands().find(x => x.cmd === '/' + m[1]);
+    return c?.unreviewed ? { cmd: c.cmd, args: (m[2] || '').trim() } : null;
+  })();
+  if (unreviewed) {
+    vscode.postMessage({ type: 'reviewSlashCommand', cmd: unreviewed.cmd, args: unreviewed.args });
+    return;
+  }
+
   if (mcpCmd) {
     promptInput.value = '';
     promptInput.style.height = 'auto';

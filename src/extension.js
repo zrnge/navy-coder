@@ -977,6 +977,20 @@ class NavyCoderViewProvider {
           this.sendApprovalMode();
           break;
         }
+        case 'reviewSlashCommand': {
+          // Approving runs it immediately: the user typed the command, read the
+          // prompt and said yes, and making them type it a second time would
+          // teach them to approve without reading in order to get on with it.
+          const approved = await this.reviewSlashCommand(message.cmd);
+          if (!approved || approved.unreviewed) break;   // declined, or approved once and re-checked
+          const template = String(approved.prompt || '');
+          const args = String(message.args || '').trim();
+          const expanded = template.includes('$ARGUMENTS')
+            ? template.split('$ARGUMENTS').join(args)
+            : (args ? template.trimEnd() + ' ' + args : template);
+          await this.askNavy(expanded, true, null, [], []);
+          break;
+        }
         case 'runMcpPrompt': {
           // The server's template becomes the user's message. Deliberately a
           // normal turn from there on: an MCP prompt is a shortcut for typing
