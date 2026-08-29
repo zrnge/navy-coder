@@ -1034,7 +1034,11 @@ select option:hover {
 }
 .message-bubble table {
   border-collapse: collapse;
-  width: 100%;
+  /* Fill the panel when the content fits, but GROW past it when it doesn't, so
+     the wrap's overflow-x:auto actually scrolls a wide table instead of a hard
+     full-width rule cramming every column down to a few characters each. */
+  width: auto;
+  min-width: 100%;
   font-size: var(--fs-md);
 }
 .message-bubble th,
@@ -1042,6 +1046,8 @@ select option:hover {
   border: 1px solid var(--border);
   padding: var(--space-3) 10px;
   text-align: left;
+  /* Break a long token rather than forcing a hair-thin column around it. */
+  overflow-wrap: anywhere;
 }
 .message-bubble th {
   background: var(--surface);
@@ -1919,46 +1925,13 @@ textarea:focus {
   font-weight: 700;
 }
 
-/* ── Approval mode select ─────────────────────────────────────────────────── */
-#approvalModeSelect {
-  padding: 3px var(--space-3);
-  font-size: var(--fs-sm);
-  font-weight: 700;
-  color: var(--gold);
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  letter-spacing: 0.3px;
-  transition: border-color 0.15s;
-}
-
-#approvalModeSelect:focus {
-  outline: none;
-  border-color: var(--blue);
-  color: var(--blue);
-}
-
-#approvalModeSelect option {
-  background: var(--surface);
-  color: var(--text);
-}
-
-/* ── Thinking level select ───────────────────────────────────────────────── */
-#thinkingLevelSelect {
-  padding: 3px var(--space-3);
-  font-size: var(--fs-sm);
-  font-weight: 700;
-  background: transparent;
-  color: var(--gold);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  letter-spacing: 0.3px;
-  transition: border-color 0.15s;
-}
-#thinkingLevelSelect:focus { outline: none; border-color: var(--blue); color: var(--blue); }
-#thinkingLevelSelect option { background: var(--surface); color: var(--text); }
+/* ── Composer-mode selects (thinking / edits / commands) ──────────────────────
+   Intentionally NO per-id styling. All three are .select-compact and nothing
+   more, so they render as one control with one appearance. They used to each
+   carry their own gold/bold/letter-spaced rules — except the commands select,
+   which had none — so the row read as two accented controls beside one muted
+   one. That mismatch is the bug; the fix is to let .select-compact be the only
+   opinion. The id-level guard in the webview suite keeps this from drifting back. */
 
 /* ── Context length badge ─────────────────────────────────────────────────── */
 /* Context-window picker. Sits among the status badges rather than with the
@@ -3148,9 +3121,12 @@ textarea:focus {
   -webkit-user-select: none;
   user-select: none;
   list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .think-summary::-webkit-details-marker { display: none; }
-.think-toggle-hint { font-size: var(--fs-xs); opacity: 0.6; margin-left: 4px; }
+.think-toggle-hint { font-size: var(--fs-xs); opacity: 0.6; margin-left: auto; }
 .think-content {
   margin: 0;
   padding: var(--space-4) 10px;
@@ -3169,6 +3145,20 @@ textarea:focus {
   padding: var(--space-2) 0;
   animation: pulse 1.5s infinite;
 }
+/* Native reasoning: ONE indicator — the same spinning ship's wheel the activity
+   log uses, not a second mind/brain glyph. It spins only while the turn is live,
+   then settles static so a finished card doesn't imply work still in flight. */
+.think-block .spin-wheel { width: 14px; height: 14px; flex-shrink: 0; color: var(--muted); }
+.think-block.think-live .spin-wheel {
+  color: var(--gold);
+  will-change: transform;
+  animation: spin-wheel 1.2s linear infinite;
+}
+.think-label { font-weight: 500; }
+/* An OPEN card folds on a click anywhere in the reasoning (see appendThinking),
+   so the whole content reads as clickable — no button to hunt for, no scroll
+   back to the header. Text selection is still allowed; only a plain click folds. */
+.think-block[open] .think-content { cursor: pointer; }
 
 /* ── Drag-over highlight ────────────────────────────────────────────────────── */
 .drag-over {
@@ -3788,6 +3778,7 @@ textarea:focus-visible,
   .app.is-thinking .brand-icon,
   .activity-row.running .act-icon,
   .activity-row.running .act-icon .spin-wheel,
+  .think-block.think-live .spin-wheel,
   .rp-wheel-wrap .spin-wheel {
     animation: none;
   }

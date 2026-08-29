@@ -113,6 +113,63 @@ promise — which stays — with no way for anyone to report what went wrong.
   secrets, and a nondeterministic model would go red on unrelated changes until
   everyone ignored it.
 
+- **`/audit` — a supply-chain scan of your own project.** No AI coding assistant
+  ships this. Type `/audit` and Navy checks the repository for what a supply-chain
+  attack actually looks like: a `postinstall` hook that pipes `curl | sh`, a
+  dependency resolved from a git URL instead of the registry, code that reads
+  `~/.ssh` or `~/.aws/credentials`, an `eval(atob(...))` payload, a `fetch` to a
+  hardcoded host. It reads **every** text file, whatever the language — there is no
+  allowlist to leave your stack out — and it reads the **build files** where the
+  C/C++ attacks really hide (`Makefile`, `CMakeLists.txt`, `configure`,
+  `Dockerfile`), which is the shape of the xz/liblzma backdoor. Navy's own code
+  does the scan deterministically — same files, same findings, every run — and only
+  then hands the *hits* to the model to judge, so you get real signals rather than a
+  wall of pattern noise. `/audit deep` goes further: the model reads the project
+  with its own tools and reasons about supply-chain risk in whatever ecosystem it
+  finds, grounded so it quotes the real line rather than inventing one.
+
+- **Repository slash commands are reviewed before they run.** A `.md` command file
+  cloned with a project could put arbitrary instructions into the model the first
+  time you pressed `/`. An unreviewed repository command is now marked in the menu
+  and, the first time you run it, its prompt is shown for you to read first —
+  trust-on-first-use, fingerprinted so an edited command asks again. A personal
+  command you wrote yourself is never gated.
+
+- **The model's reasoning, in a collapsible Thinking card.** Extended thinking
+  (Claude, Gemini, Ollama) was captured and thrown away — you saw only a
+  "Reasoning…" flicker. It now streams into a card, collapsed by default, marked
+  with the same spinning wheel the activity log uses rather than a second glyph
+  beside it. Click anywhere in the reasoning to fold it back up; a text selection is
+  preserved so you can still copy it out. Copying the reply never drags the
+  reasoning in with it.
+
+- **A native sandbox that needs nothing installed.** `navy.sandboxMode` gains a
+  `native` backend: `sandbox-exec` (Seatbelt) on macOS, bubblewrap on Linux.
+  Writes are confined to the project and temp, a short list of credential stores
+  (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.netrc`, gcloud/docker creds)
+  cannot be read, and — stated plainly rather than glossed — the network is *not*
+  restricted, because blocking it breaks the `npm install`/`pip`/`cargo` runs
+  people most want sandboxed. Weaker than a container, and honest about exactly how.
+
+- **WSL Containers (`wslc`) — container sandboxing on Windows without Docker
+  Desktop.** `navy.sandboxMode` gains a `wsl` backend built on Microsoft's
+  first-party Linux-container runtime (Build 2026 public preview; needs WSL 2.9.3+).
+  It runs commands in a container with only the project mounted, the same image
+  contract as `docker` (the project's own devcontainer/Dockerfile, or
+  `navy.sandboxImage` — never a guess), built and run through wslc's own image
+  store. On a Windows machine that has it, it is offered ahead of Docker. Windows
+  finally gets real container isolation with nothing extra to install.
+
+- **Message timestamps, and rewinding the conversation, not only its files.** Each
+  of your messages and each reply now carries the time it happened, in the actions
+  row. And "Edit" on one of your messages discards it and everything after it, hands
+  the prompt back to the composer to reword, and restores the files to that point —
+  the conversation rewinds, not just the diffs.
+
+- **MCP resources and prompts.** A connected MCP server's resources and prompts are
+  now surfaced as what they are — resources the model can read, prompts you can run
+  by name from the `/` menu — instead of being flattened into the tool list.
+
 ### Changed
 
 - **Navy learns how many characters a token is worth, per conversation.** The
@@ -132,6 +189,33 @@ promise — which stays — with no way for anyone to report what went wrong.
   billed 2.5-flash turns at 1.5-flash rates and nothing anywhere noticed. Every
   entry now names the model it exists for, and adding a broader rule above it
   breaks the build rather than someone's cost estimate.
+
+- **`navy.sandboxImage` is one image for every project, set once.** The image used
+  when a project has no devcontainer/Dockerfile of its own was stored per-workspace,
+  so a sandbox had to be set up repo by repo — the friction that made Windows
+  sandboxing feel like more work than it was worth. It now defaults to your **User**
+  settings: one image for every project that has no config of its own, for `docker`
+  and `wsl` alike. A project's own devcontainer/Dockerfile still wins, and a
+  workspace override still scopes it to a single repo.
+
+- **The plan card tells the truth, and the model is nudged to finish it.** On a
+  successful turn Navy used to strike through every plan step regardless of its real
+  state — a card reading "0/6 done" with all six crossed out, a plan completed on
+  screen without the work being done. A model-declared plan now keeps its real
+  statuses; only the *inferred* (prose-scraped) plan is presumed done on a finish.
+  And a model that quits mid-plan — narrating a plan, reading files, then stopping
+  or calling `finish()` with nothing written — is nudged, a bounded number of times,
+  to actually do the work rather than ending at 0/N. A `finish()` that followed real
+  work, or a stop that asks you a question, is left alone. Plans are also treated as
+  declared state now, not prose the panel guesses at: the card is driven by
+  `update_plan`, updated in place, and no longer overwritten by a scraper or an
+  iteration counter.
+
+- **The per-turn controls moved out of the title bar and down to the composer** —
+  thinking depth, edit approval, command approval — sitting beside the box you type
+  in, in the order you would decide them. And they stopped disagreeing about their
+  own appearance: all three now render as one control with one look, instead of two
+  accented and one muted.
 
 ### Fixed
 
@@ -160,6 +244,37 @@ promise — which stays — with no way for anyone to report what went wrong.
   isn't installed" hint always suggested `where` or `command -v`. Both now follow
   the shell that will actually run the command, so a PowerShell session is told
   about `Get-Command` rather than being sent to check the wrong thing.
+
+- **A table no longer shatters on a pipe inside a cell.** The cell splitter split
+  on every `|`, so a version range like `>=22 | ^2` — or an escaped `\|`, or a pipe
+  inside inline code — spawned phantom narrow columns that crushed the whole table
+  to slivers. Pipes in code and escaped pipes are now literal, an over-long row
+  folds its overflow back into its last cell, and a wide table scrolls instead of
+  cramming every column down to a few characters each.
+
+- **A sandbox that cannot pull its image says so, instead of looking like your code
+  broke.** A container run that fails to reach the registry (usually a DNS problem
+  in the sandbox network) returned a bare `E_FAIL` that read like the command itself
+  failed — sending the model off to edit code that was fine. Under a container
+  sandbox, Navy now recognises a pull/network failure and says plainly that it is
+  the sandbox's network, not the project: pre-pull the image, or fix the WSL/Docker
+  resolver.
+
+- **A blocked file path now says how to recover.** "Path is outside the project
+  folder" was a dead end; it now adds that file tools cannot reach outside the
+  project and to use a path relative to its root — so the model corrects itself
+  instead of retrying the same out-of-project read.
+
+- **One source of truth for every provider base URL, again.** The Anthropic base
+  URL had drifted back into three hardcoded copies and the Gemini one into two;
+  `endpoints.js` exists precisely so a change to one URL is not made three times and
+  free to diverge. Both are constants there now.
+
+- **`update_plan` rejected every plan a model actually sent.** It accepted only a
+  step keyed as `step`, while models routinely send `description`, `title`, `task`
+  or `content`; the tool errored, and the model — told its plan was malformed —
+  either gave up on planning or looped resending it. It now accepts any of the usual
+  keys.
 
 ## [0.3.0] - 2026-08-22
 

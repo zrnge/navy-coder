@@ -165,6 +165,63 @@ async function sandboxSuite() {
     // materially weaker than the other, a card that said only 'sandboxed'
     // would be telling the user less than they need to approve the command.
     check('_sandboxLabelSuffix: names the backend when docker mode is set', provider._sandboxLabelSuffix() === ' (sandboxed: docker)');
+    await vscode.workspace.getConfiguration().update('sandboxMode', 'wsl');
+    check('_sandboxLabelSuffix: names the wsl backend distinctly', provider._sandboxLabelSuffix() === ' (sandboxed: wsl)');
+    delete provider._maybeWrapForSandbox; // an earlier test stubbed it; use the real one now
+
+    // ── sandboxMode 'wsl' — WSL Containers (wslc), the Windows-native, no-Docker
+    // container backend. Windows-only, so the wrap is exercised under a forced
+    // win32 platform (restored immediately); the platform gate is checked both ways.
+    {
+      const realPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+      const setPlatform = (p) => Object.defineProperty(process, 'platform', { value: p, configurable: true });
+      try {
+        setPlatform('linux');
+        const offWin = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+        check('wsl on non-Windows: refuses as Windows-only, never runs unsandboxed',
+          offWin.refused === true && /Windows-only/.test(offWin.message), JSON.stringify(offWin));
+
+        setPlatform('win32');
+        provider._wslcAvailable = async () => false;
+        const noWslc = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+        check('wsl + wslc not installed: refuses', noWslc.refused === true);
+        check('wsl + wslc not installed: message names the install path',
+          /wsl --update --pre-release/.test(noWslc.message), noWslc.message);
+
+        provider._wslcAvailable = async () => true;
+        provider._resolveSandboxImage = async () => null;
+        const noImg = await provider._maybeWrapForSandbox({ bin: 'sh', args: ['-c', 'x'], cwd: tmp, verbatim: false });
+        check('wsl + no image: refuses rather than guessing, like docker',
+          noImg.refused === true && /navy\.sandboxImage/.test(noImg.message));
+
+        let sawBuilder = null;
+        provider._resolveSandboxImage = async (_root, builder) => { sawBuilder = builder; return { image: 'proj-img' }; };
+        const w = await provider._maybeWrapForSandbox({ bin: 'bash', args: ['-c', 'echo hi'], cwd: tmp, verbatim: false });
+        check('wsl resolves the image through the wslc builder, not docker', sawBuilder === 'wslc');
+        check('wsl + image: bin becomes wslc', w.bin === 'wslc');
+        check('wsl + image: it is a `run` with --rm', w.args[0] === 'run' && w.args.includes('--rm'));
+        const mnt = tmp.replace(/\\/g, '/') + ':/workspace';
+        check('wsl + image: mounts the project root at /workspace',
+          w.args.includes('-v') && w.args[w.args.indexOf('-v') + 1] === mnt, w.args[w.args.indexOf('-v') + 1]);
+        check('wsl + image: working directory is /workspace',
+          w.args.includes('-w') && w.args[w.args.indexOf('-w') + 1] === '/workspace');
+        check('wsl + image: uses the resolved image, then the original command',
+          w.args.includes('proj-img') && w.args.slice(-3).join(' ') === 'bash -c echo hi');
+        check('wsl + image: direct argv spawn (verbatim off)', w.verbatim === false);
+      } finally {
+        Object.defineProperty(process, 'platform', realPlatform);
+        delete provider._wslcAvailable;
+        delete provider._resolveSandboxImage;
+      }
+    }
+
+    // The manifest has to offer 'wsl', or the mode is unreachable.
+    const manifest2 = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const smDecl = manifest2.contributes.configuration.properties['navy.sandboxMode'];
+    check('navy.sandboxMode offers wsl', smDecl.enum.includes('wsl'));
+    check('…and every mode still has a description', smDecl.enum.length === smDecl.enumDescriptions.length);
+    check('…and the wsl description says it needs no Docker Desktop',
+      /Docker Desktop/i.test(smDecl.enumDescriptions[smDecl.enum.indexOf('wsl')]));
   } catch (e) {
     check('sandbox suite ran', false, e.stack || e.message);
   } finally {
@@ -719,8 +776,8 @@ async function nativeSandboxSuite() {
     const wrapped = await provider._maybeWrapForSandbox(spec);
     if (process.platform === 'win32') {
       check('native on Windows: refused, never run unsandboxed',
-        wrapped.refused === true && /Windows has no sandbox Navy can drive/.test(wrapped.message), JSON.stringify(wrapped));
-      check('native on Windows: the refusal names the way out', /"docker"/.test(wrapped.message));
+        wrapped.refused === true && /Windows has no NATIVE sandbox Navy can drive/.test(wrapped.message), JSON.stringify(wrapped));
+      check('native on Windows: the refusal names the way out', /"docker"/.test(wrapped.message) && /"wsl"/.test(wrapped.message));
       // A bare 'not supported' reads as Navy not having bothered. It names the
       // two things that were actually considered and why each fails.
       check('native on Windows: the refusal explains why, not just that',
@@ -885,15 +942,19 @@ async function sandboxImageSuite() {
       fs.rmSync(probe, { recursive: true, force: true });
     }
 
-    // ── The offer: asked once, and its answer is stored per-workspace. ────
+    // ── The offer: asked once, and its answer is stored GLOBALLY — one image
+    // for every project without its own config, set up once rather than a
+    // devcontainer per repo (the friction that prompted this).
     ctrl.config.sandboxImage = '';
+    ctrl.scoped.sandboxImage = undefined;
     fs.writeFileSync(path.join(tmp, 'package.json'), '{}');
     provider._offeredSandboxImage = false;
-    ctrl.nextWarning = 'Use node:20';
+    ctrl.nextWarning = 'Use node:20 for all projects';
     await provider.offerSandboxImage(tmp);
     check('the offer applies the suggestion the user accepted', ctrl.config.sandboxImage === 'node:20');
-    check('…scoped to the workspace, not globally — which image a project needs is that project\'s fact',
-      ctrl.scoped.sandboxImage?.workspaceValue === 'node:20', JSON.stringify(ctrl.scoped.sandboxImage));
+    check('…stored GLOBALLY, not per-workspace — one image for all projects, not one file per repo',
+      ctrl.scoped.sandboxImage?.globalValue === 'node:20' && !ctrl.scoped.sandboxImage?.workspaceValue,
+      JSON.stringify(ctrl.scoped.sandboxImage));
 
     ctrl.config.sandboxImage = '';
     ctrl.shown.warning.length = 0;

@@ -589,6 +589,66 @@ function bubbleSuite() {
     copied && copied.text.includes('The answer is 42.'));
   w.close();
 
+  // Native extended thinking (Claude/Gemini/Ollama) is surfaced in its own
+  // collapsible block — collapsed by default, streamed, kept out of the answer.
+  const wt = run([
+    { type: 'start' },
+    { type: 'thinkingChunk', text: 'First weigh the parser approach.' },
+    { type: 'thinkingChunk', text: ' Then the lexer.' },
+    { type: 'chunk', text: 'The answer is 42.' },
+    { type: 'done' },
+  ]);
+  const think = wt.document.querySelector('.think-block');
+  check('thinking: a native reasoning stream renders a collapsible block', Boolean(think));
+  check('thinking: it is collapsed by default', think && think.open === false);
+  check('thinking: it is labelled Thinking, not Reasoning',
+    /Thinking/.test(think?.querySelector('.think-summary')?.textContent || ''));
+  check('thinking: successive chunks append into ONE block',
+    wt.document.querySelectorAll('.think-block').length === 1
+    && /parser approach\. Then the lexer\./.test(wt.document.querySelector('.think-content')?.textContent || ''));
+  check('thinking: the answer renders in the bubble, separate from the reasoning',
+    /The answer is 42\./.test(wt.document.querySelector('.message-bubble')?.textContent || '')
+    && !/parser approach/.test(wt.document.querySelector('.message-bubble')?.textContent || ''));
+  check('thinking: the live pulse is dropped once the turn ends',
+    think && !think.classList.contains('think-live'));
+  check('thinking: the indicator is the spinning wheel, not a second mind/brain glyph',
+    Boolean(think?.querySelector('.think-summary .spin-wheel')) && !think?.querySelector('.think-summary .icon'));
+  check('thinking: the duplicate activity "Thinking" placeholder is removed — one indicator',
+    wt.document.querySelectorAll('.thinking-row').length === 0);
+  // Click anywhere in the open reasoning folds it — no button to hunt for.
+  think.open = true;
+  think.querySelector('.think-content').dispatchEvent(new wt.window.MouseEvent('click', { bubbles: true }));
+  check('thinking: clicking the reasoning text folds the card', think.open === false);
+  // …but a text selection is preserved, not folded away.
+  think.open = true;
+  const realGetSel = wt.window.getSelection;
+  wt.window.getSelection = () => ({ isCollapsed: false, toString: () => 'parser' });
+  think.querySelector('.think-content').dispatchEvent(new wt.window.MouseEvent('click', { bubbles: true }));
+  check('thinking: a click that finished a text selection does NOT fold (so you can copy)', think.open === true);
+  wt.window.getSelection = realGetSel;
+  think.open = false;
+  const wtCopy = wt.document.querySelector('.msg-copy-btn');
+  wtCopy?.dispatchEvent(new wt.window.Event('click'));
+  const wtCopied = wt.sent.find(m => m.type === 'copy');
+  check('thinking: copying the reply does not drag in the reasoning',
+    wtCopied && /The answer is 42\./.test(wtCopied.text) && !/parser approach/.test(wtCopied.text));
+  wt.close();
+
+  // The placeholder must go the moment reasoning streams, before any answer —
+  // otherwise the spinner row and the card show two "thinking"s at once (the bug
+  // reported). Isolated from the answer, which would also clear the placeholder.
+  const wt2 = run([{ type: 'start' }, { type: 'thinkingChunk', text: 'weighing options' }]);
+  check('thinking: the spinner placeholder is gone as soon as reasoning streams, not two indicators',
+    Boolean(wt2.document.querySelector('.think-block')) && wt2.document.querySelectorAll('.thinking-row').length === 0);
+  check('thinking: while streaming the card is marked live (drives the spinning wheel)',
+    wt2.document.querySelector('.think-block')?.classList.contains('think-live') === true);
+  wt2.close();
+  // The whole open card reads as clickable-to-fold, so its content shows a
+  // pointer cursor when open — no button to hunt for, no scroll back up.
+  const thinkCss = require('fs').readFileSync(require('path').join(__dirname, '..', 'media', 'styles.css'), 'utf8');
+  check('thinking: an open card marks its reasoning clickable to fold',
+    /\.think-block\[open\]\s+\.think-content\s*\{[^}]*cursor:\s*pointer/.test(thinkCss));
+
   // 0.2.7: your own messages are copyable too. A long prompt is collapsed
   // behind a "Show N more lines" toggle, so copying must use the original
   // text rather than whatever happens to be visible.
@@ -1307,6 +1367,48 @@ function slashCommandSuite() {
       w2.sent.some(m => m.type === 'startBackgroundTask' && m.prompt === 'refactor the parser')
       && !w2.sent.some(m => m.type === 'ask'));
     w2.close();
+
+    // /audit is a route, not a template — its empty prompt once let expansion
+    // collapse it to '' so sendPrompt bailed on the blank and NOTHING was sent.
+    // Typing it, with or without a trailing word, must reach the project scan.
+    const w3 = createWebview();
+    type(w3, '/audit');
+    w3.document.querySelector('#chatForm').dispatchEvent(new w3.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: typing /audit runs the project scan and is not swallowed',
+      w3.sent.some(m => m.type === 'runProjectAudit') && !w3.sent.some(m => m.type === 'ask'),
+      JSON.stringify(w3.sent.map(m => m.type)));
+    check('slash: plain /audit is the fast scan (deep flag is falsy)',
+      w3.sent.find(m => m.type === 'runProjectAudit') && !w3.sent.find(m => m.type === 'runProjectAudit').deep);
+    w3.close();
+
+    const w4 = createWebview();
+    type(w4, '/audit src');
+    w4.document.querySelector('#chatForm').dispatchEvent(new w4.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: /audit with a trailing argument still routes to the scan',
+      w4.sent.some(m => m.type === 'runProjectAudit') && !w4.sent.some(m => m.type === 'ask'));
+    w4.close();
+
+    // /audit deep opts into the agentic AI audit — same route, deep flag set.
+    const wDeep = createWebview();
+    type(wDeep, '/audit deep');
+    wDeep.document.querySelector('#chatForm').dispatchEvent(new wDeep.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: /audit deep routes to the scan with the deep flag set',
+      wDeep.sent.some(m => m.type === 'runProjectAudit' && m.deep === true) && !wDeep.sent.some(m => m.type === 'ask'),
+      JSON.stringify(wDeep.sent));
+    wDeep.close();
+
+    // Picking /audit from the menu — a no-argument action — fires the scan at
+    // once, like /pr-review, and leaves no stray '/audit' text in the box.
+    const w5 = createWebview();
+    type(w5, '/aud');
+    const auditItem = [...w5.document.querySelectorAll('#slashDropdown .slash-item')].find(i => i.dataset.cmd === '/audit');
+    check('slash: /audit appears in the menu', Boolean(auditItem));
+    auditItem.dispatchEvent(new w5.window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    check('slash: picking /audit from the menu runs the scan immediately',
+      w5.sent.some(m => m.type === 'runProjectAudit'));
+    check('slash: picking /audit leaves no leftover command text in the box',
+      w5.document.querySelector('#prompt').value === '');
+    w5.close();
   }
 
   // A command name comes from a file on disk, so its text reaches the menu's
@@ -2555,6 +2657,18 @@ function composerModesSuite() {
     !/(^|;|\s)(color|background|background-color|border|border-color|font-size|height)\s*:/.test(modeOverrides),
     modeOverrides.trim() || '(no overrides, as intended)');
 
+  // The same rule, enforced per-id: this is where it actually drifted. The
+  // edits and thinking selects each carried their own gold/bold styling while
+  // the commands select had none, so three identical controls read as two
+  // accented and one muted (the mismatch that reported this). A per-id opinion
+  // about a .select-compact is the same bug as a per-group one.
+  const modeIdOverrides = ['thinkingLevelSelect', 'approvalModeSelect', 'commandApprovalSelect']
+    .map(id => (new RegExp('#' + id + '\\s*\\{([^}]*)\\}').exec(css)?.[1] || ''))
+    .join(' ');
+  check('no composer-mode select restyles itself by id — they stay one appearance',
+    !/(^|;|\s)(color|background|background-color|border|border-color|font-size|font-weight|letter-spacing|height|padding)\s*:/.test(modeIdOverrides),
+    modeIdOverrides.trim() || '(no per-id overrides, as intended)');
+
   const modesRule = /\.composer-modes\s*\{([^}]*)\}/.exec(css)?.[1] || '';
   check('the modes group wraps too', /flex-wrap:\s*wrap/.test(modesRule));
   check('…and yields space before the file chips do',
@@ -2654,6 +2768,37 @@ function planCardSuite() {
   check('a restored chat replays the plan its turn ended with', restored.length === 1, restored.length);
   check('…with the states it ended in',
     [...w2.document.querySelectorAll('.plan-step')].every(li => li.classList.contains('done')));
+
+  // A model-declared plan the turn ended WITHOUT finishing must NOT be force-
+  // completed just because the turn succeeded — that struck every step through
+  // while the header still read "0/3 done", a plan that looked done without the
+  // work being done (the reported bug). Its declared statuses are the truth.
+  const w3 = run([{ type: 'start', model: 'test-model' }]);
+  w3.post({ type: 'planUpdate', steps: [
+    { step: 'Read the sources', status: 'pending' },
+    { step: 'Fix bug #1', status: 'pending' },
+    { step: 'Run the tests', status: 'pending' },
+  ] });
+  w3.post({ type: 'done' });
+  const w3steps = [...w3.document.querySelectorAll('.plan-step')];
+  check('plan: a declared plan left at 0 done is NOT force-completed when the turn ends',
+    w3steps.length === 3 && w3steps.every(li => !li.classList.contains('done')),
+    w3steps.map(li => li.className).join(' | '));
+  check('plan: …and the header still reads 0/3, not a phantom completion',
+    /0\/3 done/.test(w3.document.querySelector('.plan-card-header')?.textContent || ''),
+    w3.document.querySelector('.plan-card-header')?.textContent);
+  w3.close();
+
+  // The INFERRED plan (no update_plan, scraped from prose) still completes on a
+  // successful finish — it never reported progress, so the finish is all there is.
+  const w4 = run([{ type: 'start', model: 'test-model' }]);
+  w4.post({ type: 'chunk', text: '**Plan:**\n1. read it\n2. fix it\n\n' });
+  w4.post({ type: 'done' });
+  const w4steps = [...w4.document.querySelectorAll('.plan-step')];
+  check('plan: an inferred (prose) plan IS still marked done on a successful finish',
+    w4steps.length > 0 && w4steps.every(li => li.classList.contains('done')),
+    w4steps.map(li => li.className).join(' | '));
+  w4.close();
 }
 
 function iconSuite() {
@@ -3174,6 +3319,57 @@ function indentedFenceSuite() {
   check('a 160k-backtick run still renders in well under a second', ms < 1000, ms + 'ms');
 }
 
+// A pipe inside a table cell — in inline code, escaped, or just an unescaped one
+// the model forgot — used to split the row into phantom narrow columns, which is
+// what shattered the real report's version-range table into unreadable slivers.
+function tableSuite() {
+  console.log('\nmarkdown tables: a pipe in a cell must not shatter the layout:');
+  const render = (md) => {
+    const w = createWebview();
+    w.post({ type: 'restore', messages: [{ role: 'assistant', text: md }] });
+    const table = w.document.querySelector('.message-bubble table');
+    return {
+      cols: table ? table.querySelectorAll('thead th').length : 0,
+      rows: table ? [...table.querySelectorAll('tbody tr')].map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent)) : [],
+      w,
+    };
+  };
+
+  let r = render('| Check | Result |\n| --- | --- |\n| JSON | Valid |\n| Deps | 33 packages |');
+  check('table: a plain table has exactly the header\'s column count', r.cols === 2, 'cols=' + r.cols);
+  check('table: every body row has that many cells too',
+    r.rows.length === 2 && r.rows.every(row => row.length === 2), JSON.stringify(r.rows));
+  r.w.close();
+
+  // The reported bug: a pipe inside an inline-code span is not a delimiter.
+  r = render('| Check | Result |\n| --- | --- |\n| Engines | `>=22.12.0 | ^2.12.0` chain |');
+  check('table: a pipe inside inline code does not add a column', r.cols === 2 && r.rows[0]?.length === 2, JSON.stringify(r.rows));
+  check('table: …and the piped content survives in the one cell',
+    />=22\.12\.0/.test(r.rows[0]?.[1] || '') && /\^2\.12\.0/.test(r.rows[0]?.[1] || ''), JSON.stringify(r.rows[0]));
+  r.w.close();
+
+  // An escaped pipe is a literal pipe in the cell, not a delimiter.
+  r = render('| A | B |\n| --- | --- |\n| x | a \\| b \\| c |');
+  check('table: an escaped pipe stays in the cell, not a new column', r.cols === 2 && r.rows[0]?.length === 2, JSON.stringify(r.rows));
+  check('table: …and renders as a literal pipe', /a \| b \| c/.test(r.rows[0]?.[1] || ''), JSON.stringify(r.rows[0]));
+  r.w.close();
+
+  // A row with MORE unescaped pipes than the header folds the overflow into the
+  // last cell instead of spilling into phantom columns (GFM-ish, and legible).
+  r = render('| A | B |\n| --- | --- |\n| x | >=22 | ^2 | >=23 |');
+  check('table: an over-long row is clamped to the header column count', r.cols === 2 && r.rows[0]?.length === 2, JSON.stringify(r.rows));
+  check('table: …with the overflow folded into the last cell, not lost',
+    /\^2/.test(r.rows[0]?.[1] || '') && />=23/.test(r.rows[0]?.[1] || ''), JSON.stringify(r.rows[0]));
+  r.w.close();
+
+  // A wide table is allowed to grow past the panel and scroll, rather than a
+  // hard width:100% cramming every column to a few characters.
+  const css = require('fs').readFileSync(require('path').join(__dirname, '..', 'media', 'styles.css'), 'utf8');
+  const tableRule = /\.message-bubble table\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  check('table: styling lets a wide table scroll, not crush its columns',
+    /width:\s*auto/.test(tableRule) && /min-width:\s*100%/.test(tableRule), tableRule.trim());
+}
+
 orderingSuite();
 themeTokenSuite();
 settingsPanelSuite();
@@ -3208,6 +3404,7 @@ noContentLossSuite();
 streamConsistencySuite();
 bubbleSuite();
 highlightSuite();
+tableSuite();
 speechSuite();
 diffSuite();
 

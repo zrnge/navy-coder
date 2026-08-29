@@ -5,12 +5,20 @@
 // apiBase (user override) always wins. `host` is the fallback for 'custom'
 // (self-hosted servers configured via navy.host). Returns null for providers
 // that are not OpenAI-compatible (ollama native, anthropic).
+
+// Native (non-OpenAI-compatible) provider bases. They live here too, so the
+// "single source of truth" this file promises is not quietly undercut by the
+// same default sitting hardcoded in llm.js and extension.js — where it was,
+// three times over, free to diverge.
+const ANTHROPIC_BASE = 'https://api.anthropic.com';
+const GEMINI_NATIVE_BASE = 'https://generativelanguage.googleapis.com';
+
 function openAiCompatBase(provider, apiBase, host) {
   const DEFAULTS = {
     openai:     'https://api.openai.com/v1',
     lmstudio:   'http://localhost:1234/v1',
     deepseek:   'https://api.deepseek.com/v1',
-    gemini:     'https://generativelanguage.googleapis.com/v1beta/openai',
+    gemini:     GEMINI_NATIVE_BASE + '/v1beta/openai',
     xai:        'https://api.x.ai/v1',
     // z.ai does NOT serve /v1 — api.z.ai/v1/models is a bare nginx 404, which is
     // why the model list came back empty and no amount of re-pasting the key
@@ -84,4 +92,4 @@ function providerDisplayName(id) {
   return PROVIDER_NAMES[id] || id;
 }
 
-module.exports = { openAiCompatBase, providerDisplayName, ollamaHost, ollamaAuthHeaders, OLLAMA_CLOUD_HOST };
+module.exports = { openAiCompatBase, providerDisplayName, ollamaHost, ollamaAuthHeaders, OLLAMA_CLOUD_HOST, ANTHROPIC_BASE, GEMINI_NATIVE_BASE };

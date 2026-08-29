@@ -1,5 +1,5 @@
 const { streamAssistant, parseToolCalls, extractCodeEdits } = require('./providers/llm.js');
-const { openAiCompatBase, providerDisplayName, ollamaHost, ollamaAuthHeaders } = require('./providers/endpoints.js');
+const { openAiCompatBase, providerDisplayName, ollamaHost, ollamaAuthHeaders, ANTHROPIC_BASE } = require('./providers/endpoints.js');
 const { McpManager } = require('./providers/mcp.js');
 const { formatProviderError, classifyProviderError, isTransientProviderError } = require('./providers/errors.js');
 const { getEmbeddings, cosineSimilarity } = require('./providers/embeddings.js');
@@ -14,7 +14,7 @@ const { NET_SAFETY_METHODS } = require('./net-safety.js');
 const { UNDO_METHODS } = require('./undo.js');
 const { WEB_SEARCH_METHODS } = require('./web-search.js');
 const { DIAGNOSTICS_METHODS } = require('./diagnostics.js');
-const { COMMAND_METHODS } = require('./commands.js');
+const { COMMAND_METHODS, looksLikeContainerPullError } = require('./commands.js');
 const { UNTRUSTED_REFUSAL } = require('./trust.js');
 const { PLAN_METHODS } = require('./plan.js');
 const { SLASH_COMMAND_METHODS } = require('./slash-commands.js');
@@ -978,7 +978,7 @@ class NavyCoderViewProvider {
           break;
         }
         case 'runProjectAudit':
-          await this.runProjectAudit();
+          await this.runProjectAudit(Boolean(message.deep));
           break;
         case 'reviewSlashCommand': {
           // Approving runs it immediately: the user typed the command, read the
@@ -2430,7 +2430,7 @@ class NavyCoderViewProvider {
   _modelListRequest(provider, apiBase, host, apiKey) {
     const headers = { 'Content-Type': 'application/json' };
     if (provider === 'anthropic') {
-      const url = (apiBase || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/models?limit=100';
+      const url = (apiBase || ANTHROPIC_BASE).replace(/\/$/, '') + '/v1/models?limit=100';
       if (apiKey) { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01'; }
       return { url, headers };
     }
@@ -3193,17 +3193,18 @@ class NavyCoderViewProvider {
     const rootKnown = root && root !== 'none';
     const projectName = rootKnown ? path.basename(root) : null;
     // The shell the model must WRITE for, which is not necessarily the host's:
-    // under navy.sandboxMode 'docker' every command runs inside a Linux
-    // container. Telling a model on Windows to write cmd.exe syntax that then
-    // executes in a container is the same bug as building `cmd /c` for it —
+    // under a container sandbox ('docker' or 'wsl') every command runs inside a
+    // Linux container. Telling a model on Windows to write cmd.exe syntax that
+    // then executes in a container is the same bug as building `cmd /c` for it —
     // both have to follow the execution target. See _commandTargetIsPosix.
     // Ditto: this drives the "commands run inside a Linux container" line in
-    // the prompt, which is true of 'docker' and false of 'native'.
-    const sandboxed = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off') === 'docker';
+    // the prompt, which is true of 'docker'/'wsl' and false of 'native'.
+    const sbMode = vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off');
+    const sandboxed = sbMode === 'docker' || sbMode === 'wsl';
     const isWinShell = !this._commandTargetIsPosix();
     const hostPlatform = process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux';
     const osPlatform = sandboxed
-      ? `${hostPlatform} host, but commands run inside a Linux container (navy.sandboxMode is "docker")`
+      ? `${hostPlatform} host, but commands run inside a Linux container (navy.sandboxMode is "${sbMode}")`
       : hostPlatform;
     // The exact shell run_command executes through — NOT just the OS family,
     // and NOT inferable from it either: navy.shell can name any of them, and
@@ -3498,6 +3499,7 @@ class NavyCoderViewProvider {
       let lastAssistantText = ''; // final assistant text, persisted to history after the loop
       let hallucinationNudged = false; // false-completion-claim correction sent once
       let hallucinationWarned = false; // still claimed success after the nudge — tell the user
+      let planContinueCount = 0; // bounded auto-continue when the model quits mid-plan
       // Only worth running the hallucination guard at all if the user's request
       // could plausibly have wanted a file created/changed — avoids false
       // positives on purely informational turns (computed once; the prompt text
@@ -3629,6 +3631,36 @@ class NavyCoderViewProvider {
             continue;
           }
           hallucinationWarned = true;
+        }
+
+        // The model's own declared plan still has open steps, yet the turn is
+        // ending — the "narrated a plan, read a few files, then quit without
+        // doing the work" failure the plan card kept exposing (frozen at 0/N while
+        // the turn was over). Two shapes of it, both nudged here to actually
+        // execute: it stopped COLD (no tool calls at all), OR it called finish()
+        // having changed NOTHING — reading files is not fixing them, and a finish
+        // at 0/N with no writes/commands is a false finish, not a real one. A
+        // finish() that FOLLOWED real work is respected (partial is a fact, not an
+        // error), as is a stop that asks the user a question. Bounded so it cannot
+        // loop.
+        if (isDone && planContinueCount < 2) {
+          const openSteps = (this._session.plan || []).filter(s => s.status !== 'done');
+          const tail = String(responseText || '').slice(-400);
+          const asksUser = /\?\s*$/.test(String(responseText || '').trim())
+            || /\b(would you like|do you want|should i|shall i|let me know|which .{0,40}\?|do you prefer|your call)\b/i.test(tail);
+          const noWork = taskChanges.touched.size === 0
+            && taskChanges.deleted.filter(Boolean).length === 0
+            && taskChanges.commands.length === 0;
+          const stoppedCold = toolCalls.length === 0;   // no finish() either — narrated and quit
+          const emptyFinish = !stoppedCold && noWork;    // finish() with nothing done
+          if (openSteps.length && !asksUser && (stoppedCold || emptyFinish)) {
+            planContinueCount++;
+            messages.push({
+              role: 'user',
+              content: `[SYSTEM: Your plan still has ${openSteps.length} step(s) not marked done, and ${emptyFinish ? 'you called finish() without writing, deleting or running anything — reading files is not fixing them' : 'you ended the turn without calling finish() or taking any action'}. If work remains, DO IT NOW — call the tools to make the edits and run the checks, and update_plan as you complete each step. If you are genuinely blocked or need a decision from the user, call finish() and state exactly what is blocking you. Do NOT end a turn by only describing what you intend to do.]`,
+            });
+            continue;
+          }
         }
 
         if (isDone) {
@@ -3888,9 +3920,17 @@ class NavyCoderViewProvider {
                 failedCommands.set(cmdKey, n);
                 // A "not found"-shaped failure is a missing/PATH problem, not a code
                 // bug — point at that specifically instead of the generic "diagnose
-                // and fix the code" nudge, which doesn't apply here.
+                // and fix the code" nudge, which doesn't apply here. And under a
+                // container sandbox, an image the runtime could not PULL or resolve
+                // (DNS) is a networking problem in the sandbox, not the project — the
+                // loudest confusing case for docker/wsl, so it gets its own nudge
+                // rather than sending the model to edit code that is not broken.
                 const notFound = /is not recognized as an internal or external command|command not found|No such file or directory.*(?:PATH|command)/i.test(result);
-                result += notFound
+                const containerSandbox = ['docker', 'wsl'].includes(vscode.workspace.getConfiguration('navy').get('sandboxMode', 'off'));
+                const pullFail = containerSandbox && looksLikeContainerPullError(result);
+                result += pullFail
+                  ? '\n\n[SYSTEM: This ran under container sandboxing (navy.sandboxMode) and could not PULL or reach its image — a networking/DNS problem in the sandbox, NOT a code bug and not fixable by editing the project. The container could not resolve the image registry. Tell the user to pre-pull the image while online (e.g. "wslc pull <image>" or "docker pull <image>") so run time needs no pull, or to fix DNS in their WSL/Docker network (a broken resolver such as 0.0.0.0:53 is the usual cause). Do NOT retry until they have.]'
+                  : notFound
                   ? `\n\n[SYSTEM: This command failed because the program isn't installed or isn't on PATH — this is NOT a code bug. Verify with "${this._resolveShell().probe}" before trying again, and use an alternative if it's genuinely unavailable.]`
                   : '\n\n[SYSTEM: This command failed. Do NOT run it again without first diagnosing the error and fixing the code. Analyze the output above, find the root cause, apply a fix, then retry.]';
               } else if (typeof result === 'string' && result.startsWith('Exit code: 0')) {
@@ -4652,7 +4692,11 @@ class NavyCoderViewProvider {
     const normalCandidate = foldPath(candidate);
     const isUnder = (r) => normalCandidate === r || normalCandidate.startsWith(r + path.sep);
     if (!normalRoots.some(isUnder)) {
-      throw new Error(`Path is outside the ${looseDir ? "open file's folder" : 'project folder'}: ${inputPath}`);
+      const scope = looseDir ? "open file's folder" : 'project folder';
+      // Say WHY and HOW to recover, so the model retries with a valid path
+      // instead of dead-ending — and so a person reading the error understands
+      // the boundary is deliberate, not a failure to find the file.
+      throw new Error(`Path is outside the ${scope}: ${inputPath}. File tools cannot reach outside it — use a path inside the project (relative to its root), not an absolute path elsewhere on the machine.`);
     }
 
     // Resolve symlinks to prevent traversal through symlinks inside the workspace
@@ -5479,11 +5523,13 @@ class NavyCoderViewProvider {
     // image that has no such thing — the identical bug that shipped sandboxing
     // broken on Windows, one layer up. _maybeWrapForSandbox either wraps the
     // spec or refuses it, so this can never leak sh onto a Windows host.
-    // 'docker' only, and deliberately not 'native': a native sandbox wraps the
-    // HOST's own shell in place, so the dialect the model must write is
-    // whatever the host uses. Only a container replaces the execution
-    // environment, and only then does the shell target have to follow it.
-    if (config.get('sandboxMode', 'off') === 'docker') return { id: 'sh', ...SHELLS.sh };
+    // The container modes only — 'docker' and 'wsl' (WSL Containers) — and
+    // deliberately not 'native': a native sandbox wraps the HOST's own shell in
+    // place, so the dialect the model must write is whatever the host uses. Only
+    // a container replaces the execution environment, and only then does the
+    // shell target have to follow it.
+    const sbMode = config.get('sandboxMode', 'off');
+    if (sbMode === 'docker' || sbMode === 'wsl') return { id: 'sh', ...SHELLS.sh };
 
     const choice = config.get('shell', 'auto');
     const id = choice === 'auto' ? (process.platform === 'win32' ? 'cmd' : 'sh') : choice;
@@ -6858,7 +6904,7 @@ function activate(context) {
           completion = (data.response || '').trimEnd();
 
         } else if (aiProvider === 'anthropic') {
-          const baseUrl = apiBase || 'https://api.anthropic.com';
+          const baseUrl = apiBase || ANTHROPIC_BASE;
           const res = await fetch(baseUrl + '/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey,
@@ -7026,6 +7072,8 @@ class SupplyChainScanMethods {
     const changedSet = await this._recentlyChangedFiles(root);
 
     const findings = [];
+    const manifests = [];   // package/lockfile/build files — the deep pass seeds on these
+    const changed = [];     // recently-changed files, so the deep pass looks there first
     let scanned = 0;
     let capped = false;
 
@@ -7041,7 +7089,8 @@ class SupplyChainScanMethods {
           if (!RELEVANCE_SKIP_DIRS.has(entry.name)) await walk(full, depth + 1);
           continue;
         }
-        if (!supply.classifyForScan(entry.name)) continue;
+        const kind = supply.classifyForScan(entry.name);
+        if (!kind) continue;
         const rel = path.relative(root, full).replace(/\\/g, '/');
         if (ignored.has(rel)) continue;
         try {
@@ -7051,20 +7100,29 @@ class SupplyChainScanMethods {
           if (content.slice(0, 1024).includes(' ')) continue; // binary
           scanned++;
           if (scanned >= MAX_FILES) capped = true;
+          if (kind !== 'source' && manifests.length < 80) manifests.push(rel);
+          if (changedSet.has(rel) && changed.length < 120) changed.push(rel);
           const hits = supply.scanFile({ name: entry.name, rel, content, changed: changedSet.has(rel) });
           for (const h of hits) findings.push(h);
         } catch { /* unreadable — skip, never fail the whole audit for one file */ }
       }
     };
     await walk(root, 0);
-    return { findings, scanned, capped };
+    return { findings, scanned, capped, manifests, changed };
   }
 
-  // The command entry point. Runs the scan, tells the user what was found, and
-  // then — only if there is something to reason about — asks the model to
-  // triage it as an ordinary turn, so the answer lands in the transcript with
-  // history, approval and the rest exactly as any other reply does.
-  async runProjectAudit() {
+  // The command entry point. Runs the deterministic scan, shows the card, then
+  // hands off to the model as an ordinary turn so the answer lands in the
+  // transcript with history, approval and the rest exactly as any other reply.
+  //
+  // Two modes. `/audit` (deep=false) is the fast, reproducible path: the model
+  // is only asked to TRIAGE the pattern hits, and a clean scan spends no model
+  // call at all. `/audit deep` (deep=true) unleashes an agentic audit — the
+  // model reads the project with read_file/list_files/git and reasons about
+  // supply-chain risk in whatever language it actually finds, seeded by the
+  // scan's hints but not capped by them. It runs even when the scan is clean,
+  // because a fixed set of patterns having nothing to say proves little.
+  async runProjectAudit(deep = false) {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       this.view?.webview.postMessage({ type: 'error', message: 'Navy: open a folder before running /audit — there is nothing to scan.' });
@@ -7081,21 +7139,25 @@ class SupplyChainScanMethods {
     }
     const summary = supply.summarizeScan(walkResult.findings, { scanned: walkResult.scanned, root });
 
-    // Nothing flagged: say so and stop. Spending a model call to have it
-    // confirm an empty list would be theatre, and worse, would invite it to
-    // manufacture a concern to look useful.
-    if (!summary.total) {
-      this.view?.webview.postMessage({ type: 'auditResult', headline: summary.headline, findings: [], counts: summary.counts });
-      return summary;
-    }
-
+    // The card is deterministic, so it is shown first and always — even for a
+    // clean scan, and even when a deep pass is about to reason further.
     this.view?.webview.postMessage({
-      type: 'auditResult', headline: summary.headline, counts: summary.counts,
+      type: 'auditResult', headline: summary.headline, counts: summary.counts, deep,
       findings: summary.findings.map(f => ({ file: f.file, severity: f.severity, id: f.id, changed: Boolean(f.changed) })),
     });
 
-    // The model triages the FINDINGS, not the repo. It is told, in
-    // supply-chain.js, not to invent anything beyond the list.
+    if (deep) {
+      // The agentic pass. Seeded with the hints, the recently-changed files and
+      // the manifests the walk found; the model investigates from there.
+      await this.askNavy(supply.deepAuditPrompt(summary, walkResult), false, null, [], []);
+      return summary;
+    }
+
+    // Light mode: a clean scan stops here. Spending a model call to confirm an
+    // empty list would be theatre, and worse, would invite a manufactured
+    // concern. When there IS something, the model triages the FINDINGS only —
+    // it is told, in supply-chain.js, not to invent anything beyond the list.
+    if (!summary.total) return summary;
     await this.askNavy(supply.scanTriagePrompt(summary), false, null, [], []);
     return summary;
   }

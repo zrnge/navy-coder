@@ -261,6 +261,14 @@ function scanLockfile(raw, rel) {
 // So these fire on executable CONSTRUCTS, not vocabulary — and on the
 // combination that is actually the attack (read a credential AND reach the
 // network) rather than either half, which alone is ordinary.
+// Fragments shared across the rule sets below, composed with `.source` so each
+// piece stays a real, self-valid regex literal. The point is that the shell
+// list and the obfuscation-blob threshold each live in ONE place: change the
+// shells here and every rule — including build-network-fetch's no-double-flag
+// lookahead — moves together, rather than five copies silently diverging.
+const SH = /(?:ba|z|da|a)?sh/.source;      // sh, bash, zsh, dash, ash
+const BLOB = /['"`][A-Za-z0-9+/]{200,}={0,2}['"`]|(?:\\x[0-9a-f]{2}){16,}/.source; // a long base64 literal, or a run of \xNN byte escapes
+
 const SOURCE_RULES = [
   {
     id: 'remote-execution',
@@ -278,7 +286,7 @@ const SOURCE_RULES = [
     id: 'credential-access',
     severity: 'high',
     why: 'Reads a credential store in code — an SSH key, cloud credentials, a keychain. Rare in application code, and the first half of an exfiltration.',
-    re: /(readFileSync|readFile|open|read_file|File\.read|os\.Open|ioutil\.ReadFile)\s*\([^)]*(\.ssh\/|id_rsa|id_ed25519|\.aws\/credentials|\.gnupg|\.netrc|\.git-credentials|\.npmrc|\.kube\/config)/i,
+    re: /(readFileSync|readFile|open|read_file|File\.read|os\.Open|ioutil\.ReadFile|fopen|freopen|CreateFile)\s*\([^)]*(\.ssh\/|id_rsa|id_ed25519|\.aws\/credentials|\.gnupg|\.netrc|\.git-credentials|\.npmrc|\.kube\/config|\/etc\/shadow)/i,
   },
   {
     id: 'suspicious-network',
@@ -296,7 +304,36 @@ const SOURCE_RULES = [
     id: 'obfuscation',
     severity: 'medium',
     why: 'A long encoded or hex-escaped run. Source is written to be read; something hidden in it was hidden on purpose.',
-    re: /['"`][A-Za-z0-9+/]{200,}={0,2}['"`]|(?:\\x[0-9a-f]{2}){16,}|(?:\\u[0-9a-f]{4}){16,}/i,
+    re: new RegExp(BLOB + '|' + /(?:\\u[0-9a-f]{4}){16,}/.source, 'i'),
+  },
+
+  // ── Native-language constructs (C, C++, Objective-C, Java, C#, …). ────────
+  // A backdoor in compiled code looks nothing like a JS one. It shells out with
+  // system()/popen(), execs `/bin/sh -c`, preloads a library, or opens a raw
+  // socket to a hardcoded address — none of which the script-language rules
+  // above describe. These fire on those constructs, and (like the rest) on the
+  // suspicious form of each, not the everyday one: system("make") is left alone,
+  // system(cmd) is flagged.
+  {
+    id: 'shell-exec-native',
+    severity: 'medium',
+    why: 'Runs a shell command from a runtime value, or execs `/bin/sh -c`. Ordinary in tooling; in application code it is where command injection lives — check what is passed in.',
+    re: new RegExp(
+      /\b(system|popen)\s*\(\s*(?![)"'\s])/.source
+      + '|' + /["']\/bin\//.source + SH + /["'][^;\n]{0,60}["']-c["']/.source
+      + '|' + /\bexecl?e?\s*\(\s*["']\/bin\//.source + SH + /["']/.source, 'i'),
+  },
+  {
+    id: 'library-preload',
+    severity: 'medium',
+    why: 'Injects or loads a library at runtime — an LD_PRELOAD/DYLD_INSERT set, or a dlopen of a path built at runtime. A classic way to run code that is not in the source you are reading.',
+    re: /\b(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES)\s*=|(?:setenv|putenv)\s*\(\s*["'](?:LD_PRELOAD|DYLD_INSERT_LIBRARIES)|\bdlopen\s*\(\s*(?![)"'\s])/,
+  },
+  {
+    id: 'hardcoded-ip-connection',
+    severity: 'medium',
+    why: 'Resolves or connects to a hardcoded public IP address. Benign for a known service, but a hardcoded address in a native network call is how malware reaches its server — confirm the destination.',
+    re: /(?:inet_addr|inet_pton|inet_aton|gethostbyname|getaddrinfo|WSAConnect)\s*\([^;{\n]{0,80}["'](?!127\.0\.0\.1|0\.0\.0\.0|255\.|10\.|192\.168\.|169\.254|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[0-1]\.)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}["']|sin_addr[^;\n]{0,40}["'](?!127\.)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}["']/,
   },
 ];
 
@@ -329,20 +366,106 @@ function scanSourceFile(text, rel) {
   return findings;
 }
 
-// Which files are worth reading. Manifests always; source by extension; and
-// nothing enormous, since a multi-megabyte file is generated or vendored and a
-// hit in it is noise.
+// A build file — a Makefile, a CMake script, a configure, a Dockerfile. This is
+// where the C/C++ (and native) supply-chain attacks actually live: not in the
+// .c files but in the step that runs before you have reviewed anything, with
+// your permissions. The xz/liblzma backdoor hid in exactly this kind of file.
+// A build step that downloads-and-runs, or decodes-and-runs, is high; one that
+// merely reaches the network is worth a glance.
+const BUILD_RULES = [
+  {
+    id: 'build-remote-execution',
+    severity: 'high',
+    why: 'A build step downloads or decodes content and runs it — piped straight into a shell. The build runs before you review anything, with your permissions. This is the shape of the xz/liblzma backdoor.',
+    re: new RegExp(
+      /\b(?:curl|wget)\b[^\n]*\|\s*/.source + SH + /\b/.source
+      + '|' + /\b(?:base64|openssl|xz|gzip|gunzip|zcat)\b[^\n]*\|\s*/.source + SH + /\b/.source
+      + '|' + /\|\s*/.source + SH + /\b[^\n]*\b(?:base64|xz|openssl)\b/.source
+      + '|' + /eval\s+["']?\$\(|\bIEX\b|Invoke-Expression|DownloadString\s*\(/.source, 'i'),
+  },
+  {
+    id: 'build-network-fetch',
+    severity: 'medium',
+    why: 'A build step reaches the network — a download or a clone during the build. Often a legitimate dependency fetch, but a build that pulls code from outside a package registry is worth confirming.',
+    re: new RegExp(
+      '\\b(?:curl|wget)\\b(?![^\\n]*\\|\\s*' + SH + ')'
+      + '|' + /Invoke-WebRequest|\biwr\b|\bgit\s+clone\b[^\n]*https?:\/\//.source, 'i'),
+  },
+  {
+    id: 'build-obfuscation',
+    severity: 'medium',
+    why: 'A long encoded or hex-escaped blob in a build file. Build scripts are written to be read; something hidden in one was hidden on purpose.',
+    re: new RegExp(BLOB, 'i'),
+  },
+];
+
+function scanBuildFile(text, rel) {
+  const code = stripComments(text);
+  const findings = [];
+  for (const rule of BUILD_RULES) {
+    const m = rule.re.exec(code);
+    if (!m) continue;
+    findings.push({
+      file: rel,
+      id: rule.id,
+      severity: rule.severity,
+      why: rule.why,
+      match: m[0].replace(/\s+/g, ' ').trim().slice(0, 120),
+    });
+  }
+  return findings;
+}
+
+// Which files are worth reading. Manifests and build files get their own
+// scanners; everything else that is text is read as source. Nothing enormous,
+// since a multi-megabyte file is generated or vendored and a hit in it is noise.
 const MANIFEST_NAMES = new Set(['package.json', 'requirements.txt', 'pyproject.toml', 'Cargo.toml', 'Gemfile', 'go.mod']);
 const LOCKFILE_NAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Cargo.lock', 'poetry.lock', 'Gemfile.lock', 'go.sum']);
-const SCANNABLE_EXTS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.rb', '.go', '.rs', '.sh', '.bash', '.ps1', '.php']);
+// Build systems whose steps run automatically. Names first (a Makefile has no
+// extension), then extensions for the ones that do.
+const BUILDFILE_NAMES = new Set([
+  'Makefile', 'makefile', 'GNUmakefile', 'CMakeLists.txt',
+  'configure', 'configure.ac', 'configure.in', 'Makefile.am', 'Makefile.in',
+  'Dockerfile', 'Containerfile', 'wscript', 'BUILD', 'BUILD.bazel', 'SConstruct',
+]);
+const BUILDFILE_EXTS = new Set(['.mk', '.cmake', '.gradle', '.bazel', '.bzl']);
+// The point of a general-purpose auditor is that a language you did not think of
+// is not invisible. So instead of an ALLOWLIST — which silently skipped Lua,
+// Elixir, Zig, Perl, and anything else not enumerated — we DENYLIST the file
+// types that are binary, generated, tabular, or prose, and read everything
+// else. The walk still guards with a size cap and a NUL-byte binary check, so a
+// stray binary with an unlisted extension is dropped there, not here.
+const SKIP_EXTS = new Set([
+  // Images, media, fonts, archives, compiled artefacts — never source.
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.tif', '.tiff', '.avif', '.heic', '.icns',
+  '.mp4', '.webm', '.mov', '.avi', '.mkv', '.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac',
+  '.woff', '.woff2', '.ttf', '.otf', '.eot',
+  '.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.zst', '.7z', '.rar', '.jar', '.war', '.whl', '.nupkg', '.dmg', '.iso',
+  '.exe', '.dll', '.so', '.dylib', '.o', '.a', '.lib', '.class', '.pyc', '.pyo', '.wasm', '.bin', '.dat', '.node', '.pdb',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  // Stylesheets and tabular data: they carry base64 data URIs and long value
+  // runs that trip the obfuscation rule, but no executable construct — pure
+  // false-positive fuel.
+  '.css', '.scss', '.sass', '.less', '.csv', '.tsv', '.parquet',
+  // Prose, and generated noise. A README that documents a `curl | sh` install
+  // line is not an attack, and flagging every one is exactly the noise this
+  // scan exists to avoid.
+  '.md', '.markdown', '.mdx', '.rst', '.adoc', '.txt', '.map', '.snap', '.ipynb',
+]);
 const SCAN_MAX_BYTES = 512 * 1024;
 
 function classifyForScan(name) {
   if (MANIFEST_NAMES.has(name)) return name === 'package.json' ? 'package' : 'manifest';
   if (LOCKFILE_NAMES.has(name)) return 'lockfile';
+  if (BUILDFILE_NAMES.has(name)) return 'buildfile';
   const dot = name.lastIndexOf('.');
   const ext = dot === -1 ? '' : name.slice(dot).toLowerCase();
-  return SCANNABLE_EXTS.has(ext) ? 'source' : null;
+  if (BUILDFILE_EXTS.has(ext)) return 'buildfile';
+  if (SKIP_EXTS.has(ext)) return null;
+  // Everything else that is text is source — including a file with no extension
+  // (a LICENSE, a shell script that forgot its .sh). The walk drops it if the
+  // bytes turn out to be binary.
+  return 'source';
 }
 
 // Dispatches one file to the right scanner. `changed` marks a file the caller
@@ -355,6 +478,7 @@ function scanFile({ name, rel, content, changed }) {
   let findings;
   if (kind === 'package') findings = scanPackageJson(content, rel);
   else if (kind === 'lockfile') findings = scanLockfile(content, rel);
+  else if (kind === 'buildfile') findings = scanBuildFile(content, rel);
   else findings = scanSourceFile(content, rel);
   return changed ? findings.map(f => ({ ...f, changed: true })) : findings;
 }
@@ -416,8 +540,62 @@ function scanTriagePrompt(summary) {
   return lines.join('\n');
 }
 
+// The DEEP audit — `/audit deep`. Where scanTriagePrompt leashes the model to
+// the pattern hits, this cuts the leash: the model is told to actually read the
+// project and reason about supply-chain risk in whatever language and ecosystem
+// it finds, using its tools. The deterministic scan is handed over as HINTS and
+// a head start (the changed files, the manifests it saw), never as the ceiling.
+// The grounding demand — quote the real line, do not invent — is what keeps an
+// unleashed "find security issues" prompt from manufacturing a wall of concern.
+function deepAuditPrompt(summary, walk = {}) {
+  const changed = (walk.changed || []).slice(0, 60);
+  const manifests = (walk.manifests || []).slice(0, 60);
+  const lines = [
+    'Perform a DEEP supply-chain security audit of this project. You are hunting for a',
+    'backdoor, a dependency-based attack, or exfiltration hidden in the code — something an',
+    'attacker planted so it runs on a developer\'s or a user\'s machine.',
+    '',
+    'A fast pattern scan already ran. Treat its results as HINTS, not the whole picture: the',
+    'point of this pass is to find what a fixed set of patterns cannot, in whatever language',
+    'and ecosystem this project actually uses.',
+    '',
+    `Pattern scan: ${summary.headline}`,
+  ];
+  if (summary.findings.length) {
+    lines.push('Flagged by pattern — verify each; some are real, some are noise:');
+    for (const f of summary.findings.slice(0, 40)) {
+      lines.push(`- [${f.severity.toUpperCase()}${f.changed ? ' · recently changed' : ''}] ${f.file} — ${f.id}: ${f.match}`);
+    }
+  } else {
+    lines.push('The pattern scan flagged nothing — which proves little on its own. Investigate anyway.');
+  }
+  lines.push('');
+  if (changed.length) {
+    lines.push('Recently changed (an attack that just landed is the one that matters — look here first):');
+    for (const c of changed) lines.push(`- ${c}`);
+    lines.push('');
+  }
+  if (manifests.length) {
+    lines.push('Dependency and build files found (check for off-registry sources and steps that run on install/build):');
+    for (const m of manifests) lines.push(`- ${m}`);
+    lines.push('');
+  }
+  lines.push('How to investigate — use your tools (read_file, list_files, and git through run_command):');
+  lines.push('- Read the changed and flagged files first, then the entry points and any install/build scripts.');
+  lines.push('- Look for: code that runs on install or build; download-and-execute; obfuscated or encoded payloads;');
+  lines.push('  a read of credentials/keys/tokens paired with any network send; a dependency pulled from a git URL');
+  lines.push('  or a bare tarball rather than a registry; a typosquatted or otherwise unexpected dependency name.');
+  lines.push('- When a file looks off, `git log`/`git diff` it — whether a change was planted is often clearest there.');
+  lines.push('');
+  lines.push('Ground every finding: name the file, QUOTE the actual line, say why it is a risk and how sure you are,');
+  lines.push('and give one concrete next step. Do NOT invent problems to look thorough — if the project looks clean,');
+  lines.push('say so plainly and briefly. Order by severity, and keep it tight: this gets run repeatedly.');
+  return lines.join('\n');
+}
+
 module.exports = {
   fingerprintPrompt, auditPrompt, riskSummary, reviewReport, RISK_RULES,
   scanFile, scanSourceFile, classifyForScan, summarizeScan, scanTriagePrompt,
-  scanPackageJson, scanLockfile, SOURCE_RULES, SCAN_MAX_BYTES, SCANNABLE_EXTS,
+  deepAuditPrompt, scanPackageJson, scanLockfile, scanBuildFile, SOURCE_RULES,
+  BUILD_RULES, SCAN_MAX_BYTES, SKIP_EXTS, BUILDFILE_NAMES, BUILDFILE_EXTS,
 };

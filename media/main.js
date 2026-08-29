@@ -138,6 +138,8 @@ const SPEECH_AVAILABLE = typeof window !== 'undefined'
 let activeAssistantMessage = null;
 let activeAssistantBubble = null;
 let activeAssistantContent = '';
+let activeThinkingEl = null;       // the live "Thinking" <details> for native reasoning
+let activeThinkingContentEl = null;
 let lastAssistantMessage = null;  // persists after 'done' so 'applied' can find apply buttons
 let userScrolledUp = false;
 let activeFilePath = '';
@@ -1165,6 +1167,8 @@ window.addEventListener('message', (event) => {
     activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
     _primaryBubble = activeAssistantBubble;
     activeAssistantContent = '';
+    activeThinkingEl = null;
+    activeThinkingContentEl = null;
     _segmentStart = 0;
     _needNewBubble = false;
     _streamPre = null;
@@ -1188,6 +1192,13 @@ window.addEventListener('message', (event) => {
     if (thinkingRow) thinkingRow.classList.add('thinking-row');
   }
 
+  if (message.type === 'thinkingChunk') {
+    // Native extended thinking (Claude/Gemini/Ollama). It arrives before the
+    // answer; render it in a collapsible block, collapsed by default.
+    appendThinking(message.text);
+    return;
+  }
+
   if (message.type === 'chunk') {
     // First chunk means the model is responding directly — discard the Thinking placeholder.
     {
@@ -1205,9 +1216,14 @@ window.addEventListener('message', (event) => {
   if (message.type === 'done' || message.type === 'aborted') {
     flushAssistantText();
     setBusy(false);
-    // Only a genuinely successful finish claims every plan step is done — an
-    // aborted turn may have only completed some of them.
-    if (message.type === 'done') updatePlanProgress(0, true);
+    // Marking every step done on a successful finish is a GUESS, and only valid
+    // for the inferred plan (scraped from tool activity), where progress was
+    // never reported. An AUTHORITATIVE plan — one the model declared via
+    // update_plan — already carries each step's real status, and the turn simply
+    // ending is not the model saying they are all done: it may have stopped at
+    // 0/6. Overriding that struck every step through while the header still read
+    // "0/6 DONE" — a plan that looked completed without the work being done.
+    if (message.type === 'done' && !planIsAuthoritative) updatePlanProgress(0, true);
     // A command still streaming when the turn ends (Stop pressed) — close its card.
     // Every card still in flight, not just the most recent one — Stop ends
     // all of them, and a keyed card left out would spin at 'running…' forever.
@@ -1218,11 +1234,12 @@ window.addEventListener('message', (event) => {
     // arrived). Only discard the whole message when NOTHING is left — the old
     // check deleted the entire message on an empty bubble, taking every tool card
     // with it, even though the comment claimed the cards survived.
+    finalizeThinking();
     if (activeAssistantMessage) {
       for (const b of [...activeAssistantMessage.querySelectorAll('.message-bubble')]) {
         if (!b.innerHTML.trim()) b.remove();
       }
-      if (!activeAssistantMessage.querySelector('.message-bubble, .activity-log, .activity-log-collapsed')) {
+      if (!activeAssistantMessage.querySelector('.message-bubble, .activity-log, .activity-log-collapsed, .think-block')) {
         activeAssistantMessage.remove();
         activeAssistantMessage = null;
       } else {
@@ -1232,6 +1249,8 @@ window.addEventListener('message', (event) => {
     }
     activeAssistantBubble = null;
     activeAssistantContent = '';
+    activeThinkingEl = null;
+    activeThinkingContentEl = null;
     if (stepBadgeEl) { stepBadgeEl.textContent = ''; stepBadgeEl.classList.remove('visible'); }
     collapseToolProgress();
     updateWelcome();
@@ -1649,6 +1668,12 @@ window.addEventListener('message', (event) => {
     line.className = 'audit-headline';
     line.textContent = message.headline || '';
     card.appendChild(line);
+    if (message.deep) {
+      const note = document.createElement('div');
+      note.className = 'audit-headline';
+      note.textContent = 'Running a deep AI audit — reading the project…';
+      card.appendChild(note);
+    }
     for (const f of (message.findings || []).slice(0, 40)) {
       const row = document.createElement('div');
       row.className = 'audit-row';
@@ -2226,7 +2251,7 @@ const SLASH_COMMANDS = [
   { cmd: '/test',            label: 'Test',          iconName: 'test', desc: 'Run tests and fix failures',               prompt: 'Run the test suite, show the results, and fix any failing tests.' },
   { cmd: '/generate-tests',  label: 'Gen Tests',     iconName: 'gen-tests', desc: 'Generate unit tests for this file',        prompt: 'Generate comprehensive unit tests for the active file. First read_file to see its full content. Cover the happy path, edge cases, and error paths. Use the existing test framework — check package.json and any existing test files first to match conventions.' },
   { cmd: '/optimize',        label: 'Optimize',      iconName: 'optimize', desc: 'Optimize code performance',               prompt: 'Analyze the active file for performance bottlenecks. First read_file to see its full content. Identify the most impactful issues (unnecessary re-renders, redundant I/O, O(n²) loops, etc.) and apply optimizations without changing observable behaviour. Explain each change.' },
-  { cmd: '/audit',           label: 'Audit',         iconName: 'security', desc: 'Scan the project for supply-chain risk (deps, install hooks, backdoors)', prompt: '' },
+  { cmd: '/audit',           label: 'Audit',         iconName: 'security', desc: 'Scan the project for supply-chain risk (deps, install hooks, backdoors)', hint: 'add "deep" for a full AI audit', prompt: '/audit ' },
   { cmd: '/security',        label: 'Security',      iconName: 'security', desc: 'Security audit this code',                 prompt: 'Perform a thorough security audit of this project. Use list_files then read_file on the relevant source files. Check for OWASP Top 10 issues: injection (SQL, command, XSS), broken authentication, insecure deserialization, security misconfiguration, sensitive data exposure, and access control flaws. For each issue found: quote the vulnerable line, explain the risk and attack vector, then show the corrected code.' },
   { cmd: '/commit',          label: 'Commit',        iconName: 'commit', desc: 'Generate a git commit message',            prompt: 'Generate a conventional commit message for the current staged changes.' },
   { cmd: '/pr',              label: 'PR',            iconName: 'pr', desc: 'Generate a PR description',               prompt: 'Generate a pull request title and description for the changes in this branch compared to main.' },
@@ -2409,6 +2434,17 @@ function applySlashCommand(cmd) {
   // Special commands that trigger extension actions rather than setting prompt text.
   if (cmd.cmd === '/pr-review') {
     vscode.postMessage({ type: 'reviewPR' });
+    const state = getSlashState();
+    if (state) promptInput.value = promptInput.value.slice(0, state.index) + promptInput.value.slice(state.end);
+    promptInput.focus(); autoResize(); updateSendButton();
+    return;
+  }
+  // /audit takes no arguments — it scans the whole project — so picking it from
+  // the menu fires the scan straight away rather than seeding text to send, the
+  // same way /pr-review does. Typing `/audit` and pressing Enter is handled in
+  // sendPrompt; this is the other entry point to the same route.
+  if (cmd.cmd === '/audit') {
+    vscode.postMessage({ type: 'runProjectAudit' });
     const state = getSlashState();
     if (state) promptInput.value = promptInput.value.slice(0, state.index) + promptInput.value.slice(state.end);
     promptInput.focus(); autoResize(); updateSendButton();
@@ -2699,11 +2735,14 @@ function sendPrompt() {
 
   // /audit runs Navy's own project scan first, then a triage turn — it is not
   // a prompt template, so it cannot be a normal expansion. Same shape as /bg.
+  // `/audit deep` opts into the agentic AI audit that reads the project; plain
+  // `/audit` stays the fast, reproducible pattern scan.
   if (prompt === '/audit' || prompt.startsWith('/audit ')) {
+    const deep = /^\/audit\s+deep\b/i.test(prompt);
     promptInput.value = '';
     promptInput.style.height = 'auto';
     updateSendButton();
-    vscode.postMessage({ type: 'runProjectAudit' });
+    vscode.postMessage({ type: 'runProjectAudit', deep });
     return;
   }
 
@@ -3392,7 +3431,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0, ts = nul
       // activity records its full markdown there, so copy still yields all of it.
       const payload = role === 'user'
         ? text
-        : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
+        : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || articleBody(article));
       vscode.postMessage({ type: 'copy', text: payload });
       copyBtn.innerHTML = icon('check');
       setTimeout(() => { copyBtn.innerHTML = icon('copy'); }, 1200);
@@ -3409,7 +3448,7 @@ function addMessage(role, text, attachedFileNames = [], imageCount = 0, ts = nul
         if (speakBtn.dataset.speaking === 'true') { stopSpeaking(); return; }
         const source = role === 'user'
           ? text
-          : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || article.textContent || '');
+          : copyableReply(article.dataset.rawMd || bubble.dataset.rawMd || articleBody(article));
         speakText(speakableText(source), speakBtn);
       });
     }
@@ -3936,6 +3975,82 @@ function sealCurrentBubble() {
   // is invisible: see `.message-bubble:empty` in styles.css.
   _needNewBubble = true;
   _streamPre = null;
+}
+
+// Native extended thinking — the model's reasoning, streamed from the provider
+// (Claude/Gemini/Ollama). It lives in its OWN element, a sibling of the answer
+// bubble, because the bubble's innerHTML is rebuilt on every streaming tick and
+// would wipe anything kept inside it. Collapsed by default — it is there to open
+// when you want it, not to bury the answer under a wall of reasoning.
+function appendThinking(text) {
+  if (!text) return;
+  if (!activeAssistantMessage) {
+    activeAssistantMessage = addMessage('assistant', '');
+    activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
+    _primaryBubble = activeAssistantBubble;
+  }
+  if (!activeThinkingEl) {
+    // The activity log already shows a spinning "Thinking" placeholder for every
+    // turn. Once real reasoning arrives, THIS card owns that indicator — so drop
+    // the placeholder rather than showing two "thinking"s at once.
+    const log = currentActivityLog();
+    if (log) {
+      log.querySelector('.thinking-row')?.remove();
+      if (!log.children.length) removeCurrentActivityLog();
+    }
+    const details = document.createElement('details');
+    details.className = 'think-block think-live';
+    const summary = document.createElement('summary');
+    summary.className = 'think-summary';
+    // The same spinning ship's wheel the activity log uses — one thinking
+    // indicator, not a second mind/brain glyph beside it. It stops spinning
+    // when the turn ends (see .think-live in styles.css).
+    summary.innerHTML = WHEEL_SVG + '<span class="think-label">Thinking…</span><span class="think-toggle-hint">(click to expand)</span>';
+    const content = document.createElement('pre');
+    content.className = 'think-content';
+    // Click anywhere in the reasoning to fold the card back up — no hunting for a
+    // button or scrolling back to the header. Skipped when the click finished a
+    // text selection, so you can still highlight and copy the reasoning out.
+    content.addEventListener('click', () => {
+      const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      if (sel && !sel.isCollapsed) return; // a drag-select, not a fold
+      details.open = false;
+    });
+    // The hint says what a click does AND which way — expand when closed, fold
+    // when open — so the whole-card fold is discoverable, not a secret.
+    details.addEventListener('toggle', () => {
+      const hint = summary.querySelector('.think-toggle-hint');
+      if (hint) hint.textContent = details.open ? '(click the text to fold)' : '(click to expand)';
+    });
+    details.appendChild(summary);
+    details.appendChild(content);
+    // Above the answer — the model thinks before it writes. insertBefore keeps
+    // it under the message header and over whatever bubble comes next.
+    if (activeAssistantBubble && activeAssistantBubble.parentNode === activeAssistantMessage) {
+      activeAssistantMessage.insertBefore(details, activeAssistantBubble);
+    } else {
+      activeAssistantMessage.appendChild(details);
+    }
+    activeThinkingEl = details;
+    activeThinkingContentEl = content;
+  }
+  activeThinkingContentEl.textContent += text;
+  scrollToBottom();
+}
+
+// The reasoning is done: stop the live pulse and settle the label. Called when
+// the turn ends. A block that never got content is dropped.
+function finalizeThinking() {
+  if (!activeThinkingEl) return;
+  if (!activeThinkingContentEl || !activeThinkingContentEl.textContent.trim()) {
+    activeThinkingEl.remove();
+  } else {
+    activeThinkingEl.classList.remove('think-live');
+    const label = activeThinkingEl.querySelector('.think-label');
+    if (label) label.textContent = 'Thinking';
+  }
+  activeThinkingEl = null;
+  activeThinkingContentEl = null;
 }
 
 function appendAssistantText(text) {
@@ -4526,11 +4641,48 @@ function renderBlockMarkdown(text) {
   return out.join('\n');
 }
 
+// Splits one table row into cells, honouring the two GFM escapes a naive
+// `split('|')` ignored: a backslash-escaped pipe (`\|`) is a LITERAL pipe in the
+// cell, and a pipe inside an inline-code span (`` `a|b` ``) is not a delimiter
+// either. Missing both is what shattered a cell like `>=22 | ^2` into a row of
+// phantom narrow columns — the reported bug. Pure.
+function splitTableRow(line) {
+  const cells = [];
+  let cur = '';
+  let inCode = false;
+  for (let k = 0; k < line.length; k++) {
+    const ch = line[k];
+    if (ch === '\\') {
+      const next = line[k + 1];
+      if (next === '|') { cur += '|'; k++; }                    // escaped pipe → literal
+      else if (next !== undefined) { cur += ch + next; k++; }   // keep other escapes for renderInline
+      else cur += ch;
+      continue;
+    }
+    if (ch === '`') { inCode = !inCode; cur += ch; continue; }
+    if (ch === '|' && !inCode) { cells.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  cells.push(cur);
+  // A leading/trailing pipe makes one empty edge cell — GFM drops just those.
+  if (cells.length > 1 && cells[0].trim() === '') cells.shift();
+  if (cells.length > 1 && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells.map(c => c.trim());
+}
+
 function renderTable(lines) {
   if (lines.length < 2) return `<p>${renderInline(lines[0] || '')}</p>`;
-  const parseCells = l => l.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-  const headers = parseCells(lines[0]);
-  const body = lines.slice(2).map(parseCells);
+  const headers = splitTableRow(lines[0]);
+  const cols = headers.length;
+  // Normalise every body row to the header's column count: pad a short row, and
+  // fold an over-long row's overflow back into its LAST cell (an unescaped pipe
+  // the model should have escaped) instead of letting it spill into phantom
+  // columns that wreck the whole table's layout.
+  const norm = (row) => {
+    if (row.length <= cols) { while (row.length < cols) row.push(''); return row; }
+    return [...row.slice(0, cols - 1), row.slice(cols - 1).join(' | ')];
+  };
+  const body = lines.slice(2).map(l => norm(splitTableRow(l)));
   const th = headers.map(h => `<th>${renderInline(h)}</th>`).join('');
   const tr = body.map(row =>
     `<tr>${row.map(c => `<td>${renderInline(c)}</td>`).join('')}</tr>`
@@ -5190,6 +5342,18 @@ function copyableReply(raw) {
     .replace(/<think(?:ing)?>[\s\S]*$/i, '') // an unterminated block (stopped mid-reasoning)
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+// The article's own text with the native Thinking block removed — the fallback
+// for copy/read-aloud when no rawMd was recorded (a turn that stopped mid-way).
+// The reasoning block is a sibling of the answer bubble, so a bare
+// article.textContent would drag it into a copied reply; keep it out, the same
+// way copyableReply keeps <think> tags out.
+function articleBody(article) {
+  if (!article) return '';
+  const clone = article.cloneNode(true);
+  clone.querySelectorAll('.think-block').forEach(n => n.remove());
+  return clone.textContent || '';
 }
 
 function escapeHtml(text) {

@@ -40,6 +40,18 @@ function looksLikeMissingPathError(output) {
   return /cannot find the (file|path) specified|the filename, directory name, or volume label syntax is incorrect|is not recognized as an internal or external command|no such file or directory|\bfile not found\b|command not found/i.test(output);
 }
 
+// The signatures of a container sandbox (docker/wsl) that could not PULL or
+// REACH its image: a registry it can't resolve (DNS), a manifest that is
+// missing or denied, a pull that times out. This is a networking problem in the
+// sandbox, not a bug in the project — but it surfaces as confusing output (a
+// bare "E_FAIL", a "dial tcp: lookup … i/o timeout") that reads like the
+// command itself failed, sending the model off to edit code that is fine. The
+// CALLER gates this on the sandbox actually being a container mode; this only
+// recognises the shape. Pure.
+function looksLikeContainerPullError(output) {
+  return /not found, pulling|failed to (?:resolve|pull)|manifest unknown|pull access denied|error pulling image|dial tcp|i\/o timeout|temporary failure in name resolution|no such host|lookup [^\n]* on [^\n]*:53|\bE_FAIL\b/i.test(String(output || ''));
+}
+
 // Reads only the last `maxBytes` of a file via a positional read, instead of
 // loading the whole thing into memory just to throw away everything but the
 // tail — used for persisted background-process logs, which a chatty dev
@@ -556,5 +568,5 @@ module.exports = {
   COMMAND_METHODS: CommandMethods.prototype,
   // Exported for the tests, which read them out of this file rather than
   // reimplementing them.
-  looksLikeMissingPathError, readFileTail,
+  looksLikeMissingPathError, looksLikeContainerPullError, readFileTail,
 };

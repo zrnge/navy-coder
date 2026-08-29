@@ -684,6 +684,79 @@ async function hallucinationSuite() {
     check('intent gate prevents false-positive warning on Q&A',
       !posted.some(m => m.type === 'chunk' && /No files were actually changed/.test(m.text || '')));
 
+    // ── Plan auto-continue: a model that declares a plan then quits with no
+    // action (and no finish) is nudged to keep going, instead of the turn ending
+    // at 0/N with the plan card frozen mid-work — the reported "task completed
+    // without doing anything".
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [
+        { step: 'Read app.js', status: 'pending' },
+        { step: 'Fix the bug', status: 'pending' },
+      ] } }] },
+      { text: 'The bug lives in app.js. Let me read it and map the fix.' }, // stops: no tool calls, plan 0/2
+      { toolCalls: [
+        { name: 'write_file', args: { path: 'app.js', content: 'fixed\n' } },
+        { name: 'update_plan', args: { steps: [
+          { step: 'Read app.js', status: 'done' },
+          { step: 'Fix the bug', status: 'done' },
+        ] } },
+      ] },
+      { text: 'Both steps done.' }, // isDone, plan 2/2 → no further nudge
+    ]);
+    await provider.askNavy('fix the bug in app.js', false, null, [], []);
+    check('plan continue: a model that quits mid-plan is nudged to act, not left at 0/N',
+      read('app.js') === 'fixed\n', read('app.js'));
+    check('plan continue: …and once the plan is complete the turn is NOT reported incomplete',
+      !posted.some(m => m.type === 'planIncomplete'));
+
+    // A model that stops with a QUESTION is respected — the auto-continue must
+    // not steamroll a genuine request for a decision.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'Do X', status: 'pending' }] } }] },
+      { text: 'I can do this two ways. Which would you prefer, A or B?' }, // legitimate stop
+    ]);
+    await provider.askNavy('do X', false, null, [], []);
+    check('plan continue: a question is a legitimate stop — the turn ends rather than looping',
+      posted.some(m => m.type === 'planIncomplete'));
+
+    // A finish() with nothing actually done (a plan, maybe some reads, then quit)
+    // is a FALSE finish, challenged the same way — reading is not fixing. This is
+    // the exact shape the report hit: plan at 0/N, only reads, turn over.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [
+        { step: 'Read', status: 'pending' }, { step: 'Fix', status: 'pending' },
+      ] } }] },
+      { toolCalls: [{ name: 'finish', args: {} }] }, // premature: plan 0/2, nothing written
+      { toolCalls: [                                  // acts after the nudge
+        { name: 'write_file', args: { path: 'fixed.js', content: 'ok\n' } },
+        { name: 'update_plan', args: { steps: [{ step: 'Read', status: 'done' }, { step: 'Fix', status: 'done' }] } },
+      ] },
+      { text: 'Done.' },
+    ]);
+    await provider.askNavy('fix it', false, null, [], []);
+    check('plan continue: a premature finish() with nothing done is challenged, not accepted',
+      read('fixed.js') === 'ok\n', read('fixed.js'));
+
+    // A finish() that FOLLOWED real work is respected — partial progress is a
+    // fact, not a stop to steamroll. The trailing step only runs if the finish
+    // was WRONGLY force-continued, so b.txt staying absent proves it was honoured.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [
+        { step: 'Write a', status: 'pending' }, { step: 'Write b', status: 'pending' },
+      ] } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'a.txt', content: 'a\n' } }] }, // did real work
+      { toolCalls: [{ name: 'finish', args: {} }] }, // finish at 1/2 after working → must be respected
+      { toolCalls: [{ name: 'write_file', args: { path: 'b.txt', content: 'b\n' } }] }, // trap: only if force-continued
+    ]);
+    await provider.askNavy('write two files', false, null, [], []);
+    check('plan continue: a finish() after real work is respected, not force-continued',
+      read('a.txt') === 'a\n' && read('b.txt') === null,
+      JSON.stringify({ a: read('a.txt'), b: read('b.txt') }));
+
     // navy.systemPrompt wiring: the stale pre-agentic-loop default (SEARCH/REPLACE
     // fence instructions) must never reach the model — it directly contradicts
     // the anti-hallucination rule by telling it to paste code instead of calling
@@ -1436,10 +1509,16 @@ async function planSuite() {
     check('plan: no plan produces no note', provider._planCompletionNote() === '');
 
     // ── End to end through a real turn. ──────────────────────────────────
+    // The model that genuinely will not continue is nudged a bounded number of
+    // times first (see the plan auto-continue); stating the incomplete plan is
+    // the FALLBACK once those are spent, so it must keep stopping to reach it.
     posted.length = 0;
     global.fetch = queueOllamaFetch([
       { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'look', status: 'in_progress' }, { step: 'act' }] } }] },
       { text: 'Stopping before the second step.' },
+      { text: 'Still stopping.' },
+      { text: 'Not continuing.' },
+      { text: 'Done, I am stopping.' },
     ]);
     await provider.askNavy('do a two-step thing', false, null, [], []);
 

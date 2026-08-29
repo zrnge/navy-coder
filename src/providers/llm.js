@@ -1,5 +1,5 @@
 const { TOOLS_API, TOOLS } = require('./tools.js');
-const { openAiCompatBase, ollamaHost, ollamaAuthHeaders } = require('./endpoints.js');
+const { openAiCompatBase, ollamaHost, ollamaAuthHeaders, ANTHROPIC_BASE, GEMINI_NATIVE_BASE } = require('./endpoints.js');
 const vscode = require('vscode');
 const https = require('https');
 
@@ -161,10 +161,12 @@ async function fetchWithRetry(url, init) {
         // Ollama reports mid-stream failures (model crash, OOM) as {"error": "..."} —
         // surface them instead of silently ending with an empty response.
         if (event.error) throw new Error('Ollama error: ' + event.error);
-        // Native think mode streams reasoning in a separate field (never rendered) —
-        // update the status line so the UI doesn't look frozen while it thinks.
-        if (event.message?.thinking && !event.message?.content) {
-          provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
+        // Native think mode streams reasoning in a separate field — surface it in
+        // the panel's collapsible block, and keep the status line moving so the UI
+        // doesn't look frozen while it thinks.
+        if (event.message?.thinking) {
+          provider.view?.webview.postMessage({ type: 'thinkingChunk', text: event.message.thinking });
+          if (!event.message?.content) provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
         }
         const content = event.message?.content || '';
         if (content) {
@@ -350,7 +352,7 @@ async function fetchWithRetry(url, init) {
       return b;
     };
 
-    const anthropicEndpoint = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '') + '/v1/messages';
+    const anthropicEndpoint = (baseUrl || ANTHROPIC_BASE).replace(/\/$/, '') + '/v1/messages';
     const anthropicHeaders = {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -448,6 +450,10 @@ async function fetchWithRetry(url, init) {
         }
         if (delta?.type === 'thinking_delta' && raw?.type === 'thinking') {
           raw.thinking += delta.thinking || '';
+          // Surface the reasoning so the panel can show it in a collapsible block
+          // (streamed, not stored on the turn). onChunk callers only want the
+          // answer text, so this goes straight to the webview.
+          if (delta.thinking) provider.view?.webview.postMessage({ type: 'thinkingChunk', text: delta.thinking });
         }
         if (delta?.type === 'signature_delta' && raw?.type === 'thinking') {
           raw.signature = delta.signature || '';
@@ -667,7 +673,7 @@ async function fetchWithRetry(url, init) {
       },
     };
 
-    const base = (baseUrl || 'https://generativelanguage.googleapis.com').replace(/\/$/, '');
+    const base = (baseUrl || GEMINI_NATIVE_BASE).replace(/\/$/, '');
     const url = base + '/v1beta/models/' + encodeURIComponent(model) + ':streamGenerateContent?alt=sse';
     const response = await fetchWithRetry(url, {
       method: 'POST',
@@ -710,6 +716,8 @@ async function fetchWithRetry(url, init) {
             thinkingStarted = true;
             provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
           }
+          // A thought part carries its reasoning text in `part.text` — surface it.
+          if (typeof part.text === 'string' && part.text) provider.view?.webview.postMessage({ type: 'thinkingChunk', text: part.text });
           rawBlocks.push(part);
         } else if (typeof part.text === 'string') {
           text += part.text;

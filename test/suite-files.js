@@ -120,6 +120,33 @@ async function missingPathHintSuite() {
     }
   }
 
+  // The container-pull detector — a docker/wsl sandbox that can't pull/reach its
+  // image (usually DNS). It reads like the command failed; it is the sandbox's
+  // network, not the code. Includes the exact wslc output that reported this.
+  {
+    const { looksLikeContainerPullError } = require('../src/commands.js');
+    const pullFails = [
+      "Image 'mcr.microsoft.com/devcontainers/javascript-node:22' not found, pulling\nGet \"https://mcr.microsoft.com/v2/\": dial tcp: lookup mcr.microsoft.com on 0.0.0.0:53: read udp 127.0.0.1:18486->127.0.0.1:53: i/o timeout\nError code: E_FAIL",
+      'docker: Error response from daemon: manifest unknown',
+      'failed to resolve reference "node:22": Temporary failure in name resolution',
+      'Error: pull access denied for privaterepo, repository does not exist',
+      'Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io: no such host',
+    ];
+    for (const text of pullFails) {
+      check('looksLikeContainerPullError: detects — ' + JSON.stringify(text.slice(0, 34)) + '…', looksLikeContainerPullError(text));
+    }
+    const notPull = [
+      'Exit code: 1\nTypeError: cannot read property x of undefined',
+      "error: expected ';' before '}' token",
+      'AssertionError: 2 !== 3',
+      '',
+      'Exit code: 0\nall tests passed',
+    ];
+    for (const text of notPull) {
+      check('looksLikeContainerPullError: does NOT flag — ' + JSON.stringify(text.slice(0, 34)), !looksLikeContainerPullError(text));
+    }
+  }
+
   // Real end-to-end, via a genuine spawned process through toolRunCommand —
   // not a mock of the spawn layer.
   let provider, tmp;

