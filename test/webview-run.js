@@ -1409,6 +1409,40 @@ function slashCommandSuite() {
     check('slash: picking /audit leaves no leftover command text in the box',
       w5.document.querySelector('#prompt').value === '');
     w5.close();
+
+    // /playthrough is a route that TAKES a URL argument — it must reach the
+    // browser-QA turn with the URL, and must NOT fire with an empty argument
+    // (which would launch a browser at nothing).
+    const wPlay = createWebview();
+    type(wPlay, '/playthrough http://localhost:3000');
+    wPlay.document.querySelector('#chatForm').dispatchEvent(new wPlay.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: /playthrough <url> routes to the playthrough with the URL',
+      wPlay.sent.some(m => m.type === 'runPlaythrough' && m.url === 'http://localhost:3000')
+      && !wPlay.sent.some(m => m.type === 'ask'),
+      JSON.stringify(wPlay.sent.map(m => m.type)));
+    wPlay.close();
+
+    // Bare /playthrough (no URL) routes to the playthrough with an empty url —
+    // the extension then discovers and serves the LOCAL project.
+    const wPlayEmpty = createWebview();
+    type(wPlayEmpty, '/playthrough');
+    wPlayEmpty.document.querySelector('#chatForm').dispatchEvent(new wPlayEmpty.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: bare /playthrough routes to the local-project playthrough (empty url)',
+      wPlayEmpty.sent.some(m => m.type === 'runPlaythrough' && (m.url === '' || m.url == null))
+      && !wPlayEmpty.sent.some(m => m.type === 'ask'));
+    wPlayEmpty.close();
+
+    // Picking /playthrough from the menu seeds the sentinel and waits for a URL,
+    // rather than firing immediately the way the no-argument /audit does.
+    const wPlayMenu = createWebview();
+    type(wPlayMenu, '/playt');
+    const playItem = [...wPlayMenu.document.querySelectorAll('#slashDropdown .slash-item')].find(i => i.dataset.cmd === '/playthrough');
+    check('slash: /playthrough appears in the menu', Boolean(playItem));
+    playItem.dispatchEvent(new wPlayMenu.window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    check('slash: picking /playthrough seeds the sentinel and does not fire yet',
+      wPlayMenu.document.querySelector('#prompt').value === '/playthrough '
+      && !wPlayMenu.sent.some(m => m.type === 'runPlaythrough'));
+    wPlayMenu.close();
   }
 
   // A command name comes from a file on disk, so its text reaches the menu's

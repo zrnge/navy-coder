@@ -2261,6 +2261,7 @@ const SLASH_COMMANDS = [
   { cmd: '/debug',           label: 'Debug',         iconName: 'debug', desc: 'Help diagnose the current problem',        prompt: 'Help me debug this. Start by calling get_diagnostics on the active file, then read_file to see the code, then run_tests if a test suite exists. Identify the root cause and apply a fix.' },
   { cmd: '/search',          label: 'Web Search',    iconName: 'web', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
   { cmd: '/run',             label: 'Run Project',   iconName: 'run',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
+  { cmd: '/playthrough',     label: 'Playthrough',   iconName: 'web',  desc: 'Visually test your web project (or any URL) in a real Chrome, like a human tester', hint: 'runs on your project — or add a URL, e.g. /playthrough http://localhost:3000', prompt: '/playthrough ' },
   { cmd: '/bg',              label: 'Background',    iconName: 'background', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
 ];
 
@@ -2753,6 +2754,19 @@ function sendPrompt() {
     promptInput.style.height = 'auto';
     updateSendButton();
     vscode.postMessage({ type: 'startBackgroundTask', prompt: taskPrompt });
+    return;
+  }
+
+  // /playthrough drives a real browser through the site — like /audit, it is a
+  // seeded turn (the QA prompt lives in the extension), not a prompt template.
+  // A URL is OPTIONAL: with one, that page is tested; without, the extension
+  // discovers and serves the local project (or says it isn't a web project).
+  if (prompt === '/playthrough' || prompt.startsWith('/playthrough ')) {
+    const url = prompt.slice('/playthrough'.length).trim();
+    promptInput.value = '';
+    promptInput.style.height = 'auto';
+    updateSendButton();
+    vscode.postMessage({ type: 'runPlaythrough', url });
     return;
   }
 
@@ -5397,6 +5411,10 @@ const TOOL_VERB = {
   git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_blame: 'Git blame',
   get_diagnostics: 'Checking diagnostics',
   remember: 'Remembering', forget: 'Forgetting', finish: 'Done',
+  browser_navigate: 'Browsing', browser_snapshot: 'Reading page', browser_screenshot: 'Screenshotting',
+  browser_click: 'Clicking', browser_type: 'Typing', browser_scroll: 'Scrolling',
+  browser_evaluate: 'Evaluating', browser_console: 'Checking console', browser_back: 'Going back',
+  browser_close: 'Closing browser',
   __thinking__: 'Thinking',
 };
 
@@ -5653,7 +5671,8 @@ function addToolCallCard(tool, args, callId) {
   const verb   = TOOL_VERB[tool] || tool;
   const base   = (p) => String(p).replace(/^.*[\\/]/, '');
   const target = (args.from && args.to ? args.from + ' → ' + args.to : '')
-    || args.path || args.directory || args.query || args.command || args.id || args.url || args.fact || args.name || '';
+    || args.path || args.directory || args.query || args.command || args.id || args.url || args.fact || args.name
+    || (args.ref != null ? 'ref ' + args.ref : '') || (args.expression ? String(args.expression).slice(0, 40) : '') || '';
   const fname  = args.from && args.to ? base(args.from) + ' → ' + base(args.to)
     : target ? base(target) : '';
 

@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,209 tests, no network, no API keys
+npm test             # 2,283 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -41,13 +41,14 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~7,010 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,580 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
 | `src/commands.js` | ~560 | Command and process execution: WSL detection, the approval prompt, spawn-and-collect, `run_command`, `run_project`, and the background-process tools |
 | `src/trust.js` | ~20 | The one sentence an untrusted workspace refuses with, shared by the two files that need it |
 | `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
-| `src/sandbox.js` | ~370 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
+| `src/sandbox.js` | ~570 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
+| `src/browser.js` | ~550 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the navigate/snapshot/screenshot/click/type primitives |
 | `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
@@ -56,10 +57,10 @@ diff has to stay reviewable.
 | `src/paths.js`, `src/workspace.js`, `src/exec.js`, `src/session-context.js` | ~20 each | Small shared pieces several of the above need, extracted so no module has to import its own importer |
 
 Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.prototype`** — the methods still use `this`, so the extraction changed no call site and no signature.
-| `media/main.js` | ~5,840 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
-| `media/styles.css` | ~4,060 | Webview styling, themed off VS Code's own CSS variables |
-| `src/providers/tools.js` | ~450 | Tool schemas (`TOOLS`), the API-shaped copy (`TOOLS_API`), and the system prompt (`TOOL_PROMPT`) |
-| `src/providers/llm.js` | ~780 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
+| `media/main.js` | ~6,280 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
+| `media/styles.css` | ~4,050 | Webview styling, themed off VS Code's own CSS variables |
+| `src/providers/tools.js` | ~650 | Tool schemas (`TOOLS`), the API-shaped copy (`TOOLS_API`), and the system prompt (`TOOL_PROMPT`) |
+| `src/providers/llm.js` | ~865 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
 | `src/providers/endpoints.js` | ~90 | **Single source of truth** for every provider base URL |
 | `src/providers/pricing.js` | ~105 | The cost table, its ordering invariant, and `navy.modelPricing` overrides |
 | `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
@@ -157,6 +158,7 @@ Two suites, both run by `npm test`:
   | `suite-mcp.js` | MCP over stdio and HTTP, and its resources and prompts |
   | `suite-approval.js` | Both approval gates, settings defaults, the diagnostics bundle |
   | `suite-ui.js` | Dictation, slash commands, skills, the review regressions |
+  | `suite-browser.js` | The `/playthrough` browser: CDP framing, launch flags, the tool guards and URL routing |
 
   The files sit flat in `test/` rather than in a subdirectory on purpose: every
   suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a
@@ -302,6 +304,17 @@ A command whose prompt takes an argument should use `$ARGUMENTS`. Without it,
 typed arguments are appended to the end of the template instead, which is a
 sensible fallback and a poor design — put the placeholder where the words
 belong.
+
+Some commands aren't prompt templates at all but **routes** — `/audit`,
+`/playthrough`, `/bg` run extension code first and seed the turn themselves. A
+route needs three things, and missing any one of them is a silent failure:
+a non-empty sentinel `prompt` (`'/playthrough '`, never `''` — an empty template
+collapses during expansion and `sendPrompt` then bails on the blank, sending
+nothing at all), a branch in `sendPrompt` that posts its own message type instead
+of `ask`, and a handler in the extension's `onDidReceiveMessage` switch. If the
+command takes no argument it can also fire straight from the `/` menu via a case
+in `applySlashCommand`; if it takes one, leave it out of there so picking it
+seeds the sentinel and waits for the user to type.
 
 ## Adding an icon
 

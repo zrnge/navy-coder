@@ -431,6 +431,84 @@ const TOOLS = [
       required: ['task']
     }
   },
+  // ── Browser playthrough tools (see src/browser.js) ──────────────────────────
+  // Drive a real Chrome over CDP to test a live website like a human would. Only
+  // meaningful during a /playthrough turn; the first browser_* call launches the
+  // browser lazily, and browser_close (or ending the chat) tears it down.
+  {
+    name: 'browser_navigate',
+    description: 'Open the browser (launching it on first use) and load a URL, waiting for the page to finish loading. Only http(s) and localhost are allowed. Returns the resulting page title and URL. Call this first to start a playthrough.',
+    parameters: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'The absolute http(s) URL to navigate to.' } },
+      required: ['url']
+    }
+  },
+  {
+    name: 'browser_snapshot',
+    description: 'Return a compact, numbered outline of what is on the current page: interactive controls (links, buttons, inputs), headings, and anything that looks like an error or alert. Each row has a [ref] number you pass to browser_click / browser_type. Call this to see the page structure before clicking or typing; re-call it after the page changes, because refs go stale on navigation or re-render.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_screenshot',
+    description: 'Capture what the page looks like right now and return it as an image for you to visually inspect. Use this to judge layout, styling, overlap, cut-off text, contrast, and anything only visible by looking. Requires a vision-capable model; if you cannot see images, rely on browser_snapshot and browser_evaluate instead.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_click',
+    description: 'Click an element by its [ref] from the most recent browser_snapshot. Dispatches a real mouse click at the element centre (triggering hover/focus), then waits briefly for any resulting navigation or re-render.',
+    parameters: {
+      type: 'object',
+      properties: { ref: { type: 'number', description: 'The ref number of the element to click, from browser_snapshot.' } },
+      required: ['ref']
+    }
+  },
+  {
+    name: 'browser_type',
+    description: 'Type text into an input/textarea by its [ref] from the most recent browser_snapshot. Clears the field first, then types as real keyboard input. Set submit=true to press Enter afterward (e.g. to submit a search or form).',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: { type: 'number', description: 'The ref number of the field, from browser_snapshot.' },
+        text: { type: 'string', description: 'The text to type.' },
+        submit: { type: 'boolean', description: 'Press Enter after typing (default false).' }
+      },
+      required: ['ref', 'text']
+    }
+  },
+  {
+    name: 'browser_scroll',
+    description: 'Scroll the page vertically by a pixel amount (positive scrolls down, negative up; default 600). Returns the new scroll position and total page height so you know how much remains. Use it to reveal content below the fold.',
+    parameters: {
+      type: 'object',
+      properties: { amount: { type: 'number', description: 'Pixels to scroll; positive = down, negative = up. Default 600.' } },
+      required: []
+    }
+  },
+  {
+    name: 'browser_evaluate',
+    description: 'Run a JavaScript expression in the page and return its value (JSON-serialized). Use it to read state you cannot see — computed styles, element counts, form values, localStorage, response text, exposed globals — or to verify a functional claim. Not for making changes; use the click/type tools to interact.',
+    parameters: {
+      type: 'object',
+      properties: { expression: { type: 'string', description: 'A JavaScript expression to evaluate in the page context.' } },
+      required: ['expression']
+    }
+  },
+  {
+    name: 'browser_console',
+    description: 'Return the console messages, uncaught page errors, and failed/4xx-5xx network requests captured since the last call. Essential for catching JavaScript errors and broken requests a human would only see in devtools.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_back',
+    description: 'Navigate back to the previous page in the browser history. Returns the resulting page title and URL.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_close',
+    description: 'Close the browser and clean up its temporary profile. Call this when the playthrough is complete, before finish().',
+    parameters: { type: 'object', properties: {} }
+  },
   {
     // Offered ONLY on the reduced tier (see TOOLS_API_CORE below), but listed
     // here with every other tool because TOOLS is what parseToolCalls checks a
@@ -520,7 +598,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_scroll, browser_evaluate, browser_console, browser_back, browser_close, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.

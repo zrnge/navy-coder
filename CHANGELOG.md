@@ -1,6 +1,61 @@
 # Changelog
 
-## [Unreleased] - 0.3.1
+## [Unreleased] - 0.3.2
+
+Navy can open a real browser now.
+
+`/playthrough` launches Chrome — a visible window you can watch — and drives it the
+way a human tester would: it looks at the page, clicks through it, fills in and
+submits forms, reads the console, and reports what is broken, confusing, or risky,
+each finding tied to the screen or the console line it came from. With no argument
+it works on **the project you're in** — it detects whether the project is a web app,
+serves it, and plays through it, or tells you it isn't a web project and stops. Pass
+a URL to test that page instead. The whole
+thing runs on the Chrome DevTools Protocol spoken over Chrome's
+`--remote-debugging-pipe` — the one way to drive a browser that needs no WebSocket,
+no open port, and, the part that matters here, no npm package. Navy still ships
+with zero runtime dependencies; a browser-automation library would have been the
+first one, and this is how the feature exists without it.
+
+### Added
+
+- **`/playthrough` — an automated, human-style visual QA pass, defaulting to your
+  own project.** Run it bare and Navy works out whether the open project is a web
+  app, serves it (via `run_project`), and plays through it in a real Chrome window
+  — or tells you it isn't a web project and stops rather than inventing a site to
+  test. Pass a URL (a bare `localhost:3000` is fine; it fills in the scheme) to
+  test that page instead. Either way it navigates, reads the page's interactive
+  structure, takes screenshots it actually looks at, clicks, types, submits forms,
+  scrolls, and checks the console and network for errors a user can't see, then
+  finishes with a severity-ranked report, each finding cited to the screen or
+  console output that produced it. Needs a vision-capable model for the visual
+  half; on a text-only model it still catches functional, console, and security
+  issues from the DOM and accessibility tree.
+
+- **A zero-dependency browser engine (`src/browser.js`).** CDP over the debugging
+  pipe (NUL-delimited JSON on inherited fds 3 and 4), Chrome/Edge/Chromium
+  auto-discovery with a `navy.chromePath` override, and an isolated throwaway
+  profile per run so the test never touches your real cookies or sessions. Chrome's
+  own OS sandbox stays on — Navy never passes `--no-sandbox` — and only `http(s)`
+  URLs are navigable, so a page can't steer the browser onto `file://` or a
+  privileged surface.
+
+- **Ten browser tools** — `browser_navigate`, `browser_snapshot`,
+  `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`,
+  `browser_evaluate`, `browser_console`, `browser_back`, `browser_close` — and the
+  multimodal plumbing behind the screenshot: a tool result can now carry an image,
+  fed to the model as a vision message on every provider that supports one (native
+  on Claude and Gemini, the OpenAI content-array shape elsewhere). Only the two
+  most recent screenshots stay in context — a playthrough runs dozens of
+  iterations, and re-uploading every earlier PNG on each one would cost megabytes
+  per request.
+
+- **`navy.chromePath` and `navy.browserHeadless` settings.** Auto-detection covers
+  the standard Chrome/Edge/Chromium install locations; set `chromePath` only for an
+  unusual install. `browserHeadless` is off by default, so you watch the
+  playthrough happen in a real window.
+
+## [0.3.1] - 2026-08-29
 
 This one started as an audit rather than a bug report, and the first thing it
 found was a setting that did considerably more than its own description said.

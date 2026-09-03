@@ -125,6 +125,39 @@ Containers.
 Read-aloud is different: it runs in the panel, needs no permission, and its
 button is simply absent where the renderer has no speech synthesis.
 
+## /playthrough
+
+**"No Chrome, Edge, or Chromium found."** Navy looks in the standard install
+locations for Google Chrome, then Microsoft Edge, then Chromium. If your browser
+lives somewhere else, set **`navy.chromePath`** to the executable — e.g.
+`C:\Program Files\Google\Chrome\Application\chrome.exe`. Any Chromium-based
+browser works; Firefox and Safari do not, because this speaks the Chrome
+DevTools Protocol.
+
+**Nothing opens, and the turn ends immediately.** Launching the browser is gated
+by `navy.commandApproval` like any other command — if you declined the prompt,
+the tool returns "Browser launch rejected by user". Run it again and approve.
+
+**"This project isn't a web app."** Bare `/playthrough` inspects the open project
+first and stops if it finds no web app to serve, rather than inventing a site to
+test. If it guessed wrong, pass the URL yourself: `/playthrough http://localhost:3000`.
+
+**It says the dev server never came up.** Navy starts the project with
+`run_project`, which has to be able to work out the start command. If your
+project needs an unusual one, start the server yourself and hand Navy the URL.
+
+**The report is all console and DOM findings, nothing visual.** Judging layout
+needs a **vision-capable model** (Claude, Gemini, GPT-4o and similar). On a
+text-only model the screenshots cannot be read, so the playthrough falls back to
+what it can check without seeing — functional behaviour, console errors, failed
+requests. Switch provider/model to get the visual half.
+
+**A click did nothing, or reported a stale ref.** Element refs come from the last
+`browser_snapshot` and are invalidated whenever the page re-renders or navigates.
+This is self-correcting — the model is told to snapshot again — but a page that
+re-renders constantly can make it loop; stop the turn and give it a narrower
+instruction.
+
 ## The panel is stuck "thinking"
 
 Press **Stop**. If the panel is unresponsive rather than busy, reload the window

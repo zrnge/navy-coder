@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -296,6 +296,16 @@
           "type": "string",
           "default": "",
           "markdownDescription": "The default container image (for `docker` or `wsl` sandboxing) used for **every** project that has no `.devcontainer/devcontainer.json` or `Dockerfile` of its own — so you set a sandbox up once here rather than adding a config file to each repo. Set it in your **User** settings for one image everywhere, or per-project in a workspace's settings. Navy never guesses this — running commands in an image without the project's toolchain fails in ways that look like the code is broken — but naming one yourself is an answer, not a guess. A project's own devcontainer or Dockerfile always wins over this. Example: \"node:20\", \"python:3.12\", \"golang:1.22\"."
+        },
+        "navy.chromePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Chrome/Edge/Chromium executable Navy drives for `/playthrough` visual website testing. Leave empty to auto-detect (Google Chrome, then Microsoft Edge, then Chromium in their standard install locations). Set this only if your browser is installed somewhere unusual, or to pin a specific build. Example (Windows): `C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe`."
+        },
+        "navy.browserHeadless": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Run the `/playthrough` browser headlessly (no visible window). Off by default so you can watch the automated playthrough happen in a real Chrome window. The browser always uses a fresh throwaway profile either way, so it never touches your real cookies or sessions."
         },
         "navy.shell": {
           "type": "string",

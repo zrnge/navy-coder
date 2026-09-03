@@ -228,12 +228,14 @@ async function approvalScopeSuite() {
     // + 1 read in the diagnostics report, which states the EFFECTIVE setting
     // and goes through the helper for that reason rather than reading the key.
     check('file gates route through _editsAutoApproved', editGates === 7, 'found ' + editGates);
-    // 1 definition + 5 gates (MCP tools, MCP resource reads, _approveCommand,
-    // run_project, start_process) + the same diagnostics read. Reading an MCP
-    // resource reaches a server the user configured, so it is gated like every
-    // other call to one — it is not a file read, and the file gate has nothing
-    // to say about it.
-    check('execution gates route through _commandsAutoApproved', cmdGates === 7, 'found ' + cmdGates);
+    // 1 definition + 6 gates (MCP tools, MCP resource reads, _approveCommand,
+    // run_project, start_process, and the /playthrough browser launch) + the
+    // same diagnostics read. Reading an MCP resource reaches a server the user
+    // configured, so it is gated like every other call to one — it is not a file
+    // read, and the file gate has nothing to say about it. Launching a browser
+    // is execution for the same reason: it spawns a process and grants the model
+    // navigation plus arbitrary in-page JavaScript via browser_evaluate.
+    check('execution gates route through _commandsAutoApproved', cmdGates === 8, 'found ' + cmdGates);
 
     // ── The manifest must ship the safe default, whatever the file gate says. ──
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
