@@ -9,13 +9,20 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,283 tests, no network, no API keys
+npm test             # 2,310 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
 Press <kbd>F5</kbd> in VS Code to launch an Extension Development Host with
-Navy loaded. Changes to `media/` and `src/webview-html.js` need only a webview
-reload; changes to `src/extension.js` need the host restarting.
+Navy loaded. That runs the **Run Extension** configuration in
+`.vscode/launch.json`, which builds `dist/` first — `package.json` `main` points
+there and the folder is gitignored, so without the build the host loads nothing.
+Changes to `media/` and `src/webview-html.js` need only a webview reload;
+changes to `src/extension.js` need the host restarting.
+
+If F5 ever offers to *"find a Markdown extension in the Marketplace"*, it is
+debugging the focused file instead of the extension — pick **Run Extension** in
+the Run and Debug panel once, and F5 will keep using it.
 
 ## Three rules that aren't negotiable
 
@@ -41,7 +48,7 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~7,580 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,380 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
 | `src/commands.js` | ~560 | Command and process execution: WSL detection, the approval prompt, spawn-and-collect, `run_command`, `run_project`, and the background-process tools |
 | `src/trust.js` | ~20 | The one sentence an untrusted workspace refuses with, shared by the two files that need it |
 | `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
@@ -49,6 +56,7 @@ diff has to stay reviewable.
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
 | `src/sandbox.js` | ~570 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
 | `src/browser.js` | ~550 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the navigate/snapshot/screenshot/click/type primitives |
+| `src/browser-tools.js` | ~300 | The `/playthrough` tool layer on top of it: the ten `browser_*` tools, the launch approval gate, and the command entry point with its prompts |
 | `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
@@ -70,6 +78,15 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
 | `src/dictation-bridge.js` | ~400 | Loopback server + browser page for voice input. No pause control — see the file header for why |
 | `src/webview-html.js` | ~380 | Builds the webview markup |
+
+**Never put a raw control character in a string literal — write the escape.**
+`'\u0000'`, not a literal NUL; `'\t'`, not a real tab. A single NUL byte in
+`src/extension.js` (in, of all things, the audit's own binary-detection check)
+made git classify the file as binary for line-ending purposes while still
+diffing it as text: its blob was stored CRLF while the rest of the repo was LF,
+`grep` needed `-a`, and rewriting the file with ordinary tooling produced a
+whole-file diff that buried the real change. It went unnoticed for a long time
+because nothing looks broken until it does.
 
 `src/extension.js` is still the largest file by a distance, and that is a known
 problem rather than a style. It is being broken up one seam at a time; if you

@@ -11,6 +11,8 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 const { getWebviewHtml } = require('../src/webview-html.js');
 
+const _openWebviews = new Set();
+
 function createWebview(options = {}) {
   const html = getWebviewHtml({
     scriptUri: 'main.js', styleUri: 'styles.css',
@@ -97,10 +99,16 @@ function createWebview(options = {}) {
   // which silently removed the dropdown arrow-key navigation from test reach.
   window.Element.prototype.scrollIntoView = function scrollIntoView() {};
 
+  // Every window opened here is registered, so closeAllWebviews() below can
+  // shut down the ones individual tests forget. Relying on each test to call
+  // close() had already failed quietly: about a dozen never did, and the twelve
+  // watchdog intervals they left running kept Node alive forever — the suite
+  // printed its summary and then hung, which on Windows means `npm test` never
+  // returns and the 10-minute CI job is the only thing that ends it.
   const script = fs.readFileSync(path.join(__dirname, '..', 'media', 'main.js'), 'utf8');
   window.eval(script);
 
-  return {
+  const api = {
     dom,
     window,
     speech,
@@ -131,7 +139,10 @@ function createWebview(options = {}) {
     // main.js arms a self-watchdog setInterval that keeps Node's event loop
     // alive forever — without this the test process renders everything
     // correctly and then simply never exits.
-    close() { try { dom.window.close(); } catch {} },
+    close() {
+      _openWebviews.delete(api);
+      try { dom.window.close(); } catch {}
+    },
     // Flat, ordered list of just the things a reader sees as "the conversation",
     // which is what card-ordering assertions care about.
     flow() {
@@ -145,6 +156,15 @@ function createWebview(options = {}) {
       });
     },
   };
+  _openWebviews.add(api);
+  return api;
 }
 
-module.exports = { createWebview };
+// Shuts every window the suite left open. Called once before the final report
+// so a forgotten close() costs a little memory instead of hanging the process.
+function closeAllWebviews() {
+  for (const api of [..._openWebviews]) { try { api.close(); } catch {} }
+  _openWebviews.clear();
+}
+
+module.exports = { createWebview, closeAllWebviews };

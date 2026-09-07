@@ -1,5 +1,118 @@
 # Changelog
 
+## [0.3.3] - 2026-09-07
+
+A maintenance release, and most of it is about trust: what Navy claims it did,
+and how it behaves once a session has been running for a while.
+
+The headline is a report that said "Changed: a.ts, b.ts" when nothing had been
+written. Navy already detected that and printed a warning under it - which is
+the wrong remedy for work that never happened, so it now sends the model back to
+do it. The rest is weight that had accumulated where nobody was looking: a
+transcript that grew without bound, a chat file rewritten in full after every
+edit, a slash menu with no ceiling, a test suite that could not exit, and a stray
+NUL byte that had quietly convinced git the largest file in the project was not
+text.
+
+### Changed
+
+- **The `/playthrough` tool layer moved to `src/browser-tools.js`.** The ten
+  `browser_*` tools, the launch approval gate and the command entry point came
+  out of `extension.js` verbatim, taking it from 7,659 lines to 7,377. They are
+  still methods on the same object, so nothing else moved and no call site
+  changed. `src/browser.js` remains the engine - Chrome discovery, CDP over the
+  debugging pipe, the page primitives - and this is the layer the model calls.
+
+### Fixed
+
+- **"Done — Changed: a.ts, b.ts", when nothing was written.** The guard against
+  false completion claims only ever fired on a turn that called *no tools at
+  all*. The shape people actually hit is the opposite: the model reads a few
+  files, writes nothing, and signs off with a confident summary listing files it
+  never touched. That reached you as a finished-looking report with a footnote
+  underneath admitting none of it happened — a warning where the work should
+  have been.
+
+  Navy now checks the claim against its own record of what the turn actually
+  changed, and when a report names changed files but nothing was written,
+  renamed or deleted, it sends the model back to do the work while the turn is
+  still open instead of just flagging it afterwards. One correction per turn, so
+  it cannot ping-pong; if the model repeats the claim anyway, the plain warning
+  still appears. A turn that ran a **command** is taken at its word, since
+  `git apply`, `sed -i` and codemods all change files with no write tool
+  involved.
+
+- **A failed `taskkill` could take the whole extension host down.** Closing the
+  `/playthrough` browser on Windows spawns `taskkill` to end the process tree,
+  and that spawn had no `'error'` listener. spawn reports failure by *emitting*
+  `'error'` asynchronously, which the surrounding try/catch cannot catch - and an
+  unhandled `'error'` event is an uncaught exception, which kills the extension
+  host rather than the command. Guarded, the same way `src/background.js` already
+  guards its identical call. Every other spawn in `src/` was audited and is fine.
+
+- **The chat file was rewritten in full far more often than anything had
+  changed.** Two callers write it: the 500ms checkpoint debounce, which fires
+  after *every file edit*, and the save awaited at the end of every turn. Each
+  re-serialized the entire chat - every message plus up to 8 MB of checkpoint
+  text - however little was new, and the two could run against the same path at
+  the same time, which is an interleaving hazard rather than merely wasteful.
+
+  Writes are now serialized per chat with at most one follow-up queued behind
+  the one in flight, and a write whose content is byte-identical to the previous
+  one is skipped outright - which is the common case, since the end-of-turn save
+  usually finds exactly what the checkpoint debounce wrote moments earlier.
+  Awaiting a save still means *your* content reached disk, even when another
+  write was already running; the obvious shortcut there would have quietly
+  resolved the end-of-turn save before the turn's own messages were written.
+
+- **`src/extension.js` was not a text file, as far as git was concerned.** Its
+  own binary-detection line carried a *literal* NUL character rather than the
+  escape for one. The byte sits past the 8,000-byte window git sniffs for diffs
+  — so diffs still rendered normally and nothing looked wrong — but inside the
+  whole-buffer check that decides line-ending conversion, which git therefore
+  skipped for the single most-edited file in the project. Its blob was stored
+  CRLF while every other file was LF, `grep` refused it without `-a`, and any
+  ordinary rewrite of the file silently produced a whole-file diff. Now written
+  as `\u0000`: identical at runtime, plain text on disk.
+
+  Removing it means git normalizes the file once, so the commit that carries
+  this fix shows every line of `extension.js` as changed. That is the one-time
+  correction, not a rewrite — `git diff --ignore-cr-at-eol` shows the real
+  change underneath it.
+
+- **`npm test` never finished on Windows.** `media/main.js` arms a 250ms
+  self-watchdog `setInterval` in every window it runs in, so each jsdom window a
+  test forgot to close kept Node's event loop alive forever. The suite ran
+  everything, printed `592 passed, 0 failed`, and then hung — indistinguishable
+  from a slow machine, and only CI's job timeout ever ended it. The harness now
+  tracks every window it opens and sweeps them before the report, so a forgotten
+  `close()` costs a little memory instead of the whole run. `npm test` goes from
+  never returning to **65 seconds**.
+
+- **The slash-command menu had no ceiling and no scroll.** It opens upwards from
+  the composer, so as a project added commands the list grew off the top of the
+  panel and the ones at the far end could not be reached at all. It is now capped
+  and scrolls; arrow-key selection follows the scroll.
+
+- **Long command descriptions stretched the row instead of truncating.** The
+  ellipsis rule was already there but never fired: a flex item will not shrink
+  below its own text without `min-width: 0`. Descriptions now truncate, the full
+  text is on the row tooltip, and the two built-ins that had outgrown everything
+  else (`/audit`, `/playthrough`) are back in line with the rest.
+
+- **The panel got slower the longer a session ran.** A restored chat renders
+  only its most recent turns, but a chat that grew to the same length while you
+  were sitting in it kept every turn in the DOM — message bodies, activity logs,
+  tool cards, highlighted code. Because the auto-scroll runs on every streaming
+  chunk, each chunk paid a layout pass over all of it, so a long session got
+  progressively heavier and reloading the window was the only thing that helped
+  (and only because reloading drops the old turns).
+
+  Older turns are now moved out of the live document as the session grows,
+  behind the same **"Show N earlier messages"** button a restored chat already
+  uses. Nothing is discarded or re-rendered — clicking brings every turn back,
+  in order.
+
 ## [0.3.2] - 2026-09-03
 
 Navy can open a real browser now.

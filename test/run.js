@@ -16,12 +16,12 @@ const { pureSuites } = require('./suite-pure.js');
 const { undoRedoSuite, missingPathHintSuite, syntaxCheckSuite, cardRecordSuite, rewindSuite } = require('./suite-files.js');
 const { retrievalSuite, semanticSearchSuite, retrievalUpgradesSuite, embedIndexSuite, contextBudgetSuite, contextBudgetLearningSuite } = require('./suite-retrieval.js');
 const { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite, sandboxImageSuite } = require('./suite-process.js');
-const { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite } = require('./suite-session.js');
+const { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite, chatPersistenceSuite } = require('./suite-session.js');
 const { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite } = require('./suite-turn.js');
 const { costEstimateSuite, providerFallbackSuite, cachingFallbackSuite, adaptiveThinkingFallbackSuite, geminiSuite, providerSelfTestSuite, providerEndpointSuite, pricingSuite } = require('./suite-providers.js');
 const { mcpSuite, mcpHttpSuite, mcpExtrasSuite } = require('./suite-mcp.js');
 const { approvalCancelSuite, approvalScopeSuite, settingsDefaultsSuite, diagnosticsSuite } = require('./suite-approval.js');
-const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite } = require('./suite-ui.js');
+const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite, webviewExitSuite } = require('./suite-ui.js');
 const { browserSuite } = require('./suite-browser.js');
 
 // The pure-function and jsdom checks first: they need no mock and no temp
@@ -85,6 +85,8 @@ undoRedoSuite()
   .then(rewindSuite)
   .then(mcpExtrasSuite)
   .then(browserSuite)
+  .then(webviewExitSuite)
+  .then(chatPersistenceSuite)
   .then(() => {
     uninstallVscodeMock();
     report();

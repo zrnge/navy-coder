@@ -281,7 +281,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 2,283 tests: extension host + webview, no network or API keys needed
+npm test        # 2,310 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 

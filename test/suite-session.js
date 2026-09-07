@@ -1216,4 +1216,84 @@ async function fileWatcherSuite() {
   check('watcher: disposing the provider disposes the watcher', watcher.disposed === true);
 }
 
-module.exports = { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite };
+// The chat file is rewritten in full by two callers - the 500ms checkpoint
+// debounce after every edit, and the awaited save at the end of every turn - so
+// a long session wrote the same ever-growing payload again and again, and the
+// two could overlap on the same path. These pin the three properties that fix
+// it: writes never overlap, an unchanged chat is not rewritten, and the file
+// still round-trips.
+async function chatPersistenceSuite() {
+  console.log('');
+  console.log('chat persistence (coalesced, deduped writes):');
+  const os = require('os');
+  sharedMock();
+  let provider, tmp;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-persist-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider.view = { webview: { postMessage: () => {} } };
+
+    const chatFile = () => path.join(tmp, '.navy', 'chats', provider._session.id + '.json');
+    const readChat = () => JSON.parse(fs.readFileSync(chatFile(), 'utf8'));
+
+    provider.messages.push({ role: 'user', text: 'first' });
+    await provider._writeChatFile();
+    check('the chat file is written and parses', readChat().messages.length === 1);
+    check('...with the timestamp and the content both present',
+      typeof readChat().updated === 'string' && readChat().id === provider._session.id);
+
+    // An unchanged chat must not be rewritten: this is the case that used to
+    // re-serialize every message and up to 8 MB of checkpoints for nothing.
+    const before = fs.statSync(chatFile()).mtimeMs;
+    const bodyBefore = fs.readFileSync(chatFile(), 'utf8');
+    await new Promise(r => setTimeout(r, 20));
+    await provider._writeChatFile();
+    await provider._writeChatFile();
+    const after = fs.statSync(chatFile()).mtimeMs;
+    check('re-saving an unchanged chat does not rewrite the file',
+      after === before, 'mtime moved: ' + before + ' -> ' + after);
+    check('...and leaves the content byte-identical',
+      fs.readFileSync(chatFile(), 'utf8') === bodyBefore);
+
+    // A real change is still written.
+    provider.messages.push({ role: 'assistant', text: 'second' });
+    await provider._writeChatFile();
+    check('a changed chat IS written', readChat().messages.length === 2);
+
+    // Concurrent writes must not overlap - the debounced checkpoint save and the
+    // awaited end-of-turn save hit the same path.
+    provider.messages.push({ role: 'user', text: 'third' });
+    await Promise.all([
+      provider._writeChatFile(),
+      provider._writeChatFile(),
+      provider._writeChatFile(),
+    ]);
+    check('concurrent saves collapse and leave a valid file',
+      readChat().messages.length === 3);
+
+    // Awaiting a save must mean THIS content is on disk, even when another write
+    // was already running. Returning the in-flight promise instead would resolve
+    // the end-of-turn save as soon as an earlier checkpoint write finished -
+    // before the turn's own messages had been written at all.
+    const slow = provider._writeChatFile();          // starts a write
+    provider.messages.push({ role: 'assistant', text: 'written-while-busy' });
+    await provider._writeChatFile();                 // queued behind it
+    await slow;
+    check('awaiting a save started mid-write still persists the newer content',
+      readChat().messages.some(m => m.text === 'written-while-busy'),
+      JSON.stringify(readChat().messages.map(m => m.text)));
+
+    // Checkpoints ride along in the same file and still restore.
+    provider._session.checkpoints.push({ kind: 'edit', filePath: 'a.txt', originalText: 'old' });
+    await provider._writeChatFile();
+    check('checkpoints are persisted with the chat',
+      readChat().checkpoints.length === 1 && readChat().checkpoints[0].originalText === 'old');
+  } finally {
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite, chatPersistenceSuite };

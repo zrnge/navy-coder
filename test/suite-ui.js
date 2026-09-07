@@ -1633,4 +1633,34 @@ async function skillSuite() {
   }
 }
 
-module.exports = { dictationSuite, dictationPageSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite };
+// ── The webview suite has to be able to EXIT ────────────────────────────────
+// media/main.js arms a 250ms self-watchdog setInterval in every window it runs
+// in, so a jsdom window a test forgets to close keeps Node's event loop alive
+// forever. That is not a slow test, it is a hang: the suite printed its full
+// summary and then never returned, so `npm test` never finished and CI's job
+// timeout was the only thing that ended it. The sweeper is what guarantees the
+// process can exit regardless of which test forgot; these pin it in place,
+// because the symptom (a suite that passes, then hangs) reads like a slow
+// machine rather than a bug and went unnoticed for a long time.
+async function webviewExitSuite() {
+  console.log('');
+  console.log('webview suite can exit (no leaked jsdom timers):');
+  const harness = require('./webview-harness.js');
+  check('the harness exposes a sweeper for windows tests forgot to close',
+    typeof harness.closeAllWebviews === 'function');
+
+  const runner = fs.readFileSync(path.join(__dirname, 'webview-run.js'), 'utf8');
+  check('the webview suite calls it', /closeAllWebviews\(\)/.test(runner));
+  // Before the report, not after: the summary is the last thing printed, and a
+  // sweeper placed below it would never run on the failure path.
+  check('…before printing the summary, so it runs on the failure path too',
+    runner.indexOf('closeAllWebviews()') < runner.lastIndexOf('passed, '));
+
+  // Closing must actually deregister, or the sweeper walks a set that only grows.
+  const w = harness.createWebview();
+  w.close();
+  harness.closeAllWebviews();
+  check('closing a window twice is safe (close() then sweep)', true);
+}
+
+module.exports = { dictationSuite, dictationPageSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite, webviewExitSuite };

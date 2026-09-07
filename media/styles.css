@@ -2727,7 +2727,16 @@ textarea:focus {
   border-radius: var(--radius-sm);
   box-shadow: none;
   z-index: 200;
-  overflow: hidden;
+  /* The list grows with every command a project adds, and it opens UPWARDS from
+     the composer — so without a ceiling a long list runs off the top of the
+     panel and the commands at the far end cannot be reached at all. Scrolls
+     instead; arrow-key navigation already calls scrollIntoView, so keyboard
+     selection follows the scroll. Horizontal stays hidden: a long description
+     must ellipsize, never widen the menu. */
+  max-height: min(320px, 45vh);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   display: none;
 }
 .slash-item {
@@ -2761,6 +2770,12 @@ textarea:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* A flex item defaults to min-width:auto, which refuses to shrink below its
+     own text — so the ellipsis above never engaged and a long description just
+     pushed the row wider than the menu instead. These two are what let it
+     actually truncate; the full text is on the title attribute. */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 /* Where a custom command came from. A project's command can shadow a built-in,
    so which definition is being offered has to be visible without opening it. */

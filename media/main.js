@@ -1251,6 +1251,8 @@ window.addEventListener('message', (event) => {
     activeAssistantContent = '';
     activeThinkingEl = null;
     activeThinkingContentEl = null;
+    // Turn over — bound the transcript before the next one starts.
+    trimLiveTranscript();
     if (stepBadgeEl) { stepBadgeEl.textContent = ''; stepBadgeEl.classList.remove('visible'); }
     collapseToolProgress();
     updateWelcome();
@@ -2251,7 +2253,7 @@ const SLASH_COMMANDS = [
   { cmd: '/test',            label: 'Test',          iconName: 'test', desc: 'Run tests and fix failures',               prompt: 'Run the test suite, show the results, and fix any failing tests.' },
   { cmd: '/generate-tests',  label: 'Gen Tests',     iconName: 'gen-tests', desc: 'Generate unit tests for this file',        prompt: 'Generate comprehensive unit tests for the active file. First read_file to see its full content. Cover the happy path, edge cases, and error paths. Use the existing test framework — check package.json and any existing test files first to match conventions.' },
   { cmd: '/optimize',        label: 'Optimize',      iconName: 'optimize', desc: 'Optimize code performance',               prompt: 'Analyze the active file for performance bottlenecks. First read_file to see its full content. Identify the most impactful issues (unnecessary re-renders, redundant I/O, O(n²) loops, etc.) and apply optimizations without changing observable behaviour. Explain each change.' },
-  { cmd: '/audit',           label: 'Audit',         iconName: 'security', desc: 'Scan the project for supply-chain risk (deps, install hooks, backdoors)', hint: 'add "deep" for a full AI audit', prompt: '/audit ' },
+  { cmd: '/audit',           label: 'Audit',         iconName: 'security', desc: 'Scan the project for supply-chain risk', hint: 'add "deep" for AI', prompt: '/audit ' },
   { cmd: '/security',        label: 'Security',      iconName: 'security', desc: 'Security audit this code',                 prompt: 'Perform a thorough security audit of this project. Use list_files then read_file on the relevant source files. Check for OWASP Top 10 issues: injection (SQL, command, XSS), broken authentication, insecure deserialization, security misconfiguration, sensitive data exposure, and access control flaws. For each issue found: quote the vulnerable line, explain the risk and attack vector, then show the corrected code.' },
   { cmd: '/commit',          label: 'Commit',        iconName: 'commit', desc: 'Generate a git commit message',            prompt: 'Generate a conventional commit message for the current staged changes.' },
   { cmd: '/pr',              label: 'PR',            iconName: 'pr', desc: 'Generate a PR description',               prompt: 'Generate a pull request title and description for the changes in this branch compared to main.' },
@@ -2261,7 +2263,7 @@ const SLASH_COMMANDS = [
   { cmd: '/debug',           label: 'Debug',         iconName: 'debug', desc: 'Help diagnose the current problem',        prompt: 'Help me debug this. Start by calling get_diagnostics on the active file, then read_file to see the code, then run_tests if a test suite exists. Identify the root cause and apply a fix.' },
   { cmd: '/search',          label: 'Web Search',    iconName: 'web', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
   { cmd: '/run',             label: 'Run Project',   iconName: 'run',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
-  { cmd: '/playthrough',     label: 'Playthrough',   iconName: 'web',  desc: 'Visually test your web project (or any URL) in a real Chrome, like a human tester', hint: 'runs on your project — or add a URL, e.g. /playthrough http://localhost:3000', prompt: '/playthrough ' },
+  { cmd: '/playthrough',     label: 'Playthrough',   iconName: 'web',  desc: 'Visually test this project in Chrome', hint: 'or pass a URL', prompt: '/playthrough ' },
   { cmd: '/bg',              label: 'Background',    iconName: 'background', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
 ];
 
@@ -2366,7 +2368,7 @@ function showSlashDropdown(query) {
     `<div class="slash-item" role="option" aria-selected="false" data-idx="${i}" data-cmd="${escapeHtml(c.cmd)}">
       <span class="slash-icon">${c.iconName ? icon(c.iconName) : escapeHtml(c.icon || '')}</span>
       <span class="slash-label">${escapeHtml(c.label || c.cmd.slice(1))}</span>
-      <span class="slash-desc">${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}</span>
+      <span class="slash-desc" title="${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}">${escapeHtml(c.hint ? c.desc + ' · ' + c.hint : (c.desc || ''))}</span>
       ${c.custom ? `<span class="slash-origin">${escapeHtml(ORIGIN_LABEL[c.origin] || 'custom')}</span>` : ''}
       ${commandReviewNote(c) ? `<span class="slash-review" title="This command came with the repository and has not been reviewed. Running it opens the prompt for you to read first.">${escapeHtml(commandReviewNote(c))}</span>` : ''}
       ${c.removable ? `<button type="button" class="slash-remove" tabindex="-1"
@@ -2410,7 +2412,7 @@ function showSlashDropdown(query) {
   add.setAttribute('aria-selected', 'false');
   add.innerHTML = `<span class="slash-icon">${icon('plus')}</span>
     <span class="slash-label">New command</span>
-    <span class="slash-desc">Write your own prompt as a markdown file</span>`;
+    <span class="slash-desc" title="Write your own prompt as a markdown file">Write your own prompt as a markdown file</span>`;
   add.addEventListener('mousedown', (e) => {
     e.preventDefault();
     hideSlashDropdown();
@@ -2898,6 +2900,64 @@ function updateWelcome() {
 // cost before the panel became usable. The rest stay one click away.
 const HISTORY_RENDER_LIMIT = 60;
 
+// ── Live transcript trimming ────────────────────────────────────────────────
+// A RESTORED chat renders only the last HISTORY_RENDER_LIMIT turns, but a chat
+// that grows to the same length while you are sitting in it kept every turn in
+// the DOM: message bodies, activity logs, tool cards and highlighted code. By a
+// few hundred turns that is tens of thousands of nodes, and since scrollToBottom()
+// runs on every streaming chunk, each chunk pays a layout pass over all of them —
+// so the panel gets progressively slower the longer a session runs, and reloading
+// the window "fixes" it only because the restore path drops the old turns.
+//
+// Same remedy, applied live. The oldest turns are MOVED into a detached fragment
+// (nothing is destroyed and nothing is re-rendered when they come back) behind the
+// same "Show N earlier messages" button the restore path already uses.
+const LIVE_RENDER_LIMIT = 80;
+let _archivedFrag = null;
+let _archivedCount = 0;
+let _archiveBtn = null;
+
+function resetArchivedMessages() {
+  _archivedFrag = null;
+  _archivedCount = 0;
+  _archiveBtn = null;
+}
+
+function restoreArchivedMessages() {
+  if (!_archivedFrag) return;
+  const frag = _archivedFrag;
+  const btn = _archiveBtn;
+  resetArchivedMessages();
+  messagesEl.insertBefore(frag, btn || messagesEl.firstChild);
+  btn?.remove();
+}
+
+// Called when a turn ends — never mid-stream, so nothing being written to is
+// ever moved, and the active/last assistant message (always the newest) can not
+// be caught by a trim that only ever takes from the oldest end.
+function trimLiveTranscript() {
+  if (!messagesEl) return;
+  const articles = messagesEl.querySelectorAll('article.message');
+  const excess = articles.length - LIVE_RENDER_LIMIT;
+  if (excess <= 0) return;
+  if (!_archivedFrag) _archivedFrag = document.createDocumentFragment();
+  // appendChild MOVES a node out of the live tree; querySelectorAll returns a
+  // static list, so moving as we go does not shift the indices under us, and the
+  // fragment keeps insertion order — re-inserting it restores the transcript.
+  for (let i = 0; i < excess; i++) _archivedFrag.appendChild(articles[i]);
+  _archivedCount += excess;
+  if (!_archiveBtn) {
+    _archiveBtn = document.createElement('button');
+    _archiveBtn.type = 'button';
+    _archiveBtn.className = 'history-more-btn';
+    _archiveBtn.addEventListener('click', restoreArchivedMessages);
+  }
+  _archiveBtn.innerHTML = `Show ${_archivedCount} earlier message${_archivedCount === 1 ? '' : 's'} ` + icon('expand-less');
+  const firstLive = messagesEl.querySelector('article.message');
+  if (firstLive) messagesEl.insertBefore(_archiveBtn, firstLive);
+  else messagesEl.appendChild(_archiveBtn);
+}
+
 // Redraws one persisted tool card. Everything it needs was recorded at the
 // time (see makeCardRecord in src/extension.js) and it goes through exactly the
 // same builders the live turn used, so a restored card is the same card — not a
@@ -2983,6 +3043,7 @@ function renderHistoryItem(item) {
 function renderHistory(history) {
   messageIndex = 0;
   messagesEl.innerHTML = '';
+  resetArchivedMessages(); // the nodes it held were just destroyed with innerHTML
   messagesEl.appendChild(welcomeEl); // innerHTML='' detaches it — keep it in the DOM
   if (!Array.isArray(history) || !history.length) { updateWelcome(); return; }
   welcomeEl.classList.add('hidden');
@@ -3740,6 +3801,9 @@ function resetThreadDisplay() {
   // The extension side empties (or replaces) this.messages whenever the thread
   // is reset, so the panel index that names a rewind target resets with it.
   resetMessageIndex();
+  // The archived turns belong to the thread being reset — drop them with it,
+  // or a later trim would offer to restore another conversation's messages.
+  resetArchivedMessages();
   activeAssistantMessage = null;
   activeAssistantBubble = null;
   activeAssistantContent = '';

@@ -531,7 +531,14 @@ class Browser {
     if (!this.proc || this.proc.killed) return;
     try {
       if (process.platform === 'win32' && this.proc.pid) {
-        spawn('taskkill', ['/F', '/T', '/PID', String(this.proc.pid)], { stdio: 'ignore', windowsHide: true });
+        // The 'error' listener is not optional. spawn reports failure (taskkill
+        // missing, denied, racing shutdown) by EMITTING 'error' asynchronously,
+        // which the try/catch around this cannot catch - and an unhandled
+        // 'error' event is an uncaught exception, which takes the whole
+        // extension host down with it. src/background.js guards its identical
+        // taskkill call the same way.
+        const killer = spawn('taskkill', ['/F', '/T', '/PID', String(this.proc.pid)], { stdio: 'ignore', windowsHide: true });
+        killer.on('error', () => {});
       } else {
         this.proc.kill('SIGTERM');
       }

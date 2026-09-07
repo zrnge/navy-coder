@@ -1,8 +1,17 @@
 .vscode/**
+# NOT covered by the line above - '.vscode/**' does not match '.vscode-test'.
+# It is the VS Code build @vscode/test-electron downloads for `npm run
+# test:vscode`, and it is over a gigabyte. Anyone who ran the integration suite
+# before packaging (CI does, on every push) would otherwise ship the whole
+# editor inside the extension.
+.vscode-test/**
 node_modules/**
 .git/**
 *.vscodeignore
 .eslintrc*
+# The flat-config filename the project actually uses now; .eslintrc* predates
+# the migration and stopped matching anything.
+eslint.config.js
 .prettierrc*
 scratchpad/**
 *.sh

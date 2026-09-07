@@ -79,6 +79,37 @@ for (const file of files) {
   }
 }
 
+// A raw NUL byte in a source file is never intentional, and it is expensive in a
+// way that stays invisible. git decides whether a file is text by looking for a
+// NUL: for DIFFS it sniffs only the first 8000 bytes, but for LINE-ENDING
+// conversion it scans the whole buffer. A NUL past byte 8000 therefore diffs
+// like text while silently opting the file out of eol normalization.
+//
+// That happened here. src/extension.js carried a literal NUL inside the audit's
+// own binary-detection check, so the largest and most-edited file in the repo
+// was stored CRLF while every other file was LF, grep refused it without -a,
+// and rewriting it with ordinary tooling produced a whole-file diff that buried
+// the real change. Write the escape (\\u0000) and the character is identical at
+// runtime while the file stays plain text. Markdown is checked too — the same
+// mistake reached two docs while the fix for it was being written.
+{
+  const docs = ['README.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'TROUBLESHOOTING.md']
+    .map(f => path.join(ROOT, f))
+    .filter(f => fs.existsSync(f));
+  for (const file of [...files, ...docs]) {
+    const buf = fs.readFileSync(file);
+    const at = buf.indexOf(0);
+    if (at !== -1) {
+      const line = buf.slice(0, at).toString('utf8').split(String.fromCharCode(10)).length;
+      failures.push({
+        file: path.relative(ROOT, file).split(path.sep).join('/'),
+        message: `line ${line}: raw NUL byte in the file — git will stop treating it `
+          + `as text for line-ending purposes. Write the escape instead.`,
+      });
+    }
+  }
+}
+
 // src/webview-html.js is one enormous template literal, so a backtick typed
 // inside it — most easily inside an HTML comment, where it looks like ordinary
 // prose markup — closes the template and turns the rest of the document into

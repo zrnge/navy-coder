@@ -635,7 +635,7 @@ async function reducedToolsetSuite() {
 async function hallucinationSuite() {
   console.log('\nhallucination guard (full loop):');
   const os = require('os');
-  const { vscode } = sharedMock();
+  const { vscode, ctrl } = sharedMock();
 
   let provider, tmp;
   const realFetch = global.fetch;
@@ -683,6 +683,51 @@ async function hallucinationSuite() {
     await provider.askNavy('what does this log line mean?', false, null, [], []);
     check('intent gate prevents false-positive warning on Q&A',
       !posted.some(m => m.type === 'chunk' && /No files were actually changed/.test(m.text || '')));
+
+    // ── The common shape in the wild: the turn DOES use tools (reads a file,
+    // maybe runs a check), writes nothing, then signs off with a confident
+    // '**Changed:** app.ts'. The original guard only caught turns with NO tool
+    // calls at all, so this reached the user as a finished-looking report with a
+    // footnote under it saying none of it happened. It must be sent back to work.
+    posted.length = 0;
+    fs.writeFileSync(path.join(tmp, 'app.ts'), 'old');
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'app.ts' } }] },
+      { text: '**Changed:** app.ts' },
+      { toolCalls: [{ name: 'write_file', args: { path: 'app.ts', content: 'new' } }] },
+      { text: 'Now actually applied.' },
+    ]);
+    await provider.askNavy('refactor the config loader in app.ts', false, null, [], []);
+    check('a tool-using turn that claims changes but wrote nothing is sent back to do the work',
+      read('app.ts') === 'new', String(read('app.ts')));
+
+    // …and if it just repeats the claim, the user is told plainly rather than
+    // being left with a report that reads as done.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'app.ts' } }] },
+      { text: '**Changed:** never.ts' },
+      { text: '**Changed:** never.ts' },
+    ]);
+    await provider.askNavy('update never.ts', false, null, [], []);
+    check('…and a repeat of the same false claim is reported to the user',
+      read('never.ts') === null
+      && posted.some(m => m.type === 'chunk' && /No files were changed this turn/.test(m.text || '')));
+
+    // False-positive guard: a command can change files with no write tool at all
+    // (git apply, sed -i, a codemod), so a turn that ran one is taken at its word.
+    // Counted by requests: a nudge would have forced a third call.
+    posted.length = 0;
+    ctrl.config.commandApproval = 'auto-approve';
+    const capturedCmd = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'run_command', args: { command: 'echo hi' } }] },
+      { text: '**Changed:** patched.ts' },
+    ], capturedCmd);
+    await provider.askNavy('apply the patch to patched.ts', false, null, [], []);
+    check('a turn that ran a command is taken at its word, not nudged',
+      capturedCmd.length === 2, 'requests=' + capturedCmd.length);
+    ctrl.config.commandApproval = 'ask-always';
 
     // ── Plan auto-continue: a model that declares a plan then quits with no
     // action (and no finish) is nudged to keep going, instead of the turn ending

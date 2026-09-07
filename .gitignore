@@ -1,7 +1,12 @@
 node_modules/
 *.vsix
 dist/
-.vscode/
+# Not the whole folder: launch.json and tasks.json are what make the F5
+# workflow in CONTRIBUTING actually work, so they ship with the repo. Personal
+# settings.json stays ignored — it is machine-specific.
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
 scratchpad/
 
 # The VS Code build @vscode/test-electron downloads for the in-editor suite

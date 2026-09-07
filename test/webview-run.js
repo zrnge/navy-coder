@@ -4,7 +4,7 @@
 // using the same message protocol the extension host uses — so a pass here is
 // a statement about the shipped file, not about a reimplementation.
 
-const { createWebview } = require('./webview-harness.js');
+const { createWebview, closeAllWebviews } = require('./webview-harness.js');
 
 let passed = 0;
 const failures = [];
@@ -1443,6 +1443,74 @@ function slashCommandSuite() {
       wPlayMenu.document.querySelector('#prompt').value === '/playthrough '
       && !wPlayMenu.sent.some(m => m.type === 'runPlaythrough'));
     wPlayMenu.close();
+  }
+
+  // ── Live transcript trimming ──────────────────────────────────────────────
+  // A restored chat only renders its last 60 turns, but a chat that grew that
+  // long while you sat in it kept every turn in the DOM — and scrollToBottom()
+  // runs a layout pass over all of it on every streaming chunk, which is why a
+  // long session got slower and slower until the window was reloaded.
+  {
+    const w = createWebview();
+    for (let i = 0; i < 95; i++) {
+      w.post({ type: 'start', model: 'test' });
+      w.post({ type: 'chunk', text: 'reply number ' + i });
+      w.post({ type: 'done' });
+    }
+    const live = () => w.document.querySelectorAll('article.message').length;
+    check('a long live session does not keep every turn in the DOM',
+      live() <= 80, 'live articles=' + live());
+    const btn = w.document.querySelector('.history-more-btn');
+    check('…and the older turns are offered behind a Show-earlier button', Boolean(btn));
+    check('…which says how many it is holding',
+      /Show \d+ earlier message/.test(btn ? btn.textContent : ''), btn && btn.textContent);
+    // Nothing is destroyed: clicking brings every turn back, in order.
+    const before = live();
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    check('clicking it restores every archived turn', live() === 95, 'after=' + live() + ' before=' + before);
+    const texts = [...w.document.querySelectorAll('article.message')].map(a => a.textContent);
+    check('…in their original order',
+      texts[0].includes('reply number 0') && texts[94].includes('reply number 94'));
+    check('…and the button is gone once they are back',
+      w.document.querySelector('.history-more-btn') === null);
+    w.close();
+  }
+
+  // ── The slash menu has to stay usable as commands accumulate ──────────────
+  // It opens UPWARDS from the composer, so an unbounded list runs off the top of
+  // the panel and the commands at the far end become unreachable. And a long
+  // description used to widen the row rather than ellipsize, because a flex item
+  // will not shrink below its own text without min-width:0.
+  {
+    const css = readSource('media', 'styles.css');
+    const block = (sel) => {
+      const i = css.indexOf(sel + ' {');
+      return i === -1 ? '' : css.slice(i, css.indexOf('}', i));
+    };
+    const dd = block('.slash-dropdown');
+    check('css: the slash menu is capped in height', /max-height:/.test(dd), dd.slice(0, 120));
+    check('css: …and scrolls past the cap instead of overflowing the panel',
+      /overflow-y:\s*auto/.test(dd), dd.slice(0, 200));
+    check('css: …but never widens horizontally', /overflow-x:\s*hidden/.test(dd));
+    const desc = block('.slash-desc');
+    check('css: a long description truncates rather than stretching the row',
+      /text-overflow:\s*ellipsis/.test(desc) && /min-width:\s*0/.test(desc), desc.slice(0, 200));
+  }
+
+  // Truncated text still has to be recoverable, and the built-in descriptions
+  // have to stay short enough to read at a glance — /playthrough's had grown to
+  // twice the length of every other row.
+  {
+    const w = createWebview();
+    type(w, '/');
+    const descs = [...w.document.querySelectorAll('#slashDropdown .slash-desc')];
+    check('every menu row carries its full description as a tooltip',
+      descs.length > 0 && descs.every(d => (d.getAttribute('title') || '') === d.textContent),
+      'rows=' + descs.length);
+    const longest = descs.map(d => d.textContent.length).sort((a, b) => b - a)[0];
+    check('no built-in description is long enough to blow out the row',
+      longest <= 70, 'longest=' + longest);
+    w.close();
   }
 
   // A command name comes from a file on disk, so its text reaches the menu's
@@ -3441,6 +3509,12 @@ highlightSuite();
 tableSuite();
 speechSuite();
 diffSuite();
+
+// Shut every jsdom window still open before reporting. main.js arms a 250ms
+// self-watchdog interval in each one, so a window a test forgot to close keeps
+// Node's event loop alive indefinitely: the suite printed this very summary and
+// then hung forever, which made `npm test` never return on Windows.
+closeAllWebviews();
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);

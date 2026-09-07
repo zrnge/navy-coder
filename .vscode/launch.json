@@ -1,0 +1,47 @@
+{
+  // Committed on purpose (see .gitignore): CONTRIBUTING tells contributors to
+  // press F5, and without a configuration here VS Code falls back to "debug the
+  // active file" — which prompts to install a Markdown debugger if a .md file
+  // happens to be focused, and never launches Navy at all.
+  "version": "0.2.0",
+  "configurations": [
+    
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      // package.json `main` is ./dist/extension.js, which is gitignored and only
+      // exists after a build — so the build runs first or the host loads nothing.
+      "preLaunchTask": "npm: build",
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"]
+    },
+    {
+      // Same, but with every OTHER installed extension disabled (the development
+      // extension is exempt from --disable-extensions and still loads). The dev
+      // host normally runs your whole extension set alongside Navy, so when the
+      // extension host crashes this is the one-click way to find out whose fault
+      // it is: still crashes here = Navy, stops crashing = one of the others.
+      "name": "Run Extension (only Navy, no other extensions)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--disable-extensions"
+      ],
+      "preLaunchTask": "npm: build",
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"]
+    },
+    {
+      // The node suite, debuggable with breakpoints. Runs the same entry point
+      // `npm test` does; no network and no API keys needed.
+      "name": "Debug Tests (node suite)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/test/run.js",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    }
+  ]
+}

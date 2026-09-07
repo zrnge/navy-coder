@@ -1,0 +1,16 @@
+{
+  // Backs the preLaunchTask in launch.json. Declared explicitly rather than
+  // relying on npm-script auto-detection, which a contributor can have turned
+  // off (npm.autoDetect) — in which case F5 would fail on a missing task.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true },
+      "label": "npm: build",
+      "detail": "esbuild bundle into dist/"
+    }
+  ]
+}
