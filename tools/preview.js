@@ -66,6 +66,12 @@ const SCRIPT = [
       '**Done:** two files changed. *Nothing else* was touched.',
     ].join('\n') },
   ] },
+  // The Compact button's surfaces. Without a contextUsage the bar renders empty
+  // and there is nothing to judge the button beside it against; the notice is
+  // what a compaction leaves above the kept messages, summary collapsed inside.
+  { type: 'contextUsage', used: 118000, max: 256000 },
+  { type: 'compactResult', ok: true, condensed: 14, kept: 4,
+    summary: '- Chose exponential backoff for the fetch retry\n- Changed src/net.js and src/app_main.js\n- Open: the flaky upload test' },
   { type: 'start' },
   // A declared plan. The scripted reply above also contains a numbered list,
   // which is what the OLD prose scraper keyed on — driving update_plan here is

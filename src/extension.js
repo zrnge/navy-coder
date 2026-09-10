@@ -116,6 +116,15 @@ const CONTEXT_CHARS_FLOOR = 240000;
 // history survives. Expressed as the ratio the two literals already had
 // (200000/240000) so they can never drift apart.
 const HISTORY_CAP_FRACTION = 5 / 6;
+// How many times one turn may be sent back for reporting changes it never made.
+// More than one because a single challenge often just produces a reworded copy
+// of the same false report; three is where a model that is going to comply has
+// done so, and past which the honest move is to tell the user instead.
+const FALSE_CLAIM_MAX = 3;
+// What the Compact button leaves verbatim: roughly the last two exchanges. Enough
+// that "now do the same for the other file" still has its referent afterwards;
+// everything older is what the button exists to fold away.
+const COMPACT_KEEP_MESSAGES = 4;
 
 // Is a saved project root actually meaningful for the folders open in THIS
 // window? A root that belongs to some other project is worse than no root at
@@ -528,6 +537,9 @@ class Session {
     this._writeInFlight = null;   // Promise while a write is running
     this._writeQueued = null;     // the single follow-up write chained behind it
     this._lastWrittenBody = null; // exact JSON last written, minus the timestamp
+    // The prompt size the provider last reported for this chat. Only the Compact
+    // button reads it, to estimate the bar until the next real figure arrives.
+    this.lastContextUsed = 0;
     this.sessionDigest = '';
     // Learned chars-per-token for THIS conversation, and the previous call's
     // (chars, promptTokens) pair the next delta is measured against. In memory
@@ -1033,6 +1045,9 @@ class NavyCoderViewProvider {
         }
         case 'rewindTo':
           await this.confirmAndRewind(Number(message.index));
+          break;
+        case 'compactContext':
+          await this.compactContext();
           break;
         case 'copy':
           await vscode.env.clipboard.writeText(message.text || '');
@@ -3419,35 +3434,7 @@ class NavyCoderViewProvider {
       // zero messages, which would waste tokens instead of saving them.
       if (dropped.length) {
         this.messages = this.messages.slice(-keepCount);
-        // Mechanical digest — always available, zero latency, used as the fallback.
-        const lines = dropped.map(m => {
-          const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
-          if (!head) return '';
-          if (m.role === 'user') return '- User: ' + head;
-          const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
-          const reads = m.meta?.reads?.length ? ` [read: ${m.meta.reads.join(', ')}]` : '';
-          return '- Navy: ' + head + files + reads;
-        }).filter(Boolean);
-        let digestAddition = lines.join('\n');
-        // Preferred: let the model write a REAL summary of what's being forgotten
-        // (decisions, files changed, unresolved threads) — the way Claude Code
-        // compacts. Rare (once per ~20 turns), so the extra call is acceptable;
-        // any failure falls back to the mechanical digest above.
-        try {
-          this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
-          const excerpt = dropped
-            .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
-            .join('\n').slice(0, 12000);
-          const summary = await this._completeOnce(host, model, [
-            { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
-            { role: 'user', content: excerpt },
-          ]);
-          if (summary && summary.trim().length > 40) digestAddition = summary.trim();
-        } catch (e) { this.log?.('history summarization failed (using mechanical digest): ' + e.message); }
-        this.sessionDigest = ((this.sessionDigest || '') + '\n' + digestAddition).trim();
-        if (this.sessionDigest.length > 6000) {
-          this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
-        }
+        this._appendToDigest(await this._digestFor(host, model, dropped));
       }
     }
 
@@ -3557,6 +3544,7 @@ class NavyCoderViewProvider {
 
       let lastAssistantText = ''; // final assistant text, persisted to history after the loop
       let hallucinationNudged = false; // false-completion-claim correction sent once
+      let falseClaimNudges = 0; // corrections spent on a report that named files it never wrote
       let hallucinationWarned = false; // still claimed success after the nudge — tell the user
       let planContinueCount = 0; // bounded auto-continue when the model quits mid-plan
       // Only worth running the hallucination guard at all if the user's request
@@ -3627,6 +3615,7 @@ class NavyCoderViewProvider {
             estimatedCost, costKnown,
           });
           if (this.modelContextLength) {
+            this._session.lastContextUsed = tokenCounts.prompt; // where the Compact button's estimate starts
             this.view?.webview.postMessage({ type: 'contextUsage', used: tokenCounts.prompt, max: this.modelContextLength });
           }
         }
@@ -3707,15 +3696,27 @@ class NavyCoderViewProvider {
         // hallucinationNudged with the guard above, so a turn gets one correction
         // in total and can never ping-pong; if it repeats the claim anyway, the
         // fabricatedChangeClaim footer still tells the user plainly.
-        if (isDone && !hallucinationNudged && usedTools
+        // Bounded at FALSE_CLAIM_MAX rather than one. One correction was not
+        // enough in practice: a model that has just written a confident report
+        // will often rewrite the same report when challenged once, and only
+        // actually pick up the tools on a later push - which is exactly what
+        // happens when a user types 'you have not fixed yet' themselves. Each
+        // attempt names the files it claimed, because a nudge it can answer in
+        // generalities is one it can talk its way around.
+        if (isDone && falseClaimNudges < FALSE_CLAIM_MAX && usedTools
             && taskChanges.touched.size === 0
             && taskChanges.deleted.filter(Boolean).length === 0
             && taskChanges.commands.length === 0
             && this._claimsFilesChanged(responseText)) {
-          hallucinationNudged = true;
+          falseClaimNudges++;
+          const named = this._claimedFileNames(responseText);
+          const which = named.length ? named.join(', ') : 'the files named in your summary';
+          const lastChance = falseClaimNudges >= FALSE_CLAIM_MAX;
           messages.push({
             role: 'user',
-            content: '[SYSTEM: Your report lists files under "Changed:", but you did not write, edit, rename or delete ANY file this turn — reading a file is not changing it, and describing an edit in your reply does not save it. Nothing you just claimed actually happened. Either make the changes NOW with write_file/apply_edit/edit_line and then report what you really changed, or, if no change was actually needed, say so plainly and report "Changed: none". Do not repeat the previous summary as-is.]',
+            content: lastChance
+              ? `[SYSTEM: That is ${falseClaimNudges} summaries in a row claiming changes that were never made. Navy will not correct you again this turn. Do ONE of two things, nothing else: call apply_edit or write_file on ${which} right now, or reply with a single short sentence saying you could not make the change and why. Do NOT write another summary describing work you have not done.]`
+              : `[SYSTEM: STOP. Your report says you changed ${which}, but Navy's own record of this turn shows you did not write, edit, rename or delete a single file. Reading a file is not changing it, and printing code in your reply does not save it - none of what you just described actually happened. Do it now: call apply_edit or write_file on ${which}, and do not write another summary until a write tool has returned success. If no change is genuinely needed, say so plainly and report "Changed: none".]`
           });
           continue;
         }
@@ -3788,8 +3789,16 @@ class NavyCoderViewProvider {
             && !ranCmds.length
             && this._claimsFilesChanged(responseText);
           if (fabricatedChangeClaim) {
+            // Say whether it was challenged. A report that survived repeated
+            // corrections and still names files it never touched is a different
+            // thing from a one-off slip, and the user is the one who has to
+            // decide how much of the rest of it to believe.
+            const challenged = falseClaimNudges > 0
+              ? ` Navy sent it back ${falseClaimNudges} time${falseClaimNudges > 1 ? 's' : ''} to actually make the change and it did not.`
+              : '';
             footer += (footer ? '\n' : '\n\n---\n')
-              + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but Navy did not write, rename or delete anything — check before relying on it.';
+              + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but Navy did not write, rename or delete anything — check before relying on it.'
+              + challenged;
           }
           if (hallucinationWarned) {
             footer += (footer ? '\n' : '\n\n---\n')
@@ -4374,6 +4383,125 @@ class NavyCoderViewProvider {
   // The ratio the budget is currently derived from — the learned one once this
   // conversation has produced a usable sample, the English-prose default until
   // then, so a first turn behaves exactly as it always did.
+  // What `dropped` becomes in the digest: a model-written summary when the
+  // provider answers, the mechanical one-line-per-message digest when it does
+  // not. Shared by the automatic trigger in _askNavyTurn and the Compact button,
+  // so the two can never condense differently. Changes nothing by itself - the
+  // caller decides whether to apply it (see _appendToDigest).
+  async _digestFor(host, model, dropped) {
+    // Mechanical digest — always available, zero latency, used as the fallback.
+    const lines = dropped.map(m => {
+      const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
+      if (!head) return '';
+      if (m.role === 'user') return '- User: ' + head;
+      const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
+      const reads = m.meta?.reads?.length ? ` [read: ${m.meta.reads.join(', ')}]` : '';
+      return '- Navy: ' + head + files + reads;
+    }).filter(Boolean);
+    let digestAddition = lines.join('\n');
+    // Preferred: let the model write a REAL summary of what's being forgotten
+    // (decisions, files changed, unresolved threads) — the way Claude Code
+    // compacts. Rare (once per ~20 turns), so the extra call is acceptable;
+    // any failure falls back to the mechanical digest above.
+    try {
+      this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
+      const excerpt = dropped
+        .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
+        .join('\n').slice(0, 12000);
+      const summary = await this._completeOnce(host, model, [
+        { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
+        { role: 'user', content: excerpt },
+      ]);
+      if (summary && summary.trim().length > 40) digestAddition = summary.trim();
+    } catch (e) { this.log?.('history summarization failed (using mechanical digest): ' + e.message); }
+    return digestAddition;
+  }
+
+  // Folds one condensation into sessionDigest, keeping it under its cap.
+  _appendToDigest(digestAddition) {
+    this.sessionDigest = ((this.sessionDigest || '') + '\n' + digestAddition).trim();
+    if (this.sessionDigest.length > 6000) {
+      this.sessionDigest = '…\n' + this.sessionDigest.slice(-6000);
+    }
+  }
+
+  // The Compact button. Folds everything but the most recent exchanges into the
+  // session digest on demand - the condensation _askNavyTurn already runs by
+  // itself once history outgrows the window, offered earlier for anyone watching
+  // the context bar fill who would rather choose the moment than have it chosen.
+  compactContext() {
+    // Pinned to the chat it started in. The summary call takes seconds, and
+    // outside a sessionContext `this.messages` follows whichever tab is showing:
+    // switching tabs mid-call would otherwise compact the wrong conversation.
+    const id = this._session.id;
+    return sessionContext.run(id, () => this._compactContextIn(id));
+  }
+
+  async _compactContextIn(id) {
+    const post = (m) => this.view?.webview.postMessage(m);
+    // forSession rides on every result: the webview always resets the button,
+    // but only draws the notice in the chat that was actually compacted.
+    const fail = (reason) => { post({ type: 'compactResult', ok: false, reason, forSession: id }); return null; };
+    if (this.isBusy) return fail('Navy is working — compact once the current turn has finished.');
+
+    // Cut on a USER message, walking back from where the keep window starts, so
+    // what remains opens with a question and its answers rather than a reply to
+    // something no longer there - which is also what providers that insist the
+    // conversation begins with the user's turn require.
+    const all = this.messages;
+    let cut = all.length - COMPACT_KEEP_MESSAGES;
+    while (cut > 0 && all[cut]?.role !== 'user') cut--;
+    if (cut <= 0) return fail('Nothing to compact yet — the conversation is still short.');
+
+    const dropped = all.slice(0, cut);
+    const config = vscode.workspace.getConfiguration('navy');
+    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const model = this.currentModel || config.get('model', '');
+    const digestBefore = (this.sessionDigest || '').length;
+
+    const digestAddition = await this._digestFor(host, model, dropped);
+    post({ type: 'statusText', text: '' });
+
+    // The summary call ran with nothing locked. If the conversation moved under
+    // it - cleared, rewound, a turn that condensed on its own - the messages it
+    // summarized may no longer be the front of the chat. Checked by identity, not
+    // count, and nothing changes if it fails: folding in a summary of messages
+    // other than the ones being removed would be worse than not compacting.
+    // Messages ADDED meanwhile are fine; they sit after the cut and are kept.
+    const now = this.messages;
+    if (now.length < cut || !dropped.every((m, i) => now[i] === m)) {
+      return fail('The conversation changed while compacting — nothing was condensed.');
+    }
+    this._appendToDigest(digestAddition);
+    this.messages = now.slice(cut);
+    await this.saveProjectSession();
+
+    // Re-render from what is left, exactly as a rewind does: the rewind buttons
+    // on screen are indexes into this.messages, so leaving the condensed turns up
+    // would point every one above the cut at the wrong message. Only for the tab
+    // being shown - a compaction that finished after the user switched away must
+    // not repaint the chat they switched to.
+    const visible = this.activeSessionId === id;
+    if (visible) post({ type: 'restore', messages: this.messages });
+    this._sendSessionList();
+
+    // The bar only learns the real figure from the next model call. Until then an
+    // estimate beats a bar still showing the pre-compact number: take off what
+    // was removed, add back what the digest grew by, and say it is an estimate.
+    const lastUsed = this._session.lastContextUsed;
+    let usage = null;
+    if (lastUsed && this.modelContextLength) {
+      const cpt = this._charsPerToken();
+      const removed = dropped.reduce((n, m) => n + (m.text || '').length, 0);
+      const grew = (this.sessionDigest || '').length - digestBefore;
+      usage = { used: Math.max(0, Math.round(lastUsed - removed / cpt + grew / cpt)), max: this.modelContextLength };
+      this._session.lastContextUsed = usage.used;
+    }
+    post({ type: 'compactResult', ok: true, condensed: dropped.length, kept: this.messages.length, summary: digestAddition, forSession: id });
+    if (usage && visible) post({ type: 'contextUsage', used: usage.used, max: usage.max, estimated: true });
+    return { condensed: dropped.length, kept: this.messages.length };
+  }
+
   _charsPerToken() {
     return this.charsPerToken || CHARS_PER_TOKEN;
   }
@@ -4502,6 +4630,24 @@ class NavyCoderViewProvider {
   // and "No files changed" is its documented form for a turn that touched
   // nothing — so anything else on that line is a claim about this turn's work,
   // checkable against what Navy actually observed. Pure + testable.
+  // The file-shaped tokens a report listed under 'Changed:'. Used to quote them
+  // back when the turn changed nothing, so the correction names what it claimed
+  // rather than gesturing at 'your summary'. Deliberately forgiving: anything
+  // with a dot and no spaces counts, since the point is to be specific in a
+  // prompt, not to validate paths.
+  _claimedFileNames(text) {
+    const line = String(text || '').split(String.fromCharCode(10))
+      .map(l => l.trim())
+      .find(l => l.replace(/[*`]/g, '').toLowerCase().startsWith('changed:'));
+    if (!line) return [];
+    const flat = line.replace(/[*`]/g, '');
+    return flat.slice(flat.indexOf(':') + 1)
+      .split(',')
+      .map(t => t.trim())
+      .filter(t => t.includes('.') && !t.includes(' '))
+      .slice(0, 6);
+  }
+
   _claimsFilesChanged(text) {
     if (!text) return false;
     const m = /(?:^|\n)\s*(?:\*\*)?Changed:?(?:\*\*)?\s*([^\n]*)/i.exec(text);

@@ -2590,6 +2590,46 @@ textarea:focus {
 .context-bar-fill.ok     { background: linear-gradient(90deg, var(--green), #2ea043); }
 .context-bar-fill.warn   { background: linear-gradient(90deg, var(--amber), #b08800); }
 .context-bar-fill.danger { background: linear-gradient(90deg, var(--red), #c0392b); }
+/* The bar and its Compact button share a row. The row takes over the bar's old
+   place in the column layout (flex-shrink: 0) and the bar takes the width. */
+.context-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-3);
+  flex-shrink: 0;
+}
+.context-row .context-bar { flex: 1 1 auto; }
+.context-compact-btn {
+  flex-shrink: 0;
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+  padding: 0 var(--space-3);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.context-compact-btn:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.context-compact-btn:disabled { opacity: 0.55; cursor: default; }
+
+/* Left where the condensed turns used to be. The summary is what Navy carries
+   forward from here, so it is there to check - collapsed, not hidden. */
+.compact-notice {
+  margin: var(--space-4) 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.compact-notice > summary { cursor: pointer; }
+.compact-notice-body {
+  margin-top: var(--space-3);
+  white-space: pre-wrap;
+  color: var(--text);
+}
 
 /* ── Token counter badge ──────────────────────────────────────────────────── */
 .token-counter {

@@ -69,6 +69,11 @@ const tokenCounterEl = document.querySelector('#tokenCounter');
 const stepBadgeEl = document.querySelector('#stepBadge');
 const rulesBadgeEl = document.querySelector('#rulesBadge');
 const contextBarFill = document.querySelector('#contextBarFill');
+const compactButton = document.querySelector('#compactButton');
+// True from the click until the extension answers. Kept apart from isBusy: a
+// compaction is not a turn, and a turn ending mid-compaction must not re-enable
+// the button and invite a second one.
+let compacting = false;
 const settingsButton = document.querySelector('#settingsButton');
 const settingsPanel = document.querySelector('#settingsPanel');
 const settingsForm = document.querySelector('#settingsForm');
@@ -349,6 +354,17 @@ sendButton.addEventListener('click', (event) => {
 
 clearButton.addEventListener('click', () => {
   vscode.postMessage({ type: 'clear' });
+});
+
+// The extension refuses a compaction mid-turn as well, but disabling the button
+// keeps that refusal from being the normal path. The label changes while it
+// works because the summary call can take several seconds on a slow model.
+compactButton?.addEventListener('click', () => {
+  if (compactButton.disabled) return;
+  compacting = true;
+  compactButton.disabled = true;
+  compactButton.textContent = 'Compacting…';
+  vscode.postMessage({ type: 'compactContext' });
 });
 
 projectSelect?.addEventListener('change', () => {
@@ -1149,7 +1165,12 @@ window.addEventListener('message', (event) => {
   if (message.type === 'workspaceFolders' && message.sessionId !== undefined && message.sessionId !== activeSessionId) {
     adoptActiveSession(message.sessionId);
   }
-  const sessionGateExempt = message.type === 'sessionList' || message.type === 'workspaceFolders';
+  // compactResult is exempt because the Compact button belongs to the panel, not
+  // to a chat: a compaction that finished after a tab switch is stamped with the
+  // chat it ran in, and gating it would leave the button stuck on Compacting.
+  // Its handler still draws the notice only in the chat that was compacted.
+  const sessionGateExempt = message.type === 'sessionList' || message.type === 'workspaceFolders'
+    || message.type === 'compactResult';
   if (!sessionGateExempt && message.sessionId !== undefined && message.sessionId !== activeSessionId) {
     return;
   }
@@ -1622,12 +1643,30 @@ window.addEventListener('message', (event) => {
       message.estimatedCost, message.costKnown);
   }
 
+  if (message.type === 'compactResult') {
+    // Always reset the button, whichever chat this was for - see the gate.
+    compacting = false;
+    if (compactButton) { compactButton.textContent = 'Compact'; compactButton.disabled = isBusy; }
+    const here = message.forSession === undefined || message.forSession === activeSessionId;
+    if (here && message.ok) {
+      // restore has just redrawn the transcript from what was kept, which puts up
+      // the generic "session restored" note - wrong here, so it goes.
+      messagesEl.querySelector('.restore-note')?.remove();
+      addCompactNotice(message.condensed || 0, message.summary || '');
+    } else if (here && message.reason) {
+      addSystemMessage(message.reason);
+    }
+  }
+
   if (message.type === 'contextUsage') {
     if (contextBarFill && message.max > 0) {
       const pct = Math.min(100, (message.used / message.max) * 100);
       contextBarFill.style.width = pct + '%';
       contextBarFill.className = 'context-bar-fill ' + (pct > 85 ? 'danger' : pct > 60 ? 'warn' : 'ok');
-      const label = `Context: ${message.used.toLocaleString()} / ${message.max.toLocaleString()} tokens (${Math.round(pct)}%)`;
+      // An estimate (after a compaction, before the next model call reports the
+      // real number) says so rather than passing itself off as a measurement.
+      const label = `Context: ${message.used.toLocaleString()} / ${message.max.toLocaleString()} tokens (${Math.round(pct)}%)`
+        + (message.estimated ? ' — estimated until your next message' : '');
       contextBarFill.title = label;
       // The bar is also the only place this number appears, and colour alone
       // does not carry "nearly full" to anyone who cannot see it.
@@ -2868,6 +2907,7 @@ function setBusy(busy) {
   sendButton.title = busy ? 'Stop' : 'Send';
   if (clearButton) clearButton.style.display = busy ? 'none' : '';
   includeContext.disabled = busy;
+  if (compactButton) compactButton.disabled = busy || compacting;
   document.querySelector('.app')?.classList.toggle('is-thinking', busy);
   updateAddButton();
   updateSendButton();
@@ -4293,6 +4333,26 @@ function addSystemMessage(text) {
   el.textContent = text;
   messagesEl.appendChild(el);
   scrollToBottom();
+}
+
+// The marker left where the condensed turns used to be. The summary is what Navy
+// carries forward from here, so it is shown - collapsed, but there to check -
+// instead of asking anyone to trust a digest they cannot see.
+function addCompactNotice(count, summary) {
+  const el = document.createElement('details');
+  el.className = 'compact-notice';
+  const head = document.createElement('summary');
+  head.textContent = `Context compacted — ${count} earlier message${count === 1 ? '' : 's'} condensed into a summary`;
+  el.appendChild(head);
+  if (summary) {
+    const body = document.createElement('div');
+    body.className = 'compact-notice-body';
+    body.textContent = summary;
+    el.appendChild(body);
+  }
+  // Above the first kept message - where the condensed ones were - or at the end
+  // if nothing was kept at all.
+  messagesEl.insertBefore(el, messagesEl.querySelector('article.message'));
 }
 
 // Renders the running session-cumulative token count (and $ cost estimate,

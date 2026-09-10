@@ -1513,6 +1513,69 @@ function slashCommandSuite() {
     w.close();
   }
 
+  // ── The Compact button ────────────────────────────────────────────────────
+  {
+    const w = createWebview();
+    const btn = w.document.querySelector('#compactButton');
+    check('compact: the button sits in the context row', Boolean(btn) && btn.closest('.context-row') !== null);
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    check('compact: clicking asks the extension to compact', w.sent.some(m => m.type === 'compactContext'));
+    check('compact: ...and the button is disabled and says so while it works',
+      btn.disabled === true && /Compacting/.test(btn.textContent));
+    const sentBefore = w.sent.filter(m => m.type === 'compactContext').length;
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    check('compact: a second click while it works does not compact twice',
+      w.sent.filter(m => m.type === 'compactContext').length === sentBefore);
+
+    // Success: the extension redraws from what was kept, then the notice lands
+    // above it with the summary Navy will carry forward.
+    w.post({ type: 'restore', messages: [
+      { role: 'user', text: 'kept question' }, { role: 'assistant', text: 'kept answer' },
+    ] });
+    w.post({ type: 'compactResult', ok: true, condensed: 6, kept: 2, summary: '- Decided the retry design' });
+    const notice = w.document.querySelector('.compact-notice');
+    check('compact: success leaves a notice saying how much was condensed',
+      Boolean(notice) && /6 earlier messages condensed/.test(notice.textContent), notice && notice.textContent);
+    check('compact: ...showing the summary Navy will carry forward', Boolean(notice) && /retry design/.test(notice.textContent));
+    const first = w.document.querySelector('#messages article.message');
+    check('compact: ...placed where the condensed turns were, above what was kept',
+      Boolean(notice && first) && Boolean(notice.compareDocumentPosition(first) & w.window.Node.DOCUMENT_POSITION_FOLLOWING));
+    check('compact: the button comes back once it is done', btn.disabled === false && btn.textContent === 'Compact');
+
+    // A refusal says why, and frees the button.
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    w.post({ type: 'compactResult', ok: false, reason: 'Nothing to compact yet — the conversation is still short.' });
+    check('compact: a refusal says why', /Nothing to compact yet/.test(w.document.body.textContent));
+    check('compact: ...and re-enables the button', btn.disabled === false);
+
+    // A turn in flight disables it.
+    w.post({ type: 'start', model: 'test' });
+    check('compact: disabled while a turn is running', btn.disabled === true);
+    w.post({ type: 'done' });
+    check('compact: ...and enabled again after it', btn.disabled === false);
+
+    // The estimate is labelled as one.
+    w.post({ type: 'contextUsage', used: 12000, max: 32000, estimated: true });
+    const bar = w.document.querySelector('#contextBar');
+    check('compact: an estimated context figure says it is an estimate',
+      /estimated/.test(bar.getAttribute('aria-valuetext') || ''), bar.getAttribute('aria-valuetext'));
+    w.close();
+  }
+
+  // A result for a chat that is not on screen must still free the button - it
+  // belongs to the panel - but must not draw a notice in the wrong chat.
+  {
+    const w = createWebview();
+    const btn = w.document.querySelector('#compactButton');
+    w.post({ type: 'restore', messages: [{ role: 'user', text: 'this chat' }] });
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    w.post({ type: 'compactResult', ok: true, condensed: 3, summary: 'x', forSession: 'some-other-chat', sessionId: 'some-other-chat' });
+    check('compact: a result for another chat still frees the button',
+      btn.disabled === false && btn.textContent === 'Compact');
+    check('compact: ...but draws no notice in the chat on screen', w.document.querySelector('.compact-notice') === null);
+    w.close();
+  }
+
   // A command name comes from a file on disk, so its text reaches the menu's
   // innerHTML from outside this file for the first time.
   {

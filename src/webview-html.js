@@ -144,9 +144,17 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
          cannot take focus, so keyboard and touch users never saw it and assistive
          tech was told nothing at all. It is a progressbar, so it says so, and the
          numbers live in aria-valuetext where they can actually be read. -->
-    <div class="context-bar" id="contextBar" role="progressbar"
-         aria-label="Context window used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-      <div id="contextBarFill" class="context-bar-fill ok"></div>
+    <!-- The Compact button sits beside the bar because the bar is where the reason
+         to press it shows: it filling up. A word rather than an icon - nothing in
+         the icon set reads as "condense", and a word needs no tooltip to explain. -->
+    <div class="context-row">
+      <div class="context-bar" id="contextBar" role="progressbar"
+           aria-label="Context window used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="contextBarFill" class="context-bar-fill ok"></div>
+      </div>
+      <button id="compactButton" type="button" class="context-compact-btn"
+              title="Condense earlier messages into a summary to free up the context window"
+              aria-label="Compact context: condense earlier messages into a summary">Compact</button>
     </div>
 
     <div id="debugPanel" class="debug-panel" style="display:none"></div>

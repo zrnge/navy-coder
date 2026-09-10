@@ -701,18 +701,48 @@ async function hallucinationSuite() {
     check('a tool-using turn that claims changes but wrote nothing is sent back to do the work',
       read('app.ts') === 'new', String(read('app.ts')));
 
-    // …and if it just repeats the claim, the user is told plainly rather than
-    // being left with a report that reads as done.
+
+    // The reported case: one correction was not enough. The model answers the
+    // first challenge with another confident summary and only picks up the tools
+    // on a later push - which is what happens when a user types 'you have not
+    // fixed yet' by hand. Navy has to do that pushing itself.
     posted.length = 0;
+    fs.writeFileSync(path.join(tmp, 'input.js'), 'old');
     global.fetch = queueOllamaFetch([
-      { toolCalls: [{ name: 'read_file', args: { path: 'app.ts' } }] },
-      { text: '**Changed:** never.ts' },
-      { text: '**Changed:** never.ts' },
+      { toolCalls: [{ name: 'read_file', args: { path: 'input.js' } }] },
+      { text: '**Changed:** input.js' },                       // lie 1
+      { text: '**Changed:** input.js -- verified live.' },     // lie 2, after the first push
+      { toolCalls: [{ name: 'write_file', args: { path: 'input.js', content: 'fixed' } }] },
+      { text: 'Actually applied now.' },
     ]);
-    await provider.askNavy('update never.ts', false, null, [], []);
-    check('…and a repeat of the same false claim is reported to the user',
-      read('never.ts') === null
-      && posted.some(m => m.type === 'chunk' && /No files were changed this turn/.test(m.text || '')));
+    await provider.askNavy('fix the sticky key bug in input.js', false, null, [], []);
+    check('a model that repeats the false claim is pushed again, not given up on',
+      read('input.js') === 'fixed', String(read('input.js')));
+
+    // ...and the correction is specific about which files it claimed.
+    check('the correction names the files the report claimed',
+      provider._claimedFileNames('**Changed:** src/input.js, src/player.js').join(',')
+        === 'src/input.js,src/player.js');
+    check('...and finds nothing when the report claims nothing',
+      provider._claimedFileNames('all done, no file list here').length === 0);
+
+    // The budget is finite: a model that never complies must not loop forever,
+    // and the user is told it was challenged rather than left with the report.
+    posted.length = 0;
+    const capCaptured = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'input.js' } }] },
+      { text: '**Changed:** never.js' },
+      { text: '**Changed:** never.js' },
+      { text: '**Changed:** never.js' },
+      { text: '**Changed:** never.js' },
+    ], capCaptured);
+    await provider.askNavy('update never.js', false, null, [], []);
+    check('the corrections are bounded rather than looping forever',
+      read('never.js') === null && capCaptured.length === 5, 'requests=' + capCaptured.length);
+    check('...and the user is told it was challenged and still did not comply',
+      posted.some(m => m.type === 'chunk' && /sent it back/.test(m.text || '')),
+      JSON.stringify(posted.filter(m => m.type === 'chunk').map(m => (m.text || '').slice(-120))));
 
     // False-positive guard: a command can change files with no write tool at all
     // (git apply, sed -i, a codemod), so a turn that ran one is taken at its word.
@@ -1638,4 +1668,116 @@ async function planSuite() {
   }
 }
 
-module.exports = { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite };
+// The Compact button: the automatic history condensation, on demand. Pinned: it
+// condenses through the same summarizer and keeps the recent tail, cuts on a user
+// message, refuses mid-turn and on a short chat without spending a model call,
+// falls back to the mechanical digest when the model will not answer, refuses to
+// apply a summary if the conversation moved while it was written, re-renders so
+// rewind indexes stay true, and gives the bar an estimate flagged as one.
+async function compactContextSuite() {
+  console.log('');
+  console.log('compact button (on-demand history condensation):');
+  const os = require('os');
+  sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  const isDigestCall = (req) => typeof req?.messages?.[0]?.content === 'string'
+    && req.messages[0].content.includes('You compress coding-assistant conversation history');
+  const convo = (n) => Array.from({ length: n }, (_, i) => ({ role: i % 2 === 0 ? 'user' : 'assistant', text: 'm' + i }));
+  const summary = '- Decided on the retry design; changed src/net.js to back off; flaky test still open';
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-compact-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._wslCache = { available: false };
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+
+    // The ordinary case.
+    provider.messages = convo(10);
+    provider.sessionDigest = '';
+    const cap1 = [];
+    global.fetch = queueOllamaFetch([{ text: summary }], cap1);
+    const r = await provider.compactContext();
+    check('compact condenses through the same summarizer the automatic trigger uses', cap1.some(isDigestCall));
+    check('...keeping the most recent exchanges verbatim, in order',
+      provider.messages.length === 4 && provider.messages[0].text === 'm6' && provider.messages[3].text === 'm9',
+      JSON.stringify(provider.messages.map(m => m.text)));
+    check('...and folding the rest into the session digest', (provider.sessionDigest || '').includes('retry design'));
+    check('...reporting how many it condensed', r && r.condensed === 6);
+    check('the transcript is re-rendered from what is left, so rewind indexes stay true',
+      posted.some(m => m.type === 'restore' && Array.isArray(m.messages) && m.messages.length === 4));
+    check('the webview is told it worked, with the summary to show',
+      posted.some(m => m.type === 'compactResult' && m.ok === true && m.condensed === 6 && /retry design/.test(m.summary || '')));
+    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.navy', 'chats', provider._session.id + '.json'), 'utf8'));
+    check('...and the compacted chat is what gets saved', saved.messages.length === 4 && /retry design/.test(saved.digest));
+
+    // The cut lands on a user message: 9 - 4 = 5 is an assistant reply.
+    provider.messages = convo(9);
+    provider.sessionDigest = '';
+    global.fetch = queueOllamaFetch([{ text: summary }]);
+    await provider.compactContext();
+    check('the kept history opens with a user message, never an orphaned reply',
+      provider.messages[0].role === 'user' && provider.messages[0].text === 'm4', provider.messages[0].text);
+
+    // Refused mid-turn, and without spending a model call.
+    posted.length = 0;
+    provider.messages = convo(10);
+    provider.isBusy = true;
+    const cap2 = [];
+    global.fetch = queueOllamaFetch([], cap2);
+    const busy = await provider.compactContext();
+    provider.isBusy = false;
+    check('compact is refused while a turn is running', busy === null && provider.messages.length === 10 && cap2.length === 0);
+    check('...and says why', posted.some(m => m.type === 'compactResult' && m.ok === false && /working/.test(m.reason || '')));
+
+    // Nothing to compact on a short chat.
+    posted.length = 0;
+    provider.messages = convo(3);
+    const cap3 = [];
+    global.fetch = queueOllamaFetch([], cap3);
+    await provider.compactContext();
+    check('a short chat is left alone, with no model call spent',
+      provider.messages.length === 3 && cap3.length === 0
+      && posted.some(m => m.type === 'compactResult' && m.ok === false && /Nothing to compact/.test(m.reason || '')));
+
+    // The model will not answer: the mechanical digest still condenses.
+    provider.messages = convo(10);
+    provider.sessionDigest = '';
+    global.fetch = queueOllamaFetch([{ fail: { status: 500, text: 'down' } }]);
+    await provider.compactContext();
+    check('a failed summary falls back to the mechanical digest rather than losing the turns',
+      provider.messages.length === 4 && /User: m0/.test(provider.sessionDigest || ''), provider.sessionDigest);
+
+    // The conversation moved while the summary was being written.
+    posted.length = 0;
+    provider.messages = convo(10);
+    provider.sessionDigest = '';
+    const inner = queueOllamaFetch([{ text: summary }]);
+    const fresh = [{ role: 'user', text: 'fresh start' }];
+    global.fetch = async (...a) => { provider.messages = fresh; return inner(...a); };
+    await provider.compactContext();
+    check('a summary is not applied if the conversation changed underneath it',
+      provider.messages === fresh && !provider.sessionDigest
+      && posted.some(m => m.type === 'compactResult' && m.ok === false && /changed while compacting/.test(m.reason || '')));
+
+    // The bar gets an estimate straight away, flagged as one.
+    posted.length = 0;
+    provider.messages = convo(10).map(m => ({ ...m, text: m.text + 'x'.repeat(4000) }));
+    provider.sessionDigest = '';
+    provider._session.lastContextUsed = 20000;
+    provider.modelContextLength = 32000;
+    global.fetch = queueOllamaFetch([{ text: summary }]);
+    await provider.compactContext();
+    const est = posted.find(m => m.type === 'contextUsage');
+    check('the context bar gets an estimate straight away, marked as an estimate',
+      est && est.estimated === true && est.used < 20000 && est.max === 32000, JSON.stringify(est));
+  } finally {
+    global.fetch = realFetch;
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite, compactContextSuite };

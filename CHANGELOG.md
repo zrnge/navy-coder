@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.3.4] - 2026-09-07
+
+### Added
+
+- **A Compact button beside the context bar.** Navy already condensed old
+  history by itself once a chat outgrew the window; now you can choose the
+  moment. Compact folds everything but the last couple of exchanges into the
+  session digest - a model-written summary, or a mechanical one if the model
+  will not answer - and shows that summary, collapsed, where the condensed turns
+  used to be, so what Navy carries forward is there to check rather than taken
+  on trust. The context bar updates straight away with an estimate, marked as
+  one until your next message reports the real figure.
+
+  It shares the automatic trigger's summarizer rather than duplicating it, so
+  the two cannot condense differently. It is refused mid-turn, cuts on one of
+  your messages so the kept history never opens with an orphaned reply, and
+  redraws the transcript afterwards the way a rewind does - rewind buttons point
+  into the saved history, so leaving condensed turns on screen would have aimed
+  every one above the cut at the wrong message. If the chat changes while the
+  summary is being written - cleared, rewound, or condensed by a turn - nothing
+  is applied, and switching tabs mid-compaction neither compacts the wrong chat
+  nor leaves the button stuck.
+
+### Fixed
+
+- **One correction was not enough for a report that claimed work it never did.**
+  0.3.3 started sending the model back when its summary named changed files and
+  nothing had been written - but it did that exactly once, and a model that has
+  just produced a confident report will often answer the challenge with a
+  reworded copy of the same report. The turn then ended with the fabricated
+  summary standing and a warning under it, which is the situation the fix was
+  meant to remove. Users were finishing the job by hand, typing "you have not
+  fixed yet" - and that worked, which is the tell: the pushing was right, there
+  just was not enough of it.
+
+  Navy now pushes up to three times, and each correction quotes the specific
+  files the report claimed rather than gesturing at "your summary" - a nudge
+  answerable in generalities is one a model can talk its way around. The last
+  attempt stops asking and offers two choices: call a write tool, or say plainly
+  that it could not. If it still will not, the warning now says how many times it
+  was challenged, so a fabricated report is not mistaken for a one-off slip.
+
 ## [0.3.3] - 2026-09-07
 
 A maintenance release, and most of it is about trust: what Navy claims it did,
