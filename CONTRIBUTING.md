@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,343 tests, no network, no API keys
+npm test             # 2,508 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -48,15 +48,19 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~7,380 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,660 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
 | `src/commands.js` | ~560 | Command and process execution: WSL detection, the approval prompt, spawn-and-collect, `run_command`, `run_project`, and the background-process tools |
 | `src/trust.js` | ~20 | The one sentence an untrusted workspace refuses with, shared by the two files that need it |
 | `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
 | `src/sandbox.js` | ~570 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
-| `src/browser.js` | ~550 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the navigate/snapshot/screenshot/click/type primitives |
-| `src/browser-tools.js` | ~300 | The `/playthrough` tool layer on top of it: the ten `browser_*` tools, the launch approval gate, and the command entry point with its prompts |
+| `src/browser.js` | ~900 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the navigate/snapshot/screenshot/click/type primitives |
+| `src/browser-tools.js` | ~450 | The `/playthrough` tool layer on top of it: the twelve `browser_*` tools, the launch approval gate, and the command entry point with its prompts |
+| `src/png.js` | ~210 | A minimal PNG codec and pixel differ on Node's zlib, for `/playthrough`'s visual regression check — no image library |
+| `src/export.js` | ~170 | The conversation export: each reply with its turn's tool calls and a diff of every file it changed, rebuilt from the saved cards and the undo checkpoints |
+| `src/text-diff.js` | ~120 | Line diffs in `diff -u` form for the export — the same Myers algorithm the webview's diff cards use |
+| `src/transcript-cards.js` | ~150 | The diff, approval, reasoning and audit cards the panel draws from their own messages, recorded into the turn that drew them so a reopened chat shows them |
 | `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
@@ -65,7 +69,7 @@ diff has to stay reviewable.
 | `src/paths.js`, `src/workspace.js`, `src/exec.js`, `src/session-context.js` | ~20 each | Small shared pieces several of the above need, extracted so no module has to import its own importer |
 
 Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.prototype`** — the methods still use `this`, so the extraction changed no call site and no signature.
-| `media/main.js` | ~6,280 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
+| `media/main.js` | ~6,500 | The entire webview: rendering, streaming, cards, markdown, syntax highlighting, dictation |
 | `media/styles.css` | ~4,050 | Webview styling, themed off VS Code's own CSS variables |
 | `src/providers/tools.js` | ~650 | Tool schemas (`TOOLS`), the API-shaped copy (`TOOLS_API`), and the system prompt (`TOOL_PROMPT`) |
 | `src/providers/llm.js` | ~865 | Streaming, tool-call parsing, edit extraction, per-provider request shapes |
@@ -176,6 +180,10 @@ Two suites, both run by `npm test`:
   | `suite-approval.js` | Both approval gates, settings defaults, the diagnostics bundle |
   | `suite-ui.js` | Dictation, slash commands, skills, the review regressions |
   | `suite-browser.js` | The `/playthrough` browser: CDP framing, launch flags, the tool guards and URL routing |
+  | `suite-visual.js` | The PNG codec and pixel differ, every row filter checked against an independent encoder |
+  | `suite-a11y.js` | The accessibility audit run inside jsdom, the contrast arithmetic, and the Tab-order analysis |
+  | `suite-export.js` | The export's line diffs and its Markdown: tool calls, per-turn diffs, and created, deleted, renamed and hand-edited files |
+  | `suite-cards.js` | Saving and redrawing those cards: the recorder and its bounds, then real turns through the real postMessage wrapper, stopped and failed ones included |
 
   The files sit flat in `test/` rather than in a subdirectory on purpose: every
   suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a

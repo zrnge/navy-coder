@@ -194,6 +194,285 @@ function snapshotScript(max) {
   })()`;
 }
 
+// ── Accessibility checks ─────────────────────────────────────────────────────
+// Colour contrast (WCAG 2.x). Real functions rather than strings: the in-page
+// audit below embeds their source, and the test suite calls them directly, so
+// the arithmetic behind every contrast finding is checked without a browser.
+
+// 'rgb(1, 2, 3)', 'rgba(1, 2, 3, 0.5)', '#abc', '#aabbcc' or 'transparent' ->
+// [r, g, b, a] with a in 0..1; null for anything it cannot read, so an unknown
+// colour is skipped rather than guessed at. Chrome's getComputedStyle always
+// answers in rgb()/rgba(); the hex forms are for other callers.
+function parseCssColor(str) {
+  const s = String(str || '').trim().toLowerCase();
+  if (!s) return null;
+  if (s === 'transparent') return [0, 0, 0, 0];
+  let m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:[\s,/]+([\d.]+%?))?\s*\)$/.exec(s);
+  if (m) {
+    const a = m[4] === undefined ? 1 : (m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4]));
+    return [Number(m[1]), Number(m[2]), Number(m[3]), a];
+  }
+  m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/.exec(s);
+  if (m) {
+    const h = m[1].length === 3 ? m[1].split('').map(c => c + c).join('') : m[1];
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16), 1];
+  }
+  return null;
+}
+
+// A translucent colour composited over an opaque one.
+function blendOver(fg, bg) {
+  const a = fg[3] === undefined ? 1 : fg[3];
+  return [fg[0] * a + bg[0] * (1 - a), fg[1] * a + bg[1] * (1 - a), fg[2] * a + bg[2] * (1 - a), 1];
+}
+
+function relativeLuminance(c) {
+  const ch = (v) => {
+    const x = v / 255;
+    return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2]);
+}
+
+function contrastRatio(c1, c2) {
+  const l1 = relativeLuminance(c1);
+  const l2 = relativeLuminance(c2);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+// The in-page accessibility audit. Returns what a screen-reader or keyboard user
+// would trip over, each finding with where it is and why it matters:
+//   img-alt       images with no text alternative
+//   label         form fields with no label, or only a placeholder
+//   name          buttons and links with no accessible name
+//   keyboard      clickable things the keyboard cannot reach
+//   tab-order     positive tabindex, which reorders focus
+//   lang, title   a page with no language or no title
+//   headings      a skipped heading level
+//   duplicate-id  an id used more than once (labels reach only the first)
+//   contrast      text below WCAG AA contrast
+// Only visible elements are judged. Text over a background image is skipped for
+// contrast: its real background cannot be read from styles, and a guess would
+// produce findings that are not true.
+function a11yAuditScript(max = 40) {
+  return `(() => {
+    ${parseCssColor.toString()}
+    ${blendOver.toString()}
+    ${relativeLuminance.toString()}
+    ${contrastRatio.toString()}
+    const MAX = ${Math.max(1, Number(max) || 40)};
+    const issues = [];
+    const textOf = (el) => ((el && el.textContent) || '').replace(/\\s+/g, ' ').trim();
+    const describe = (el) => {
+      if (!el || !el.tagName) return '';
+      const tag = el.tagName.toLowerCase();
+      const id = el.id ? '#' + el.id : '';
+      const cls = (el.getAttribute('class') || '').trim().split(/\\s+/).filter(Boolean).slice(0, 2).map(c => '.' + c).join('');
+      const txt = tag === 'html' || tag === 'body' ? '' : textOf(el).slice(0, 40);
+      return tag + id + cls + (txt ? ' "' + txt + '"' : '');
+    };
+    const add = (kind, severity, el, text) => {
+      if (issues.filter(i => i.kind === kind).length >= MAX) return;
+      issues.push({ kind, severity, where: describe(el), text });
+    };
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width < 1 || r.height < 1) return false;
+      const cs = getComputedStyle(el);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+    };
+    const byIds = (ids) => ids.split(/\\s+/).map(i => document.getElementById(i)).filter(Boolean).map(textOf).join(' ').trim();
+    const accName = (el) => {
+      const lb = el.getAttribute('aria-labelledby');
+      if (lb) { const t = byIds(lb); if (t) return t; }
+      const al = (el.getAttribute('aria-label') || '').trim();
+      if (al) return al;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'input' || tag === 'select' || tag === 'textarea') {
+        if (el.id) {
+          const l = Array.from(document.querySelectorAll('label')).find(x => x.htmlFor === el.id);
+          if (l && textOf(l)) return textOf(l);
+        }
+        const wrap = el.closest('label');
+        if (wrap && textOf(wrap)) return textOf(wrap);
+        const type = (el.getAttribute('type') || '').toLowerCase();
+        if ((type === 'submit' || type === 'button' || type === 'reset') && el.value) return el.value;
+        if (type === 'image') return (el.getAttribute('alt') || '').trim();
+        return (el.getAttribute('title') || '').trim();
+      }
+      if (tag === 'img') return (el.getAttribute('alt') || '').trim();
+      const own = textOf(el);
+      if (own) return own;
+      const img = el.querySelector('img[alt]');
+      if (img && img.getAttribute('alt').trim()) return img.getAttribute('alt').trim();
+      const svgTitle = el.querySelector('svg title');
+      if (svgTitle && textOf(svgTitle)) return textOf(svgTitle);
+      return (el.getAttribute('title') || '').trim();
+    };
+
+    for (const img of document.querySelectorAll('img')) {
+      if (!visible(img)) continue;
+      const role = img.getAttribute('role');
+      if (!img.hasAttribute('alt') && !img.getAttribute('aria-label') && !img.getAttribute('aria-labelledby')
+          && role !== 'presentation' && role !== 'none') {
+        add('img-alt', 'serious', img, 'Image has no alt text: a screen reader announces its file name or nothing. Use alt="" if it is purely decorative.');
+      }
+    }
+    for (const el of document.querySelectorAll('[role="img"], input[type="image"]')) {
+      if (visible(el) && !accName(el)) add('img-alt', 'serious', el, 'Image element has no text alternative, so it has no name.');
+    }
+
+    for (const el of document.querySelectorAll('input, select, textarea')) {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (['hidden', 'submit', 'button', 'reset', 'image'].includes(type) || !visible(el)) continue;
+      if (accName(el)) continue;
+      const ph = (el.getAttribute('placeholder') || '').trim();
+      add('label', 'serious', el, ph
+        ? 'Field is labelled only by its placeholder ("' + ph.slice(0, 40) + '"), which disappears once someone starts typing.'
+        : 'Form field has no label: a screen-reader user hears "edit text" with no idea what goes in it.');
+    }
+
+    for (const el of document.querySelectorAll('button, [role="button"], a[href], [role="link"]')) {
+      if (!visible(el) || accName(el)) continue;
+      const isLink = el.tagName.toLowerCase() === 'a' || el.getAttribute('role') === 'link';
+      add('name', 'serious', el, isLink
+        ? 'Link has no text, so it is announced only as "link".'
+        : 'Button has no accessible name (icon-only?), so it is announced only as "button".');
+    }
+
+    const NATIVE = ['a', 'button', 'input', 'select', 'textarea', 'summary', 'option'];
+    for (const el of document.querySelectorAll('[onclick], [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"]')) {
+      const tag = el.tagName.toLowerCase();
+      if (NATIVE.includes(tag) && !(tag === 'a' && !el.hasAttribute('href'))) continue;
+      if (!visible(el)) continue;
+      if (el.tabIndex < 0) add('keyboard', 'serious', el, 'Clickable, but the keyboard cannot reach it: it is not a link or button and has no tabindex.');
+    }
+
+    for (const el of document.querySelectorAll('[tabindex]')) {
+      const n = Number(el.getAttribute('tabindex'));
+      if (n > 0 && visible(el)) add('tab-order', 'moderate', el, 'tabindex="' + n + '" pulls this ahead of the page order, so keyboard focus jumps around the page.');
+    }
+
+    if (!(document.documentElement.getAttribute('lang') || '').trim()) {
+      add('lang', 'moderate', document.documentElement, 'The page declares no language (no lang attribute), so screen readers guess it and may mispronounce everything.');
+    }
+    if (!(document.title || '').trim()) {
+      add('title', 'moderate', document.documentElement, 'The page has no title, so its tab and history entry say nothing.');
+    }
+
+    let lastLevel = 0;
+    for (const h of document.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+      if (!visible(h)) continue;
+      const level = Number(h.tagName.charAt(1));
+      if (lastLevel && level > lastLevel + 1) {
+        add('headings', 'minor', h, 'Heading jumps from h' + lastLevel + ' to h' + level + ', skipping a level in the outline screen-reader users navigate by.');
+      }
+      lastLevel = level;
+    }
+
+    const idCount = {};
+    for (const el of document.querySelectorAll('[id]')) idCount[el.id] = (idCount[el.id] || 0) + 1;
+    for (const id of Object.keys(idCount)) {
+      if (idCount[id] > 1) {
+        add('duplicate-id', 'minor', document.getElementById(id), 'id="' + id + '" is used ' + idCount[id] + ' times; labels and aria references pointing at it only ever reach the first.');
+      }
+    }
+
+    const effectiveBg = (el) => {
+      const layers = [];
+      for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+        const cs = getComputedStyle(n);
+        if (cs.backgroundImage && cs.backgroundImage !== 'none') return null;
+        const c = parseCssColor(cs.backgroundColor);
+        if (c && c[3] > 0) {
+          layers.push(c);
+          if (c[3] >= 1) break;
+        }
+      }
+      let bg = [255, 255, 255, 1];
+      for (let i = layers.length - 1; i >= 0; i--) bg = blendOver(layers[i], bg);
+      return bg;
+    };
+    let contrastChecked = 0;
+    const seen = new Set();
+    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    for (let t = walker.nextNode(); t && contrastChecked < 500; t = walker.nextNode()) {
+      if (!t.nodeValue || !t.nodeValue.trim()) continue;
+      const el = t.parentElement;
+      if (!el || seen.has(el)) continue;
+      seen.add(el);
+      if (['script', 'style', 'noscript', 'template'].includes(el.tagName.toLowerCase()) || !visible(el)) continue;
+      const cs = getComputedStyle(el);
+      const fg = parseCssColor(cs.color);
+      const bg = fg && effectiveBg(el);
+      if (!fg || !bg) continue;
+      contrastChecked++;
+      const ratio = contrastRatio(blendOver(fg, bg), bg);
+      const size = parseFloat(cs.fontSize) || 16;
+      const bold = (parseInt(cs.fontWeight, 10) || 400) >= 700;
+      const large = size >= 24 || (bold && size >= 18.66);
+      const need = large ? 3 : 4.5;
+      if (ratio < need) {
+        add('contrast', ratio < need - 1.5 ? 'serious' : 'moderate', el,
+          'Text contrast is ' + ratio.toFixed(2) + ':1, below the ' + need + ':1 WCAG AA minimum for ' + (large ? 'large' : 'normal')
+          + ' text (' + cs.color + ' on rgb(' + bg.slice(0, 3).map(Math.round).join(', ') + ')).');
+      }
+    }
+
+    const counts = {};
+    for (const i of issues) counts[i.kind] = (counts[i.kind] || 0) + 1;
+    return { url: location.href, title: document.title, issues, counts, contrastChecked };
+  })()`;
+}
+
+// Describe whichever element has keyboard focus, for focusOrder. null when focus
+// is on nothing in particular (the body) - where Tab lands after the last
+// focusable element, before it wraps. Each element gets a stable key the first
+// time it is seen, so the sequence can tell "moved on" from "stuck".
+const FOCUS_DESCRIBE_SCRIPT = `(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return null;
+  const r = el.getBoundingClientRect();
+  const cs = getComputedStyle(el);
+  const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || el.value || '')
+    .replace(/\\s+/g, ' ').trim().slice(0, 40);
+  const outline = cs.outlineStyle !== 'none' && parseFloat(cs.outlineWidth) > 0;
+  const ring = Boolean(cs.boxShadow) && cs.boxShadow !== 'none';
+  if (!el.__navyFocusKey) el.__navyFocusKey = 'f' + (window.__navyFocusSeq = (window.__navyFocusSeq || 0) + 1);
+  return {
+    key: el.__navyFocusKey, tag: el.tagName.toLowerCase(), label,
+    visible: r.width >= 1 && r.height >= 1 && cs.visibility !== 'hidden',
+    indicator: outline || ring, x: Math.round(r.left), y: Math.round(r.top),
+  };
+})()`;
+
+// Turn the raw Tab sequence into findings. Pure, so it is tested without a
+// browser.
+//   - a return to the first stop, or focus leaving the page's elements, ends
+//     the cycle (complete);
+//   - the same element twice in a row, when it is not the only stop, means Tab
+//     did not move focus: a keyboard trap;
+//   - focus on something with no size, or hidden, is focus nobody can see;
+//   - a visible stop whose focused style shows no outline or ring probably has
+//     no focus indicator (a site can mark focus other ways, hence "probably").
+function analyzeFocusStops(stops) {
+  const sequence = [];
+  const traps = [];
+  const invisible = [];
+  const noIndicator = [];
+  let complete = false;
+  for (const s of stops) {
+    if (!s) { complete = sequence.length > 0; break; }
+    if (sequence.length && s.key === sequence[0].key) { complete = true; break; }
+    const prev = sequence[sequence.length - 1];
+    if (prev && s.key === prev.key) { traps.push(s); break; }
+    sequence.push(s);
+    if (!s.visible) invisible.push(s);
+    else if (!s.indicator) noIndicator.push(s);
+  }
+  return { sequence, traps, invisible, noIndicator, complete };
+}
+
 class Browser {
   constructor(opts = {}) {
     this.chromePath = opts.chromePath || null;
@@ -504,6 +783,67 @@ class Browser {
 
   // Return captured console/error/network entries, newest cleared by default so
   // each call reports only what happened since the last one.
+  // ── Accessibility and visual regression ──────────────────────────────────
+  async accessibilityAudit(max = 40) {
+    return this.evaluate(a11yAuditScript(max));
+  }
+
+  // Press Tab through the page the way a keyboard user would, from the top, and
+  // report what focus did. Real key events, not element.focus(): only real Tab
+  // presses exercise the page's own tab order, its focus traps and its
+  // :focus-visible styling. Stops as soon as the cycle completes or focus sticks.
+  async focusOrder(max = 60) {
+    await this.evaluate('(() => { const b = document.body || document.documentElement; const had = b.hasAttribute("tabindex");'
+      + ' if (!had) b.setAttribute("tabindex", "-1"); b.focus({ preventScroll: true }); if (!had) b.removeAttribute("tabindex");'
+      + ' window.scrollTo(0, 0); return true; })()');
+    const stops = [];
+    for (let i = 0; i < max; i++) {
+      for (const type of ['rawKeyDown', 'keyUp']) {
+        await this._send('Input.dispatchKeyEvent',
+          { type, key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9 }, this._sessionId);
+      }
+      stops.push(await this.evaluate(FOCUS_DESCRIBE_SCRIPT));
+      const sofar = analyzeFocusStops(stops);
+      if (sofar.complete || sofar.traps.length) break;
+    }
+    return { ...analyzeFocusStops(stops), pressed: stops.length };
+  }
+
+  // A screenshot at a fixed size and pixel density, for visual regression.
+  // Baselines have to be comparable across runs and machines: a headed window
+  // can be resized between runs, and a HiDPI display doubles every screenshot's
+  // pixels. The override applies to this capture only and is cleared straight
+  // after, so ordinary screenshots still show exactly what the user sees.
+  //
+  // It also captures the page at rest rather than in whatever state the last
+  // tool left it. Measured in real Chrome, the focus ring left on the page by
+  // focusOrder's Tab walk changed 965 pixels and a 600px scroll changed 760,
+  // so either one reported "CHANGED" for a screen nobody touched, and so did
+  // the :hover style under the mouse where the last click left it (2,660). So:
+  // the mouse off the page, nothing focused, scrolled to the top - with the
+  // scroll put back afterwards so the playthrough carries on where it was.
+  // Focus and the mouse are not put back: a scripted focus() draws a different
+  // ring from the one Tab drew, and the next click or type moves both to where
+  // it needs them anyway.
+  async captureFixed({ width = 1280, height = 800 } = {}) {
+    await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: -1, y: -1 }, this._sessionId).catch(() => {});
+    const was = await this.evaluate('(() => { const a = document.activeElement;'
+      + ' if (a && a !== document.body && typeof a.blur === "function") a.blur();'
+      + ' const s = { x: window.scrollX, y: window.scrollY }; window.scrollTo(0, 0); return s; })()').catch(() => null);
+    await this._send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }, this._sessionId);
+    try {
+      await this.evaluate('document.fonts && document.fonts.ready ? document.fonts.ready.then(() => true) : true',
+        { awaitPromise: true }).catch(() => {});
+      await new Promise(r => setTimeout(r, 350)); // the resize's layout and paint
+      return await this.screenshot();
+    } finally {
+      await this._send('Emulation.clearDeviceMetricsOverride', {}, this._sessionId).catch(() => {});
+      if (was && (was.x || was.y)) {
+        await this.evaluate(`window.scrollTo(${Number(was.x) || 0}, ${Number(was.y) || 0})`).catch(() => {});
+      }
+    }
+  }
+
   drainEvents(clear = true) {
     const out = this._events.slice();
     if (clear) this._events = [];
@@ -553,4 +893,7 @@ class Browser {
   }
 }
 
-module.exports = { Browser, chromeCandidates, firstExisting, launchArgs, drainFrames, snapshotScript, INTERACTIVE_TAGS };
+module.exports = {
+  Browser, chromeCandidates, firstExisting, launchArgs, drainFrames, snapshotScript, INTERACTIVE_TAGS,
+  parseCssColor, blendOver, relativeLuminance, contrastRatio, a11yAuditScript, FOCUS_DESCRIBE_SCRIPT, analyzeFocusStops,
+};

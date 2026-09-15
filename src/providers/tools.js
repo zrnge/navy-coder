@@ -510,6 +510,23 @@ const TOOLS = [
     parameters: { type: 'object', properties: {} }
   },
   {
+    name: 'browser_accessibility',
+    description: 'Check the current page for the accessibility problems a screen-reader or keyboard user would hit: images without alt text, form fields without labels, buttons and links with no name, clickable elements the keyboard cannot reach, text below WCAG AA contrast, a missing page language or title, skipped heading levels and duplicate ids. It also presses Tab through the page to check the focus order, focus traps, and whether focus is visible. Run it on each important screen. Automated checks find only part of what matters: report findings, never a clean bill of health.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_visual_check',
+    description: 'Visual regression check. Captures the current page at a fixed 1280x800 and compares it with the saved baseline for `name`, a short stable label for this screen such as "home" or "login-form". It captures the top of the page at rest - scrolled to the top, nothing focused, the mouse off the page - so the scroll is put back afterwards but focus is not: click a field again before typing into it. The first run for a name saves the baseline; later runs report what changed and attach a diff image with the changed pixels in red. If a change is intended, call it again with update: true to make the current screen the new baseline.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'A short, stable label for this screen, reused across runs, e.g. "home" or "checkout-form".' },
+        update: { type: 'boolean', description: 'Accept the current screen as the new baseline (default false).' }
+      },
+      required: ['name']
+    }
+  },
+  {
     // Offered ONLY on the reduced tier (see TOOLS_API_CORE below), but listed
     // here with every other tool because TOOLS is what parseToolCalls checks a
     // name against before accepting a JSON-formatted call. Left out of this
@@ -598,7 +615,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_scroll, browser_evaluate, browser_console, browser_back, browser_close, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_scroll, browser_evaluate, browser_console, browser_back, browser_close, browser_accessibility, browser_visual_check, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.

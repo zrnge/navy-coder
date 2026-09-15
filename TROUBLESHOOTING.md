@@ -158,6 +158,30 @@ This is self-correcting — the model is told to snapshot again — but a page t
 re-renders constantly can make it loop; stop the turn and give it a narrower
 instruction.
 
+**Where are the visual baselines, and how do I reset one?** In the project's
+`.navy/playthrough/baselines/` - one PNG per site and screen name - or in Navy's
+global storage when no folder is open. A local dev server is named without its
+port (`localhost__home.png`), so a server that moves from 5173 to 5174 keeps its
+baselines. Each baseline is the top 1280x800 of the page; anything below that is
+not compared. Delete a file to make that screen's next check save a fresh
+baseline, or let the model call `browser_visual_check(name, update: true)` for a
+change you meant to make.
+
+**A visual check says a screen changed when nothing did.** Something on the page
+moves on its own - a carousel, a clock, a random banner, an animation. Navy rules
+out the rest: captures are taken at a fixed size and density, so window size and
+display scaling cannot cause this, and of the page at rest - the mouse off it,
+nothing focused, scrolled to the top - so a hover style, a focus ring or a
+blinking cursor cannot either. Content that animates still will. Point the check
+at a state where the page is still, or treat that screen's diff as
+informational.
+
+**The accessibility check found nothing, so the site is accessible?** No.
+Automated checks find the mechanical problems - missing alt text and labels,
+contrast, keyboard reachability, focus order - but not whether alt text is
+meaningful, whether the reading order makes sense, or how a screen reader really
+announces the page. The report says so itself; a person still has to look.
+
 ## The panel is stuck "thinking"
 
 Press **Stop**. If the panel is unresponsive rather than busy, reload the window

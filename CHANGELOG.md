@@ -1,5 +1,101 @@
 # Changelog
 
+## [0.3.5] - 2026-09-15
+
+Accessibility and visual regression for `/playthrough`, a safety catch on
+Compact, and exports that show what each turn did.
+
+### Added
+
+- **`/playthrough` checks accessibility.** A new `browser_accessibility` tool
+  audits each important screen for what a screen-reader or keyboard user would
+  hit: images with no alt text, form fields with no label (or only a
+  placeholder), buttons and links with no name, clickable elements the keyboard
+  cannot reach, text below WCAG AA contrast - measured from the page's real
+  computed colours - a missing page language or title, skipped heading levels,
+  and duplicate ids. It then presses Tab through the page with real key events
+  and reports the focus order, any keyboard trap, focus that lands somewhere
+  invisible, and stops with no visible focus indicator. The report ends by
+  saying what automated checks cannot see, so a clean result is never
+  presented as "accessible".
+
+- **`/playthrough` catches visual regressions.** `browser_visual_check` captures
+  a screen at a fixed 1280x800 and 1x density - so a resized window or a HiDPI
+  display cannot make every comparison look like a change - and compares it with
+  the baseline saved under that screen's name. The first run saves the baseline;
+  later runs report what changed and where, and attach a diff image with the
+  changed pixels in red for the model to judge. An intended change is accepted
+  with `update: true`. Baselines live in the project's
+  `.navy/playthrough/baselines/`.
+
+  Each capture is of the page at rest: the mouse moved off it, nothing focused,
+  scrolled to the top, with the scroll put back afterwards. Measured in real
+  Chrome, the focus ring left by the accessibility check's Tab walk changed 965
+  pixels of an untouched screen, a 600px scroll 760, and a hover style under the
+  last click 2,660 - each enough on its own to report a change that never
+  happened. A local dev server's baselines are named without its port, so Vite
+  moving from 5173 to 5174 still compares against the same baselines instead of
+  quietly starting new ones, and `localhost`, `127.0.0.1` and `[::1]` share them.
+  A real domain keeps its port, so staging is never compared with the live site.
+
+  The comparison is a small PNG codec and pixel differ, `src/png.js`, on Node's
+  own zlib: still no image library, and no second browser tab or exposure to the
+  tested site's content-security policy, both of which an in-page comparison
+  would have needed. A caret-sized difference counts as noise; a percentage
+  threshold would have hidden a single changed word.
+
+- **Compact asks first.** The condensed messages are gone from the saved chat
+  afterwards and rewind cannot reach past a compaction, so Compact now says how
+  many messages go and how many stay, and offers **Export first, then
+  compact**. Cancelling the save cancels the compaction.
+
+- **Exports show what each turn did.** Under each of Navy's replies an export
+  now lists the tool calls that turn made, with the output the transcript
+  showed (an excerpt for long output, marked as one), and a diff of every file
+  it changed, in the usual `diff -u` form. Nothing new is recorded to make that
+  possible: the tool calls are the cards each reply already keeps so a reopened
+  chat can redraw them, and the diffs come from the undo checkpoints. A diff
+  runs from the file as it was before the turn to the file just before its next
+  change, or to the file on disk for the latest turn, and a file that also
+  changed outside Navy in between is marked as such. Where undo history no
+  longer reaches back that far, the export names the files and says why their
+  diffs are missing rather than leaving them out. The line diff is
+  `src/text-diff.js`, the same algorithm the diff cards use.
+
+### Fixed
+
+- **Reopening a chat lost its diff cards, and more.** Only tool-result cards
+  were saved with a turn. The diff card for each file change, the approval card
+  for each command, browser launch or MCP call, the reasoning block and the
+  `/audit` card were drawn from their own messages and never saved, so a chat
+  reopened after a reload or restart came back without a single diff. They are
+  now recorded as they are drawn, into the turn that drew them and in the order
+  it drew them, and redrawn settled - applied or rejected, approved or refused,
+  with no buttons left to press. A diff is saved as its changed hunks rather
+  than both files, capped per card and per turn, so the chat file stays small.
+  The recording happens where every message to the panel already passes, so a
+  card added later is saved without anyone having to remember to.
+
+  A turn that was stopped, or failed after doing some work, was dropped from the
+  saved chat entirely, cards and all. It is now saved with what it drew and the
+  error it ended on, and Navy's record of what earlier turns changed includes
+  it - a stopped turn's edits used to be invisible to the model afterwards. The
+  notice marking history that Compact condensed is redrawn too. Chats saved
+  before this version have no such records, so their diffs stay missing.
+
+- **Export Conversation (the command) dropped every speaker label.** It had its
+  own copy of the export, which looked for `message-user` and
+  `message-assistant` classes the transcript never had, so every line came out
+  with no **You:** or **Navy:**. The command and the toolbar button now share
+  one export.
+
+- **Exports silently left out turns that were not on screen.** Both exports
+  scraped the panel, which only ever holds part of a long chat: a restored chat
+  renders its last turns, and since 0.3.3's transcript trimming a long live one
+  moves older turns out of the page. The export is now built from the saved
+  chat itself and includes what earlier compactions condensed - which is what
+  makes "Export first, then compact" worth trusting.
+
 ## [0.3.4] - 2026-09-10
 
 ### Added

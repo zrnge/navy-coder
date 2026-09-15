@@ -41,6 +41,10 @@ const { sessionContext } = require('./session-context.js');
 // Workspace trust — see src/workspace.js for why it lives in its own module.
 const { workspaceIsTrusted } = require('./workspace.js');
 
+// Diff, approval and reasoning cards, saved with the turn that drew them - see
+// src/transcript-cards.js.
+const { beginTurnCards, endTurnCards, recordTranscriptCard, auditCardRecord } = require('./transcript-cards.js');
+
 
 // Syntax checkers run with cwd set OUTSIDE the project on purpose — see
 // src/exec.js, which owns CHECKER_CWD because the sandbox and background-process
@@ -876,6 +880,11 @@ class NavyCoderViewProvider {
     const realPostMessage = webviewView.webview.postMessage.bind(webviewView.webview);
     webviewView.webview.postMessage = (message) => {
       const sessionId = sessionContext.getStore() ?? this.activeSessionId;
+      // Diff cards, approval cards and reasoning are drawn from their own
+      // messages rather than from tool results, so they are recorded into the
+      // running turn here, where every one of them passes - see
+      // src/transcript-cards.js. Recording can never stop the message itself.
+      try { recordTranscriptCard(this.sessions.get(sessionId), message); } catch {}
       return realPostMessage({ sessionId, ...message });
     };
 
@@ -1136,7 +1145,9 @@ class NavyCoderViewProvider {
           break;
         }
         case 'exportConversation':
-          await this.exportConversation(message.text || '');
+          // Built here from the saved chat, whatever the webview sends - it only
+          // ever holds part of a long conversation. See _exportMarkdown.
+          await this.exportConversation();
           break;
         case 'reviewPR':
           await this.generatePRReview();
@@ -3445,6 +3456,10 @@ class NavyCoderViewProvider {
       // writes, so a note appended there becomes a format it copies. Once it
       // is copying the shape it invents the contents too, reporting files it
       // never touched. That record is in the system prompt now — _historyLedger.
+      // A turn saved for its cards alone - stopped or failed before it wrote a
+      // reply - has nothing to say to the model, and an empty assistant turn
+      // is refused outright by some providers.
+      if (item.role === 'assistant' && !String(item.text || '').trim()) continue;
       messages.push({ role: item.role, content: item.text });
     }
 
@@ -3490,6 +3505,11 @@ class NavyCoderViewProvider {
 
     let hitCap = false;   // declared outside try so finally{} can read it
     let usedTools = false; // outside try — the catch offers "Continue" only for turns with progress
+    // Saves the turn to the chat. Assigned inside the try, once what it saves
+    // exists; declared out here so the catch can save a turn that was stopped
+    // or failed, not only one that finished.
+    let persistTurn = null;
+    const turnSession = this._session;
     try {
 
       // One controller for the entire turn so Stop cancels both the current
@@ -3533,11 +3553,41 @@ class NavyCoderViewProvider {
       // what the turn DID for the model's benefit — this one is purely visual
       // and is capped independently.
       const cardLog = [];
-      const postToolCall = (tool, args, callId) =>
+      // The webview's own cards - diffs, approvals, reasoning - are recorded
+      // into this same log as they are posted (see the postMessage wrapper), so
+      // everything the turn drew replays in the order it was drawn.
+      beginTurnCards(turnSession, cardLog);
+      // The /audit card was drawn just before this turn, for this prompt.
+      const lead = turnSession.leadCards;
+      if (lead && lead.prompt === prompt) {
+        cardLog.push(...lead.cards);
+        turnSession.leadCards = null;
+      }
+      // A tool's card is logged when it is CALLED and filled in when it
+      // returns, so a diff or an approval the tool raised while it ran lands
+      // after its own card, as it does on screen, rather than ahead of it.
+      const cardsByCall = new Map();
+      let toolCards = 0;
+      const postToolCall = (tool, args, callId) => {
         this.view?.webview.postMessage({ type: 'toolCall', tool, args, callId });
+        if (callId && toolCards < CARD_LOG_MAX) {
+          toolCards++;
+          const record = makeCardRecord(tool, args, '');
+          cardLog.push(record);
+          cardsByCall.set(callId, record);
+        }
+      };
       const postToolResult = (tool, args, result, callId) => {
         this.view?.webview.postMessage({ type: 'toolResult', tool, result, callId });
-        if (cardLog.length < CARD_LOG_MAX) cardLog.push(makeCardRecord(tool, args, result));
+        const done = makeCardRecord(tool, args, result);
+        const record = callId && cardsByCall.get(callId);
+        if (record) {
+          Object.assign(record, done);
+          cardsByCall.delete(callId);
+        } else if (toolCards < CARD_LOG_MAX) {
+          toolCards++;
+          cardLog.push(done);
+        }
       };
       const turnTokens = { prompt: 0, completion: 0 }; // accumulated across every model call this turn — see meta.tokens below
       this.subAgentTokens = { prompt: 0, completion: 0 }; // reset — any delegate_research calls this turn accumulate into this fresh object
@@ -3553,6 +3603,88 @@ class NavyCoderViewProvider {
       // doesn't change mid-turn).
       const promptRequestsFileAction = this._promptRequestsFileAction(prompt);
       const messagesRef = this.messages; // identity guard: clearChat/project-switch replace this array
+
+      // Saves the turn to the chat: the final reply, what the turn changed and
+      // the cards it drew. Called once after the loop, and from the catch for a
+      // turn that was stopped or failed after drawing something - those used
+      // to be dropped whole, and every card they drew went with them on the
+      // next reload. A turn that drew nothing and said nothing is not saved.
+      // Skipped if the chat was cleared or the project switched mid-turn —
+      // this.messages is a different array by then and pushing would create an
+      // orphan entry.
+      let persistedTurn = null;
+      persistTurn = ({ error = '' } = {}) => {
+        if (persistedTurn || this.messages !== messagesRef) return;
+        if (!lastAssistantText.trim() && !cardLog.length) return;
+        // A tool still running when the turn ended never got its result.
+        for (const record of cardsByCall.values()) {
+          record.result = (record.tool === 'run_command' || record.tool === 'run_tests')
+            ? '__stopped__' : 'Stopped before it finished.';
+        }
+        cardsByCall.clear();
+        // Attach what the turn changed so a restored session can still show it —
+        // the live change-report footer is webview-only and lost on reload.
+        const meta = {};
+        if (taskChanges.touched.size)   meta.files   = [...taskChanges.touched.keys()].map(p => path.basename(p));
+        if (taskChanges.deleted.length) meta.deleted = taskChanges.deleted.filter(Boolean).map(p => path.basename(p));
+        if (taskChanges.commands.length) {
+          meta.commands = taskChanges.commands.length; // display only — media/main.js renders this as a count
+          meta.commandLog = taskChanges.commands;       // model-facing only — see _historyLedger
+        }
+        // reads: model-facing only — the webview has no use for it and ignores unknown meta keys.
+        if (taskChanges.reads.length) meta.reads = taskChanges.reads;
+        // provider/model travel WITH the tokens they priced — _sessionUsage prices
+        // each turn at what actually ran it, not whatever's currently configured.
+        // lastUsedProvider/lastUsedModel (not the immutable primary aiProviderForTag/
+        // model) so a turn where navy.providerFallbacks actually engaged is priced
+        // at the provider that really ran it, not the one that failed.
+        // Includes any delegate_research sub-agent usage from this turn — it's
+        // real spend against the same provider/model, so it belongs in the total.
+        const finalTokens = {
+          prompt: turnTokens.prompt + this.subAgentTokens.prompt,
+          completion: turnTokens.completion + this.subAgentTokens.completion,
+        };
+        if (finalTokens.prompt + finalTokens.completion > 0) {
+          meta.tokens = finalTokens;
+          meta.provider = lastUsedProvider;
+          meta.model = lastUsedModel;
+        }
+        // The plan as it stood when the turn ended, so reopening the chat shows
+        // the same progress it showed live. Display-only, like cards: the model
+        // is handed the CURRENT plan directly by _planForPrompt, and replaying
+        // every past turn's finished plan into its context would be noise.
+        if (this._session.plan?.length) meta.plan = this._session.plan;
+        // Ties this turn to the checkpoints it produced — see _turnIdsFrom.
+        // Model-facing code ignores unknown meta keys, and _turnLedgerParts
+        // never reads it, so this costs the context window nothing.
+        if (this.currentTurnId) meta.turnId = this.currentTurnId;
+
+        // Fallback notices ride along in the persisted text so a reloaded
+        // session still shows that a different provider (and a different
+        // account) served this turn — see _announceFallback.
+        const notices = this._session.fallbackNotices;
+        // A plan with steps still open is a fact about what happened, not an
+        // error — the user may have pressed Stop, or the task may genuinely be
+        // partial. Stating it beats a progress display that simply stopped.
+        const planNote = lastAssistantText.trim() ? this._planCompletionNote() : '';
+        const persistedText = !lastAssistantText.trim() ? '' : (notices.length
+          ? notices.map(n => `_[${n}]_`).join('\n') + '\n\n' + lastAssistantText
+          : lastAssistantText) + planNote;
+        if (planNote) this.view?.webview.postMessage({ type: 'planIncomplete', note: planNote.trim() });
+        persistedTurn = {
+          role: 'assistant',
+          text: persistedText,
+          ...(Object.keys(meta).length ? { meta } : {}),
+          // Visual only. Kept off `meta` on purpose: meta is read back into the
+          // model's context by _historyLedger, and the cards are already
+          // described there far more cheaply than replaying them as prose.
+          ...(cardLog.length ? { cards: cardLog } : {}),
+          // Shown under the turn's cards when the chat is reopened; never
+          // read back by the model, like the cards themselves.
+          ...(error ? { error } : {}),
+        };
+        this.messages.push(persistedTurn);
+      };
 
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         if (this.abortController.signal.aborted) break;
@@ -4093,7 +4225,7 @@ class NavyCoderViewProvider {
             // instead of at the start of the turn, where that API wants them.
             if (imageForModel) {
               imageMessages.push({ role: 'user', content: [
-                { type: 'text', text: `[Screenshot from ${tool.name} — analyze it for visual bugs: layout, overlap, cut-off or overflowing text, contrast, broken images, and anything a human tester would notice.]` },
+                { type: 'text', text: imageForModel.caption || `[Screenshot from ${tool.name} — analyze it for visual bugs: layout, overlap, cut-off or overflowing text, contrast, broken images, and anything a human tester would notice.]` },
                 { type: 'image_url', image_url: { url: `data:${imageForModel.mediaType};base64,${imageForModel.data}` } },
               ] });
             }
@@ -4123,69 +4255,7 @@ class NavyCoderViewProvider {
         }
       }
 
-      // Persist only the final assistant message to session history (see note above).
-      // Skip if the chat was cleared or the project switched mid-turn — this.messages
-      // is a different array by then and pushing would create an orphan entry.
-      if (lastAssistantText.trim() && this.messages === messagesRef) {
-        // Attach what the turn changed so a restored session can still show it —
-        // the live change-report footer is webview-only and lost on reload.
-        const meta = {};
-        if (taskChanges.touched.size)   meta.files   = [...taskChanges.touched.keys()].map(p => path.basename(p));
-        if (taskChanges.deleted.length) meta.deleted = taskChanges.deleted.filter(Boolean).map(p => path.basename(p));
-        if (taskChanges.commands.length) {
-          meta.commands = taskChanges.commands.length; // display only — media/main.js renders this as a count
-          meta.commandLog = taskChanges.commands;       // model-facing only — see _historyLedger
-        }
-        // reads: model-facing only — the webview has no use for it and ignores unknown meta keys.
-        if (taskChanges.reads.length) meta.reads = taskChanges.reads;
-        // provider/model travel WITH the tokens they priced — _sessionUsage prices
-        // each turn at what actually ran it, not whatever's currently configured.
-        // lastUsedProvider/lastUsedModel (not the immutable primary aiProviderForTag/
-        // model) so a turn where navy.providerFallbacks actually engaged is priced
-        // at the provider that really ran it, not the one that failed.
-        // Includes any delegate_research sub-agent usage from this turn — it's
-        // real spend against the same provider/model, so it belongs in the total.
-        const finalTokens = {
-          prompt: turnTokens.prompt + this.subAgentTokens.prompt,
-          completion: turnTokens.completion + this.subAgentTokens.completion,
-        };
-        if (finalTokens.prompt + finalTokens.completion > 0) {
-          meta.tokens = finalTokens;
-          meta.provider = lastUsedProvider;
-          meta.model = lastUsedModel;
-        }
-        // The plan as it stood when the turn ended, so reopening the chat shows
-        // the same progress it showed live. Display-only, like cards: the model
-        // is handed the CURRENT plan directly by _planForPrompt, and replaying
-        // every past turn's finished plan into its context would be noise.
-        if (this._session.plan?.length) meta.plan = this._session.plan;
-        // Ties this turn to the checkpoints it produced — see _turnIdsFrom.
-        // Model-facing code ignores unknown meta keys, and _turnLedgerParts
-        // never reads it, so this costs the context window nothing.
-        if (this.currentTurnId) meta.turnId = this.currentTurnId;
-
-        // Fallback notices ride along in the persisted text so a reloaded
-        // session still shows that a different provider (and a different
-        // account) served this turn — see _announceFallback.
-        const notices = this._session.fallbackNotices;
-        // A plan with steps still open is a fact about what happened, not an
-        // error — the user may have pressed Stop, or the task may genuinely be
-        // partial. Stating it beats a progress display that simply stopped.
-        const planNote = this._planCompletionNote();
-        const persistedText = (notices.length
-          ? notices.map(n => `_[${n}]_`).join('\n') + '\n\n' + lastAssistantText
-          : lastAssistantText) + planNote;
-        if (planNote) this.view?.webview.postMessage({ type: 'planIncomplete', note: planNote.trim() });
-        this.messages.push({
-          role: 'assistant',
-          text: persistedText,
-          ...(Object.keys(meta).length ? { meta } : {}),
-          // Visual only. Kept off `meta` on purpose: meta is read back into the
-          // model's context by _historyLedger, and the cards are already
-          // described there far more cheaply than replaying them as prose.
-          ...(cardLog.length ? { cards: cardLog } : {}),
-        });
-      }
+      persistTurn();
 
       // Only auto-apply code fences in pure-chat mode (no tool use), to prevent double-applies.
       if (!usedTools) {
@@ -4194,19 +4264,29 @@ class NavyCoderViewProvider {
           await this.applyCode(edit.code, edit.path);
         }
       }
+      // A code block applied just now drew its diff card after the turn was
+      // saved; the saved turn carries it all the same.
+      if (persistedTurn && cardLog.length && !persistedTurn.cards) persistedTurn.cards = cardLog;
     } catch (error) {
       if (error.name === 'AbortError') {
         this.view?.webview.postMessage({ type: 'aborted' });
+        // A stopped turn keeps what it drew - see persistTurn.
+        try { persistTurn?.(); } catch (e) { this.log?.('saving the stopped turn failed: ' + e.message); }
       } else {
         const p = vscode.workspace.getConfiguration('navy').get('provider', 'ollama');
         const providerLabel = providerDisplayName(p);
         // Classified + redacted: plain-language cause, concrete next steps, no account ids.
         this.log?.('provider error: ' + error.message);
-        this.view?.webview.postMessage({ type: 'error', message: formatProviderError(providerLabel, error.message) });
+        const shown = formatProviderError(providerLabel, error.message);
+        this.view?.webview.postMessage({ type: 'error', message: shown });
+        // So does one that failed after drawing something, with the error it
+        // ended on. One that failed before drawing anything is not saved.
+        try { persistTurn?.({ error: shown }); } catch (e) { this.log?.('saving the failed turn failed: ' + e.message); }
         // The turn made real progress before failing — offer a one-click resume.
         if (usedTools) this.view?.webview.postMessage({ type: 'errorContinue' });
       }
     } finally {
+      endTurnCards(turnSession);
       clearInterval(this._heartbeat);
       this._heartbeat = undefined;
       clearTimeout(this._watchdog);
@@ -4454,6 +4534,28 @@ class NavyCoderViewProvider {
     if (cut <= 0) return fail('Nothing to compact yet — the conversation is still short.');
 
     const dropped = all.slice(0, cut);
+    // Ask first. The condensed messages are gone from the saved chat afterwards -
+    // rewind cannot reach past a compaction - so this is the last point at which
+    // keeping the full text is still possible. Export is offered right here,
+    // where that choice matters, rather than in a warning read after the fact.
+    const kept = all.length - cut;
+    const detail = `The ${cut} earliest message${cut === 1 ? '' : 's'} will be replaced by a summary that Navy keeps working from. `
+      + 'They cannot be brought back afterwards: rewind cannot reach past a compaction. '
+      + `The last ${kept} message${kept === 1 ? '' : 's'} stay exactly as they are.\n\n`
+      + 'Export the conversation first if you might want the full text later.';
+    const choice = await vscode.window.showWarningMessage(
+      'Compact this conversation?', { modal: true, detail }, 'Compact', 'Export first, then compact');
+    if (!choice) {
+      // Cancelled: free the button and say nothing - a cancel needs no explanation.
+      post({ type: 'compactResult', ok: false, cancelled: true, forSession: id });
+      return null;
+    }
+    // The export is built from this chat's saved messages (see _exportMarkdown),
+    // so it holds everything about to be condensed, not just what is on screen.
+    // A cancelled save means the full text was not kept, so nothing is condensed.
+    if (choice === 'Export first, then compact' && !(await this.exportConversation())) {
+      return fail('Not compacted — the export was cancelled, so the full conversation is still here.');
+    }
     const config = vscode.workspace.getConfiguration('navy');
     const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
     const model = this.currentModel || config.get('model', '');
@@ -4482,7 +4584,7 @@ class NavyCoderViewProvider {
     // being shown - a compaction that finished after the user switched away must
     // not repaint the chat they switched to.
     const visible = this.activeSessionId === id;
-    if (visible) post({ type: 'restore', messages: this.messages });
+    if (visible) post({ type: 'restore', messages: this.messages, digest: this.sessionDigest || '' });
     this._sendSessionList();
 
     // The bar only learns the real figure from the next model call. Until then an
@@ -4900,6 +5002,8 @@ class NavyCoderViewProvider {
         case 'browser_console': return await this.toolBrowserConsole();
         case 'browser_back': return await this.toolBrowserBack();
         case 'browser_close': return await this.toolBrowserClose();
+        case 'browser_accessibility': return await this.toolBrowserAccessibility();
+        case 'browser_visual_check': return await this.toolBrowserVisualCheck(tool.args.name, tool.args.update);
         case '__parse_error__':
           return 'Tool call JSON was invalid and could not be parsed. Tool attempted: ' + tool.args.tool + '. Error: ' + tool.args.error + '. Please re-emit the tool block with valid JSON.';
         default: return 'Unknown tool: ' + tool.name;
@@ -6735,16 +6839,41 @@ ${task.trim()}`;
       .catch(e => this._reportTurnFailure(e, 'PR review'));
   }
 
+  // Returns whether the file was actually saved: Compact's "Export first" only
+  // condenses once the full text is safely on disk.
   async exportConversation(conversationText) {
+    const text = conversationText || await this._exportMarkdown();
     const defaultName = `navy-chat-${new Date().toISOString().slice(0, 10)}.md`;
     const defaultDir = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     const uri = await vscode.window.showSaveDialog({
       defaultUri: vscode.Uri.file(path.join(defaultDir, defaultName)),
       filters: { 'Markdown': ['md'], 'Text': ['txt'] },
     });
-    if (!uri) return;
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(conversationText, 'utf8'));
+    if (!uri) return false;
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(text, 'utf8'));
     vscode.window.showInformationMessage('Conversation exported to ' + path.basename(uri.fsPath));
+    return true;
+  }
+
+  // The conversation as Markdown, built from the saved chat rather than scraped
+  // from the panel. The panel only ever holds part of a long chat - a restored
+  // one renders its last turns, and a long live one moves older turns out of the
+  // page - so an export built from it silently dropped whatever was not on
+  // screen. That mattered most for Compact's "Export first", whose whole purpose
+  // is to keep the full text of exactly what is about to be condensed. What
+  // earlier compactions already condensed leads the file, so nothing Navy still
+  // knows about the conversation is missing from it. Each reply also carries
+  // the tool calls its turn made and a diff of every file it changed - see
+  // src/export.js for where those come from.
+  _exportMarkdown() {
+    const { buildExportMarkdown } = require('./export.js');
+    return buildExportMarkdown({
+      messages: this.messages,
+      digest: this.sessionDigest,
+      checkpoints: this.checkpoints,
+      projectRoot: this.projectRoot,
+      readText: (p) => this.readFileText(p),
+    });
   }
 
   markEdited(filePath, startLine, endLine) {
@@ -6866,7 +6995,7 @@ ${task.trim()}`;
   }
 
   restoreMessages() {
-    this.view?.webview.postMessage({ type: 'restore', messages: this.messages });
+    this.view?.webview.postMessage({ type: 'restore', messages: this.messages, digest: this.sessionDigest || '' });
   }
 
   // One-shot, non-streaming completion through the ACTIVE provider (not just Ollama).
@@ -7456,15 +7585,24 @@ class SupplyChainScanMethods {
 
     // The card is deterministic, so it is shown first and always — even for a
     // clean scan, and even when a deep pass is about to reason further.
-    this.view?.webview.postMessage({
+    const auditMessage = {
       type: 'auditResult', headline: summary.headline, counts: summary.counts, deep,
       findings: summary.findings.map(f => ({ file: f.file, severity: f.severity, id: f.id, changed: Boolean(f.changed) })),
-    });
+    };
+    this.view?.webview.postMessage(auditMessage);
+    // The card is drawn before any turn exists, so the turn that answers it
+    // carries it, and a reopened chat still shows the scan above its answer.
+    // Matched by prompt, so a message queued ahead of this one cannot take it.
+    // A clean light scan starts no turn, so its card is not kept.
+    const handOff = async (prompt) => {
+      this._session.leadCards = { prompt, cards: [auditCardRecord(auditMessage)] };
+      await this.askNavy(prompt, false, null, [], []);
+    };
 
     if (deep) {
       // The agentic pass. Seeded with the hints, the recently-changed files and
       // the manifests the walk found; the model investigates from there.
-      await this.askNavy(supply.deepAuditPrompt(summary, walkResult), false, null, [], []);
+      await handOff(supply.deepAuditPrompt(summary, walkResult));
       return summary;
     }
 
@@ -7473,7 +7611,7 @@ class SupplyChainScanMethods {
     // concern. When there IS something, the model triages the FINDINGS only —
     // it is told, in supply-chain.js, not to invent anything beyond the list.
     if (!summary.total) return summary;
-    await this.askNavy(supply.scanTriagePrompt(summary), false, null, [], []);
+    await handOff(supply.scanTriagePrompt(summary));
     return summary;
   }
 }

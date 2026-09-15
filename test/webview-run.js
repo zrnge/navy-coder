@@ -745,6 +745,91 @@ function bubbleSuite() {
   const w5 = run([{ type: 'restore', messages: [{ role: 'assistant', text: 'done' }] }]);
   check('an older chat still explains the gap', w5.document.querySelector('.restore-note') !== null);
   w5.close();
+
+  // 0.3.5: the cards the transcript draws from their own messages come back
+  // too. They were drawn live and never saved, so a reopened chat had no diffs.
+  const w6 = run([{
+    type: 'restore',
+    digest: '- decided to add a retry',
+    messages: [
+      { role: 'user', text: 'add the retry' },
+      {
+        role: 'assistant',
+        text: 'Added it.',
+        cards: [
+          { kind: 'thinking', text: 'Consider backoff first.' },
+          { tool: 'apply_edit', args: { path: 'src/client.js' }, result: 'Applied to src/client.js' },
+          { kind: 'diff', path: 'src/client.js', status: 'applied', added: 1, removed: 1, lines: 20, hunks: '@@ -2,3 +2,3 @@\n a\n-b\n+B\n c' },
+          { tool: 'run_command', args: { command: 'npm test' }, result: 'Exit code: 0\nok' },
+          { kind: 'approval', command: 'npm test', status: 'approved' },
+          { kind: 'diff', path: 'src/other.js', status: 'rejected', added: 2, removed: 0, lines: 3, hunks: '@@ -3,0 +4,2 @@\n+x\n+y' },
+        ],
+      },
+      { role: 'user', text: 'audit it' },
+      {
+        role: 'assistant',
+        text: 'One finding.',
+        cards: [{ kind: 'audit', headline: '1 finding in 12 files', counts: { high: 1 }, deep: true,
+          findings: [{ file: 'package.json', severity: 'high', id: 'install-script' }] }],
+      },
+      { role: 'user', text: 'keep going' },
+      { role: 'assistant', text: '', error: 'The API key was rejected.', cards: [{ tool: 'read_file', args: { path: 'a.js' }, result: 'x' }] },
+    ],
+  }]);
+  const d6 = w6.document;
+  const diffCards = [...d6.querySelectorAll('.diff-card')];
+  check('restore: a turn\'s diff cards come back', diffCards.length === 2, String(diffCards.length));
+  check('restore: ...settled, with no buttons left to press',
+    !d6.querySelector('.diff-card .diff-actions')
+    && /Applied/.test(diffCards[0]?.querySelector('.diff-status')?.textContent || '')
+    && /Rejected/.test(diffCards[1]?.querySelector('.diff-status')?.textContent || ''));
+  const removedRow = diffCards[0]?.querySelector('.diff-removed');
+  const addedRow = diffCards[0]?.querySelector('.diff-added');
+  check('restore: ...showing the change at its real line numbers',
+    removedRow?.querySelector('code')?.textContent === 'b' && removedRow?.querySelectorAll('.diff-ln')[0]?.textContent.trim() === '3'
+    && addedRow?.querySelector('code')?.textContent === 'B' && addedRow?.querySelectorAll('.diff-ln')[1]?.textContent.trim() === '3',
+    diffCards[0]?.innerHTML.slice(0, 400));
+  const skipped = [...(diffCards[0]?.querySelectorAll('.diff-skip') || [])].map(e => e.textContent.trim());
+  check('restore: ...with the unchanged lines before and after counted, as a live card counts them',
+    skipped.some(t => t.endsWith(' 1 unchanged line') || t === '1 unchanged line') && skipped.some(t => t.endsWith('16 unchanged lines')),
+    JSON.stringify(skipped));
+  check('restore: an applied diff keeps its preview and the toggle to the whole diff, a rejected one collapses',
+    Boolean(diffCards[0]?.querySelector('.diff-expand-btn')) && !diffCards[1]?.querySelector('.diff-body'));
+  const editRow = [...d6.querySelectorAll('.activity-row')].find(r => r.textContent.includes('client.js'));
+  check('restore: a diff card sits under the tool that made it, as it did live',
+    Boolean(editRow && diffCards[0]) && Boolean(editRow.compareDocumentPosition(diffCards[0]) & w6.window.Node.DOCUMENT_POSITION_FOLLOWING));
+  const approvalCard = d6.querySelector('.command-card');
+  check('restore: an approval card comes back with its answer and no buttons',
+    Boolean(approvalCard) && /Approved/.test(approvalCard.querySelector('.command-status')?.textContent || '')
+    && !approvalCard.querySelector('.command-actions') && approvalCard.querySelector('pre')?.textContent === 'npm test');
+  const restoredThink = d6.querySelector('.think-block');
+  check('restore: the reasoning comes back, settled rather than live',
+    Boolean(restoredThink) && !restoredThink.classList.contains('think-live')
+    && restoredThink.querySelector('.think-content')?.textContent === 'Consider backoff first.'
+    && restoredThink.querySelector('.think-label')?.textContent === 'Thinking');
+  const auditCard = d6.querySelector('.audit-card');
+  check('restore: the audit card comes back inside the turn that answered it',
+    Boolean(auditCard) && auditCard.closest('.message.assistant') !== null
+    && /1 finding in 12 files/.test(auditCard.textContent) && auditCard.querySelectorAll('.audit-row').length === 1);
+  check('restore: ...without claiming a deep audit is still running', !/Running a deep AI audit/.test(auditCard?.textContent || ''));
+  const errors = [...d6.querySelectorAll('.message.error')];
+  check('restore: a turn that failed says why, under the work it did',
+    errors.length === 1 && /API key was rejected/.test(errors[0].textContent), String(errors.length));
+  const notice = d6.querySelector('.compact-notice');
+  check('restore: condensed history is marked where it was, with the summary Navy works from',
+    Boolean(notice) && /Earlier messages were condensed/.test(notice.querySelector('summary')?.textContent || '')
+    && /decided to add a retry/.test(notice.textContent));
+  w6.close();
+
+  const w7 = run([
+    { type: 'restore', digest: '- old', messages: [{ role: 'user', text: 'q' }, { role: 'assistant', text: 'a' }] },
+    { type: 'compactResult', ok: true, condensed: 3, summary: '- new' },
+  ]);
+  const compactNotices = [...w7.document.querySelectorAll('.compact-notice')];
+  check('compact: its notice replaces the one a reopened chat drew, rather than stacking under it',
+    compactNotices.length === 1 && /3 earlier messages/.test(compactNotices[0].textContent),
+    compactNotices.map(n => n.textContent).join(' | '));
+  w7.close();
 }
 
 // ── Syntax highlighting in code cards ───────────────────────────────────────
@@ -1573,6 +1658,26 @@ function slashCommandSuite() {
     check('compact: a result for another chat still frees the button',
       btn.disabled === false && btn.textContent === 'Compact');
     check('compact: ...but draws no notice in the chat on screen', w.document.querySelector('.compact-notice') === null);
+    w.close();
+  }
+
+  // Export is built by the extension from the saved chat, so both entry points
+  // just ask for it. The command's own copy used to look for class names the
+  // transcript never had and dropped every speaker label.
+  {
+    const w = createWebview();
+    w.document.querySelector('#exportButton').dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    w.post({ type: 'requestExport' });
+    check('export: the toolbar button and the command both ask the extension to build the export',
+      w.sent.filter(m => m.type === 'exportConversation').length === 2);
+    // A cancelled Compact confirmation frees the button and adds nothing.
+    const btn = w.document.querySelector('#compactButton');
+    btn.dispatchEvent(new w.window.MouseEvent('click', { bubbles: true }));
+    const noticesBefore = w.document.querySelectorAll('.system-notice').length;
+    w.post({ type: 'compactResult', ok: false, cancelled: true });
+    check('compact: cancelling the confirmation frees the button', btn.disabled === false && btn.textContent === 'Compact');
+    check('compact: ...and adds nothing to the chat',
+      w.document.querySelectorAll('.system-notice').length === noticesBefore && !w.document.querySelector('.compact-notice'));
     w.close();
   }
 

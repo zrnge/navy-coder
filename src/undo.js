@@ -208,7 +208,7 @@ class UndoMethods {
     this.lastReply = '';
 
     await this.saveProjectSession();
-    this.view?.webview.postMessage({ type: 'restore', messages: this.messages });
+    this.view?.webview.postMessage({ type: 'restore', messages: this.messages, digest: this.sessionDigest || '' });
     this.view?.webview.postMessage({
       type: 'rewound',
       index,

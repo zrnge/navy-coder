@@ -42,6 +42,8 @@
 - **`/playthrough` — a visual QA pass in a real browser** — run it bare and Navy works out whether the open project is a web app, serves it, and plays through it in a real Chrome window you can watch; point it at a URL instead to test that page. It behaves like a human tester: it takes screenshots and **actually looks at them**, reads the page structure, clicks, types, submits forms, scrolls, and checks the console and network for the JavaScript errors and failed requests a user never sees. Findings come back ranked by severity, each cited to the screen or console line that produced it — and if the project *isn't* a web app, it says so and stops rather than inventing a site to test.
 
   It drives Chrome over the DevTools Protocol on a **pipe** — no WebSocket, no open debugging port, and no browser-automation package, so the zero-dependency rule survives a feature that would normally cost Puppeteer. Every run gets a throwaway profile (your real cookies and sessions are never touched), Chrome's own sandbox stays on, only `http(s)` is reachable, and launching the browser goes through the same approval gate as any other command. Needs a vision-capable model to judge the visuals; on a text-only model it still catches functional, console and security issues
+
+  Each important screen can also be checked for **accessibility** — missing alt text and labels, unnamed controls, text below WCAG AA contrast from the real computed colours, and a real Tab walk for focus order, keyboard traps and invisible focus — and for **visual regressions** against a saved baseline, with a diff image of exactly what changed. Baselines live in the project's `.navy/playthrough/baselines/`
 - **No telemetry, zero runtime dependencies** — nothing is sent anywhere except to the AI provider you configure; the shipped extension has no npm packages bundled in besides the code in this repo
 - **Diagnostics you choose to share** — `Navy Coder: Export Diagnostics` assembles what a bug report needs (versions, provider, resolved shell, both approval gates, recent errors) into an *unsaved* editor tab. Nothing is written to disk and nothing is transmitted; API keys are never read into it, and paths, home directory and anything credential-shaped are redacted on the way in. You read it, then decide
 
@@ -112,7 +114,7 @@ Navy runs an autonomous tool-use loop. The full tool set:
 | Shell | `run_command`, `run_tests` (auto-detected runner), `run_project`, `start_process` / `read_process_output` / `kill_process`, `get_terminal_output` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_blame` |
 | Web | `web_search` (Brave / Tavily / DuckDuckGo), `fetch_url` |
-| Browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_evaluate`, `browser_console`, `browser_back`, `browser_close` — a real Chrome, driven over CDP (see `/playthrough`) |
+| Browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_evaluate`, `browser_console`, `browser_back`, `browser_close`, `browser_accessibility`, `browser_visual_check` — a real Chrome, driven over CDP (see `/playthrough`) |
 | Delegation | `delegate_research` — an isolated, read-only sub-agent for broad investigations |
 | Skills | `activate_skill` — load an installed skill's instructions, or one of its bundled documents |
 | Memory | `remember`, `forget` — project facts that persist across sessions |
@@ -281,7 +283,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 2,343 tests: extension host + webview, no network or API keys needed
+npm test        # 2,508 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 

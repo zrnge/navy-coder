@@ -1678,7 +1678,8 @@ async function compactContextSuite() {
   console.log('');
   console.log('compact button (on-demand history condensation):');
   const os = require('os');
-  sharedMock();
+  const { vscode, ctrl } = sharedMock();
+  const realWarn = vscode.window.showWarningMessage;
   let provider, tmp;
   const realFetch = global.fetch;
   const isDigestCall = (req) => typeof req?.messages?.[0]?.content === 'string'
@@ -1693,6 +1694,11 @@ async function compactContextSuite() {
     provider._wslCache = { available: false };
     const posted = [];
     provider.view = { webview: { postMessage: (m) => posted.push(m) } };
+    // Every compaction asks first. The dialog is captured so it can be checked
+    // itself, and answered 'Compact' so the cases below test what follows it.
+    const warns = [];
+    vscode.window.showWarningMessage = async (...args) => { warns.push(args); return ctrl.nextWarning; };
+    ctrl.nextWarning = 'Compact';
 
     // The ordinary case.
     provider.messages = convo(10);
@@ -1773,8 +1779,87 @@ async function compactContextSuite() {
     const est = posted.find(m => m.type === 'contextUsage');
     check('the context bar gets an estimate straight away, marked as an estimate',
       est && est.estimated === true && est.used < 20000 && est.max === 32000, JSON.stringify(est));
+    // The confirmation itself.
+    posted.length = 0;
+    warns.length = 0;
+    provider.messages = convo(10);
+    provider.sessionDigest = '';
+    ctrl.nextWarning = undefined;
+    const capC = [];
+    global.fetch = queueOllamaFetch([], capC);
+    await provider.compactContext();
+    const [title, opts, ...choices] = warns[0] || [];
+    check('compact asks first, in a modal dialog', /Compact this conversation/.test(title || '') && Boolean(opts && opts.modal));
+    check('...saying how many messages go, how many stay, and that they cannot come back',
+      /6 earliest messages/.test((opts && opts.detail) || '') && /last 4 messages/.test((opts && opts.detail) || '')
+      && /cannot be brought back/.test((opts && opts.detail) || ''), opts && opts.detail);
+    check('...and offering to export first', choices.includes('Compact') && choices.includes('Export first, then compact'));
+    check('a cancelled dialog condenses nothing and spends no model call', provider.messages.length === 10 && capC.length === 0);
+    check('...and frees the button without a message',
+      posted.some(m => m.type === 'compactResult' && m.ok === false && m.cancelled === true && !m.reason));
+
+    // Export first: the whole conversation is saved, then it is condensed.
+    posted.length = 0;
+    provider.messages = convo(10);
+    provider.sessionDigest = '- an earlier summary';
+    ctrl.nextWarning = 'Export first, then compact';
+    const exportPath = path.join(tmp, 'before-compact.md');
+    ctrl.nextSaveUri = vscode.Uri.file(exportPath);
+    global.fetch = queueOllamaFetch([{ text: summary }]);
+    await provider.compactContext();
+    const exported = fs.existsSync(exportPath) ? fs.readFileSync(exportPath, 'utf8') : '';
+    check('"Export first" saves every message, with who said it, before condensing',
+      /\*\*You:\*\* m0/.test(exported) && /\*\*Navy:\*\* m9/.test(exported), exported.slice(0, 160));
+    check('...including what earlier compactions condensed', /an earlier summary/.test(exported));
+    check('...and then compacts', provider.messages.length === 4);
+
+    // Cancelling the export cancels the compaction.
+    posted.length = 0;
+    provider.messages = convo(10);
+    provider.sessionDigest = '';
+    ctrl.nextSaveUri = undefined;
+    const capE = [];
+    global.fetch = queueOllamaFetch([], capE);
+    await provider.compactContext();
+    check('cancelling the export cancels the compaction too, and says so',
+      provider.messages.length === 10 && capE.length === 0
+      && posted.some(m => m.type === 'compactResult' && m.ok === false && /export was cancelled/.test(m.reason || '')));
+    ctrl.nextWarning = 'Compact';
+
+    // Export on its own builds from the saved chat and reports the outcome.
+    provider.messages = convo(4);
+    provider.sessionDigest = '';
+    const plainPath = path.join(tmp, 'plain-export.md');
+    ctrl.nextSaveUri = vscode.Uri.file(plainPath);
+    const saved1 = await provider.exportConversation();
+    const plain = fs.existsSync(plainPath) ? fs.readFileSync(plainPath, 'utf8') : '';
+    check('Export writes every message with who said it',
+      saved1 === true && /\*\*You:\*\* m0/.test(plain) && /\*\*Navy:\*\* m3/.test(plain), plain.slice(0, 160));
+    ctrl.nextSaveUri = undefined;
+    check('...and reports a cancelled save as not exported', (await provider.exportConversation()) === false);
+
+    // The export also carries what each turn did: its tool calls and a diff of
+    // every file, rebuilt from the saved cards and the undo checkpoints.
+    const edited = path.join(tmp, 'app.js');
+    fs.writeFileSync(edited, 'const a = 1;\nconst b = 3;\n');
+    provider.checkpoints = [{ kind: 'edit', filePath: edited, originalText: 'const a = 1;\nconst b = 2;\n', turnId: 'turn-x', time: 1 }];
+    provider.messages = [
+      { role: 'user', text: 'set b to 3' },
+      { role: 'assistant', text: 'Done.', meta: { turnId: 'turn-x', files: ['app.js'] },
+        cards: [{ tool: 'apply_edit', args: { path: 'app.js' }, result: 'Applied edit to app.js' }] },
+    ];
+    const richPath = path.join(tmp, 'rich-export.md');
+    ctrl.nextSaveUri = vscode.Uri.file(richPath);
+    await provider.exportConversation();
+    const rich = fs.existsSync(richPath) ? fs.readFileSync(richPath, 'utf8') : '';
+    check('Export includes each turn\'s tool calls with their output',
+      /\*\*`apply_edit`\*\* path: `app\.js`/.test(rich) && /Applied edit to app\.js/.test(rich), rich.slice(0, 400));
+    check('...and a diff of every file the turn changed, from the undo checkpoints',
+      /```diff/.test(rich) && /-const b = 2;/.test(rich) && /\+const b = 3;/.test(rich) && /app\.js` modified, \+1 -1/.test(rich), rich);
+    ctrl.nextSaveUri = undefined;
   } finally {
     global.fetch = realFetch;
+    vscode.window.showWarningMessage = realWarn;
     try { provider?.dispose?.(); } catch {}
     try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }

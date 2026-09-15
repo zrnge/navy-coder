@@ -23,6 +23,10 @@ const { mcpSuite, mcpHttpSuite, mcpExtrasSuite } = require('./suite-mcp.js');
 const { approvalCancelSuite, approvalScopeSuite, settingsDefaultsSuite, diagnosticsSuite } = require('./suite-approval.js');
 const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite, webviewExitSuite } = require('./suite-ui.js');
 const { browserSuite } = require('./suite-browser.js');
+const { pngSuite } = require('./suite-visual.js');
+const { a11ySuite } = require('./suite-a11y.js');
+const { exportSuite } = require('./suite-export.js');
+const { transcriptCardsSuite } = require('./suite-cards.js');
 
 // The pure-function and jsdom checks first: they need no mock and no temp
 // filesystem, so a failure there is the cheapest possible signal.
@@ -88,6 +92,10 @@ undoRedoSuite()
   .then(webviewExitSuite)
   .then(chatPersistenceSuite)
   .then(compactContextSuite)
+  .then(pngSuite)
+  .then(a11ySuite)
+  .then(exportSuite)
+  .then(transcriptCardsSuite)
   .then(() => {
     uninstallVscodeMock();
     report();

@@ -12,6 +12,16 @@
 // actually calls, plus the /playthrough entry point and the prompts it seeds.
 
 const vscode = require('vscode');
+const fs = require('fs');
+const path = require('path');
+const png = require('./png.js');
+
+// How many changed pixels still count as "the same screen". A text caret that
+// blinked between two captures is about 16 pixels; a genuine change is at least
+// a glyph. A percentage would be the wrong measure here: one changed word on a
+// 1280x800 capture is a few hundred pixels, well under a tenth of a percent,
+// and a regression check that cannot see one wrong word is not doing its job.
+const VISUAL_NOISE_PIXELS = 24;
 
 class BrowserToolMethods {
   // ── Browser playthrough tools (see src/browser.js) ──────────────────────────
@@ -152,6 +162,133 @@ class BrowserToolMethods {
     } catch (e) { return 'Error: ' + e.message; }
   }
 
+  async toolBrowserAccessibility() {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    try {
+      const b = this._session.browser;
+      const audit = await b.accessibilityAudit();
+      const focus = await b.focusOrder();
+      return this._formatAccessibility(audit, focus);
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  // One readable report from the markup audit and the Tab walk. Bounded, so a
+  // page with hundreds of problems does not flood the context: the counts are
+  // always complete, the examples are capped. It ends by saying what automated
+  // checks cannot see, so a clean result is not reported as "accessible".
+  _formatAccessibility(audit, focus) {
+    const out = [];
+    const where = audit && audit.title ? `${audit.title} (${audit.url})` : (audit && audit.url) || 'this page';
+    out.push(`Accessibility check of ${where}`);
+    const issues = (audit && audit.issues) || [];
+    const rank = { serious: 0, moderate: 1, minor: 2 };
+    if (!issues.length) {
+      out.push(`Markup and contrast: no problems found (${(audit && audit.contrastChecked) || 0} text elements checked for contrast).`);
+    } else {
+      const by = { serious: 0, moderate: 0, minor: 0 };
+      for (const i of issues) by[i.severity] = (by[i.severity] || 0) + 1;
+      out.push(`Markup and contrast: ${issues.length} finding${issues.length === 1 ? '' : 's'} — ${by.serious} serious, ${by.moderate} moderate, ${by.minor} minor.`);
+      const shown = issues.slice().sort((a, b) => (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3)).slice(0, 25);
+      for (const i of shown) out.push(`  [${i.severity}] ${i.kind} — ${i.where}: ${i.text}`);
+      if (issues.length > shown.length) out.push(`  …and ${issues.length - shown.length} more of the same kinds.`);
+    }
+    if (focus) {
+      const seq = focus.sequence || [];
+      const name = (s) => `${s.tag}${s.label ? ' "' + s.label + '"' : ''}`;
+      out.push(`Keyboard: Tab reached ${seq.length} stop${seq.length === 1 ? '' : 's'}`
+        + (focus.complete ? '.' : ` and had not come back round after ${focus.pressed} presses.`));
+      if (seq.length) {
+        out.push('  Order: ' + seq.slice(0, 15).map((s, k) => `${k + 1} ${name(s)}`).join(' → ') + (seq.length > 15 ? ' → …' : ''));
+      } else {
+        out.push('  Nothing on the page took keyboard focus — fine for a static page, serious if it has anything to click or fill in.');
+      }
+      for (const t of focus.traps || []) out.push(`  [serious] Focus is trapped on ${name(t)}: pressing Tab does not move it.`);
+      for (const v of focus.invisible || []) out.push(`  [serious] Focus lands on ${name(v)}, which is not visible.`);
+      const ni = focus.noIndicator || [];
+      if (ni.length) {
+        out.push(`  [moderate] ${ni.length} stop${ni.length === 1 ? '' : 's'} show no visible focus indicator (no outline or ring when focused), e.g. ${ni.slice(0, 3).map(name).join(', ')}.`);
+      }
+    }
+    out.push('Automated checks catch only part of what matters: whether alt text is meaningful, whether the reading order makes sense, and how a screen reader actually announces the page still need a person. Report the findings, not a clean bill of health.');
+    return out.join('\n');
+  }
+
+  // A short, file-safe version of a screen name or a host. Anything outside
+  // [a-z0-9._-] becomes a dash, and leading or trailing dots and dashes are cut,
+  // so a name like "../../x" cannot climb out of the baselines folder.
+  _baselineKey(raw) {
+    return String(raw || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 60);
+  }
+
+  // Where baselines live: the project's own .navy folder when one is open, so
+  // they sit with the project they describe (.navy is already kept out of git);
+  // Navy's global storage otherwise, for a URL tested with no folder open.
+  async _baselineDir() {
+    const navy = this.projectRoot ? await this.ensureNavyDir() : null;
+    return { dir: path.join(navy || this._globalProjectsDir(), 'playthrough', 'baselines'), inProject: Boolean(navy) };
+  }
+
+  // Which site a baseline belongs to. A local dev server's port is not part of
+  // its identity: Vite moves from 5173 to 5174 whenever 5173 is taken, and a
+  // name that included the port quietly saved a fresh baseline for every screen
+  // instead of comparing - a regression check that silently stopped checking.
+  // The loopback spellings (localhost, 127.0.0.1, [::1], 0.0.0.0) are one
+  // machine, so they share one name too. That holds inside a project's .navy,
+  // where every local server is that project's own. With no folder open the
+  // baselines are shared by every project, so there the port still tells two
+  // local apps apart. A real domain always keeps its port: staging:8443 is not
+  // the live site.
+  _baselineHost(info, inProject) {
+    const host = String((info && info.host) || '').toLowerCase();
+    const hostname = String((info && info.hostname) || host.replace(/:\d+$/, '')).toLowerCase();
+    if (inProject) {
+      if (/^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])$/.test(hostname)) return 'localhost';
+      if (/\.localhost$|^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return this._baselineKey(hostname) || 'site';
+    }
+    return this._baselineKey(host) || 'site';
+  }
+
+  async toolBrowserVisualCheck(name, update) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const key = this._baselineKey(name);
+    if (!key) return 'Error: browser_visual_check needs a name for the screen, e.g. "home" or "checkout-form".';
+    try {
+      const b = this._session.browser;
+      const info = await b.evaluate('({ host: location.host, hostname: location.hostname, url: location.href })').catch(() => null);
+      const { dir, inProject } = await this._baselineDir();
+      const host = this._baselineHost(info, inProject);
+      const file = path.join(dir, host + '__' + key + '.png');
+      const shot = Buffer.from(await b.captureFixed(), 'base64');
+      const existed = fs.existsSync(file);
+      if (!existed || update) {
+        await fs.promises.mkdir(dir, { recursive: true });
+        await fs.promises.writeFile(file, shot);
+        return existed
+          ? `Updated the baseline for "${key}" on ${host} to the current screen. Later checks compare against this one.`
+          : `No baseline for "${key}" on ${host} yet — saved the current screen as its baseline. Later runs of browser_visual_check("${key}") compare against it.`;
+      }
+      const d = png.diffImages(png.decodePng(await fs.promises.readFile(file)), png.decodePng(shot));
+      if (d.sizeMismatch) {
+        return `"${key}" cannot be compared: its baseline is ${d.base.width}x${d.base.height} but the current capture is ${d.current.width}x${d.current.height}. `
+          + `If that is expected, call browser_visual_check("${key}", update: true) to re-baseline it.`;
+      }
+      const pct = (d.ratio * 100).toFixed(d.ratio < 0.01 ? 2 : 1);
+      if (d.changed <= VISUAL_NOISE_PIXELS) {
+        return `"${key}" matches its baseline (${d.changed} pixel${d.changed === 1 ? '' : 's'} differ — within noise).`;
+      }
+      const box = d.bbox;
+      return {
+        __image: {
+          mediaType: 'image/png',
+          data: png.encodePng(d.diff).toString('base64'),
+          caption: `[Screenshot from browser_visual_check — this is a DIFF of "${key}" against its baseline, not a screenshot: the baseline is washed out to pale grey and every changed pixel is solid red. Judge whether the red areas are a regression or an intended change.]`,
+        },
+        text: `"${key}" CHANGED since its baseline: ${d.changed} pixels (${pct}%) differ, within x ${box.x}–${box.x + box.width - 1}, y ${box.y}–${box.y + box.height - 1} of a ${d.width}x${d.height} capture. `
+          + `The attached diff shows where. If the change is intended, call browser_visual_check("${key}", update: true) to accept it as the new baseline; if not, report it as a regression.`,
+      };
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
   async toolBrowserClose() {
     if (!this._session.browser) return 'Browser was not open.';
     try { await this._session.browser.close(); } catch {}
@@ -251,17 +388,22 @@ Tools available to you (a real Chrome window is open and visible):
 - browser_scroll(amount) — reveal below-the-fold content.
 - browser_console() — JavaScript errors, uncaught exceptions, and failed/4xx-5xx requests since the last check. Check it after loads and after actions — these are bugs a user can't see but you can.
 - browser_evaluate(expression) — read state you can't see (values, counts, computed styles, localStorage, exposed globals) or verify a functional claim.
+- browser_accessibility() — what a screen-reader or keyboard user would hit: missing alt text and labels, unnamed buttons and links, text below WCAG AA contrast, and a real Tab walk of the focus order (traps, invisible focus). Run it on each important screen.
+- browser_visual_check(name, update) — visual regression: compares the screen with its saved baseline and attaches a red-on-grey diff of what changed. Give each screen a short, stable name ("home", "checkout"); the first run saves the baseline. Pass update: true only for a change that is intended.
 - browser_back(), browser_close().
 
 Once the page is open:
 - Screenshot + snapshot + console to establish the baseline.
 - Walk the main user journeys: click primary actions, fill and submit at least one form if present, follow key links. After each meaningful step: screenshot, snapshot, and check console.
 - Probe for problems a human would catch: broken/missing images, dead or 404 links, layout that overlaps or overflows, forms that accept bad input or give no feedback, obvious accessibility gaps, and any visible security smell (secrets in page/console, mixed content, missing auth checks, sensitive data in the DOM).
+- On each important screen, run browser_accessibility and browser_visual_check (with that screen's stable name).
 - When done, call browser_close(), then write the report.
 
 Final report format (as your finish message):
 **Playthrough summary:** what you tested and the overall impression.
 **Findings:** a numbered list, most severe first. For each: a one-line title, severity (Critical / Major / Minor / Polish), what you observed, and how you found it (which screen/action, quoting the console line or describing the visual). If you found nothing wrong in an area, say the site passed it.
+**Accessibility:** what browser_accessibility found, most serious first. Automated checks cover only part of accessibility, so say that rather than calling the site accessible.
+**Visual changes:** each screen that differs from its baseline, whether it looks like a regression or an intended change, and any baselines saved for the first time.
 **Not covered:** anything you couldn't reach or test, and why.
 
 Be concrete and honest — cite the exact screen or console output. Do not invent issues; if the site works, say so.`;

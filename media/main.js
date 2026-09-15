@@ -859,30 +859,12 @@ outlineListEl?.addEventListener('keydown', (e) => {
 
 // ── Export ───────────────────────────────────────────────────────────────────
 
+// The export is built by the extension from the saved chat, not scraped from the
+// panel: the panel only ever holds part of a long conversation (a restored chat
+// renders its last turns; a long live one moves older turns out of the page),
+// so an export built from it silently dropped the rest.
 exportButton?.addEventListener('click', () => {
-  const lines = ['# Navy Chat Export', `> ${new Date().toLocaleString()}`, ''];
-  document.querySelectorAll('.message').forEach(el => {
-    const isUser = el.classList.contains('user');
-    const isAssistant = el.classList.contains('assistant');
-    const bubble = el.querySelector('.message-bubble');
-    if (!bubble) return;
-    let text = '';
-    if (bubble.dataset.rawMd) {
-      // Assistant messages keep their original markdown — cleanest export.
-      text = bubble.dataset.rawMd.trim();
-    } else {
-      // Strip UI chrome (Copy/Insert/Apply buttons, expand toggles) and keep line breaks.
-      const clone = bubble.cloneNode(true);
-      clone.querySelectorAll('button, .msg-attachments').forEach(n => n.remove());
-      clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
-      text = clone.textContent.trim();
-    }
-    if (text) {
-      lines.push(isUser ? '**You:** ' + text : isAssistant ? '**Navy:** ' + text : text);
-      lines.push('');
-    }
-  });
-  vscode.postMessage({ type: 'exportConversation', text: lines.join('\n') });
+  vscode.postMessage({ type: 'exportConversation' });
 });
 
 // ── Shell panel ──────────────────────────────────────────────────────────────
@@ -1332,6 +1314,12 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'restore') {
     renderHistory(message.messages);
+    // What earlier compactions condensed is gone from the transcript but not
+    // from what Navy works from. Say so where those messages used to be, as the
+    // Compact notice did before the chat was reopened.
+    if (message.digest && Array.isArray(message.messages) && message.messages.length) {
+      addCompactNotice(null, message.digest);
+    }
     // The dock points at cards in the transcript, and this replaced all of
     // them — a row pointing at a detached card would scroll nowhere. A
     // process that is genuinely still alive re-registers itself on its next
@@ -1479,37 +1467,7 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'diffResolved') {
     const card = document.querySelector(`.diff-card[data-diff-id="${message.id}"]`);
-    if (card) {
-      card.querySelector('.diff-actions')?.remove();
-      card.querySelector('.diff-summary')?.remove();
-      const status = card.querySelector('.diff-status');
-      if (status) status.innerHTML = message.approved ? icon('check') + ' Applied' : icon('close') + ' Rejected';
-      card.classList.add(message.approved ? 'is-approved' : 'is-rejected');
-      const body = card.querySelector('.diff-body');
-      if (body) {
-        // Prefer the count recorded at render time; fall back to a DOM count only
-        // for cards created before that was tracked.
-        const changedRows = card.dataset.changeCount !== undefined
-          ? parseInt(card.dataset.changeCount, 10) || 0
-          : body.querySelectorAll('.diff-added, .diff-removed').length;
-        if (message.approved && changedRows > 0) {
-          // Keep a compact preview of the change (added/removed lines only) with a
-          // toggle to reveal the full diff — instead of discarding it entirely.
-          body.classList.add('preview');
-          const btn = document.createElement('button');
-          btn.type = 'button';
-          btn.className = 'expand-btn diff-expand-btn';
-          btn.textContent = 'Click to expand';
-          btn.addEventListener('click', () => {
-            const collapsed = body.classList.toggle('preview');
-            btn.textContent = collapsed ? 'Click to expand' : 'Collapse';
-          });
-          card.appendChild(btn);
-        } else {
-          body.remove(); // rejected (or empty diff): collapse to the one-line summary
-        }
-      }
-    }
+    if (card) markDiffResolved(card, message.approved);
   }
 
   if (message.type === 'checkpoints') {
@@ -1652,6 +1610,8 @@ window.addEventListener('message', (event) => {
       // restore has just redrawn the transcript from what was kept, which puts up
       // the generic "session restored" note - wrong here, so it goes.
       messagesEl.querySelector('.restore-note')?.remove();
+      // ...and so does the notice it redrew from the digest: this one replaces it.
+      for (const n of messagesEl.querySelectorAll('.compact-notice')) n.remove();
       addCompactNotice(message.condensed || 0, message.summary || '');
     } else if (here && message.reason) {
       addSystemMessage(message.reason);
@@ -1699,39 +1659,7 @@ window.addEventListener('message', (event) => {
   }
 
   if (message.type === 'auditResult') {
-    const card = document.createElement('div');
-    card.className = 'audit-card' + (message.counts && message.counts.high ? ' audit-high' : (message.total === 0 || !(message.findings || []).length ? ' audit-clean' : ''));
-    const head = document.createElement('div');
-    head.className = 'audit-head';
-    head.innerHTML = icon('security') + ' <span>Supply-chain scan</span>';
-    card.appendChild(head);
-    const line = document.createElement('div');
-    line.className = 'audit-headline';
-    line.textContent = message.headline || '';
-    card.appendChild(line);
-    if (message.deep) {
-      const note = document.createElement('div');
-      note.className = 'audit-headline';
-      note.textContent = 'Running a deep AI audit — reading the project…';
-      card.appendChild(note);
-    }
-    for (const f of (message.findings || []).slice(0, 40)) {
-      const row = document.createElement('div');
-      row.className = 'audit-row';
-      row.classList.add('audit-sev-' + (f.severity || 'low'));
-      const sev = document.createElement('span');
-      sev.className = 'audit-sev';
-      sev.textContent = (f.severity || 'low').toUpperCase();
-      const file = document.createElement('span');
-      file.className = 'audit-file';
-      file.textContent = f.file + (f.changed ? '  · changed' : '');
-      const id = document.createElement('span');
-      id.className = 'audit-id';
-      id.textContent = f.id;
-      row.appendChild(sev); row.appendChild(file); row.appendChild(id);
-      card.appendChild(row);
-    }
-    messagesEl.appendChild(card);
+    messagesEl.appendChild(buildAuditCard(message));
     scrollToBottom();
   }
 
@@ -1802,19 +1730,12 @@ window.addEventListener('message', (event) => {
   }
 
 
+  // The Export Conversation command. It used to build its own copy of the export,
+  // looking for 'message-user'/'message-assistant' classes the transcript never
+  // had - so every line came out with no speaker. It is the same export as the
+  // toolbar button now: the extension builds it.
   if (message.type === 'requestExport') {
-    const lines = ['# Navy Chat Export', `> ${new Date().toLocaleString()}`, ''];
-    document.querySelectorAll('.message').forEach(el => {
-      const isUser = el.classList.contains('message-user');
-      const isAssistant = el.classList.contains('message-assistant');
-      const bubble = el.querySelector('.message-bubble');
-      const text = bubble ? bubble.innerText.trim() : '';
-      if (text) {
-        lines.push(isUser ? '**You:** ' + text : isAssistant ? '**Navy:** ' + text : text);
-        lines.push('');
-      }
-    });
-    vscode.postMessage({ type: 'exportConversation', text: lines.join('\n') });
+    vscode.postMessage({ type: 'exportConversation' });
   }
 
   // ── Background task updates ───────────────────────────────────────────────────
@@ -3003,6 +2924,7 @@ function trimLiveTranscript() {
 // same builders the live turn used, so a restored card is the same card — not a
 // summary of one.
 function replayCard(card) {
+  if (card?.kind) { replayDrawnCard(card); return; }
   const tool = card?.tool;
   if (!tool) return;
   const args = card.args || {};
@@ -3020,6 +2942,126 @@ function replayCard(card) {
   }
 }
 
+// Cards the webview draws from their own messages rather than from a tool
+// result - diffs, approvals, reasoning, the audit card, which
+// src/transcript-cards.js records - redrawn in their settled state. No
+// buttons: whatever they asked was answered before the chat was saved.
+function replayDrawnCard(card) {
+  if (card.kind === 'diff') {
+    replayDiffCard(card);
+  } else if (card.kind === 'approval') {
+    replayApprovalCard(card);
+  } else if (card.kind === 'thinking') {
+    appendThinking((card.text || '')
+      + (card.truncated ? '\n\n[The rest of the reasoning was not kept when the chat was saved.]' : ''));
+    finalizeThinking();
+  } else if (card.kind === 'audit') {
+    appendTurnCard(buildAuditCard(card, true));
+  }
+}
+
+function replayDiffCard(card) {
+  let html;
+  if (card.rewritten) html = diffNote('Rewritten too thoroughly to show line by line — open the file to see it');
+  else if (card.dropped) html = diffNote('Not kept: this turn changed more than a saved chat holds — open the file to see it');
+  else html = renderStoredDiff(card.hunks || '', card.lines || 0, Boolean(card.truncated));
+  const el = buildDiffCard('', String(card.path || ''), html, card.added || 0, card.removed || 0);
+  if (card.status === 'applied' || card.status === 'rejected') {
+    markDiffResolved(el, card.status === 'applied');
+  } else {
+    // The turn ended before anyone decided, so nothing was written.
+    el.querySelector('.diff-actions')?.remove();
+    const status = el.querySelector('.diff-status');
+    if (status) status.textContent = 'Not applied';
+  }
+}
+
+function replayApprovalCard(card) {
+  const el = addPendingCommandCard('', String(card.command || ''));
+  el.querySelector('.command-actions')?.remove();
+  const status = el.querySelector('.command-status');
+  if (status) {
+    status.textContent = card.status === 'approved' ? 'Approved'
+      : card.status === 'rejected' ? 'Rejected by you' : 'Not decided';
+  }
+}
+
+function diffNote(text) {
+  return `<div class="diff-skip">${icon('collapsed')} ${escapeHtml(text)}</div>`;
+}
+
+// The rows of a diff saved as unified hunks, drawn the way renderDiff draws a
+// live one: the same rows with the same line numbers, and the same "N
+// unchanged lines" between hunks and after the last.
+function renderStoredDiff(hunks, oldLineCount, truncated) {
+  let html = '';
+  let o = 1, n = 1;   // the next line number on each side
+  let nextOld = 1;    // the first old line not yet drawn or skipped
+  for (const line of String(hunks).split('\n')) {
+    const h = /^@@ -(\d+),(\d+) \+(\d+),(\d+) @@/.exec(line);
+    if (h) {
+      o = Number(h[2]) ? Number(h[1]) : Number(h[1]) + 1;
+      n = Number(h[4]) ? Number(h[3]) : Number(h[3]) + 1;
+      const skip = o - nextOld;
+      if (skip > 0) html += diffNote(`${skip} unchanged line${skip > 1 ? 's' : ''}`);
+      nextOld = o;
+      continue;
+    }
+    if (!line) continue;
+    const text = line.slice(1);
+    if (line[0] === '+') html += diffRow('+', 'diff-added', null, n++, text);
+    else if (line[0] === '-') html += diffRow('-', 'diff-removed', o++, null, text);
+    else html += diffRow(' ', 'diff-unchanged', o++, n++, text);
+    nextOld = o;
+  }
+  if (truncated) {
+    html += diffNote('Diff trimmed when the chat was saved — open the file to see the change in full');
+  } else if (html && oldLineCount >= nextOld) {
+    const rest = oldLineCount - nextOld + 1;
+    html += diffNote(`${rest} unchanged line${rest > 1 ? 's' : ''}`);
+  }
+  return html || diffRow(' ', 'diff-unchanged', null, null, 'No changes');
+}
+
+// The /audit card. Drawn live from auditResult, and again from the record its
+// turn saved - then without the "running a deep audit" line, which was only
+// ever true while it ran.
+function buildAuditCard(message, restored = false) {
+  const card = document.createElement('div');
+  card.className = 'audit-card' + (message.counts && message.counts.high ? ' audit-high' : (message.total === 0 || !(message.findings || []).length ? ' audit-clean' : ''));
+  const head = document.createElement('div');
+  head.className = 'audit-head';
+  head.innerHTML = icon('security') + ' <span>Supply-chain scan</span>';
+  card.appendChild(head);
+  const line = document.createElement('div');
+  line.className = 'audit-headline';
+  line.textContent = message.headline || '';
+  card.appendChild(line);
+  if (message.deep && !restored) {
+    const note = document.createElement('div');
+    note.className = 'audit-headline';
+    note.textContent = 'Running a deep AI audit — reading the project…';
+    card.appendChild(note);
+  }
+  for (const f of (message.findings || []).slice(0, 40)) {
+    const row = document.createElement('div');
+    row.className = 'audit-row';
+    row.classList.add('audit-sev-' + (f.severity || 'low'));
+    const sev = document.createElement('span');
+    sev.className = 'audit-sev';
+    sev.textContent = (f.severity || 'low').toUpperCase();
+    const file = document.createElement('span');
+    file.className = 'audit-file';
+    file.textContent = f.file + (f.changed ? '  · changed' : '');
+    const id = document.createElement('span');
+    id.className = 'audit-id';
+    id.textContent = f.id;
+    row.appendChild(sev); row.appendChild(file); row.appendChild(id);
+    card.appendChild(row);
+  }
+  return card;
+}
+
 // Rebuilds ONE assistant turn — its tool activity and then its reply, in that
 // order, inside a single message. Deliberately drives the live streaming path
 // (activeAssistantMessage → cards → appendAssistantText → flush → collapse)
@@ -3028,7 +3070,7 @@ function replayCard(card) {
 // implementation of them would drift.
 function renderAssistantTurn(item) {
   const cards = Array.isArray(item.cards) ? item.cards : [];
-  if (!cards.length) { addMessage('assistant', item.text); return; }
+  if (!cards.length) { if (item.text) addMessage('assistant', item.text); return; }
 
   activeAssistantMessage = addMessage('assistant', '');
   activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
@@ -3042,6 +3084,8 @@ function renderAssistantTurn(item) {
   currentActivityRowEl = null;
   activityRowsById.clear();
   activeTermCard = null;
+  activeThinkingEl = null;
+  activeThinkingContentEl = null;
 
   for (const card of cards) replayCard(card);
   if (item.text) { appendAssistantText(item.text); flushAssistantText(); }
@@ -3077,6 +3121,9 @@ function renderHistoryItem(item) {
       if (item.meta.commands)        bits.push(item.meta.commands + ' command' + (item.meta.commands > 1 ? 's' : '') + ' run');
       if (bits.length) addSystemMessage('This turn: ' + bits.join(' · '));
     }
+    // A turn that failed after doing some work is saved with the error it
+    // ended on, so a reopened chat still says why it stopped.
+    if (item.error) addMessage('error', item.error);
   }
 }
 
@@ -4342,7 +4389,11 @@ function addCompactNotice(count, summary) {
   const el = document.createElement('details');
   el.className = 'compact-notice';
   const head = document.createElement('summary');
-  head.textContent = `Context compacted — ${count} earlier message${count === 1 ? '' : 's'} condensed into a summary`;
+  // count is null for the notice redrawn when a chat is reopened: the digest
+  // is kept, but how many messages went into it is not.
+  head.textContent = count == null
+    ? 'Earlier messages were condensed into a summary'
+    : `Context compacted — ${count} earlier message${count === 1 ? '' : 's'} condensed into a summary`;
   el.appendChild(head);
   if (summary) {
     const body = document.createElement('div');
@@ -5539,6 +5590,7 @@ const TOOL_VERB = {
   browser_click: 'Clicking', browser_type: 'Typing', browser_scroll: 'Scrolling',
   browser_evaluate: 'Evaluating', browser_console: 'Checking console', browser_back: 'Going back',
   browser_close: 'Closing browser',
+  browser_accessibility: 'Checking accessibility', browser_visual_check: 'Comparing to baseline',
   __thinking__: 'Thinking',
 };
 
@@ -6000,7 +6052,13 @@ function finalizeTermCard(result, streamId) {
 
 function addPendingDiffCard(id, filePath, oldText, newText) {
   const { html, added, removed } = renderDiff(oldText || '', newText || '');
+  return buildDiffCard(id, filePath, html, added, removed);
+}
 
+// The card itself, around an already-rendered body: a live diff is rendered
+// from the two texts, a restored one from the hunks its turn saved (see
+// renderStoredDiff). Returns the card.
+function buildDiffCard(id, filePath, html, added, removed) {
   const card = document.createElement('div');
   card.className = 'diff-card';
   card.dataset.diffId = id;
@@ -6081,6 +6139,41 @@ function addPendingDiffCard(id, filePath, oldText, newText) {
   // edit. The pending-approval count in the approval queue is what surfaces a
   // card you scrolled past.
   scrollToBottom();
+  return card;
+}
+
+// A decided diff: the buttons go, the status says which way it went, and an
+// applied change keeps a compact preview with a toggle to the whole diff. The
+// live diffResolved message and a restored card both settle a card this way.
+function markDiffResolved(card, approved) {
+  card.querySelector('.diff-actions')?.remove();
+  card.querySelector('.diff-summary')?.remove();
+  const status = card.querySelector('.diff-status');
+  if (status) status.innerHTML = approved ? icon('check') + ' Applied' : icon('close') + ' Rejected';
+  card.classList.add(approved ? 'is-approved' : 'is-rejected');
+  const body = card.querySelector('.diff-body');
+  if (!body) return;
+  // Prefer the count recorded at render time; fall back to a DOM count only
+  // for cards created before that was tracked.
+  const changedRows = card.dataset.changeCount !== undefined
+    ? parseInt(card.dataset.changeCount, 10) || 0
+    : body.querySelectorAll('.diff-added, .diff-removed').length;
+  if (approved && changedRows > 0) {
+    // Keep a compact preview of the change (added/removed lines only) with a
+    // toggle to reveal the full diff — instead of discarding it entirely.
+    body.classList.add('preview');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'expand-btn diff-expand-btn';
+    btn.textContent = 'Click to expand';
+    btn.addEventListener('click', () => {
+      const collapsed = body.classList.toggle('preview');
+      btn.textContent = collapsed ? 'Click to expand' : 'Collapse';
+    });
+    card.appendChild(btn);
+  } else {
+    body.remove(); // rejected (or empty diff): collapse to the one-line summary
+  }
 }
 
 function addPendingCommandCard(id, command) {
@@ -6126,6 +6219,7 @@ function addPendingCommandCard(id, command) {
   appendTurnCard(card);
   userScrolledUp = false;
   scrollToBottom();
+  return card;
 }
 
 // ── Myers-diff-based unified diff ─────────────────────────────────────────────

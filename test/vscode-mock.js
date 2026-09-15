@@ -31,6 +31,7 @@ function createVscodeMock() {
       persistBackgroundProcesses: false,
     },
     nextWarning: undefined,           // value the next showWarningMessage resolves to
+    nextSaveUri: undefined,           // value the next showSaveDialog resolves to (a Uri, or undefined for Cancel)
     nextInfo: undefined,              // value the next showInformationMessage resolves to (modal choices)
     nextRename: null,                 // [{ fsPath, newText }] the fake rename provider returns
     nextOpenDialog: null,             // [fsPath] the next showOpenDialog returns, or null for cancel
@@ -42,7 +43,7 @@ function createVscodeMock() {
     shownInfoCalls: [],               // [{ msg, options, items }] — full showInformationMessage calls, see the mock above
     applyEditFails: false,
     reset() {
-      this.nextWarning = undefined; this.nextInfo = undefined; this.nextRename = null;
+      this.nextWarning = undefined; this.nextSaveUri = undefined; this.nextInfo = undefined; this.nextRename = null;
       this.nextOpenDialog = null; this.applyEditFails = false;
       this.nextWorkspaceSymbols = null;
       this.nextDocumentSymbols = null;
@@ -171,6 +172,7 @@ function createVscodeMock() {
       activeTextEditor: undefined,
       createTextEditorDecorationType: () => ({ dispose() {} }),
       showWarningMessage: async (msg) => { ctrl.shown.warning.push(msg); return ctrl.nextWarning; },
+      showSaveDialog: async () => ctrl.nextSaveUri,
       // shownInfoCalls carries the FULL call (options/button labels included) for
       // tests that need to assert on more than the message text — ctrl.shown.info
       // stays string-only so every existing `.some(m => regex.test(m))` check
