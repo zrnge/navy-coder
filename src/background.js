@@ -26,7 +26,7 @@ class BackgroundMethods {
     return vscode.workspace.getConfiguration('navy').get('persistBackgroundProcesses', false) === true;
   }
 
-  _bgManifestPath(root) { return path.join(root, '.navy', 'bg-processes.json'); }
+  _bgManifestPath(root) { return path.join(this.getNavyDir(root), 'bg-processes.json'); }
 
   // The stable handle for one background task: `navy/<project>/<task>`.
   //
@@ -103,7 +103,7 @@ class BackgroundMethods {
   // survival past this process exiting work.
   async _openPersistLog(root, id) {
     await this.ensureNavyDir(root);
-    const dir = path.join(root, '.navy', 'bg-logs');
+    const dir = path.join(this.getNavyDir(root), 'bg-logs');
     await fs.promises.mkdir(dir, { recursive: true });
     const safe = String(id).replace(/[^a-z0-9_-]/gi, '_');
     const logPath = path.join(dir, `${safe}-${Date.now()}.log`);
@@ -113,21 +113,20 @@ class BackgroundMethods {
     // stays for the life of the project (a chatty dev server's logs are MBs
     // each). Fire-and-forget: log housekeeping must never delay or fail
     // starting the process the user actually asked for.
-    this._pruneBgLogs(dir, logPath).catch(() => {});
+    this._pruneBgLogs(dir, logPath, root).catch(() => {});
     return { fd, logPath };
   }
 
-  // Keeps .navy/bg-logs/ to the most recent PERSIST_LOG_KEEP files. Never
+  // Keeps the project's bg-logs/ to the most recent PERSIST_LOG_KEEP files. Never
   // touches the log just opened, nor one still named by a live manifest entry —
   // read_process_output reads these back from disk, so deleting one out from
   // under a running process would silently blank its output.
-  async _pruneBgLogs(dir, currentLogPath) {
+  async _pruneBgLogs(dir, currentLogPath, root) {
     let names;
     try { names = await fs.promises.readdir(dir); } catch { return; }
     const logs = names.filter(n => n.endsWith('.log'));
     if (logs.length <= PERSIST_LOG_KEEP) return;
 
-    const root = path.dirname(path.dirname(dir)); // .../<root>/.navy/bg-logs → <root>
     const inUse = new Set([currentLogPath]);
     for (const rec of await this._readBgManifest(root)) { if (rec.logPath) inUse.add(rec.logPath); }
 

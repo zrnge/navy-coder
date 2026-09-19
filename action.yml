@@ -1,0 +1,68 @@
+name: Navy AI Coder
+description: Navy's supply-chain audit and visual QA playthrough, run headless in CI.
+author: Zrnge
+branding:
+  icon: anchor
+  color: blue
+
+inputs:
+  command:
+    description: "audit (scan the project for supply-chain attack patterns) or playthrough (test a web app in headless Chrome)"
+    required: true
+    default: audit
+  url:
+    description: "playthrough: the page to test, e.g. http://localhost:3000. Start the server in an earlier step."
+    required: false
+    default: ""
+  path:
+    description: The project folder
+    required: false
+    default: "."
+  fail-on:
+    description: "The severity that fails the step. audit: high (default), medium, low, none. playthrough: critical (default), major, minor, polish, none."
+    required: false
+    default: ""
+  provider:
+    description: "The model provider, for playthrough or audit --triage/--deep: ollama, anthropic, openai, gemini, deepseek, openrouter, ..."
+    required: false
+    default: ""
+  model:
+    description: The model to use
+    required: false
+    default: ""
+  api-key:
+    description: The provider's API key. Pass it from a secret.
+    required: false
+    default: ""
+  args:
+    description: 'Any other options, e.g. "--exclude test/** --report navy-report.md"'
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Navy has no runtime dependencies, so the command runs straight from the
+    # action's checkout: no npm install. Inputs reach the shell as environment
+    # variables, never spliced into the script, so none of them can inject a
+    # command.
+    - name: Run navy ${{ inputs.command }}
+      shell: bash
+      env:
+        NAVY_COMMAND: ${{ inputs.command }}
+        NAVY_URL: ${{ inputs.url }}
+        NAVY_PATH: ${{ inputs.path }}
+        NAVY_FAIL_ON: ${{ inputs.fail-on }}
+        NAVY_PROVIDER: ${{ inputs.provider }}
+        NAVY_MODEL: ${{ inputs.model }}
+        NAVY_API_KEY: ${{ inputs.api-key }}
+        NAVY_ARGS: ${{ inputs.args }}
+      run: |
+        set -f
+        cmd=(node "$GITHUB_ACTION_PATH/src/cli.js" "$NAVY_COMMAND")
+        if [ -n "$NAVY_URL" ]; then cmd+=("$NAVY_URL"); fi
+        cmd+=(--path "$NAVY_PATH")
+        if [ -n "$NAVY_FAIL_ON" ]; then cmd+=(--fail-on "$NAVY_FAIL_ON"); fi
+        # NAVY_ARGS is a list of options, so it is split on spaces on purpose;
+        # set -f above keeps a pattern like test/** from being expanded.
+        exec "${cmd[@]}" $NAVY_ARGS

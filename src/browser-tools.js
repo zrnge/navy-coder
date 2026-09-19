@@ -45,7 +45,7 @@ class BrowserToolMethods {
     if (!this._commandsAutoApproved()) {
       const id = this.generateId();
       this.view?.webview.postMessage({
-        type: 'pendingCommand', id,
+        type: 'pendingCommand', id, kind: 'browser-launch',
         command: 'Launch a browser for a visual playthrough (isolated temporary profile)',
       });
       const approved = await new Promise((resolve) => {

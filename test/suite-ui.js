@@ -349,7 +349,7 @@ async function reviewRegressionSuite() {
       const doomed = provider.activeSessionId;
       provider.messages = [{ role: 'user', text: 'temporary chat' }];
       await provider.saveProjectSession();
-      const chatFile = path.join(tmp, '.navy', 'chats', doomed + '.json');
+      const chatFile = path.join(provider.getNavyDir(tmp), 'chats', doomed + '.json');
       check('setup: the chat was persisted to its own file', fs.existsSync(chatFile));
       await provider.closeSessionTab(doomed);
       check('closing a tab deletes its persisted chat file', !fs.existsSync(chatFile));
@@ -1341,18 +1341,13 @@ async function slashCommandSuite() {
     check('slash: each command knows the file it came from',
       byName['/mine'].file === path.join(personal, 'commands', 'mine.md'), byName['/mine'].file);
 
-    // A project's commands are meant to be committed, so .navy/'s blanket
-    // self-ignore has to make an exception for them — a `*` that hides the
-    // command your team is supposed to get is the whole feature not working.
+    // A project's commands are meant to be committed. Navy keeps nothing else
+    // of its own in the project any more, so there is no ignore file there for
+    // them to need an exemption from - and making Navy's folder touches the
+    // project not at all.
     await provider.ensureNavyDir();
-    const gitignore = fs.readFileSync(path.join(root, '.navy', '.gitignore'), 'utf8');
-    check('slash: .navy/ still ignores the chat history it holds', /^\*$/m.test(gitignore));
-    check('slash: …but un-ignores commands/, directory AND contents',
-      /^!commands\/$/m.test(gitignore) && /^!commands\/\*\*$/m.test(gitignore), gitignore);
-    fs.writeFileSync(path.join(root, '.navy', '.gitignore'), '*\n# mine\n');
-    await provider.ensureNavyDir();
-    check('slash: a .gitignore the user has edited is left alone',
-      fs.readFileSync(path.join(root, '.navy', '.gitignore'), 'utf8') === '*\n# mine\n');
+    check('slash: Navy\'s own folder is not in the project, and writes no ignore file into it',
+      !fs.existsSync(path.join(root, '.navy', '.gitignore')) && !provider.getNavyDir(root).startsWith(root));
 
     // A namespace directory.
     write('.navy/commands/db', 'migrate.md', 'Run the migrations.');

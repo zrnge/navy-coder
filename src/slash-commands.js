@@ -373,11 +373,9 @@ const SLASH_COMMAND_METHODS = {
     const bare = name.trim().replace(/^\//, '');
     const parts = bare.split(':');
     const file = path.join(where.dir, ...parts) + '.md';
-    // Through ensureNavyDir for a project command, so .navy/.gitignore exists
-    // and carries its `!commands/` exemption — otherwise the file is written
-    // into a directory git has been told to ignore wholesale, and the command
-    // the user just wrote for their team is invisible to `git status`.
-    if (where.dir.startsWith(path.join(this.projectRoot || '\0', '.navy'))) await this.ensureNavyDir();
+    // A project command goes in <project>/.navy/commands/, to be committed and
+    // shared. Nothing else of Navy's lives in the project any more, so there is
+    // no ignore file to exempt it from.
     try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(file))); } catch {}
 
     // Never overwrite: the whole point of the feature is a prompt somebody

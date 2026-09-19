@@ -305,7 +305,7 @@ async function persistentBgProcessSuite() {
     await provider._removeFromBgManifest(tmp, 111);
     manifest = await provider._readBgManifest(tmp);
     check('manifest: removeFromBgManifest drops only the matching pid', manifest.length === 1 && manifest[0].pid === 222);
-    check('manifest: file actually exists on disk at .navy/bg-processes.json', fs.existsSync(path.join(tmp, '.navy', 'bg-processes.json')));
+    check('manifest: file actually exists on disk, in the project\'s folder in the profile', fs.existsSync(path.join(provider.getNavyDir(tmp), 'bg-processes.json')));
     await provider._writeBgManifest(tmp, []); // reset for later tests
 
     // _pidAlive: true for a pid that definitely exists (this test process

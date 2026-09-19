@@ -40,10 +40,15 @@ const { sessionContext } = require('./session-context.js');
 
 // Workspace trust — see src/workspace.js for why it lives in its own module.
 const { workspaceIsTrusted } = require('./workspace.js');
+// Where each project's chats, memory and the rest live: the profile, not the project.
+const { projectDataDir } = require('./data-dir.js');
+const { THINKING_LEVELS, normalizeThinkingLevel } = require('./thinking.js');
 
 // Diff, approval and reasoning cards, saved with the turn that drew them - see
 // src/transcript-cards.js.
 const { beginTurnCards, endTurnCards, recordTranscriptCard, auditCardRecord } = require('./transcript-cards.js');
+// Tab-to-accept completions — see src/inline-completions.js.
+const { createInlineCompletionProvider, warmOllamaModel } = require('./inline-completions.js');
 
 
 // Syntax checkers run with cwd set OUTSIDE the project on purpose — see
@@ -629,7 +634,7 @@ class NavyCoderViewProvider {
     this.modelContextLength = null;
     this.modelContextMax = null; // the largest window the ACTIVE model reports, before the user's choice is applied
     // Restore the persisted thinking level so the choice survives window reloads.
-    this.thinkingLevel = vscode.workspace.getConfiguration('navy').get('thinkingLevel', 'medium');
+    this.thinkingLevel = normalizeThinkingLevel(vscode.workspace.getConfiguration('navy').get('thinkingLevel', 'medium'));
     this.statusBarItem = null; // set by activate() after construction
     this.log = null; // set by activate() → Navy Coder output channel; safe to call before
     this.mcp = new McpManager((line) => this.log?.(line)); // external MCP tool servers — shared across all sessions, config is global
@@ -813,6 +818,8 @@ class NavyCoderViewProvider {
     for (const segment of String(fsPath).split(/[\\/]+/)) {
       if (RELEVANCE_SKIP_DIRS.has(segment)) return;
     }
+    // The project index takes the change on its next query (src/retrieval.js).
+    this._noteLexicalChange(fsPath);
     const isGitignore = /(^|[\\/])\.gitignore$/.test(fsPath);
     for (const [root, cache] of this._projectCaches) {
       if (!root || !(fsPath === root || fsPath.startsWith(root + path.sep))) continue;
@@ -1099,6 +1106,9 @@ class NavyCoderViewProvider {
           break;
         case 'openCatalogProject':
           await this.openCatalogProject(message.root || '');
+          break;
+        case 'forgetProjects':
+          await this.forgetProjectsFromList();
           break;
         case 'setThinkingLevel':
           this.setThinkingLevel(message.level);
@@ -1648,10 +1658,7 @@ class NavyCoderViewProvider {
     // Picking one goes through openCatalogProject's open-here/add-to-
     // workspace choice instead of a direct switch, since it isn't part of
     // this window's workspace (yet).
-    const shown = new Set(displayRoots.map(fold));
-    const globalProjects = await this._readGlobalProjects();
-    const catalog = globalProjects
-      .filter(p => !shown.has(fold(p.path)))
+    const catalog = (await this._otherProjects())
       .map(p => ({ path: p.path, name: p.name || path.basename(p.path) }));
 
     this.view?.webview.postMessage({ type: 'workspaceFolders', roots: displayRoots, current: this.projectRoot, catalog });
@@ -1925,6 +1932,45 @@ class NavyCoderViewProvider {
   // isn't part of this window's workspace right now — same "open here or add
   // to the workspace" choice as a brand-new folder pick, just sourced from
   // Navy's own memory instead of a fresh file-dialog browse.
+  // The projects under "Other projects" in the picker: every one Navy
+  // remembers except those this window already shows - its workspace folders
+  // and the current project root. One definition, so the dropdown and the
+  // removal picker below can never disagree about what the list is.
+  async _otherProjects() {
+    const shown = new Set([this.projectRoot, ...(vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath)]
+      .filter(Boolean).map(fold));
+    return (await this._readGlobalProjects()).filter(p => !shown.has(fold(p.path)));
+  }
+
+  // "Remove projects from this list…", from the picker or the command palette.
+  // Offers what "Other projects" shows - a project open in this window would
+  // be put straight back the next time it is used - and takes the chosen ones
+  // off the list and nothing more (see _forgetProjects).
+  async forgetProjectsFromList() {
+    const others = await this._otherProjects();
+    if (!others.length) {
+      vscode.window.showInformationMessage('Navy: there are no other projects on the list to remove.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      others.map(p => ({
+        label: p.name || path.basename(p.path),
+        description: p.path,
+        detail: p.lastOpened ? 'Last opened ' + new Date(p.lastOpened).toLocaleDateString() : undefined,
+        path: p.path,
+      })),
+      {
+        canPickMany: true,
+        title: 'Remove projects from Navy\'s list',
+        placeHolder: 'Pick the projects to remove. Only the list changes: folders and their chats stay as they are.',
+      });
+    if (!picked || !picked.length) return;
+    await this._forgetProjects(picked.map(p => p.path));
+    await this.sendWorkspaceFolders();
+    const n = picked.length;
+    vscode.window.showInformationMessage(`Navy: removed ${n} project${n === 1 ? '' : 's'} from the list. Opening ${n === 1 ? 'it' : 'one'} again adds it back.`);
+  }
+
   async openCatalogProject(picked) {
     if (!picked) return;
     if (this._refuseIfBusy()) return;
@@ -1972,7 +2018,7 @@ class NavyCoderViewProvider {
     return true;
   }
 
-  // Reads `root`'s persisted chats (.navy/chats/*.json) into `this.sessions`
+  // Reads `root`'s persisted chats (<profile folder>/chats/*.json) into `this.sessions`
   // the first time this window visits that root — a no-op on every later
   // call, so re-selecting a project you've already opened this session never
   // re-hits disk or clobbers whatever's accumulated in memory since. Falls
@@ -1983,7 +2029,8 @@ class NavyCoderViewProvider {
   async _ensureProjectChatsLoaded(root) {
     if (!root || this._loadedChatRoots.has(root)) return;
     this._loadedChatRoots.add(root);
-    const chatsDir = path.join(root, '.navy', 'chats');
+    await this._migrateProjectNavyDir(root);
+    const chatsDir = path.join(this.getNavyDir(root), 'chats');
     let entries = [];
     try { entries = await vscode.workspace.fs.readDirectory(vscode.Uri.file(chatsDir)); } catch { entries = []; }
     const chatFiles = entries.filter(([name, type]) => type === vscode.FileType.File && name.endsWith('.json'));
@@ -2008,14 +2055,14 @@ class NavyCoderViewProvider {
       }));
     } else {
       try {
-        const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, '.navy', 'session.json')));
+        const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(this.getNavyDir(root), 'session.json')));
         const parsed = JSON.parse(Buffer.from(data).toString('utf8'));
         const id = this.generateId();
         const s = new Session(id, root);
         s.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
         s.sessionDigest = typeof parsed.digest === 'string' ? parsed.digest : '';
         try {
-          const cpData = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, '.navy', 'checkpoints.json')));
+          const cpData = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(this.getNavyDir(root), 'checkpoints.json')));
           const cpParsed = JSON.parse(Buffer.from(cpData).toString('utf8'));
           if (Array.isArray(cpParsed.checkpoints)) s.checkpoints = cpParsed.checkpoints;
         } catch {}
@@ -2256,7 +2303,7 @@ class NavyCoderViewProvider {
     clearTimeout(session._cpSaveTimer);
     session._cpSaveTimer = undefined;
     if (!session.projectRoot || !session.id) return;
-    const file = path.join(session.projectRoot, '.navy', 'chats', session.id + '.json');
+    const file = path.join(this.getNavyDir(session.projectRoot), 'chats', session.id + '.json');
     try { await vscode.workspace.fs.delete(vscode.Uri.file(file)); }
     catch { /* never written (unsaved/blank chat), or already gone — nothing to do */ }
   }
@@ -2758,7 +2805,7 @@ class NavyCoderViewProvider {
   }
 
   setThinkingLevel(level) {
-    if (['fast', 'medium', 'high'].includes(level)) {
+    if (THINKING_LEVELS.includes(level)) {
       this.thinkingLevel = level;
       // Persist so the choice survives window reloads (fire-and-forget is fine here).
       vscode.workspace.getConfiguration('navy').update('thinkingLevel', level, vscode.ConfigurationTarget.Global);
@@ -2774,34 +2821,125 @@ class NavyCoderViewProvider {
   // processes, which are keyed by whichever root spawned them, not
   // whichever one happens to be on-screen — don't have to fake-switch
   // projectRoot just to reuse this helper.
+  //
+  // The folder is in your profile (see src/data-dir.js), never in the project.
   getNavyDir(root = this.projectRoot) {
-    return root ? path.join(root, '.navy') : null;
+    return root ? projectDataDir(root) : null;
   }
 
-  // Self-ignoring directory: chat files contain the full conversation text,
-  // which must never end up committed to the user's repo.
-  //
-  // `commands/` is the deliberate exception. A project's slash commands are
-  // meant to be shared with the people working on it, and a blanket `*` made
-  // that impossible — the files existed and git refused to see them. Both
-  // negations are needed: git does not descend into an excluded directory, so
-  // un-ignoring only the contents would never be reached.
-  static NAVY_GITIGNORE = '*\n!.gitignore\n!commands/\n!commands/**\n';
+  // git, for the few checks Navy makes on its own behalf - never for anything a
+  // model asked for. Only in a trusted workspace, and with core.fsmonitor off:
+  // a repository's own git config can name a program for git to run.
+  // Resolves { code, stdout }; code is null when git could not run at all.
+  _gitQuiet(args, cwd) {
+    if (!cwd || !workspaceIsTrusted()) return Promise.resolve({ code: null, stdout: '' });
+    return new Promise((resolve) => {
+      let stdout = '';
+      let proc;
+      try {
+        proc = spawn('git', ['-c', 'core.fsmonitor=false', ...args], { cwd, windowsHide: true });
+      } catch {
+        resolve({ code: null, stdout: '' });
+        return;
+      }
+      proc.stdout.on('data', (d) => { stdout += d; });
+      proc.stderr.on('data', () => {});
+      proc.on('error', () => resolve({ code: null, stdout: '' }));
+      proc.on('close', (code) => resolve({ code, stdout }));
+    });
+  }
 
+  // Whether `git add -A` would pick this file up: inside the project, in a git
+  // repository, and not ignored. False whenever that cannot be known.
+  async _gitWouldCommit(fsPath) {
+    const root = this.projectRoot;
+    const rel = root ? path.relative(root, fsPath) : '';
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+    const { code } = await this._gitQuiet(['check-ignore', '-q', '--', rel], root);
+    return code === 1; // 0 ignored, 1 not ignored, 128 not a repository
+  }
+
+  // What Navy wrote as <project>/.navy/.gitignore, back when it kept its files
+  // in the project. Recognised so the migration below can remove Navy's own
+  // ignore file, and never one a person wrote.
+  static LEGACY_NAVY_GITIGNORES = ['*\n', '*\n!.gitignore\n!commands/\n!commands/**\n'];
+
+  // Creates the project's folder in the profile, with a project.json saying
+  // which project it belongs to - its name alone carries only a short hash.
   async ensureNavyDir(root = this.projectRoot) {
     const dir = this.getNavyDir(root);
     if (!dir) return null;
-    try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir)); } catch {}
-    const gi = vscode.Uri.file(path.join(dir, '.gitignore'));
-    let current = null;
-    try { current = Buffer.from(await vscode.workspace.fs.readFile(gi)).toString('utf8'); } catch {}
-    // Rewritten only when it is still byte-for-byte what Navy itself wrote
-    // before commands existed. Anything the user has since edited is theirs,
-    // and silently rewriting a .gitignore is not a thing to do twice.
-    if (current === null || current === '*\n') {
-      try { await vscode.workspace.fs.writeFile(gi, Buffer.from(NavyCoderViewProvider.NAVY_GITIGNORE, 'utf8')); } catch {}
+    if (!this._navyDirsReady) this._navyDirsReady = new Set();
+    if (this._navyDirsReady.has(dir)) return dir;
+    try { await fs.promises.mkdir(dir, { recursive: true }); } catch {}
+    const about = path.join(dir, 'project.json');
+    try { await fs.promises.access(about); } catch {
+      try { await fs.promises.writeFile(about, JSON.stringify({ path: path.resolve(root), name: path.basename(path.resolve(root)) }, null, 2) + '\n'); } catch {}
     }
+    this._navyDirsReady.add(dir);
     return dir;
+  }
+
+  // Projects Navy worked in before 0.3.6 kept all of this in <project>/.navy.
+  // Moved out on the first visit: everything except what is meant to live in
+  // the project - the team's slash commands (commands/) and skills (skills/).
+  // Nothing already in the profile folder is overwritten, and a file that
+  // cannot be moved (a log a still-running process holds open) stays where it
+  // is rather than stopping the rest.
+  async _migrateProjectNavyDir(root) {
+    if (!root) return;
+    const old = path.join(root, '.navy');
+    let entries;
+    try { entries = await fs.promises.readdir(old, { withFileTypes: true }); } catch { return; }
+    const stays = new Set(['commands', 'skills', '.gitignore']);
+    const movable = entries.filter(ent => !stays.has(ent.name));
+    const dest = await this.ensureNavyDir(root);
+    if (!dest || foldPath(dest) === foldPath(old)) return;
+    let moved = 0;
+    const left = [];
+    const exists = (p) => fs.promises.access(p).then(() => true, () => false);
+    const moveInto = async (from, to) => {
+      const st = await fs.promises.lstat(from);
+      if (st.isDirectory()) {
+        await fs.promises.mkdir(to, { recursive: true });
+        for (const name of await fs.promises.readdir(from)) await moveInto(path.join(from, name), path.join(to, name));
+        await fs.promises.rmdir(from).catch(() => {}); // stays if anything inside could not move
+        return;
+      }
+      if (await exists(to)) { left.push(from); return; }
+      try {
+        await fs.promises.rename(from, to);
+      } catch {
+        // Another drive (the project on E:, the profile on C:), or a file in
+        // use: copy it, then remove the original if that is allowed.
+        await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL);
+        try { await fs.promises.unlink(from); } catch { left.push(from); return; }
+      }
+      moved++;
+    };
+    for (const ent of movable) {
+      try { await moveInto(path.join(old, ent.name), path.join(dest, ent.name)); }
+      catch (err) { left.push(path.join(old, ent.name)); this.log?.(`could not move ${ent.name} out of ${old}: ${err.message}`); }
+    }
+    // Navy's own ignore file goes as well, and the folder with it, once nothing
+    // of Navy's is left in it. One a person edited is theirs, and stays.
+    let rest = [];
+    try { rest = await fs.promises.readdir(old); } catch {}
+    if (rest.length === 1 && rest[0] === '.gitignore') {
+      try {
+        const gi = await fs.promises.readFile(path.join(old, '.gitignore'), 'utf8');
+        if (NavyCoderViewProvider.LEGACY_NAVY_GITIGNORES.includes(gi.replace(/\r\n/g, '\n'))) {
+          await fs.promises.unlink(path.join(old, '.gitignore'));
+          await fs.promises.rmdir(old);
+        }
+      } catch {}
+    }
+    if (moved) {
+      this.log?.(`moved ${moved} file(s) of ${path.basename(root)}'s chats and memory from ${old} to ${dest}`
+        + (left.length ? `; ${left.length} could not be moved and are still there` : ''));
+      vscode.window.showInformationMessage(`Navy moved ${path.basename(root)}'s chats and memory out of the project, to ${dest}. `
+        + 'Navy no longer keeps anything of its own inside your projects.');
+    }
   }
 
   // Refreshes the webview from the ACTIVE session's already-in-memory state.
@@ -3195,7 +3333,7 @@ class NavyCoderViewProvider {
     let lastUsedModel = model;
 
     // Map thinking level to temperature.
-    const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7 };
+    const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7, xhigh: 0.7, max: 0.7 };
     const temperature = tempByLevel[this.thinkingLevel] ?? config.get('temperature', 0.2);
     const maxIterations = config.get('maxToolIterations', 100);
     const maxContextChars = config.get('maxContextChars', 12000);
@@ -6844,14 +6982,26 @@ ${task.trim()}`;
   async exportConversation(conversationText) {
     const text = conversationText || await this._exportMarkdown();
     const defaultName = `navy-chat-${new Date().toISOString().slice(0, 10)}.md`;
-    const defaultDir = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    // .navy/exports/ by default. .navy keeps itself out of git, so an export
+    // saved where the dialog first points cannot ride along in a commit. It
+    // used to default to the project root - exactly what `git add -A` sweeps
+    // up, and the file holds the whole conversation, anything pasted into it
+    // included.
+    const navy = this.projectRoot ? await this.ensureNavyDir() : null;
+    const defaultDir = navy ? path.join(navy, 'exports') : os.homedir();
+    if (navy) { try { await vscode.workspace.fs.createDirectory(vscode.Uri.file(defaultDir)); } catch {} }
     const uri = await vscode.window.showSaveDialog({
       defaultUri: vscode.Uri.file(path.join(defaultDir, defaultName)),
       filters: { 'Markdown': ['md'], 'Text': ['txt'] },
     });
     if (!uri) return false;
     await vscode.workspace.fs.writeFile(uri, Buffer.from(text, 'utf8'));
-    vscode.window.showInformationMessage('Conversation exported to ' + path.basename(uri.fsPath));
+    if (await this._gitWouldCommit(uri.fsPath)) {
+      vscode.window.showWarningMessage(`Navy: exported to ${path.basename(uri.fsPath)}, which is inside your git repository and not ignored - `
+        + 'your next commit would include the whole conversation. Move it into .navy/exports/, or add it to .gitignore.');
+    } else {
+      vscode.window.showInformationMessage('Conversation exported to ' + path.basename(uri.fsPath));
+    }
     return true;
   }
 
@@ -7226,20 +7376,6 @@ function documentEligibleForCompletion(document, folderPaths) {
   return rootBelongsToWorkspace(fsPath, folderPaths);
 }
 
-// A model given both prefix and suffix context (FIM) sometimes "overshoots"
-// and echoes part of the suffix back at the end of its completion instead of
-// stopping right before it. Trims the longest matching overlap between the
-// end of `completion` and the start of `suffix`, so that text isn't inserted
-// twice. Pure — greedy longest-match, capped so it can't scan huge strings.
-function stripSuffixOverlap(completion, suffix) {
-  if (!completion || !suffix) return completion;
-  const maxCheck = Math.min(completion.length, suffix.length, 200);
-  for (let n = maxCheck; n > 0; n--) {
-    if (completion.slice(-n) === suffix.slice(0, n)) return completion.slice(0, -n);
-  }
-  return completion;
-}
-
 function activate(context) {
   const proposedProvider = new NavyProposedContentProvider();
   context.__navyProposedProvider = proposedProvider;
@@ -7288,103 +7424,37 @@ function activate(context) {
   context.subscriptions.push(statusBar);
   provider.statusBarItem = statusBar;
 
-  // Inline ghost-text completions — routes to the active provider (or the
-  // separate, faster navy.completionModel if set) with debounce.
-  let _inlineReqId = 0;
-  const inlineCompletionProvider = {
-    async provideInlineCompletionItems(document, position, _ctx, token) {
-      const config = vscode.workspace.getConfiguration('navy');
-      if (!config.get('inlineCompletions', false)) return [];
-      if (!workspaceIsTrusted()) return [];
-      // Registered on '**', so this is where scope is actually enforced: only
-      // real files inside the workspace, never credential-shaped ones.
-      const folderPaths = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
-      if (!documentEligibleForCompletion(document, folderPaths)) return [];
-      // A separate model exists specifically so completions (which need low
-      // latency) don't have to share a slow/large chat model just because
-      // that's what navy.model is set to.
-      const model = config.get('completionModel', '').trim() || config.get('model', '');
-      if (!model) return [];
-
-      const reqId = ++_inlineReqId;
-      await new Promise(r => setTimeout(r, 350));
-      if (reqId !== _inlineReqId || token.isCancellationRequested) return [];
-
-      const startLine = Math.max(0, position.line - 20);
-      const prefix = document.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
-      if (!prefix.trim()) return [];
-      // Fill-in-middle context: code AFTER the cursor. Without this the model
-      // has no idea a closing brace/return/next statement is right there and
-      // routinely duplicates or contradicts it — this matters most for
-      // completions requested mid-function, the common case while editing.
-      const endLine = Math.min(document.lineCount, position.line + 20);
-      const suffix = document.getText(new vscode.Range(position, new vscode.Position(endLine, 0))).slice(0, 2000);
-
-      const aiProvider = config.get('provider', 'ollama');
-      const host       = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
-      const apiBase    = config.get('apiBase', '');
-      const apiKey     = await provider.context.secrets.get('navy.apiKey.' + aiProvider)
-                       || await provider.context.secrets.get('navy.apiKey') || '';
-
-      const ctrl = new AbortController();
-      token.onCancellationRequested(() => ctrl.abort());
-
-      try {
-        let completion = '';
-
-        if (aiProvider === 'ollama') {
-          // Ollama's /api/generate has native FIM support via `suffix` for
-          // FIM-capable models (qwen2.5-coder, deepseek-coder, codegemma, …).
-          const res = await fetch(provider._ollamaBase() + '/api/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...ollamaAuthHeaders(apiKey) },
-            body: JSON.stringify({ model, prompt: prefix, suffix, stream: false,
-              options: { temperature: 0.05, num_predict: 80, stop: ['\n\n', '```', '\nfunction ', '\nclass ', '\ndef '] } }),
-            signal: ctrl.signal,
-          });
-          if (!res.ok) return [];
-          const data = await res.json();
-          completion = (data.response || '').trimEnd();
-
-        } else if (aiProvider === 'anthropic') {
-          const baseUrl = apiBase || ANTHROPIC_BASE;
-          const res = await fetch(baseUrl + '/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey,
-              'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model, max_tokens: 80, temperature: 0.05,
-              system: 'You are a code completion engine filling in the gap between CODE BEFORE and CODE AFTER. Output ONLY the missing middle — no explanation, no markdown fences, and do NOT repeat any part of CODE AFTER.',
-              messages: [{ role: 'user', content: `CODE BEFORE:\n${prefix}\n\nCODE AFTER:\n${suffix}` }] }),
-            signal: ctrl.signal,
-          });
-          if (!res.ok) return [];
-          const data = await res.json();
-          completion = stripSuffixOverlap((data.content?.[0]?.text || '').trimEnd(), suffix);
-
-        } else {
-          const base = openAiCompatBase(aiProvider, apiBase, host) || host;
-          const headers = { 'Content-Type': 'application/json' };
-          if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-          const res = await fetch(base + '/chat/completions', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ model, max_tokens: 80, temperature: 0.05,
-              messages: [
-                { role: 'system', content: 'You are a code completion engine filling in the gap between CODE BEFORE and CODE AFTER. Output ONLY the missing middle — no explanation, no markdown fences, no repeating CODE BEFORE, and do NOT repeat any part of CODE AFTER.' },
-                { role: 'user', content: `CODE BEFORE:\n${prefix}\n\nCODE AFTER:\n${suffix}` },
-              ] }),
-            signal: ctrl.signal,
-          });
-          if (!res.ok) return [];
-          const data = await res.json();
-          completion = stripSuffixOverlap((data.choices?.[0]?.message?.content || '').trimEnd(), suffix);
-        }
-
-        if (!completion || token.isCancellationRequested) return [];
-        return [new vscode.InlineCompletionItem(completion, new vscode.Range(position, position))];
-      } catch { return []; }
-    }
+  // Inline ghost-text completions — see src/inline-completions.js.
+  const inlineCompletionProvider = createInlineCompletionProvider({
+    vscode,
+    getConfig: () => vscode.workspace.getConfiguration('navy'),
+    getApiKey: async (id) => await provider.context.secrets.get('navy.apiKey.' + id)
+      || await provider.context.secrets.get('navy.apiKey') || '',
+    ollamaBase: () => provider._ollamaBase(),
+    // Registered on '**', so this is where scope is actually enforced: only
+    // real files inside the workspace, never credential-shaped ones.
+    eligible: (document) => documentEligibleForCompletion(
+      document, (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath)),
+    isTrusted: workspaceIsTrusted,
+    log: (line) => provider.log?.(line),
+  });
+  // A local completion model is loaded before the first keystroke rather than
+  // on it, and again whenever a setting that decides which model it is changes.
+  const warmCompletionModel = () => {
+    const c = vscode.workspace.getConfiguration('navy');
+    if (!c.get('inlineCompletions', false) || c.get('provider', 'ollama') !== 'ollama') return;
+    if (c.get('ollamaMode', 'local') === 'cloud' || !workspaceIsTrusted()) return;
+    const model = c.get('completionModel', '').trim() || c.get('model', '');
+    if (!model) return;
+    provider._ollamaKey()
+      .then(apiKey => warmOllamaModel({ ollamaBase: provider._ollamaBase(), model, apiKey }))
+      .catch(() => {});
   };
+  warmCompletionModel();
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
+    const keys = ['navy.inlineCompletions', 'navy.completionModel', 'navy.model', 'navy.provider', 'navy.host', 'navy.ollamaMode'];
+    if (keys.some(k => e.affectsConfiguration(k))) warmCompletionModel();
+  }));
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('navy-proposed', proposedProvider),
@@ -7445,6 +7515,7 @@ function activate(context) {
     vscode.commands.registerCommand('navy.rewindConversation', () => provider.rewindConversation()),
     vscode.commands.registerCommand('navy.newSlashCommand', () => provider.createSlashCommand()),
     vscode.commands.registerCommand('navy.openSlashCommands', () => provider.openSlashCommandsFolder()),
+    vscode.commands.registerCommand('navy.forgetProjects', () => provider.forgetProjectsFromList()),
     vscode.window.onDidChangeActiveTextEditor(editor => {
       if (editor) provider.applyGutterDecorations(editor);
     }),

@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,508 tests, no network, no API keys
+npm test             # 2,655 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -48,10 +48,12 @@ diff has to stay reviewable.
 
 | Path | Lines | What lives there |
 | --- | ---: | --- |
-| `src/extension.js` | ~7,660 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
+| `src/extension.js` | ~7,730 | The agent loop, the remaining tool implementations, session persistence, and the webview host |
 | `src/commands.js` | ~560 | Command and process execution: WSL detection, the approval prompt, spawn-and-collect, `run_command`, `run_project`, and the background-process tools |
 | `src/trust.js` | ~20 | The one sentence an untrusted workspace refuses with, shared by the two files that need it |
-| `src/retrieval.js` | ~860 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
+| `src/retrieval.js` | ~930 | Lexical + semantic retrieval, the sharded embedding index, the repo map |
+| `src/lexical-index.js` | ~370 | The project index behind `find_relevant_files`: identifier-aware tokens, definitions per language, BM25, and keeping it current |
+| `src/inline-completions.js` | ~280 | Tab-to-accept completions: context, the typing-through cache, per-provider FIM or chat requests, model warm-up |
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
 | `src/sandbox.js` | ~570 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
@@ -61,8 +63,12 @@ diff has to stay reviewable.
 | `src/export.js` | ~170 | The conversation export: each reply with its turn's tool calls and a diff of every file it changed, rebuilt from the saved cards and the undo checkpoints |
 | `src/text-diff.js` | ~120 | Line diffs in `diff -u` form for the export — the same Myers algorithm the webview's diff cards use |
 | `src/transcript-cards.js` | ~150 | The diff, approval, reasoning and audit cards the panel draws from their own messages, recorded into the turn that drew them so a reopened chat shows them |
+| `src/cli.js` | ~350 | The `navy` command line: options, output, exit codes, GitHub annotations (`action.yml` wraps it) |
+| `src/headless.js` | ~380 | Running the extension with no editor: the `vscode` stand-in, the headless context and panel, the read-only guard |
 | `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
+| `src/data-dir.js` | ~40 | Where a project's chats, memory and the rest live: `~/.navy-coder/<project>-<hash>/`, in the profile, never in the project |
+| `src/thinking.js` | ~120 | The five thinking levels, what each provider is sent for them, stepping down when a model refuses one, and the note that says so |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
 | `src/slash-commands.js` | ~290 | Custom slash commands: the markdown format, where they load from, precedence and the trust gate |
 | `src/skills.js` | ~420 | Agent Skills: frontmatter parsing and validation, discovery, the context-budget cap, `activate_skill` |
@@ -184,6 +190,12 @@ Two suites, both run by `npm test`:
   | `suite-a11y.js` | The accessibility audit run inside jsdom, the contrast arithmetic, and the Tab-order analysis |
   | `suite-export.js` | The export's line diffs and its Markdown: tool calls, per-turn diffs, and created, deleted, renamed and hand-edited files |
   | `suite-cards.js` | Saving and redrawing those cards: the recorder and its bounds, then real turns through the real postMessage wrapper, stopped and failed ones included |
+  | `suite-completions.js` | Tab completion: context, the typing-through cache, the request each provider gets, the gates |
+  | `suite-index.js` | The project index: tokens, definitions, BM25 ranking, git listing, watcher updates, a project past the old walk's reach |
+  | `suite-cli.js` | The `navy` command run as its own process: exit codes, JSON, annotations, and the read-only guard against a scripted model (`stub-ollama.js`) |
+  | `suite-projects.js` | Removing projects from the picker's list: what is offered, what changes, and a removal racing a recording |
+  | `suite-datadir.js` | That folder: where it is, that nothing lands in the project, and moving an old project's `.navy` out |
+  | `suite-thinking.js` | Thinking levels: the mapping per provider, a refused level stepping down and being remembered, the setting |
 
   The files sit flat in `test/` rather than in a subdirectory on purpose: every
   suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a
@@ -408,6 +420,21 @@ is to describe the oldest engine Navy runs on, not the newest one available.
 every tinted background resolves to nothing and the panel renders flat — so
 `themeTokenSuite` in `test/webview-run.js` asserts the declared target stays at
 or above 111 for as long as the stylesheet uses `color-mix`.
+
+## The headless command line
+
+`navy` (`src/cli.js`) runs the extension with no editor, through the `vscode`
+stand-in in `src/headless.js`. Two things follow for anyone changing code the
+command line can reach — the audit walk, the turn loop, the tools and
+`/playthrough`:
+
+- **A `vscode` API that code path starts using has to exist in the stand-in.**
+  `suite-cli.js` runs the real command as its own process, so a missing one
+  fails there rather than in someone's pipeline.
+- **A new tool that changes files goes into `WRITE_TOOL_METHODS`.** A headless
+  run is read-only because every tool on that list is replaced with a refusal;
+  a tool that isn't on it would write. The suite checks every name on the list
+  still exists, so a rename can't quietly turn a refusal back into a write.
 
 ## Adding a setting
 

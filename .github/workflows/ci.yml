@@ -38,6 +38,11 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      # Navy's own supply-chain scan, through its own command line. The test
+      # suites and the scanner's rule table hold attack samples on purpose.
+      - name: Supply-chain audit (navy audit)
+        run: node src/cli.js audit --exclude "test/**,src/supply-chain.js"
+
       - name: Build (bundle extension.js)
         run: npm run build
 

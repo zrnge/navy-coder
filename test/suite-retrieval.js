@@ -161,8 +161,8 @@ async function semanticSearchSuite() {
     // Sharded since 0.2.7 — one flat embeddings.json was capped at 24 MB and
     // silently not persisted past it. See embedIndexSuite for the storage
     // itself; this only asserts the end-to-end path really wrote something.
-    const shardDir = path.join(tmp, '.navy', 'embeddings');
-    check('semantic: index actually persisted to .navy/embeddings/',
+    const shardDir = path.join(provider.getNavyDir(tmp), 'embeddings');
+    check('semantic: index actually persisted, to the project\'s folder in the profile',
       fs.existsSync(shardDir) && fs.readdirSync(shardDir).some(n => n.endsWith('.json')),
       fs.existsSync(shardDir) ? fs.readdirSync(shardDir).join(',') : 'no shard dir');
 

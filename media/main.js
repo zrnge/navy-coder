@@ -368,6 +368,13 @@ compactButton?.addEventListener('click', () => {
 });
 
 projectSelect?.addEventListener('change', () => {
+  if (projectSelect.value === '__forget_projects__') {
+    // Opens VS Code's own picker; the dropdown goes straight back to the
+    // project it was showing, and redraws once the list has changed.
+    vscode.postMessage({ type: 'forgetProjects' });
+    projectSelect.value = projectSelect.dataset.lastValue || '';
+    return;
+  }
   if (projectSelect.value === '__add_folder__') {
     vscode.postMessage({ type: 'openFolder' });
     setTimeout(() => {
@@ -1661,6 +1668,12 @@ window.addEventListener('message', (event) => {
   if (message.type === 'auditResult') {
     messagesEl.appendChild(buildAuditCard(message));
     scrollToBottom();
+  }
+
+  // A one-line note from the extension that belongs in the conversation - for
+  // one, that a model doesn't have the thinking level chosen, and which it used.
+  if (message.type === 'systemNotice') {
+    addSystemMessage(String(message.text || ''));
   }
 
   if (message.type === 'planIncomplete') {
@@ -3229,9 +3242,23 @@ function populateProjects(roots, current, catalog) {
   addOption.textContent = '+ Open project...';
   projectSelect.appendChild(addOption);
 
-  // If we just added a folder, re-select the current root
+  // A native dropdown has no room for a remove button on each row, so removal
+  // is one entry that opens a picker for as many as you like. Offered only
+  // when there is something under "Other projects" to remove.
+  if (catalog && catalog.length) {
+    const forgetOption = document.createElement('option');
+    forgetOption.value = '__forget_projects__';
+    forgetOption.textContent = 'Remove projects from this list...';
+    projectSelect.appendChild(forgetOption);
+  }
+
+  // If we just added a folder, re-select the current root. It is also what
+  // the dropdown goes back to when an action entry (open, remove, a project
+  // from another window) is picked and then cancelled - remembered here, not
+  // only on a manual change, or it went back to blank.
   if (current) {
     projectSelect.value = current;
+    projectSelect.dataset.lastValue = current;
   }
 }
 

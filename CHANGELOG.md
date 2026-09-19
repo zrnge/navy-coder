@@ -1,5 +1,129 @@
 # Changelog
 
+## [Unreleased] - 0.3.6
+
+Faster tab completion, retrieval that covers a whole large codebase, and
+`/audit` and `/playthrough` in CI.
+
+### Added
+
+- **`navy`, a command line for CI.** `navy audit` and `navy playthrough` run
+  headless, with no editor, and exit with a code a pipeline can act on: 0
+  passed, 1 something at or above `--fail-on`, 2 the run could not finish.
+  `navy audit` is the same deterministic scan as `/audit` and needs no model; in
+  GitHub Actions each finding becomes an annotation on its file, `--json`
+  prints the findings for other tools, and `--exclude` leaves out paths that
+  hold attack samples on purpose. `navy playthrough` drives headless Chrome
+  through the same turn loop as the panel, and the model ends its report with a
+  `NAVY-RESULT` line of counts by severity that decides the exit code. A GitHub
+  Action (`uses: zrnge/navy-coder@v0.3.6`) wraps both, and Navy's own CI now
+  runs `navy audit` on itself.
+
+  The extension runs unchanged. Its one link to the editor is
+  `require('vscode')`, which the command line answers with a stand-in built
+  from package.json's own setting defaults, the options and the environment;
+  with no runtime dependencies, that runs straight from a checkout. A headless
+  run is read-only by construction: the tools that change files are replaced
+  with a refusal before the model sees them, and commands are refused unless
+  `--allow-commands` is given - except `/playthrough`'s own browser.
+
+- **A project index behind `find_relevant_files`.** The walk it replaces read
+  files in directory order until it had seen 1,500, and re-read them all for
+  every query, so on a large repository most files were never considered. The
+  index covers every source file; it is built in the background on first use
+  and kept current from the file watcher, with a re-check every five minutes
+  for changes no watcher saw. It ranks with BM25 - a rare identifier outweighs
+  a word every file uses, and a match in the path or on a line that defines the
+  term counts for more - and each hit names the line that defines what was
+  asked about. On a 7,400-file codebase (this repository's own dependencies),
+  for 200 plain-word queries such as "parse user token", it put the file
+  defining the function first 59.5% of the time and in the top five 86.5%,
+  against 3.0% and 5.5% for the walk - at about a millisecond a query instead
+  of 1.8 seconds. It stays on the machine and in memory, at about two bytes per
+  byte of source, capped near 130 MB. Files are listed through git where that
+  is safe: only in a trusted workspace, and with `core.fsmonitor` off, because
+  a repository's own git config can name a program for git to run.
+
+- **Projects can be removed from the picker's list.** "Other projects" only
+  ever grew: a project stayed on it until its folder was deleted. The picker now
+  ends with **Remove projects from this list...**, which opens a picker for
+  choosing as many as you like (also *Navy Coder: Remove Projects from List...*
+  in the Command Palette). Only the list changes - the folders, their chats and
+  their settings are left alone, and opening a project again adds it back.
+  Projects open in the window aren't offered, since using one would add it
+  straight back. The dropdown also goes back to the current project when an
+  action in it is cancelled; before, that could leave it blank.
+
+- **Extra high and Max thinking.** Navy had three thinking levels - Fast,
+  Medium, High - while newer models reason deeper than "high": Claude's effort
+  goes to `xhigh` on Opus 4.7 and later and `max` on Opus 4.6 and later, and
+  OpenAI's `reasoning_effort` to `xhigh` on its GPT-5 reasoning models (and
+  `max` on some). The picker now has **X-High** and **Max**, and each provider
+  is sent the nearest level it has: Claude's effort and OpenAI's
+  reasoning_effort by name, Gemini 3 its deepest `thinkingLevel`, Gemini 2.5 a
+  bigger thinking budget, Ollama's gpt-oss `high`. A model that turns a level
+  down is asked again one step lower - Max, then Extra high, then High - and
+  the level that worked is remembered for that model for the rest of the
+  session, so later requests don't fail first; the chat says once which level
+  was actually used. The deep levels also get the output room their thinking
+  needs - thinking counts against the output cap, and at 16k it would crowd out
+  the answer - with the usual cap as the fallback for a backend that refuses
+  the larger one.
+
+  Along the way: GPT-5 reasoning models now get `reasoning_effort` and no
+  `temperature`, as the o-series already did; Ollama's gpt-oss is sent a level
+  rather than on/off, which it ignored, so its thinking level had never
+  changed anything; Gemini 3 gets its own `thinkingLevel` rather than a 2.5-style
+  budget; and a Claude model found to want the adaptive thinking shape is sent
+  it from then on, instead of a legacy request it refuses first every time.
+
+### Changed
+
+- **Navy keeps nothing of its own in your projects.** Chats and their undo
+  history, memory, the embedding index, background-process logs, visual
+  baselines and exports used to live in `<project>/.navy`, kept out of git by a
+  `.gitignore` there - which protects against git and nothing else. A Docker
+  build that copies the project, a zip, a deploy tool or a packager that
+  ignores nested ignore files took the whole chat history with it, anything
+  pasted into it included. They now live in your profile, at
+  `~/.navy-coder/<project>-<hash>/`: the name, plus a short hash of the full
+  path so two projects called `app` don't share a history, and a
+  `project.json` in each saying which project it is. Only what is meant to be
+  shared stays in the project - slash commands and skills in `.navy/commands/`
+  and `.navy/skills/` - and Navy no longer creates a `.navy` folder at all
+  unless you add one of those. A project's existing `.navy` is moved out the
+  first time Navy opens it: nothing already in the profile is overwritten, a
+  file that can't be moved (a log a running process holds open) is left where
+  it was, and Navy's own `.gitignore` goes with the folder once nothing of
+  Navy's is left in it.
+
+- **Export Conversation no longer offers to save into the project root.** The
+  default was the project folder itself, where `git add -A` picks the file up
+  with everything else, and a transcript holds the whole conversation. It now
+  defaults to the project's folder in the profile, and if you do save it
+  somewhere git would commit it, Navy says so.
+
+- **Tab completion is faster, and asks for less.** Typing through a suggestion
+  costs no request: recent suggestions are kept and replayed as you type the
+  characters they predicted. With code to the right of the cursor, only the
+  rest of that line is asked for - shorter to generate, and it cannot run over
+  what follows. DeepSeek gets its real fill-in-the-middle endpoint
+  (`/beta/completions`), as Ollama already did, and falls back to chat for a
+  model that refuses it. A local Ollama completion model is loaded before the
+  first keystroke and kept loaded between pauses; Ollama's own default unloads
+  it after five idle minutes, which cost seconds on the next keystroke. The
+  prompt now names the file, and the wait before asking is 200 ms, down from
+  350. The completion code moved out of `activate()` into
+  `src/inline-completions.js`, where the whole path is tested; before, only two
+  of its helpers were.
+
+- **The README and the marketplace description lead with what Navy is for** -
+  local-first, asks before it acts, zero runtime dependencies, `/audit` and
+  `/playthrough` - and stop underselling it: 15 providers, not 11 (Moonshot,
+  Qwen, MiniMax and MiMo were missing from the table), and three sandbox
+  backends, not two (the WSL container backend was left out, and Docker called
+  the only option on Windows).
+
 ## [0.3.5] - 2026-09-15
 
 Accessibility and visual regression for `/playthrough`, a safety catch on

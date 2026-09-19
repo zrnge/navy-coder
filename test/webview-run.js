@@ -830,6 +830,41 @@ function bubbleSuite() {
     compactNotices.length === 1 && /3 earlier messages/.test(compactNotices[0].textContent),
     compactNotices.map(n => n.textContent).join(' | '));
   w7.close();
+
+  // 0.3.6: a remembered project can be taken off the list.
+  const projectsMsg = (catalog) => ({ type: 'workspaceFolders', roots: ['/work/app'], current: '/work/app', catalog });
+  const wp = run([projectsMsg([{ path: '/old/site', name: 'site' }, { path: '/old/tool', name: 'tool' }])]);
+  const select = wp.document.querySelector('#projectSelect');
+  const values = [...select.options].map(o => o.value);
+  check('projects: with other projects listed, the picker offers to remove some',
+    values[values.length - 1] === '__forget_projects__' && values[values.length - 2] === '__add_folder__'
+    && /Remove projects from this list/.test(select.options[select.options.length - 1].textContent), JSON.stringify(values));
+  select.value = '__forget_projects__';
+  select.dispatchEvent(new wp.window.Event('change'));
+  check('projects: choosing it asks the extension, and the picker goes back to the current project',
+    wp.sent.some(m => m.type === 'forgetProjects') && select.value === '/work/app', select.value);
+  // What a cancelled "+ Open project..." falls back to: remembered when the
+  // picker is drawn, not only after a manual change - or it fell back to blank.
+  check('projects: the picker remembers the current project as the one to go back to',
+    select.dataset.lastValue === '/work/app', JSON.stringify(select.dataset.lastValue));
+  wp.close();
+  const wq = run([projectsMsg([])]);
+  check('projects: with nothing else remembered, there is nothing to offer removing',
+    ![...wq.document.querySelector('#projectSelect').options].some(o => o.value === '__forget_projects__'));
+  wq.close();
+
+  // 0.3.6: two deeper thinking levels, and the note when a model lacks one.
+  const wThink = run([{ type: 'systemNotice', text: 'claude-opus-4-6 doesn\'t offer Extra high thinking, so Navy used High - the deepest it has.' }]);
+  const thinkLevels = [...wThink.document.querySelector('#thinkingLevelSelect').options].map(o => o.value);
+  check('thinking: the picker offers all five levels, deepest last',
+    JSON.stringify(thinkLevels) === '["fast","medium","high","xhigh","max"]', JSON.stringify(thinkLevels));
+  check('thinking: a note that a model lacks a level shows in the conversation',
+    [...wThink.document.querySelectorAll('.system-notice')].some(n => /doesn't offer Extra high thinking/.test(n.textContent)));
+  const thinkPick = wThink.document.querySelector('#thinkingLevelSelect');
+  thinkPick.value = 'max';
+  thinkPick.dispatchEvent(new wThink.window.Event('change'));
+  check('thinking: choosing Max tells the extension', wThink.sent.some(m => m.type === 'setThinkingLevel' && m.level === 'max'));
+  wThink.close();
 }
 
 // ── Syntax highlighting in code cards ───────────────────────────────────────

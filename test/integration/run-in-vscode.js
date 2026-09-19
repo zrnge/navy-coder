@@ -6,9 +6,16 @@
 // be hostile. `npm run test:vscode` runs it on demand; CI runs it on both
 // Linux and Windows alongside the fast suites.
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { runTests } = require('@vscode/test-electron');
+
+// Navy keeps each project's chats and memory in the profile
+// (~/.navy-coder/...). NAVY_HOME points that at a throwaway folder for the
+// run, so testing never adds a folder to the real one.
+const navyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-vscode-home-'));
 
 // VS Code's integrated terminal and its extension host both export
 // ELECTRON_RUN_AS_NODE=1. Inherited by the child, it makes the VS Code we just
@@ -38,10 +45,13 @@ delete process.env.ELECTRON_RUN_AS_NODE;
         '--disable-extensions',
         '--disable-gpu',
       ],
+      extensionTestsEnv: { NAVY_HOME: navyHome },
     });
   } catch (err) {
     console.error('\nIntegration run failed.');
     console.error(err?.message || err);
-    process.exit(1);
+    process.exitCode = 1;
+  } finally {
+    try { fs.rmSync(navyHome, { recursive: true, force: true }); } catch { /* temp dir */ }
   }
 })();

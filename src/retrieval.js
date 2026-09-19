@@ -17,6 +17,7 @@ const os = require('os');
 const { getEmbeddings, cosineSimilarity } = require('./providers/embeddings.js');
 const { fold, foldPath } = require('./paths.js');
 const { workspaceIsTrusted } = require('./workspace.js');
+const { createIndexEntry, buildLexicalIndex, refreshLexicalIndex } = require('./lexical-index.js');
 
 // ── Semantic index storage ──────────────────────────────────────────────────
 // The index used to be one flat `.navy/embeddings.json` with a 24 MB ceiling,
@@ -705,6 +706,57 @@ class RetrievalMethods {
     } catch { return ''; }
   }
 
+  // ── The project index ──────────────────────────────────────────────────────
+  // The whole-project lexical index for `root` (src/lexical-index.js). Built in
+  // the background on first use; a query that arrives while that first build is
+  // still running past `waitMs` gets null and uses the bounded walk instead of
+  // waiting. The three most recently used projects keep their index.
+  async _lexicalIndexFor(root, { waitMs = 8000 } = {}) {
+    if (!this._lexicalIndexes) this._lexicalIndexes = new Map();
+    const opts = { trusted: workspaceIsTrusted(), skipDirs: RELEVANCE_SKIP_DIRS, exts: RELEVANCE_CODE_EXTS };
+    let entry = this._lexicalIndexes.get(root);
+    if (entry) {
+      this._lexicalIndexes.delete(root);
+      this._lexicalIndexes.set(root, entry); // most recently used goes last
+    } else {
+      entry = createIndexEntry(root);
+      this._lexicalIndexes.set(root, entry);
+      while (this._lexicalIndexes.size > 3) this._lexicalIndexes.delete(this._lexicalIndexes.keys().next().value);
+      const started = Date.now();
+      entry.building = buildLexicalIndex(entry, opts)
+        .then(() => this.log?.(`project index: ${entry.index.size} files in ${Date.now() - started} ms`
+          + (entry.capped ? ' (stopped at its size limit)' : '')))
+        .catch((e) => {
+          entry.failed = true;
+          this.log?.('project index could not be built, using the bounded walk: ' + e.message);
+        });
+    }
+    if (entry.failed) return null;
+    if (!entry.ready) {
+      let timer;
+      await Promise.race([entry.building, new Promise(r => { timer = setTimeout(r, waitMs); })]);
+      clearTimeout(timer);
+      if (!entry.ready) return null;
+    }
+    // Read-only tools run concurrently, so two queries can arrive together;
+    // they share one refresh rather than each re-reading the same files.
+    if (!entry.refreshing) {
+      entry.refreshing = refreshLexicalIndex(entry, opts).finally(() => { entry.refreshing = null; });
+    }
+    await entry.refreshing;
+    return entry;
+  }
+
+  // The file watcher's change notices (see _invalidatePathCaches), queued for
+  // each index to pick up on its next query.
+  _noteLexicalChange(fsPath) {
+    if (!this._lexicalIndexes || !fsPath) return;
+    for (const [root, entry] of this._lexicalIndexes) {
+      if (!String(fsPath).startsWith(root + path.sep)) continue;
+      entry.dirty.add(path.relative(root, fsPath).replace(/\\/g, '/'));
+    }
+  }
+
   async toolFindRelevantFiles(query, maxResults = 8, folder) {
     const resolved = this._resolveTargetFolder(folder);
     if (resolved.error) return resolved.error;
@@ -712,8 +764,27 @@ class RetrievalMethods {
     if (!root) return 'No workspace open.';
     const terms = this._tokenizeQuery(query);
     if (!terms.length) return 'Give a more specific query — identifiers, symbol names, or distinctive keywords.';
-    const hits = await this._collectRelevance(root, terms);
-    let ranked = this._rankRelevance(hits, terms);
+    // The project index when it is ready - every source file, BM25-ranked -
+    // and the bounded walk when it is not: still building, or unable to build.
+    let ranked;
+    let coverage = '';
+    const entry = await this._lexicalIndexFor(root).catch(() => null);
+    if (entry) {
+      const found = entry.index.search(terms, { limit: 60 });
+      // Scaled so the best match scores 60: the LSP and semantic bonuses below
+      // were sized against the walk's scores, and still have to mean something.
+      const top = found.length ? found[0].score : 1;
+      ranked = found.map(h => ({ ...h, score: Math.max(1, Math.round(60 * h.score / top)) }));
+      coverage = ` — searched all ${entry.index.size.toLocaleString('en-US')} source files`
+        + (entry.capped ? ' the index holds (it stopped at its size limit)' : '');
+    } else {
+      const hits = await this._collectRelevance(root, terms);
+      ranked = this._rankRelevance(hits, terms);
+      const building = this._lexicalIndexes?.get(root);
+      if (building && !building.ready && !building.failed) {
+        coverage = ' — the project index is still being built, so this searched at most 1,500 files';
+      }
+    }
 
     // Real LSP symbol matches are a stronger "this file defines something
     // you asked about" signal than the regex-based `defs` guess above —
@@ -745,10 +816,11 @@ class RetrievalMethods {
 
     ranked = ranked.slice(0, Math.max(1, Math.min(maxResults || 8, 25)));
     if (!ranked.length) return `No files matched: ${terms.map(t => t.term).join(', ')}`;
-    const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}${usedSemantic ? ' (keyword + semantic)' : ''}\n`;
+    const header = `Ranked by relevance to: ${terms.map(t => t.term).join(', ')}${usedSemantic ? ' (keyword + semantic)' : ''}${coverage}\n`;
     return header + ranked.map(h => {
       const semanticNote = h.semantic ? ', semantic-match' + (h.semanticRange ? ` at lines ${h.semanticRange.startLine}-${h.semanticRange.endLine}` : '') : '';
-      return `${h.rel}  [score ${h.score}${h.defs ? ', defines' : ''}${h.inName ? ', name-match' : ''}${h.lspMatch ? ', LSP-defines' : ''}${semanticNote}; matched: ${h.matched.join(', ') || '—'}]`;
+      const defines = h.defs ? (h.defLine ? `, defines ${h.defName} at line ${h.defLine}` : ', defines') : '';
+      return `${h.rel}  [score ${h.score}${defines}${h.inName ? ', name-match' : ''}${h.lspMatch ? ', LSP-defines' : ''}${semanticNote}; matched: ${h.matched.join(', ') || '—'}]`;
     }).join('\n');
   }
 

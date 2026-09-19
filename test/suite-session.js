@@ -147,7 +147,7 @@ async function sessionIsolationSuite() {
     let dirC;
     try {
       dirC = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-sessC-'));
-      const chatsDir = path.join(dirC, '.navy', 'chats');
+      const chatsDir = path.join(provider.getNavyDir(dirC), 'chats');
       fs.mkdirSync(chatsDir, { recursive: true });
       const ids = ['chat1', 'chat2', 'chat3'];
       for (const id of ids) {
@@ -1235,7 +1235,7 @@ async function chatPersistenceSuite() {
     provider.projectRoot = tmp;
     provider.view = { webview: { postMessage: () => {} } };
 
-    const chatFile = () => path.join(tmp, '.navy', 'chats', provider._session.id + '.json');
+    const chatFile = () => path.join(provider.getNavyDir(tmp), 'chats', provider._session.id + '.json');
     const readChat = () => JSON.parse(fs.readFileSync(chatFile(), 'utf8'));
 
     provider.messages.push({ role: 'user', text: 'first' });

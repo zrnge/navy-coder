@@ -147,7 +147,7 @@ console.log('\nfenced-code regex safety:');
 // ── 1b. stripSuffixOverlap (inline FIM completion dedup) ─────────────────────
 console.log('\nstripSuffixOverlap:');
 {
-  const stripSuffixOverlap = eval('(' + extractFunction(extSrc, 'function stripSuffixOverlap') + ')');
+  const { stripSuffixOverlap } = require('../src/inline-completions.js');
   check('trims a completion that echoes the start of the suffix',
     stripSuffixOverlap('return x;\n}', '\n}\n\nfunction next(){}') === 'return x;');
   check('leaves a completion with no overlap untouched',

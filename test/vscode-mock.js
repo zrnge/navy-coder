@@ -35,6 +35,8 @@ function createVscodeMock() {
     nextInfo: undefined,              // value the next showInformationMessage resolves to (modal choices)
     nextRename: null,                 // [{ fsPath, newText }] the fake rename provider returns
     nextOpenDialog: null,             // [fsPath] the next showOpenDialog returns, or null for cancel
+    nextQuickPick: undefined,         // what the next showQuickPick resolves to, or a function (items) => answer
+    quickPickCalls: [],               // [{ items, options }] — every showQuickPick call
     nextWorkspaceSymbols: null,       // [{ name, location: { uri: { fsPath }, range } }] the fake symbol provider returns
     nextDocumentSymbols: null,        // [{name,kind}] for every file, or a Map<fsPath, [...]> for per-file control
     executedCommands: [],             // [{ command, args }] — lets tests assert vscode.openFolder etc.
@@ -45,6 +47,7 @@ function createVscodeMock() {
     reset() {
       this.nextWarning = undefined; this.nextSaveUri = undefined; this.nextInfo = undefined; this.nextRename = null;
       this.nextOpenDialog = null; this.applyEditFails = false;
+      this.nextQuickPick = undefined; this.quickPickCalls = [];
       this.nextWorkspaceSymbols = null;
       this.nextDocumentSymbols = null;
       this.executedCommands = [];
@@ -183,6 +186,11 @@ function createVscodeMock() {
         return ctrl.nextInfo;
       },
       showOpenDialog: async () => (ctrl.nextOpenDialog ? ctrl.nextOpenDialog.map(uri) : undefined),
+      showQuickPick: async (items, options) => {
+        const list = await items;
+        ctrl.quickPickCalls.push({ items: list, options });
+        return typeof ctrl.nextQuickPick === 'function' ? ctrl.nextQuickPick(list) : ctrl.nextQuickPick;
+      },
       showTextDocument: async () => ({ }),
       showErrorMessage: async (msg) => { ctrl.shown.error.push(msg); return undefined; },
       createStatusBarItem: () => ({ show() {}, dispose() {}, text: '', tooltip: '', command: '', name: '' }),

@@ -159,7 +159,7 @@ re-renders constantly can make it loop; stop the turn and give it a narrower
 instruction.
 
 **Where are the visual baselines, and how do I reset one?** In the project's
-`.navy/playthrough/baselines/` - one PNG per site and screen name - or in Navy's
+folder under `~/.navy-coder/`, in `playthrough/baselines/` - one PNG per site and screen name - or in Navy's
 global storage when no folder is open. A local dev server is named without its
 port (`localhost__home.png`), so a server that moves from 5173 to 5174 keeps its
 baselines. Each baseline is the top 1280x800 of the page; anything below that is
@@ -181,6 +181,41 @@ Automated checks find the mechanical problems - missing alt text and labels,
 contrast, keyboard reachability, focus order - but not whether alt text is
 meaningful, whether the reading order makes sense, or how a screen reader really
 announces the page. The report says so itself; a person still has to look.
+
+**Inline completions are slow.** A completion is only as fast as the model
+answering it. Point `navy.completionModel` at a small fill-in-the-middle model,
+such as `qwen2.5-coder:1.5b` on Ollama, rather than letting completions share
+your chat model. A request that took over two seconds is logged in the Output
+panel (View -> Output -> Navy Coder) with the model that took it.
+
+**`find_relevant_files` says the project index is still being built.** The
+first build reads every source file once. On a large repository, or on
+Windows with antivirus scanning each file as it is opened, that can take a
+while, and searches use the old bounded walk until it finishes. After that,
+changes are picked up as they happen.
+
+**`navy playthrough` saves new baselines on every CI run instead of comparing.**
+The baselines folder didn't survive between runs. Point `--baselines` at a
+folder you commit to the repository, or keep it with your CI's cache.
+
+**`navy playthrough` can't start Chrome in a Linux container.** Chrome's
+sandbox needs unprivileged user namespaces, which many container setups don't
+allow - especially running as root - and Navy never passes `--no-sandbox` to
+get around it. GitHub's hosted runners work as they are. In your own
+container, run as a non-root user with user namespaces allowed, and use
+`--chrome` to point at the browser if Navy doesn't find it.
+
+**Where did my chats go after updating?** Out of the project. Since 0.3.6 Navy
+keeps each project's chats, memory and the rest in your profile, at
+`~/.navy-coder/<project>-<hash>/` (each folder's `project.json` says which
+project it belongs to), and a project's old `.navy` folder is moved there the
+first time Navy opens it. Only project slash commands and skills stay in the
+project, because they are meant to be shared.
+
+**I moved or renamed a project folder and its chats are gone.** They are keyed by
+the project's full path, so the moved project starts a new folder under
+`~/.navy-coder/`. Copy the contents of the old one - find it by its
+`project.json` - into the new one, with VS Code closed.
 
 ## The panel is stuck "thinking"
 

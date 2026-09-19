@@ -1,5 +1,7 @@
 const { TOOLS_API, TOOLS } = require('./tools.js');
 const { openAiCompatBase, ollamaHost, ollamaAuthHeaders, ANTHROPIC_BASE, GEMINI_NATIVE_BASE } = require('./endpoints.js');
+// Navy's five thinking levels and what each provider is sent for them.
+const thinking = require('../thinking.js');
 const vscode = require('vscode');
 const https = require('https');
 
@@ -123,10 +125,14 @@ async function fetchWithRetry(url, init) {
     };
     // Toggle native thinking for model families that support it. Only sent when the
     // name matches — Ollama 400s if `think` is passed to a non-thinking model.
-    if (/(qwen3|deepseek-r1|gpt-oss|magistral|smallthinker|exaone-deep|phi4-reasoning)/i.test(model)) {
-      const level = provider.thinkingLevel || 'medium';
-      if (level === 'high') ollamaBody.think = true;
-      else if (level === 'fast') ollamaBody.think = false;
+    // gpt-oss takes a level and ignores true/false; the others take on or off.
+    {
+      const asked = thinking.normalizeThinkingLevel(provider.thinkingLevel);
+      const { think, used } = thinking.ollamaThink(model, asked);
+      if (think !== undefined) {
+        ollamaBody.think = think;
+        thinking.noteThinkingLimit(provider, model, asked, used);
+      }
     }
 
     // Ollama Cloud serves this exact endpoint at ollama.com with a bearer
@@ -311,16 +317,26 @@ async function fetchWithRetry(url, init) {
     }));
 
     // Older model generations cap max_tokens lower — exceeding the cap is a 400 error.
-    const maxTokens = /claude-3-(opus|sonnet|haiku)-/.test(model) ? 4096
+    const baseMaxTokens = /claude-3-(opus|sonnet|haiku)-/.test(model) ? 4096
                     : /claude-3-5-/.test(model) ? 8192
                     : 16384;
-    // High thinking level → Anthropic extended thinking. Temperature must be omitted
+    // High thinking levels → Anthropic extended thinking. Temperature must be omitted
     // (the API requires the default of 1 when thinking is enabled). Claude 3.x
     // generations don't support the thinking parameter — fall back to temperature.
     const supportsThinking = !/claude-3-(opus|sonnet|haiku|5)/.test(model);
-    const thinkingLevel = provider.thinkingLevel || 'medium';
-    const useThinking = supportsThinking && thinkingLevel === 'high';
-    const effortMap = { fast: 'low', medium: 'medium', high: 'high' };
+    const askedLevel = thinking.normalizeThinkingLevel(provider.thinkingLevel);
+    // Starts from the deepest level this model is already known to take; a
+    // level it turns down is asked again one step lower, below.
+    let thinkingLevel = thinking.effectiveLevel(provider, 'anthropic', model, askedLevel);
+    // The legacy shape's fixed thinking budget, per level.
+    const LEGACY_BUDGET = { high: 6000, xhigh: 12000, max: 24000 };
+    // Thinking counts against max_tokens, so the deep levels need much more of
+    // it or the answer is cut off: 32k for the legacy shape (every Claude 4
+    // model takes that), 64k for adaptive (the 4.6+ generations take 128k). A
+    // backend that refuses the larger cap is asked again with the usual one.
+    let capMaxTokens = false;
+    const maxTokensFor = (adaptive) => (capMaxTokens || !supportsThinking || !thinking.isDeep(thinkingLevel))
+      ? baseMaxTokens : (adaptive ? 64000 : 32000);
 
     // Prompt caching: system + tools + newest message become cache breakpoints.
     const cached = applyAnthropicCacheControl(systemText, anthropicTools, mergedMessages);
@@ -334,16 +350,19 @@ async function fetchWithRetry(url, init) {
     const buildBody = (useAdaptive, withCaching) => {
       const b = {
         model,
-        max_tokens: maxTokens,
+        max_tokens: maxTokensFor(useAdaptive),
         stream: true,
         messages: withCaching ? cached.messages : mergedMessages,
         tools: withCaching ? cached.tools : anthropicTools,
       };
+      // A budget must stay under max_tokens, with room left for the answer.
+      const budget = supportsThinking && LEGACY_BUDGET[thinkingLevel]
+        ? Math.min(LEGACY_BUDGET[thinkingLevel], b.max_tokens - 4096) : 0;
       if (useAdaptive) {
         b.thinking = { type: 'adaptive' };
-        b.output_config = { effort: effortMap[thinkingLevel] || 'medium' };
-      } else if (useThinking) {
-        b.thinking = { type: 'enabled', budget_tokens: 6000 };
+        b.output_config = { effort: thinking.effortFor(thinkingLevel) };
+      } else if (budget) {
+        b.thinking = { type: 'enabled', budget_tokens: budget };
       } else {
         b.temperature = temperature;
       }
@@ -369,7 +388,13 @@ async function fetchWithRetry(url, init) {
     const needsAdaptiveRetry = (txt) => /thinking\.type\.enabled|thinking\.type\.adaptive|output_config\.effort|`?temperature`?\s+is deprecated/i.test(txt);
 
     let withCaching = true;
-    let useAdaptive = false;
+    // A model already found to want the adaptive shape gets it from the start,
+    // rather than a legacy request it is known to refuse every time.
+    let useAdaptive = Boolean(provider._anthropicAdaptiveModels && provider._anthropicAdaptiveModels.has(model));
+    const again = async () => {
+      const r = await postAnthropic(buildBody(useAdaptive, withCaching));
+      return { r, t: (r.ok && r.body) ? null : await r.text() };
+    };
     let response = await postAnthropic(buildBody(useAdaptive, withCaching));
     let txt = null;
     if (!response.ok || !response.body) {
@@ -377,19 +402,38 @@ async function fetchWithRetry(url, init) {
 
       if (response.status === 400 && looksLikeCachingIssue(txt) && !needsAdaptiveRetry(txt)) {
         withCaching = false;
-        response = await postAnthropic(buildBody(useAdaptive, withCaching));
-        txt = (response.ok && response.body) ? null : await response.text();
+        ({ r: response, t: txt } = await again());
       }
 
-      if (txt !== null && response.status === 400 && needsAdaptiveRetry(txt)) {
+      if (txt !== null && response.status === 400 && !useAdaptive && needsAdaptiveRetry(txt)) {
         useAdaptive = true;
-        response = await postAnthropic(buildBody(useAdaptive, withCaching));
-        txt = (response.ok && response.body) ? null : await response.text();
+        ({ r: response, t: txt } = await again());
+      }
+
+      // A deep level this model doesn't have - xhigh on Opus 4.6, max on an
+      // older model - is asked again one step lower.
+      while (txt !== null && response.status === 400 && useAdaptive && /effort/i.test(txt) && thinking.stepDown(thinkingLevel)) {
+        thinkingLevel = thinking.stepDown(thinkingLevel);
+        ({ r: response, t: txt } = await again());
+      }
+
+      // A backend that won't take the larger output cap the deep levels ask for.
+      if (txt !== null && response.status === 400 && /max_tokens/i.test(txt) && !capMaxTokens && thinking.isDeep(thinkingLevel)) {
+        capMaxTokens = true;
+        ({ r: response, t: txt } = await again());
       }
 
       if (txt !== null) {
         throw new Error('Anthropic API error ' + response.status + ': ' + txt);
       }
+    }
+    if (useAdaptive) {
+      if (!provider._anthropicAdaptiveModels) provider._anthropicAdaptiveModels = new Set();
+      provider._anthropicAdaptiveModels.add(model);
+    }
+    if (thinkingLevel !== askedLevel) {
+      thinking.rememberCeiling(provider, 'anthropic', model, thinkingLevel);
+      thinking.noteThinkingLimit(provider, model, askedLevel, thinkingLevel);
     }
 
     const reader = response.body.getReader();
@@ -503,24 +547,38 @@ async function fetchWithRetry(url, init) {
     if (!baseUrl.includes('generativelanguage')) {
       body.stream_options = { include_usage: true };
     }
-    // o-series reasoning models reject `temperature` and take `reasoning_effort` instead.
-    if (/^o[0-9]/.test(model)) {
-      const level = provider.thinkingLevel || 'medium';
-      body.reasoning_effort = level === 'high' ? 'high' : level === 'fast' ? 'low' : 'medium';
-    } else {
-      body.temperature = temperature;
-    }
+    // o-series and GPT-5 reasoning models reject `temperature` and take
+    // `reasoning_effort` instead - up to xhigh, and max on some.
+    const reasoning = thinking.isOpenAiReasoningModel(model);
+    const askedLevel = thinking.normalizeThinkingLevel(provider.thinkingLevel);
+    let effortLevel = thinking.effectiveLevel(provider, 'openai', model, askedLevel);
+    if (!reasoning) body.temperature = temperature;
+    const post = () => {
+      if (reasoning) body.reasoning_effort = thinking.effortFor(effortLevel);
+      return fetchWithRetry(baseUrl + '/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: signal || provider.abortController?.signal
+      });
+    };
 
-    const response = await fetchWithRetry(baseUrl + '/chat/completions', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: signal || provider.abortController?.signal
-    });
-
+    let response = await post();
     if (!response.ok || !response.body) {
-      const txt = await response.text();
-      throw new Error('API error ' + response.status + ': ' + txt);
+      let txt = await response.text();
+      // A level this model doesn't have - max on GPT-5.5, xhigh on an older
+      // model - is asked again one step lower.
+      while (reasoning && response.status === 400 && /reasoning[._]?effort/i.test(txt) && thinking.stepDown(effortLevel)) {
+        effortLevel = thinking.stepDown(effortLevel);
+        response = await post();
+        txt = (response.ok && response.body) ? null : await response.text();
+        if (txt === null) break;
+      }
+      if (txt !== null) throw new Error('API error ' + response.status + ': ' + txt);
+    }
+    if (reasoning && effortLevel !== askedLevel) {
+      thinking.rememberCeiling(provider, 'openai', model, effortLevel);
+      thinking.noteThinkingLimit(provider, model, askedLevel, effortLevel);
     }
 
     const reader = response.body.getReader();
@@ -661,15 +719,18 @@ async function fetchWithRetry(url, init) {
         })) }]
       : undefined;
 
-    const useThinking = (provider.thinkingLevel || 'medium') === 'high';
+    // Gemini 3 takes a thinkingLevel whose deepest is "high"; 2.5 a token budget.
+    const askedLevel = thinking.normalizeThinkingLevel(provider.thinkingLevel);
+    const gThink = thinking.geminiThinking(model, askedLevel);
+    thinking.noteThinkingLimit(provider, model, askedLevel, gThink.used);
     const body = {
       contents,
       ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
       ...(geminiTools ? { tools: geminiTools } : {}),
       generationConfig: {
         temperature,
-        maxOutputTokens: 8192,
-        ...(useThinking ? { thinkingConfig: { includeThoughts: true, thinkingBudget: 8000 } } : {}),
+        maxOutputTokens: gThink.maxOutputTokens,
+        ...(gThink.thinkingConfig ? { thinkingConfig: gThink.thinkingConfig } : {}),
       },
     };
 

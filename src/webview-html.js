@@ -483,10 +483,12 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
                  One group, in the empty middle of a row that already existed,
                  reading left to right in the order you would decide them. -->
             <div class="composer-modes">
-              <select id="thinkingLevelSelect" title="Thinking depth" aria-label="Thinking depth" class="select-compact">
+              <select id="thinkingLevelSelect" title="Thinking depth. Extra high and Max reach the deeper levels newer models have; a model without them uses its deepest." aria-label="Thinking depth" class="select-compact">
                 <option value="fast">Fast</option>
                 <option value="medium" selected>Med</option>
                 <option value="high">High</option>
+                <option value="xhigh">X-High</option>
+                <option value="max">Max</option>
               </select>
               <span class="composer-modes-sep" aria-hidden="true"></span>
               <select id="approvalModeSelect" title="Approval for file changes — writes, deletes and renames" aria-label="Approval for file changes" class="select-compact">

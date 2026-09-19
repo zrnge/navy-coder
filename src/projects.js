@@ -171,6 +171,25 @@ const PROJECT_CATALOG_METHODS = {
       });
     });
   },
+
+  // Takes projects off the list, and does nothing else: the folders, their
+  // .navy chats and their settings stay exactly as they are, and a project
+  // opened again later simply comes back. Same lock and same read-modify-write
+  // as _recordProjectUsage, so a removal cannot undo a concurrent recording or
+  // be undone by one. Returns how many entries went.
+  async _forgetProjects(paths) {
+    const drop = new Set((paths || []).filter(p => typeof p === 'string' && p).map(fold));
+    if (!drop.size) return 0;
+    await this._migrateGlobalProjectsOnce();
+    let removed = 0;
+    await this._withGlobalProjectsLock(() => this._rmwJsonFile(this._globalProjectsPath(), [], (list) => {
+      const arr = Array.isArray(list) ? list : [];
+      const next = arr.filter(p => !(p && typeof p.path === 'string' && drop.has(fold(p.path))));
+      removed = arr.length - next.length;
+      return next;
+    }));
+    return removed;
+  },
 };
 
 module.exports = { PROJECT_CATALOG_METHODS };

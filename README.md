@@ -1,6 +1,12 @@
 # Navy AI Coder
 
-**An autonomous AI coding assistant for VS Code.** Navy works with any AI provider — local or cloud — to read your project, edit files, run commands, search the web, and manage dev servers, all with your approval before anything touches disk.
+**The local-first AI coding agent for VS Code that asks before it acts.** Run it on a local model with Ollama or LM Studio, or bring your own key for OpenAI, Anthropic, Gemini, DeepSeek and nine more. There is no Navy account and no telemetry: nothing leaves your machine except what goes to the model you picked. And the extension ships with **zero runtime dependencies**, so installing it adds no npm supply chain of its own.
+
+- **Nothing happens without you** — every file change is a diff you approve, and every command, dev server, MCP call and browser launch asks first, behind a gate of its own. Optional sandboxing (Docker, WSL containers, or the OS's own sandbox) adds a second layer underneath.
+- **`/audit`** scans your own project for what a supply-chain attack actually looks like: install hooks that pipe `curl | sh`, code that reads your SSH or cloud credentials, obfuscated payloads, build files that download and run.
+- **`/playthrough`** tests your web app in a real Chrome the way a human tester would, checks each screen for accessibility problems, and compares it against a saved baseline.
+- **Made for local models too** — a small model gets a reduced tool set, so the tool list doesn't swallow its context window.
+- **In CI as well** — `navy audit` and `navy playthrough` run headless from the command line or as a GitHub Action, with exit codes a pipeline can act on. See [Command line and CI](#command-line-and-ci).
 
 > **Preview release** — core features are stable. Report bugs at [github.com/zrnge/navy-coder/issues](https://github.com/zrnge/navy-coder/issues).
 
@@ -11,16 +17,16 @@
 - **Agentic tool loop** — Navy reads files, searches the codebase, runs commands, and applies edits autonomously until the task is done, remembering what it actually did (files read, commands run and their exit code) across the whole conversation, not just what it said it did
 - **Diff approval gate** — every file change is shown as a side-by-side diff; you approve or reject before it's written
 - **Queue a prompt while Navy works — and take it back** — anything you send during a running turn waits its turn, and its own bubble carries a Cancel button for as long as it is still waiting; cancelling leaves your text in the transcript, marked as never sent, rather than deleting what you wrote or forcing you to Stop the running turn to get rid of it
-- **Multiple projects, multiple chats** — a tab strip holds several conversations per project (a running turn keeps streaming in a background tab while you work in another), and Navy remembers every project you've ever opened in a small catalog (`~/.navy/projects.json`) so you can jump back into one without re-browsing for its folder — picking one offers to replace the current workspace or add it alongside what's already open
-- **11 AI providers** — Ollama, LM Studio, OpenAI, Anthropic Claude, DeepSeek, Google Gemini, xAI Grok, z.ai, Groq, OpenRouter, and any custom OpenAI-compatible endpoint — with a native path for Anthropic extended thinking and Gemini's thinking/tool-call signatures, not just an OpenAI-compatible shim. The model's reasoning is surfaced in a collapsible **Thinking** block — collapsed by default, there when you want it
+- **Multiple projects, multiple chats** — a tab strip holds several conversations per project (a running turn keeps streaming in a background tab while you work in another), and Navy remembers every project you've ever opened in a small catalog (`projects.json`, in VS Code's storage for Navy) so you can jump back into one without re-browsing for its folder — picking one offers to replace the current workspace or add it alongside what's already open
+- **15 AI providers** — Ollama (local, or Ollama Cloud with nothing installed), LM Studio, OpenAI, Anthropic Claude, DeepSeek, Google Gemini, xAI Grok, z.ai, Groq, OpenRouter, Moonshot (Kimi), Alibaba Qwen, MiniMax, Xiaomi MiMo, and any custom OpenAI-compatible endpoint — with a native path for Anthropic extended thinking and Gemini's thinking/tool-call signatures, not just an OpenAI-compatible shim. Five thinking levels, from Fast to Extra high and Max for the models that reason deeper than High — Claude Opus 4.7 and later, OpenAI's GPT-5 reasoning models — each provider sent the nearest level it has. The model's reasoning is surfaced in a collapsible **Thinking** block — collapsed by default, there when you want it
 - **Per-provider API keys** — switch providers without losing other keys; keys live in VS Code's OS keychain, never on disk
 - **Opt-in cross-provider failover** (`navy.providerFallbacks`) — an ordered list of backup providers Navy falls through to on a genuinely transient failure (rate limit, outage, network error) — never for an auth/quota/context-length problem, and every fallback attempt is announced in the chat before it runs
 - **Running cost estimate** — a cumulative token counter with an approximate $ cost for well-known hosted models, priced per turn using whichever provider actually served it; local models always show $0, and `navy.modelPricing` prices anything the built-in table has never heard of rather than making you wait for a release
 - **A search that admits when it is degraded** — `search_files` uses VS Code's bundled ripgrep when it can find it. When it can't, the JavaScript fallback labels every answer it gives, because "No matches" from a bounded walk reads exactly like "No matches" from a full-tree search — and the model would otherwise conclude the string is absent and reason from that
-- **Deep retrieval** — `find_relevant_files` blends keyword search with semantic embeddings (chunked per-file, not truncated to the first slice) and real LSP symbol matches, and the repository map the model sees is enriched with a one-line function/class outline per file, not just a bare file tree
+- **Retrieval that scales to large codebases** — `find_relevant_files` ranks every source file in the project from a local index: BM25, so a rare identifier outweighs a word every file uses; built in the background and kept current as files change; and each hit names the line that defines what was asked about. On a 7,400-file codebase it put the defining file first for 59.5% of plain-word queries and in the top five for 86.5%, against 3% and 5.5% for the bounded walk it replaced, at about a millisecond a query. Semantic embeddings (chunked per file) and real LSP symbol matches blend in on top, and the repository map the model sees carries a one-line function/class outline per file
 - **Reduced tool set for small models** (`navy.reducedToolset`) — the full ~37 tool schemas ride on every request, which is a real tax on a 7B local model's context and measurably worsens its tool choice; a small local model (Ollama/LM Studio, ≤9B-named or ≤16k effective window) is instead offered a lean core covering read → edit → verify, and unlocks the full set mid-turn with one `request_more_tools` call when the task needs it — a context optimization, never a permission change
 - **`delegate_research`** — the model can spin off an isolated, read-only sub-agent for a broad investigation, getting back only the written conclusion instead of filling the main conversation with every file it looked at
-- **Opt-in sandboxing, two backends** (`navy.sandboxMode`) — a second layer of isolation under the approval gate. `docker` runs commands inside a container built from the project's own `.devcontainer`/`Dockerfile` (strongest, and the only option on Windows). `native` uses the OS's own sandbox with nothing to install — `sandbox-exec` on macOS, `bubblewrap` on Linux — confining writes to the project and temp, and blocking reads of SSH and cloud credential stores. Neither ever falls back to running unsandboxed: if it can't proceed it refuses and says why. The network is not restricted under `native` — see [Safety](#safety)
+- **Opt-in sandboxing, three backends** (`navy.sandboxMode`) — a second layer of isolation under the approval gate. `docker` runs commands inside a container built from the project's own `.devcontainer`/`Dockerfile` (or `navy.sandboxImage`), on any OS. `wsl` gives Windows the same container isolation through WSL Containers (`wslc`), with no Docker Desktop (needs WSL 2.9.3+). `native` uses the OS's own sandbox with nothing to install — `sandbox-exec` on macOS, `bubblewrap` on Linux — confining writes to the project and temp, and blocking reads of SSH and cloud credential stores. None of them ever falls back to running unsandboxed: if it can't proceed it refuses and says why. The network is not restricted under `native` — see [Safety](#safety)
 - **Opt-in persistent background processes** (`navy.persistBackgroundProcesses`) — let a dev server survive a window reload instead of being killed, with its output logged to a file and Navy offering to stop it if you reopen the project with one still running
 - **MCP servers: tools, resources and prompts** — plug in any Model Context Protocol server, local (stdio) or remote (streamable HTTP), same config format as Claude Desktop (`navy.mcpServers`). A server's **tools** become tools the model can call; its **resources** are reachable through `list_mcp_resources` and `read_mcp_resource` (two tools between all of them, because a server can expose hundreds and one schema each would cost more context than the data is worth); its **prompts** become slash commands — `/mcp:<server>:<prompt>` — because a prompt is a template *you* invoke, not something to hand the model. All three are capability-gated: a server that doesn't declare resources is never asked for them, and the resource tools aren't offered to the model unless something has some. Remote servers currently authenticate with a static header only — OAuth is not implemented
 - **Prompt caching on Claude** — repeated agent steps reuse the cached prefix: several times cheaper and faster
@@ -33,7 +39,7 @@
 - **Multi-root workspace aware** — search and file tools can target a sibling folder explicitly in a multi-root workspace, not just the active project root
 - **Rename & delete are undoable** — transactional undo/redo across edits, renames, and file deletions; structural `rename_symbol` uses the real language server when one's available
 - **Rewind the conversation, not just the files** — click **Edit** under any message you sent (or run *Navy Coder: Rewind Conversation*) to put the chat back to just before you asked it. Undoing a bad turn's files was never the whole problem: the model still held every wrong assumption that produced them, including its own account of edits you had just reverted, and the next turn built on it. Rewinding discards those turns, restores the session digest to what it was, and offers to undo the files those turns changed — that part is redoable, the transcript is not, and the confirmation says so
-- **Inline completions** — ghost-text suggestions as you type (opt-in, can use a separate faster model via `navy.completionModel`), with real fill-in-middle context from both sides of the cursor
+- **Inline completions** — ghost-text suggestions as you type (opt-in; `navy.completionModel` can point at a small, fast model). Typing through a suggestion costs no request at all; with code to the right of the cursor only the rest of the line is asked for; Ollama and DeepSeek get real fill-in-the-middle requests; and a local completion model is loaded before your first keystroke and kept loaded between pauses
 - **Code Lens** — "Ask Navy" buttons above functions in the editor
 - **Read aloud & dictation** — a speaker button reads any message out as prose (not punctuation), and a microphone button transcribes speech into the prompt box, where you review and send it yourself. VS Code webviews cannot reach the microphone ([microsoft/vscode#250568](https://github.com/microsoft/vscode/issues/250568)), so dictation runs in your browser via a token-gated loopback page and streams the words back — see [Privacy](#privacy)
 - **`/audit` — a supply-chain scan of your own project** — run it any time to check the repository for the things a supply-chain attack actually looks like: a `postinstall` hook that pipes `curl | sh`, a dependency resolved from a git URL instead of the registry, code that reads `~/.ssh` or `~/.aws/credentials`, an `eval(atob(...))` payload, a `fetch` to a hardcoded external host. It covers compiled languages too — C, C++, Java, C#, Swift — with rules for their own constructs (`system()`/`popen()` on a runtime value, `/bin/sh -c`, an `LD_PRELOAD` injection, `dlopen` of a runtime path, a socket to a hardcoded IP), and it reads the **build files** where the C/C++ attacks really hide — `Makefile`, `CMakeLists.txt`, `configure`, `Dockerfile` — for a step that downloads-and-runs, the shape of the xz/liblzma backdoor. It reads **every** text file, whatever the language — there is no allowlist to leave your stack out — and skips only the binary, generated, and prose files that would just add noise. Navy's own code does the scan deterministically — same files, same findings, every run — and only then hands the *hits* to the model to judge and explain, so you get a short list of real signals rather than a wall of pattern noise. Recently-changed files are flagged first, because an attack that just landed is the one that matters.
@@ -43,7 +49,7 @@
 
   It drives Chrome over the DevTools Protocol on a **pipe** — no WebSocket, no open debugging port, and no browser-automation package, so the zero-dependency rule survives a feature that would normally cost Puppeteer. Every run gets a throwaway profile (your real cookies and sessions are never touched), Chrome's own sandbox stays on, only `http(s)` is reachable, and launching the browser goes through the same approval gate as any other command. Needs a vision-capable model to judge the visuals; on a text-only model it still catches functional, console and security issues
 
-  Each important screen can also be checked for **accessibility** — missing alt text and labels, unnamed controls, text below WCAG AA contrast from the real computed colours, and a real Tab walk for focus order, keyboard traps and invisible focus — and for **visual regressions** against a saved baseline, with a diff image of exactly what changed. Baselines live in the project's `.navy/playthrough/baselines/`
+  Each important screen can also be checked for **accessibility** — missing alt text and labels, unnamed controls, text below WCAG AA contrast from the real computed colours, and a real Tab walk for focus order, keyboard traps and invisible focus — and for **visual regressions** against a saved baseline, with a diff image of exactly what changed. Baselines are kept in the project's folder under `~/.navy-coder/`
 - **No telemetry, zero runtime dependencies** — nothing is sent anywhere except to the AI provider you configure; the shipped extension has no npm packages bundled in besides the code in this repo
 - **Diagnostics you choose to share** — `Navy Coder: Export Diagnostics` assembles what a bug report needs (versions, provider, resolved shell, both approval gates, recent errors) into an *unsaved* editor tab. Nothing is written to disk and nothing is transmitted; API keys are never read into it, and paths, home directory and anything credential-shaped are redacted on the way in. You read it, then decide
 
@@ -87,7 +93,7 @@ Search for **Navy AI Coder** in the Extensions panel (`Ctrl+Shift+X`) and click 
 
 | Provider | Key required | Notes |
 |---|---|---|
-| **Ollama** | No | Local; set `navy.host` to your Ollama URL |
+| **Ollama** | No (local) · Yes (Ollama Cloud) | Local on `navy.host`, or set `navy.ollamaMode` to `cloud` to use ollama.com with nothing installed |
 | **LM Studio** | No | Local OpenAI-compatible at `http://localhost:1234` |
 | **OpenAI** | Yes | GPT-4o, o-series, etc. |
 | **Anthropic** | Yes | Claude Sonnet, Haiku, Opus — native extended-thinking path |
@@ -97,6 +103,10 @@ Search for **Navy AI Coder** in the Extensions panel (`Ctrl+Shift+X`) and click 
 | **z.ai** | Yes | z.ai models |
 | **Groq** | Yes | Fast inference; llama, mixtral, etc. |
 | **OpenRouter** | Yes | Routes to 100+ models, grouped by vendor in the picker |
+| **Moonshot** | Yes | Kimi models (api.moonshot.ai; set `navy.apiBase` for the mainland-China endpoint) |
+| **Alibaba Qwen** | Yes | Qwen through Model Studio / DashScope (international endpoint by default) |
+| **MiniMax** | Yes | MiniMax models (api.minimax.io) |
+| **Xiaomi MiMo** | Yes | MiMo models (api.xiaomimimo.com) |
 | **Custom** | Optional | Any OpenAI-compatible endpoint; set `navy.apiBase` |
 
 Model lists are fetched live from each provider's API where supported, so new models show up automatically.
@@ -191,6 +201,43 @@ Every skill is **also a slash command** — `/pdf-tools` loads it directly, no m
 
 ---
 
+## Command line and CI
+
+`/audit` and `/playthrough` also run headless, with no editor, so they can gate a pipeline. Navy has no runtime dependencies, so the command runs straight from a checkout — there is nothing to install:
+
+```bash
+npx github:zrnge/navy-coder audit --fail-on high
+npx github:zrnge/navy-coder playthrough http://localhost:3000 --provider anthropic --model claude-sonnet-5 --fail-on major
+```
+
+Or as a GitHub Action:
+
+```yaml
+- uses: zrnge/navy-coder@v0.3.6
+  with:
+    command: audit
+    args: --exclude "test/fixtures/**"
+
+- run: |
+    npm ci
+    npm start &
+    until curl -s http://localhost:3000 > /dev/null; do sleep 1; done
+- uses: zrnge/navy-coder@v0.3.6
+  with:
+    command: playthrough
+    url: http://localhost:3000
+    provider: anthropic
+    model: claude-sonnet-5
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    fail-on: major
+    args: --baselines tests/visual-baselines --report navy-playthrough.md
+```
+
+- **`navy audit`** is the same deterministic scan as `/audit`: no model, and the same findings for the same files every run. It exits 1 when anything reaches `--fail-on` (`high` by default), and inside GitHub Actions each finding becomes an annotation on its file. `--json` prints the findings for other tools, `--exclude` leaves out paths that hold attack samples on purpose, and `--triage` or `--deep` adds the model's review.
+- **`navy playthrough`** is `/playthrough` in headless Chrome. The model ends its report with a `NAVY-RESULT` line of counts by severity, and the run exits 1 when anything reaches `--fail-on` (`critical` by default). Pass the URL of a server an earlier step started, or add `--allow-commands` to let Navy start it. Visual baselines can only be compared if they outlive the run: point `--baselines` at a folder you commit, or cache it.
+- **A headless run is read-only.** The tools that change files are replaced with a refusal before the model sees them, and every command is refused unless you pass `--allow-commands` — except `/playthrough`'s own browser. Don't pass `--allow-commands` for pull requests from forks: it lets the model run commands in a checkout of code you haven't reviewed.
+- **Exit codes:** `0` passed, `1` something at or above `--fail-on`, `2` the run could not finish — bad options, a model it couldn't reach, a timeout. Never a quiet pass. API keys come from the environment: the provider's usual variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) or `NAVY_API_KEY`. `navy --help` lists every option.
+
 ## Safety
 
 - **Workspace trust** — in an untrusted workspace, Navy still reads files and answers questions, but every tool that executes code or sends data off the machine (shell commands, tests, dev servers, MCP servers, embedding upload) refuses at runtime. A repository's own slash commands and skills don't load there either: cloning something must not silently redefine what `/fix` means.
@@ -215,7 +262,7 @@ Open via **File → Preferences → Settings** and search for `navy`, or click t
 | `navy.ollamaMode` | `local` | Which Ollama to talk to. `local` uses the server at `navy.host` and needs Ollama installed; `cloud` uses ollama.com, which needs no install and runs models too large for most machines — but needs an API key, and your code leaves the machine |
 | `navy.apiBase` | *(empty)* | API URL override for custom or self-hosted providers |
 | `navy.providerFallbacks` | `[]` | Ordered backup providers to fall through to on a transient failure — see [Safety](#safety) |
-| `navy.thinkingLevel` | `medium` | Reasoning effort: `fast`, `medium`, or `high` |
+| `navy.thinkingLevel` | `medium` | Reasoning effort: `fast`, `medium`, `high`, `xhigh` (Extra high) or `max`. The last two reach the deeper levels newer models have; a model without them uses its deepest, and Navy says which |
 | `navy.temperature` | `0.2` | Sampling temperature (0 = deterministic, 2 = creative) |
 | `navy.approvalMode` | `ask-always` | Files only. `ask-always` shows a diff before every write, delete or rename; `auto-approve` applies them immediately |
 | `navy.commandApproval` | `ask-always` | Execution only. `ask-always` confirms every shell command, background process, MCP tool call and browser launch; `auto-approve` runs them unattended |
@@ -262,7 +309,7 @@ API keys are **not** stored in settings — they are stored in VS Code's encrypt
 | Clear Chat (Navy focused) | `Ctrl+Alt+K` | `Cmd+Alt+K` |
 | Insert Last Reply | `Ctrl+Alt+I` | `Cmd+Alt+I` |
 
-Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P` → search **Navy**): Undo Last Edit, Generate PR Description, Ask About This Function, Explain Terminal Error, Export Conversation, Review Pull Request, **Test Provider Connection**, New Slash Command, Open Slash Commands Folder.
+Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P` → search **Navy**): Undo Last Edit, Generate PR Description, Ask About This Function, Explain Terminal Error, Export Conversation, Review Pull Request, **Test Provider Connection**, New Slash Command, Open Slash Commands Folder, Remove Projects from List.
 
 **Test Provider Connection** is the one to reach for when something won't connect. It asks your configured provider for its model list through the same code a real request uses, and tells you which problem you have — wrong base URL, wrong key, right key for the wrong region, empty balance, rate limited, or nothing listening — instead of leaving you to guess. See [Troubleshooting](TROUBLESHOOTING.md).
 
@@ -270,6 +317,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 
 ## Privacy
 
+- **Nothing of Navy's is kept in your project.** Chats and their undo history, memory, the embedding index, background-process logs, visual baselines and exports all live in your profile, at `~/.navy-coder/<project>-<hash>/`, so none of it can be committed, pushed, or copied into a build or a Docker image along with your code. The one exception is what you make to share with your team: project slash commands and skills, in the project's `.navy/commands/` and `.navy/skills/`. Projects from earlier versions, which kept everything in `<project>/.navy`, have it moved out the first time Navy opens them.
 - Your code is sent to whichever AI provider you configure. With Ollama or LM Studio, everything stays local.
 - API keys are stored in VS Code's OS keychain — never written to disk or sent anywhere except the configured provider.
 - Semantic search (`navy.embeddingModel`) is opt-in and off by default; enabling it sends file content to your configured embedding provider — see that setting's description for exactly what's excluded.
@@ -283,7 +331,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 2,508 tests: extension host + webview, no network or API keys needed
+npm test        # 2,655 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 

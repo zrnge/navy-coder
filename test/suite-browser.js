@@ -418,11 +418,11 @@ async function browserSuite() {
         evaluate: async () => where,
         captureFixed: async () => png.encodePng(screen).toString('base64'),
       };
-      const dir = path.join(tmp, '.navy', 'playthrough', 'baselines');
+      const dir = path.join(provider.getNavyDir(tmp), 'playthrough', 'baselines');
       const file = path.join(dir, 'localhost__home.png');
 
       const first = await provider.toolBrowserVisualCheck('home');
-      check('visual: the first check saves a baseline, in the project\'s .navy, and says so',
+      check('visual: the first check saves a baseline, in the project\'s folder in the profile, and says so',
         /saved the current screen as its baseline/.test(first) && fs.existsSync(file), first);
 
       const same = await provider.toolBrowserVisualCheck('home');

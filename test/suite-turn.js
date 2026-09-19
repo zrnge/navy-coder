@@ -1716,7 +1716,7 @@ async function compactContextSuite() {
       posted.some(m => m.type === 'restore' && Array.isArray(m.messages) && m.messages.length === 4));
     check('the webview is told it worked, with the summary to show',
       posted.some(m => m.type === 'compactResult' && m.ok === true && m.condensed === 6 && /retry design/.test(m.summary || '')));
-    const saved = JSON.parse(fs.readFileSync(path.join(tmp, '.navy', 'chats', provider._session.id + '.json'), 'utf8'));
+    const saved = JSON.parse(fs.readFileSync(path.join(provider.getNavyDir(tmp), 'chats', provider._session.id + '.json'), 'utf8'));
     check('...and the compacted chat is what gets saved', saved.messages.length === 4 && /retry design/.test(saved.digest));
 
     // The cut lands on a user message: 9 - 4 = 5 is an assistant reply.

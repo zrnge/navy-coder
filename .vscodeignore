@@ -28,6 +28,8 @@ eval/**
 **/*.map
 # CI config — repository tooling, of no use inside an installed extension.
 .github/**
+# The GitHub Action that runs the `navy` command line from a checkout.
+action.yml
 # Same: the icon generator runs against a Font Awesome package at development
 # time and writes src/icons.js, which is what the bundle actually carries.
 tools/**

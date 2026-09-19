@@ -1,8 +1,8 @@
 {
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
-  "description": "AI coding assistant for VS Code — agentic tool-use, file edits with diff approval, multi-provider (Ollama, OpenAI, compatible APIs).",
-  "version": "0.3.5",
+  "description": "Local-first AI coding agent that asks before it acts: approve every diff and command, zero runtime dependencies, /audit supply-chain scans and /playthrough browser QA. Ollama, LM Studio or your own key.",
+  "version": "0.3.6",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -26,7 +26,12 @@
     "inline completion",
     "chat",
     "deepseek",
-    "gemini"
+    "gemini",
+    "local-llm",
+    "privacy",
+    "security",
+    "supply-chain",
+    "accessibility"
   ],
   "galleryBanner": {
     "color": "#0d1b2a",
@@ -56,6 +61,9 @@
     }
   },
   "main": "./dist/extension.js",
+  "bin": {
+    "navy": "src/cli.js"
+  },
   "contributes": {
     "configuration": {
       "title": "Navy AI Coder",
@@ -189,7 +197,7 @@
         "navy.embeddingModel": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Embedding model for semantic codebase search (used by `find_relevant_files` in addition to keyword search). Leave empty to disable — keyword-only search is the default.\n\n**⚠️ Privacy:** enabling this sends the first ~1500 characters of each source file in your project to the embedding provider you have configured. If `navy.provider` is a hosted service (OpenAI, Gemini, …), your code leaves your machine. Files whose names look credential-bearing (`.env*`, `*secret*`, `*credentials*`, `*.pem`, `serviceAccount*`, `docker-compose*`, …) and anything your repo gitignores are excluded, but review the setting before enabling it on a private codebase. Use a local Ollama embedding model (e.g. `nomic-embed-text`) to keep everything on-device.\n\nMust be an embeddings-capable model for the active `navy.provider` (e.g. `nomic-embed-text` or `mxbai-embed-large` for Ollama, `text-embedding-3-small` for OpenAI, `text-embedding-004` for Gemini). The index is built incrementally and cached in `.navy/embeddings/`, which is gitignored automatically; re-indexing a changed file rewrites only the shard it belongs to."
+          "markdownDescription": "Embedding model for semantic codebase search (used by `find_relevant_files` in addition to keyword search). Leave empty to disable — keyword-only search is the default.\n\n**⚠️ Privacy:** enabling this sends the first ~1500 characters of each source file in your project to the embedding provider you have configured. If `navy.provider` is a hosted service (OpenAI, Gemini, …), your code leaves your machine. Files whose names look credential-bearing (`.env*`, `*secret*`, `*credentials*`, `*.pem`, `serviceAccount*`, `docker-compose*`, …) and anything your repo gitignores are excluded, but review the setting before enabling it on a private codebase. Use a local Ollama embedding model (e.g. `nomic-embed-text`) to keep everything on-device.\n\nMust be an embeddings-capable model for the active `navy.provider` (e.g. `nomic-embed-text` or `mxbai-embed-large` for Ollama, `text-embedding-3-small` for OpenAI, `text-embedding-004` for Gemini). The index is built incrementally and cached in the project's folder under `~/.navy-coder/`, never in the project itself; re-indexing a changed file rewrites only the shard it belongs to."
         },
         "navy.provider": {
           "type": "string",
@@ -255,14 +263,18 @@
           "enum": [
             "fast",
             "medium",
-            "high"
+            "high",
+            "xhigh",
+            "max"
           ],
           "enumDescriptions": [
             "Lowest latency — minimal reasoning (temperature 0, no extended thinking)",
             "Balanced (default)",
-            "Deepest reasoning — extended thinking on Claude, high reasoning effort on o-series, think mode on Ollama reasoning models"
+            "Deep reasoning — extended thinking on Claude, high reasoning effort on OpenAI's reasoning models, thinking on for Ollama and Gemini reasoning models",
+            "Extra high — deeper than High, on models that have it: Claude Opus 4.7 and later, OpenAI's GPT-5 reasoning models. Others use their deepest level, and Navy says which",
+            "Max — the deepest reasoning a model offers: Claude Opus 4.6 and later, some OpenAI models. Slowest and most expensive. Others use their deepest level, and Navy says which"
           ],
-          "description": "How much reasoning effort the model should spend per request."
+          "description": "How much reasoning effort the model should spend per request. Extra high and Max reach the deeper levels newer models have; a model without them uses its deepest, and Navy tells you once which level it used."
         },
         "navy.searchApiKey": {
           "type": "string",
@@ -432,7 +444,7 @@
         "navy.persistBackgroundProcesses": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Let `run_project`/`start_process` background processes survive closing or reloading this window instead of being stopped when it does. Off by default — with this off, nothing changes. When on, those processes are simply never told to stop, and their output is written to a log file under `.navy/bg-logs/` instead of streamed live to the chat, since there is no longer anything on this end reading it once the window that started them is gone (`read_process_output` reads the log file's current contents either way). Reopening a project that still has one of these running offers to stop it, so a background process you forgot about doesn't run forever unnoticed."
+          "markdownDescription": "Let `run_project`/`start_process` background processes survive closing or reloading this window instead of being stopped when it does. Off by default — with this off, nothing changes. When on, those processes are simply never told to stop, and their output is written to a log file in the project's folder under `~/.navy-coder/` instead of streamed live to the chat, since there is no longer anything on this end reading it once the window that started them is gone (`read_process_output` reads the log file's current contents either way). Reopening a project that still has one of these running offers to stop it, so a background process you forgot about doesn't run forever unnoticed."
         }
       }
     },
@@ -516,6 +528,10 @@
       {
         "command": "navy.openSlashCommands",
         "title": "Navy Coder: Open Slash Commands Folder"
+      },
+      {
+        "command": "navy.forgetProjects",
+        "title": "Navy Coder: Remove Projects from List…"
       }
     ],
     "viewsContainers": {
@@ -596,6 +612,7 @@
     "build": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "esbuild src/extension.js --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "check": "node test/check-syntax.js",
+    "navy": "node src/cli.js",
     "lint": "eslint .",
     "preview": "node tools/preview.js",
     "vscode:prepublish": "npm run build",
