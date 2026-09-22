@@ -110,6 +110,7 @@ async function cliSuite() {
     const script = () => [
       { toolCalls: [{ name: 'write_file', args: { path: 'hacked.txt', content: 'pwned' } }] },
       { toolCalls: [{ name: 'run_command', args: { command: 'echo pwned > ran.txt' } }] },
+      { toolCalls: [{ name: 'ask_user', args: { question: 'Which page?', options: [{ label: 'Home' }, { label: 'Checkout' }] } }] },
       { text: report },
     ];
     let stub = await startStubOllama(script());
@@ -121,6 +122,8 @@ async function cliSuite() {
       !fs.existsSync(path.join(clean, 'hacked.txt')) && /Refused: this is a headless Navy run/.test(JSON.stringify(stub.chats()[1]?.body || {})));
     check('playthrough: ...and so is its command, without --allow-commands',
       !fs.existsSync(path.join(clean, 'ran.txt')) && /refused to run "echo pwned > ran\.txt"/.test(strict.err), strict.err);
+    check('playthrough: a question has nobody to answer it, so the model is told to decide itself',
+      /nobody to ask/.test(JSON.stringify(stub.chats()[3]?.body || {})), JSON.stringify(stub.chats()[3]?.body || {}).slice(0, 200));
     check('playthrough: the model is told it is running headless, and how to end its report',
       /HEADLESS RUN/.test(JSON.stringify(stub.chats()[0]?.body || {})));
     check('playthrough: no chat is saved into the project', !fs.existsSync(path.join(clean, '.navy', 'chats')));

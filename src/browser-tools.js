@@ -90,8 +90,12 @@ class BrowserToolMethods {
       if (!snap || !snap.nodes?.length) {
         return `Page: ${snap?.title || ''} (${snap?.url || ''})\n(no interactive elements found — the page may still be loading, or its UI is drawn in canvas/an iframe. Try browser_screenshot to look, or browser_scroll.)`;
       }
-      const lines = snap.nodes.map(n => `[${n.ref}] ${n.role}${n.text ? ' "' + n.text + '"' : ''}`);
-      return `Page: ${snap.title} (${snap.url})\n${lines.join('\n')}`;
+      // A row from an iframe says so, and where from: the model has to know it
+      // is looking at an embedded checkout rather than the page around it.
+      const lines = snap.nodes.map(n => `[${n.ref}] ${n.role}${n.text ? ' "' + n.text + '"' : ''}${n.frame ? ` (in iframe: ${n.frame})` : ''}`);
+      const frames = new Set(snap.nodes.filter(n => n.frame).map(n => n.frame));
+      const note = frames.size ? `\n(${frames.size} iframe${frames.size === 1 ? '' : 's'} included; their controls work like any other)` : '';
+      return `Page: ${snap.title} (${snap.url})${note}\n${lines.join('\n')}`;
     } catch (e) { return 'Error: ' + e.message; }
   }
 
@@ -106,22 +110,174 @@ class BrowserToolMethods {
     } catch (e) { return 'Error: ' + e.message; }
   }
 
-  async toolBrowserClick(ref) {
+  // What a tool means by "that element": a ref from the last snapshot, or a CSS
+  // selector for anything the outline does not list - a drop zone, a plain-div
+  // menu trigger, a canvas. One shape for every tool that takes an element.
+  _browserTarget(ref, selector) {
+    if (selector != null && String(selector).trim()) return { selector: String(selector).trim() };
+    if (ref == null || isNaN(Number(ref))) return null;
+    return { ref: Number(ref) };
+  }
+
+  _browserTargetName(target) {
+    return target.selector ? `"${target.selector}"` : `ref ${target.ref}`;
+  }
+
+  async toolBrowserClick(ref, selector, button, clicks) {
     if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
-    if (ref == null || isNaN(Number(ref))) return 'Error: browser_click needs a numeric ref from browser_snapshot.';
+    const target = this._browserTarget(ref, selector);
+    if (!target) return 'Error: browser_click needs a ref from browser_snapshot, or a CSS selector.';
+    const btn = String(button || 'left').toLowerCase();
+    if (!['left', 'right', 'middle'].includes(btn)) return 'Error: button must be left, right or middle.';
     try {
-      await this._session.browser.click(Number(ref));
+      const done = await this._session.browser.click(target, { button: btn, clicks: Number(clicks) || 1 });
       const info = await this._session.browser.evaluate('({ title: document.title, url: location.href })').catch(() => null);
-      return `Clicked ref ${ref}. Now on: ${info?.title || ''} (${info?.url || ''}). Call browser_snapshot to see the updated page.`;
+      const how = `${done.clicks > 1 ? done.clicks + '× ' : ''}${btn === 'left' ? '' : btn + '-'}`;
+      return `${how}Clicked ${this._browserTargetName(target)}. Now on: ${info?.title || ''} (${info?.url || ''}). Call browser_snapshot to see the updated page.`;
     } catch (e) { return 'Error: ' + e.message; }
   }
 
-  async toolBrowserType(ref, text, submit) {
+  async toolBrowserType(ref, text, submit, selector) {
     if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
-    if (ref == null || isNaN(Number(ref))) return 'Error: browser_type needs a numeric ref from browser_snapshot.';
+    const target = this._browserTarget(ref, selector);
+    if (!target) return 'Error: browser_type needs a ref from browser_snapshot, or a CSS selector.';
     try {
-      await this._session.browser.type(Number(ref), String(text ?? ''), Boolean(submit));
-      return `Typed into ref ${ref}${submit ? ' and pressed Enter — call browser_snapshot to see the result' : ''}.`;
+      const out = await this._session.browser.type(target, String(text ?? ''), Boolean(submit));
+      // A <select> is chosen from rather than typed into, and says so - with
+      // the real options when the wanted one is not among them.
+      if (out && out.select) {
+        if (!out.ok) {
+          return `Error: no option matching "${text}" in that dropdown. Its options are: ${(out.options || []).map(o => `"${o}"`).join(', ') || '(none)'}.`;
+        }
+        return `Chose "${out.chosen}" (value "${out.value}") in the dropdown at ${this._browserTargetName(target)}.`;
+      }
+      return `Typed into ${this._browserTargetName(target)}${submit ? ' and pressed Enter — call browser_snapshot to see the result' : ''}.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserHover(ref, selector) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const target = this._browserTarget(ref, selector);
+    if (!target) return 'Error: browser_hover needs a ref from browser_snapshot, or a CSS selector.';
+    try {
+      await this._session.browser.hover(target);
+      return `Hovering ${this._browserTargetName(target)}. Anything it reveals is on screen now — call browser_snapshot to get refs for it, or browser_screenshot to look. It stays hovered until the next click, hover or navigation.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserPress(key) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    if (!key || typeof key !== 'string') return 'Error: browser_press needs a key, such as "Escape", "Tab" or "Control+a".';
+    try {
+      await this._session.browser.press(key);
+      return `Pressed ${key}. Call browser_snapshot to see what it did.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  // The file goes from the workspace into the page. Only from the workspace:
+  // the page it lands in is a website, so anything else on the machine would be
+  // a way to post a file off it - and a playthrough is often driven by text the
+  // model read somewhere.
+  async toolBrowserUpload(ref, filePath, selector) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const target = this._browserTarget(ref, selector);
+    if (!target) return 'Error: browser_upload needs a ref from browser_snapshot, or a CSS selector.';
+    if (!filePath || typeof filePath !== 'string') return 'Error: browser_upload needs the path of a file in this workspace.';
+    let full;
+    try { full = this.resolveWorkspacePath(filePath); }
+    catch (e) { return 'Error: ' + e.message; }
+    if (!fs.existsSync(full)) return `Error: ${filePath} does not exist.`;
+    if (!fs.statSync(full).isFile()) return `Error: ${filePath} is not a file.`;
+    try {
+      const out = await this._session.browser.upload(target, [full]);
+      return `Attached ${path.basename(full)} to ${this._browserTargetName(target)} (${out?.count || 0} file). Submit the form to see what the site does with it.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserWait(text, selector, gone, timeout) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    if (!String(text || '').trim() && !String(selector || '').trim()) {
+      return 'Error: browser_wait needs text to wait for, or a CSS selector.';
+    }
+    try {
+      const what = selector ? `"${selector}"` : `"${text}"`;
+      const out = await this._session.browser.waitFor({
+        text: String(text || ''), selector: String(selector || ''),
+        gone: Boolean(gone), timeout: Number(timeout) || 10000,
+      });
+      if (out.found) return `${what} ${gone ? 'went away' : 'appeared'} after ${out.waitedMs}ms.`;
+      return `Error: ${what} still ${gone ? 'there' : 'missing'} after ${out.waitedMs}ms. It may be inside an iframe or drawn differently than expected — check with browser_snapshot or browser_screenshot.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserViewport(width, height, mobile, reset) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    try {
+      if (reset) {
+        await this._session.browser.clearViewport();
+        return 'Viewport back to the window size. Re-check the screens you tested at another size.';
+      }
+      if (!width || !height) return 'Error: browser_viewport needs a width and a height (or reset: true).';
+      const vp = await this._session.browser.setViewport({ width, height, mobile: Boolean(mobile) });
+      return `Viewport is now ${vp.width}x${vp.height}${vp.mobile ? ' with touch emulation' : ''}. The page has re-laid out — screenshot it and check for overlap, cut-off text and controls too small to tap.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserTabs(action, index) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const b = this._session.browser;
+    try {
+      const act = String(action || 'list').toLowerCase();
+      if (act === 'list') {
+        const tabs = await b.listTabs();
+        return tabs.map(t => `[${t.index}]${t.current ? ' (current)' : ''} ${t.title || '(untitled)'} — ${t.url}`).join('\n') || 'No tabs open.';
+      }
+      if (index == null || isNaN(Number(index))) return 'Error: browser_tabs needs the index of the tab to ' + act + '.';
+      if (act === 'switch') {
+        const info = await b.switchTab(Number(index));
+        return `Now on tab ${index}: ${info?.title || ''} (${info?.url || ''}). Refs from the other tab are gone — call browser_snapshot.`;
+      }
+      if (act === 'close') {
+        const tabs = await b.closeTab(Number(index));
+        return `Closed tab ${index}. Open now:\n${tabs.map(t => `[${t.index}]${t.current ? ' (current)' : ''} ${t.title || '(untitled)'} — ${t.url}`).join('\n')}`;
+      }
+      return 'Error: action must be list, switch or close.';
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserDialog(accept, text) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const policy = this._session.browser.setDialogPolicy({ accept: accept !== false, promptText: text || '' });
+    return `Alerts and confirms will be ${policy.accept ? 'accepted (OK)' : 'dismissed (Cancel)'}${policy.promptText ? `, and prompts answered with "${policy.promptText}"` : ''}. Each one is reported by browser_console.`;
+  }
+
+  async toolBrowserDrag(from, to, fromSelector, toSelector) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    const a = this._browserTarget(from, fromSelector);
+    const z = this._browserTarget(to, toSelector);
+    if (!a || !z) return 'Error: browser_drag needs what to drag and where to drop it, each a ref or a CSS selector.';
+    try {
+      const out = await this._session.browser.drag(a, z);
+      return `Dragged ${this._browserTargetName(a)} onto ${this._browserTargetName(z)}${out.html5 ? ' as an HTML5 drag' : ''}. Check the result with browser_snapshot or browser_screenshot — a drag that did nothing looks the same as one that was refused.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserForward() {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    try {
+      const info = await this._session.browser.forward();
+      if (!info.moved) return 'Nothing to go forward to — this is the latest page in the history.';
+      return `Forward to: ${info.title || ''} (${info.url || ''}). Call browser_snapshot to see it.`;
+    } catch (e) { return 'Error: ' + e.message; }
+  }
+
+  async toolBrowserNetwork(condition) {
+    if (!this._session.browser?.running) return 'Error: no page open — call browser_navigate first.';
+    try {
+      const out = await this._session.browser.setNetworkCondition(condition);
+      if (out.condition === 'offline') return 'The page is now offline. Reload or act on it and see whether it says so or just breaks.';
+      if (out.condition === 'slow') return 'The connection is now slow (400ms latency, ~400kbps). Watch for missing loading states and layout that jumps as things arrive.';
+      return 'The connection is back to normal.';
     } catch (e) { return 'Error: ' + e.message; }
   }
 
@@ -382,20 +538,30 @@ class BrowserToolMethods {
 
 Tools available to you (a real Chrome window is open and visible):
 - browser_navigate(url) — go to a page.
-- browser_snapshot() — numbered outline of interactive elements + headings + alerts; the [ref] numbers feed click/type. Re-snapshot after every navigation or page change (refs go stale).
+- browser_snapshot() — numbered outline of interactive elements + headings + alerts, across every frame (rows inside an iframe say so); the [ref] numbers feed click/type/hover. Re-snapshot after every navigation or page change (refs go stale). Anything it does not list — a drop zone, a plain-div menu, a canvas — can be addressed by CSS selector instead of a ref on any of these tools.
 - browser_screenshot() — SEE the page as an image. Take one on each important screen and actually look: layout, alignment, overlap, cut-off/overflowing text, contrast, broken images, responsiveness. (If you cannot see images, say so and lean on snapshot + evaluate.)
-- browser_click(ref), browser_type(ref, text, submit) — interact. Use realistic input; set submit=true to send a form/search.
+- browser_click(ref), browser_type(ref, text, submit) — interact. Use realistic input; set submit=true to send a form/search. browser_click takes button="right" and clicks=2; browser_type on a <select> chooses the option.
+- browser_hover(ref) — open a menu, tooltip or toolbar that only exists under the pointer, then snapshot to reach what appeared.
+- browser_press(key) — "Escape", "Tab", "Shift+Tab", "ArrowDown", "Control+k". The keyboard-only paths, and whether the page answers them at all.
+- browser_upload(ref, path) — attach a workspace file to a file input; the OS picker cannot be driven, so this is the only way to test an upload.
+- browser_drag(from, to) — drag and drop, HTML5 or mouse-driven.
+- browser_wait(text|selector, gone, timeout) — wait for what an action loads instead of assuming it arrived.
+- browser_viewport(width, height, mobile) — test the responsive layouts: 390x844 is a phone. Screenshot after each change.
+- browser_tabs(action, index) — a target=_blank link or window.open is followed automatically and becomes the current tab; this lists, switches and closes them.
+- browser_dialog(accept, text) — how alert/confirm/prompt are answered from now on. They are accepted by default, and each is reported by browser_console; pass accept=false to test what a confirm guards.
+- browser_network(condition) — "offline" or "slow", to see what the app does when a request cannot complete.
 - browser_scroll(amount) — reveal below-the-fold content.
 - browser_console() — JavaScript errors, uncaught exceptions, and failed/4xx-5xx requests since the last check. Check it after loads and after actions — these are bugs a user can't see but you can.
 - browser_evaluate(expression) — read state you can't see (values, counts, computed styles, localStorage, exposed globals) or verify a functional claim.
 - browser_accessibility() — what a screen-reader or keyboard user would hit: missing alt text and labels, unnamed buttons and links, text below WCAG AA contrast, and a real Tab walk of the focus order (traps, invisible focus). Run it on each important screen.
 - browser_visual_check(name, update) — visual regression: compares the screen with its saved baseline and attaches a red-on-grey diff of what changed. Give each screen a short, stable name ("home", "checkout"); the first run saves the baseline. Pass update: true only for a change that is intended.
-- browser_back(), browser_close().
+- browser_back(), browser_forward(), browser_close().
 
 Once the page is open:
 - Screenshot + snapshot + console to establish the baseline.
 - Walk the main user journeys: click primary actions, fill and submit at least one form if present, follow key links. After each meaningful step: screenshot, snapshot, and check console.
 - Probe for problems a human would catch: broken/missing images, dead or 404 links, layout that overlaps or overflows, forms that accept bad input or give no feedback, obvious accessibility gaps, and any visible security smell (secrets in page/console, mixed content, missing auth checks, sensitive data in the DOM).
+- Use the whole toolset where the site calls for it: hover the menus, press Escape on a modal and Tab through a form, upload a file if there is a file input, choose real options in dropdowns, and take at least one pass at phone width (browser_viewport 390x844) — responsive breakage is one of the commonest real defects.
 - On each important screen, run browser_accessibility and browser_visual_check (with that screen's stable name).
 - When done, call browser_close(), then write the report.
 

@@ -545,6 +545,7 @@ function getWebviewHtml({ scriptUri, styleUri, cspSource, nonce, version }) {
     <div id="imageLightbox" class="lightbox hidden" role="dialog" aria-modal="true">
       <div id="lightboxBackdrop" class="lightbox-backdrop"></div>
       <img id="lightboxImg" class="lightbox-img" src="" alt="Full size preview">
+      <button id="lightboxOpen" class="lightbox-open hidden" title="Open this file in the editor">Open in editor</button>
       <button id="lightboxClose" class="lightbox-close" title="Close (Esc)">${icon('close')}</button>
     </div>
   </main>

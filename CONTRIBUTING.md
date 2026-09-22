@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,655 tests, no network, no API keys
+npm test             # 2,815 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -57,8 +57,8 @@ diff has to stay reviewable.
 | `src/background.js` | ~300 | Persistent background processes: manifest, logs, pid verification |
 | `src/net-safety.js` | ~240 | SSRF defence (address pinning against DNS rebinding) and `fetch_url` |
 | `src/sandbox.js` | ~570 | Sandboxing (`navy.sandboxMode`): Docker, WSL Containers (`wslc`, Windows), and native seatbelt/bubblewrap |
-| `src/browser.js` | ~900 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the navigate/snapshot/screenshot/click/type primitives |
-| `src/browser-tools.js` | ~450 | The `/playthrough` tool layer on top of it: the twelve `browser_*` tools, the launch approval gate, and the command entry point with its prompts |
+| `src/browser.js` | ~1,550 | The `/playthrough` browser engine: Chrome discovery and launch, CDP over `--remote-debugging-pipe`, and the primitives - navigate, a snapshot across every frame, screenshot, click, type, hover, keys, uploads, drag, waiting, viewport, tabs, dialogs |
+| `src/browser-tools.js` | ~610 | The `/playthrough` tool layer on top of it: the `browser_*` tools, the launch approval gate, and the command entry point with its prompts |
 | `src/png.js` | ~210 | A minimal PNG codec and pixel differ on Node's zlib, for `/playthrough`'s visual regression check — no image library |
 | `src/export.js` | ~170 | The conversation export: each reply with its turn's tool calls and a diff of every file it changed, rebuilt from the saved cards and the undo checkpoints |
 | `src/text-diff.js` | ~120 | Line diffs in `diff -u` form for the export — the same Myers algorithm the webview's diff cards use |
@@ -68,6 +68,7 @@ diff has to stay reviewable.
 | `src/undo.js` | ~370 | Transactional undo/redo, checkpoints, and conversation rewind |
 | `src/projects.js` | ~180 | The global project catalog (`projects.json`) |
 | `src/data-dir.js` | ~40 | Where a project's chats, memory and the rest live: `~/.navy-coder/<project>-<hash>/`, in the profile, never in the project |
+| `src/screenshots.js` | ~60 | The screenshots a playthrough takes: written as PNGs in the project's folder in the profile, so the chat can show them, and pruned to the most recent |
 | `src/thinking.js` | ~120 | The five thinking levels, what each provider is sent for them, stepping down when a model refuses one, and the note that says so |
 | `src/web-search.js` | ~115 | Tavily / Brave / DuckDuckGo backends |
 | `src/slash-commands.js` | ~290 | Custom slash commands: the markdown format, where they load from, precedence and the trust gate |
@@ -83,6 +84,7 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/providers/pricing.js` | ~105 | The cost table, its ordering invariant, and `navy.modelPricing` overrides |
 | `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
 | `src/plan.js` | ~130 | Task plans: validation, the block the model reads back, the incomplete-plan note |
+| `src/questions.js` | ~130 | `ask_user`: what counts as a question, the wait for an answer, a typed answer, and cancelling one that will never be answered |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
 | `src/providers/mcp.js` | ~420 | MCP client, stdio and streamable HTTP: tools, resources and prompts |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
@@ -185,7 +187,7 @@ Two suites, both run by `npm test`:
   | `suite-mcp.js` | MCP over stdio and HTTP, and its resources and prompts |
   | `suite-approval.js` | Both approval gates, settings defaults, the diagnostics bundle |
   | `suite-ui.js` | Dictation, slash commands, skills, the review regressions |
-  | `suite-browser.js` | The `/playthrough` browser: CDP framing, launch flags, the tool guards and URL routing |
+  | `suite-browser.js` | The `/playthrough` browser: CDP framing, launch flags, the tool guards and URL routing, and driving a whole UI - dialogs, tabs, frames, hover, keys, uploads, drag, waiting, viewport |
   | `suite-visual.js` | The PNG codec and pixel differ, every row filter checked against an independent encoder |
   | `suite-a11y.js` | The accessibility audit run inside jsdom, the contrast arithmetic, and the Tab-order analysis |
   | `suite-export.js` | The export's line diffs and its Markdown: tool calls, per-turn diffs, and created, deleted, renamed and hand-edited files |
@@ -196,6 +198,8 @@ Two suites, both run by `npm test`:
   | `suite-projects.js` | Removing projects from the picker's list: what is offered, what changes, and a removal racing a recording |
   | `suite-datadir.js` | That folder: where it is, that nothing lands in the project, and moving an old project's `.navy` out |
   | `suite-thinking.js` | Thinking levels: the mapping per provider, a refused level stepping down and being remembered, the setting |
+  | `suite-screenshots.js` | Screenshots in the chat: saved in the profile and pruned, the card kept with its turn, a pruned one marked, and only Navy's own files openable |
+  | `suite-questions.js` | `ask_user`: what a question must be, waiting and answering, a typed answer, cancelling, and the card kept with the turn |
 
   The files sit flat in `test/` rather than in a subdirectory on purpose: every
   suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a

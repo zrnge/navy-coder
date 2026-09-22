@@ -1,6 +1,98 @@
 # Changelog
 
-## [Unreleased] - 0.3.6
+## [0.3.7] - 2026-09-22
+
+Screenshots in the chat, a playthrough that can drive the whole UI, and Navy
+asking when a request could mean two things.
+
+### Added
+
+- **Navy asks instead of guessing.** A request that could be read two ways was
+  read one way, silently, and the whole turn went into it - and the person found
+  out at the end. Navy can now put the question in the chat as a card: the two
+  to four readings it actually sees, one line on what each would mean, the one
+  it recommends marked as such, and a box for an answer none of them covers.
+  Click an option, or just type the answer in the composer - a typed reply
+  answers the waiting question instead of queueing behind the turn that is
+  waiting for it. The answer comes back as the tool result and the same turn
+  carries on with it.
+
+  It is a question, not a permission prompt: the rules tell the model to ask
+  only where the readings would lead to different work - which component, which
+  approach, which of several matching files - never for things it can settle by
+  reading the code, and never as "shall I proceed?". One question at a time.
+  Stop, a closed panel or a cleared chat cancels a waiting question and tells
+  the model to choose the most reasonable option and say which it chose, so a
+  turn is never parked on an answer that is not coming; a headless `navy` run
+  gets that answer immediately, since nobody is there. The question and what
+  was chosen are kept with the turn, so a reopened chat still shows both.
+
+- **`/playthrough` can now reach the parts of a UI it could not.** It drove the
+  top frame of one tab with a mouse and the Enter key, which left real ground
+  untested - and one of the gaps could end a run outright:
+
+  - **A dialog no longer stalls the session.** Nothing answered `alert`,
+    `confirm` or `prompt`, so the page hung on the first one and every command
+    after it timed out until the browser was closed. They are now accepted like
+    a user clicking OK, reported by `browser_console` as part of what the page
+    did, and `browser_dialog(accept: false)` takes Cancel instead - which is how
+    you test what a confirm is guarding.
+  - **Iframes are part of the page.** `browser_snapshot` walks every frame,
+    same-origin or cross-process, marks which rows came from where, and their
+    controls click and type like any other. Embedded checkouts, sign-ins and
+    players were invisible before.
+  - **New tabs are followed.** A `target="_blank"` link or a `window.open` used
+    to leave Navy looking at the page it came from. The new tab is attached as
+    it opens and becomes the one being driven; `browser_tabs` lists, switches
+    and closes them.
+  - **`browser_hover`** opens the menus, tooltips and toolbars that only exist
+    under the pointer. It moves the pointer *and* forces the `:hover` state,
+    because a visible browser window follows the real mouse, not a synthetic
+    one - so this works headed and headless.
+  - **`browser_press`** sends any key, with modifiers: `Escape`, `Tab`,
+    `Shift+Tab`, `ArrowDown`, `Control+k`. Enter was the only key that could be
+    sent before, through `browser_type`.
+  - **`browser_upload`** attaches a file from the workspace to a file input
+    (and only from the workspace - the page it lands in is a website). The
+    browser's own picker is an OS window nothing can drive.
+  - **`browser_viewport`** resizes the page, so responsive layouts can actually
+    be tested - the prompt asked the model to judge responsiveness it had no way
+    to exercise. It survives a `browser_visual_check`, which sets its own size
+    for the baseline and now puts yours back.
+  - **`browser_wait`** waits for text or a selector to appear or go, instead of
+    fixed pauses and hope. **`browser_drag`** does drag-and-drop, HTML5 or
+    mouse-driven. **`browser_network`** goes offline or slow.
+    **`browser_forward`** is the other half of `browser_back`.
+  - **A native `<select>`** is chosen from by typing the option into it. Clicking
+    one opens a list the page does not draw and CDP mouse events cannot walk, so
+    dropdowns were effectively unsettable; a wrong option now reports the real
+    ones.
+  - **Anything can be addressed by CSS selector** where the outline has no row
+    for it - a drop zone, a plain-div menu trigger, a canvas - on every tool that
+    takes an element. Draggable elements are listed in the outline too.
+  - **Downloads** are allowed into the throwaway profile and reported, so
+    "clicking Export downloads a file" is a checkable claim.
+
+- **Every screenshot Navy takes is now in the conversation.** A `/playthrough`
+  captured the screen, looked at it and reported what it found - but the picture
+  went to the model and nowhere else, so the chat read as a list of tool names
+  with the evidence missing. Each capture is now a thumbnail under the tool that
+  took it, captioned with what that tool was looking at. Clicking it opens the
+  full-size image over the chat, and **Open in editor** there hands the PNG to
+  VS Code's own image viewer, which zooms and pans in a way a card in a narrow
+  panel cannot. `browser_visual_check` draws the same card.
+
+  The image is written as a PNG in the project's folder in the profile
+  (`~/.navy-coder/<project>/screenshots/`), never in the project, and the chat
+  keeps its path rather than the image: a playthrough takes dozens of captures
+  of a few hundred kilobytes each, which in the saved chat would be megabytes
+  rewritten on every turn. The folder keeps the 60 most recent and prunes
+  itself, and a card whose file has gone says so instead of showing a broken
+  picture. A reopened chat draws them again, and an exported conversation links
+  each one where the reply it belongs to is. The panel can name a file to open
+  but not choose which: anything outside Navy's own folder is refused.
+
+## [0.3.6] - 2026-09-19
 
 Faster tab completion, retrieval that covers a whole large codebase, and
 `/audit` and `/playthrough` in CI.

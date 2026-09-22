@@ -4,7 +4,7 @@
 
 - **Nothing happens without you** — every file change is a diff you approve, and every command, dev server, MCP call and browser launch asks first, behind a gate of its own. Optional sandboxing (Docker, WSL containers, or the OS's own sandbox) adds a second layer underneath.
 - **`/audit`** scans your own project for what a supply-chain attack actually looks like: install hooks that pipe `curl | sh`, code that reads your SSH or cloud credentials, obfuscated payloads, build files that download and run.
-- **`/playthrough`** tests your web app in a real Chrome the way a human tester would, checks each screen for accessibility problems, and compares it against a saved baseline.
+- **`/playthrough`** tests your web app in a real Chrome the way a human tester would, checks each screen for accessibility problems, and compares it against a saved baseline. Every screenshot it takes appears in the chat, click to enlarge.
 - **Made for local models too** — a small model gets a reduced tool set, so the tool list doesn't swallow its context window.
 - **In CI as well** — `navy audit` and `navy playthrough` run headless from the command line or as a GitHub Action, with exit codes a pipeline can act on. See [Command line and CI](#command-line-and-ci).
 
@@ -45,7 +45,8 @@
 - **`/audit` — a supply-chain scan of your own project** — run it any time to check the repository for the things a supply-chain attack actually looks like: a `postinstall` hook that pipes `curl | sh`, a dependency resolved from a git URL instead of the registry, code that reads `~/.ssh` or `~/.aws/credentials`, an `eval(atob(...))` payload, a `fetch` to a hardcoded external host. It covers compiled languages too — C, C++, Java, C#, Swift — with rules for their own constructs (`system()`/`popen()` on a runtime value, `/bin/sh -c`, an `LD_PRELOAD` injection, `dlopen` of a runtime path, a socket to a hardcoded IP), and it reads the **build files** where the C/C++ attacks really hide — `Makefile`, `CMakeLists.txt`, `configure`, `Dockerfile` — for a step that downloads-and-runs, the shape of the xz/liblzma backdoor. It reads **every** text file, whatever the language — there is no allowlist to leave your stack out — and skips only the binary, generated, and prose files that would just add noise. Navy's own code does the scan deterministically — same files, same findings, every run — and only then hands the *hits* to the model to judge and explain, so you get a short list of real signals rather than a wall of pattern noise. Recently-changed files are flagged first, because an attack that just landed is the one that matters.
 
   Two modes: **`/audit`** is that fast, reproducible pattern pass. **`/audit deep`** cuts the leash — the model reads the project with its own tools (`read_file`, `list_files`, `git`) and reasons about supply-chain risk in whatever language and ecosystem it actually finds, seeded by the scan's hints but not capped by them, and grounded so it quotes the real line instead of inventing one. It runs even when the pattern scan is clean, because a fixed set of patterns having nothing to say proves little
-- **`/playthrough` — a visual QA pass in a real browser** — run it bare and Navy works out whether the open project is a web app, serves it, and plays through it in a real Chrome window you can watch; point it at a URL instead to test that page. It behaves like a human tester: it takes screenshots and **actually looks at them**, reads the page structure, clicks, types, submits forms, scrolls, and checks the console and network for the JavaScript errors and failed requests a user never sees. Findings come back ranked by severity, each cited to the screen or console line that produced it — and if the project *isn't* a web app, it says so and stops rather than inventing a site to test.
+- **It asks when the request is ambiguous** — where a request could mean two different things that lead to different work, Navy puts the readings in the chat as options, marks the one it recommends, and waits. Answer by clicking, or just type it. It asks once, for real ambiguity — not for permission to do what you already asked for.
+- **`/playthrough` — a visual QA pass in a real browser** — run it bare and Navy works out whether the open project is a web app, serves it, and plays through it in a real Chrome window you can watch; point it at a URL instead to test that page. It behaves like a human tester: it takes screenshots and **actually looks at them**, reads the page structure, clicks, types, submits forms, scrolls, and checks the console and network for the JavaScript errors and failed requests a user never sees. It drives the whole UI, not just the easy half: controls inside iframes, tabs a link opens, hover menus, keyboard-only paths, file uploads, drag and drop, native dropdowns, and the page at phone width — and it answers the `alert`/`confirm` dialogs that would otherwise stop a run dead. Every screenshot it takes appears in the chat as a thumbnail under the tool that took it - click one to see it full size, or open it in the editor's image viewer. Findings come back ranked by severity, each cited to the screen or console line that produced it — and if the project *isn't* a web app, it says so and stops rather than inventing a site to test.
 
   It drives Chrome over the DevTools Protocol on a **pipe** — no WebSocket, no open debugging port, and no browser-automation package, so the zero-dependency rule survives a feature that would normally cost Puppeteer. Every run gets a throwaway profile (your real cookies and sessions are never touched), Chrome's own sandbox stays on, only `http(s)` is reachable, and launching the browser goes through the same approval gate as any other command. Needs a vision-capable model to judge the visuals; on a text-only model it still catches functional, console and security issues
 
@@ -124,10 +125,11 @@ Navy runs an autonomous tool-use loop. The full tool set:
 | Shell | `run_command`, `run_tests` (auto-detected runner), `run_project`, `start_process` / `read_process_output` / `kill_process`, `get_terminal_output` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_blame` |
 | Web | `web_search` (Brave / Tavily / DuckDuckGo), `fetch_url` |
-| Browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_evaluate`, `browser_console`, `browser_back`, `browser_close`, `browser_accessibility`, `browser_visual_check` — a real Chrome, driven over CDP (see `/playthrough`) |
+| Browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_hover`, `browser_press`, `browser_upload`, `browser_drag`, `browser_wait`, `browser_viewport`, `browser_tabs`, `browser_dialog`, `browser_network`, `browser_scroll`, `browser_evaluate`, `browser_console`, `browser_back`, `browser_forward`, `browser_close`, `browser_accessibility`, `browser_visual_check` — a real Chrome, driven over CDP (see `/playthrough`) |
 | Delegation | `delegate_research` — an isolated, read-only sub-agent for broad investigations |
 | Skills | `activate_skill` — load an installed skill's instructions, or one of its bundled documents |
 | Memory | `remember`, `forget` — project facts that persist across sessions |
+| Asking | `ask_user` — when a request could mean two things, the readings as clickable options with one recommended, answered by click or by typing |
 | External | Any MCP server tool you've configured, exposed as `mcp__<server>__<tool>` |
 
 Every file-mutating tool goes through the diff approval gate (unless `navy.approvalMode` is set to `auto-approve`), and every edit is undoable. Anything that *executes* — shell commands, test runs, dev servers, background processes, MCP tools, launching the `/playthrough` browser — is gated separately by `navy.commandApproval`, which you have to turn off on its own.
@@ -213,7 +215,7 @@ npx github:zrnge/navy-coder playthrough http://localhost:3000 --provider anthrop
 Or as a GitHub Action:
 
 ```yaml
-- uses: zrnge/navy-coder@v0.3.6
+- uses: zrnge/navy-coder@v0.3.7
   with:
     command: audit
     args: --exclude "test/fixtures/**"
@@ -222,7 +224,7 @@ Or as a GitHub Action:
     npm ci
     npm start &
     until curl -s http://localhost:3000 > /dev/null; do sleep 1; done
-- uses: zrnge/navy-coder@v0.3.6
+- uses: zrnge/navy-coder@v0.3.7
   with:
     command: playthrough
     url: http://localhost:3000
@@ -331,7 +333,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 2,655 tests: extension host + webview, no network or API keys needed
+npm test        # 2,815 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 

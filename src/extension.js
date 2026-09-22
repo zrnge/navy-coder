@@ -41,8 +41,12 @@ const { sessionContext } = require('./session-context.js');
 // Workspace trust — see src/workspace.js for why it lives in its own module.
 const { workspaceIsTrusted } = require('./workspace.js');
 // Where each project's chats, memory and the rest live: the profile, not the project.
-const { projectDataDir } = require('./data-dir.js');
+const { projectDataDir, navyDataHome } = require('./data-dir.js');
+// /playthrough's screenshots, kept as files so the chat can show them.
+const { saveScreenshot } = require('./screenshots.js');
 const { THINKING_LEVELS, normalizeThinkingLevel } = require('./thinking.js');
+// Asking the person when the request could mean more than one thing.
+const { QuestionMethods } = require('./questions.js');
 
 // Diff, approval and reasoning cards, saved with the turn that drew them - see
 // src/transcript-cards.js.
@@ -526,6 +530,7 @@ class Session {
     this.messages = [];
     this.pendingApprovals = new Map();
     this.pendingCommandApprovals = new Map();
+    this.pendingQuestions = new Map();   // ask_user, waiting on an answer
     this.checkpoints = [];
     this.redoStack = []; // entries: { files: [{ filePath, text }] } — text as it was before the undo
     this.activeToolCall = null;
@@ -687,6 +692,8 @@ class NavyCoderViewProvider {
   set pendingApprovals(v) { this._session.pendingApprovals = v; }
   get pendingCommandApprovals() { return this._session.pendingCommandApprovals; }
   set pendingCommandApprovals(v) { this._session.pendingCommandApprovals = v; }
+  get pendingQuestions() { return this._session.pendingQuestions; }
+  set pendingQuestions(v) { this._session.pendingQuestions = v; }
   get checkpoints() { return this._session.checkpoints; }
   set checkpoints(v) { this._session.checkpoints = v; }
   get redoStack() { return this._session.redoStack; }
@@ -897,7 +904,9 @@ class NavyCoderViewProvider {
 
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [this.context.extensionUri]
+      // The profile folder as well: that is where /playthrough's screenshots
+      // are kept, and the panel shows them (src/screenshots.js).
+      localResourceRoots: [this.context.extensionUri, vscode.Uri.file(navyDataHome())],
     };
 
     webviewView.webview.html = this.getHtml(webviewView.webview);
@@ -942,7 +951,16 @@ class NavyCoderViewProvider {
           await this.closeSessionTab(message.sessionId || '');
           break;
         case 'ask':
+          // A question is waiting: what was just typed IS the answer. Queuing it
+          // instead would park it behind the very turn that is waiting for it.
+          if (this.answerPendingQuestion(message.prompt)) {
+            this.view?.webview.postMessage({ type: 'answeredByTyping', id: message.queueId || '' });
+            break;
+          }
           await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || [], message.queueId || '');
+          break;
+        case 'answerQuestion':
+          this.resolveQuestion(message.id, message.answer || null);
           break;
         case 'cancelQueued':
           this.cancelQueuedMessage(message.id || '');
@@ -1212,6 +1230,11 @@ class NavyCoderViewProvider {
           }
           break;
         }
+        case 'openImage':
+          // "Open in editor" on a screenshot: the editor's own image viewer
+          // zooms and pans, which a card in a narrow panel cannot.
+          await this.openImageFile(message.file || '');
+          break;
         case 'openDiffFile':
           // "Open in editor" on a diff card — the card can only ever show a
           // truncated view of a large change, and it used to say "use the
@@ -1395,6 +1418,7 @@ class NavyCoderViewProvider {
     for (const id of [...this.pendingCommandApprovals.keys()]) {
       this.resolveCommandApproval(id, false);
     }
+    this.cancelPendingQuestions();
   }
 
   // Every session's pending approvals — used ONLY when the whole webview
@@ -1414,6 +1438,7 @@ class NavyCoderViewProvider {
         for (const id of [...session.pendingCommandApprovals.keys()]) {
           this.resolveCommandApproval(id, false);
         }
+        this.cancelPendingQuestions();
       });
     }
   }
@@ -2279,6 +2304,7 @@ class NavyCoderViewProvider {
     session.abortController?.abort();
     for (const [, approval] of session.pendingApprovals) approval.resolve(false);
     for (const [, approval] of session.pendingCommandApprovals) approval.resolve(false);
+    for (const [, question] of session.pendingQuestions) question.resolve(null);
     this._disposeSession(session);
     this.sessions.delete(sessionId);
     // Closing is permanent, so the chat's own file goes with it. Dropping the
@@ -2940,6 +2966,65 @@ class NavyCoderViewProvider {
       vscode.window.showInformationMessage(`Navy moved ${path.basename(root)}'s chats and memory out of the project, to ${dest}. `
         + 'Navy no longer keeps anything of its own inside your projects.');
     }
+  }
+
+  // A screenshot or a visual diff, shown in the chat under the tool that took
+  // it. The PNG is written to the project's folder in the profile (never the
+  // project) and the card keeps its path, so a reopened chat shows it again -
+  // see src/screenshots.js for why it is a file rather than base64 in the chat.
+  async _showToolImage(tool, image, callId) {
+    const webview = this.view?.webview;
+    if (!image || !image.data || !webview) return;
+    try {
+      const dir = await this.ensureNavyDir();
+      if (!dir) return;
+      const file = await saveScreenshot(dir, tool, image.data);
+      if (!file) return;
+      webview.postMessage({
+        type: 'toolImage', tool, callId, file,
+        uri: this._webviewFileUri(file),
+        caption: image.caption || '',
+      });
+    } catch { /* a screenshot that cannot be saved must not fail the turn */ }
+  }
+
+  // A file path as something the panel may actually load. Empty when there is
+  // no panel, or the file has since been pruned.
+  _webviewFileUri(file) {
+    const webview = this.view?.webview;
+    if (!file || !webview?.asWebviewUri || !fs.existsSync(file)) return '';
+    try { return String(webview.asWebviewUri(vscode.Uri.file(file))); } catch { return ''; }
+  }
+
+  // The chat as the panel needs it. An image card holds a file path, which
+  // only the extension can turn into a URI the webview is allowed to load -
+  // and a screenshot pruned since is marked so the card says as much instead
+  // of showing a broken picture.
+  _messagesForPanel() {
+    return this.messages.map((m) => {
+      if (!Array.isArray(m.cards) || !m.cards.some(c => c && c.kind === 'image')) return m;
+      return {
+        ...m,
+        cards: m.cards.map((c) => {
+          if (!c || c.kind !== 'image') return c;
+          const uri = this._webviewFileUri(c.file);
+          return uri ? { ...c, uri } : { ...c, missing: true };
+        }),
+      };
+    });
+  }
+
+  // Opens a screenshot in the editor's image viewer. Only files Navy wrote
+  // itself: the panel can name a path, so it must not be able to name any path.
+  async openImageFile(file) {
+    const full = path.resolve(String(file || ''));
+    if (!foldPath(full).startsWith(foldPath(navyDataHome()) + path.sep)) return;
+    if (!fs.existsSync(full)) {
+      vscode.window.showInformationMessage('Navy: that screenshot is no longer kept — only the most recent ones are.');
+      return;
+    }
+    try { await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(full)); }
+    catch (e) { vscode.window.showWarningMessage('Navy: could not open the screenshot — ' + e.message); }
   }
 
   // Refreshes the webview from the ACTIVE session's already-in-memory state.
@@ -4353,6 +4438,10 @@ class NavyCoderViewProvider {
             }
 
             postToolResult(tool.name, tool.args, result, callId);
+            // The model is not the only one who should see the picture. Awaited,
+            // and after the tool's own card, so the thumbnail lands under the
+            // tool that took it and is recorded while this turn is still open.
+            if (imageForModel) await this._showToolImage(tool.name, imageForModel, callId);
             toolResults.push(makeToolResult(tool, result));
             // The captured image rides as its own vision user message, collected
             // separately and appended AFTER every tool result (see below). It must
@@ -4722,7 +4811,7 @@ class NavyCoderViewProvider {
     // being shown - a compaction that finished after the user switched away must
     // not repaint the chat they switched to.
     const visible = this.activeSessionId === id;
-    if (visible) post({ type: 'restore', messages: this.messages, digest: this.sessionDigest || '' });
+    if (visible) post({ type: 'restore', messages: this._messagesForPanel(), digest: this.sessionDigest || '' });
     this._sendSessionList();
 
     // The bar only learns the real figure from the next model call. Until then an
@@ -5130,11 +5219,22 @@ class NavyCoderViewProvider {
         case 'search_docs': return await this.toolSearchDocs(tool.args.query, tool.args.maxResults);
         case 'find_relevant_files': return await this.toolFindRelevantFiles(tool.args.query, tool.args.maxResults, tool.args.folder);
         case 'activate_skill': return await this.toolActivateSkill(tool.args);
+        case 'ask_user': return await this.toolAskUser(tool.args);
         case 'browser_navigate': return await this.toolBrowserNavigate(tool.args.url);
         case 'browser_snapshot': return await this.toolBrowserSnapshot();
         case 'browser_screenshot': return await this.toolBrowserScreenshot();
-        case 'browser_click': return await this.toolBrowserClick(tool.args.ref);
-        case 'browser_type': return await this.toolBrowserType(tool.args.ref, tool.args.text, tool.args.submit);
+        case 'browser_click': return await this.toolBrowserClick(tool.args.ref, tool.args.selector, tool.args.button, tool.args.clicks);
+        case 'browser_type': return await this.toolBrowserType(tool.args.ref, tool.args.text, tool.args.submit, tool.args.selector);
+        case 'browser_hover': return await this.toolBrowserHover(tool.args.ref, tool.args.selector);
+        case 'browser_press': return await this.toolBrowserPress(tool.args.key);
+        case 'browser_upload': return await this.toolBrowserUpload(tool.args.ref, tool.args.path, tool.args.selector);
+        case 'browser_wait': return await this.toolBrowserWait(tool.args.text, tool.args.selector, tool.args.gone, tool.args.timeout);
+        case 'browser_viewport': return await this.toolBrowserViewport(tool.args.width, tool.args.height, tool.args.mobile, tool.args.reset);
+        case 'browser_tabs': return await this.toolBrowserTabs(tool.args.action, tool.args.index);
+        case 'browser_dialog': return await this.toolBrowserDialog(tool.args.accept, tool.args.text);
+        case 'browser_drag': return await this.toolBrowserDrag(tool.args.from, tool.args.to, tool.args.fromSelector, tool.args.toSelector);
+        case 'browser_forward': return await this.toolBrowserForward();
+        case 'browser_network': return await this.toolBrowserNetwork(tool.args.condition);
         case 'browser_scroll': return await this.toolBrowserScroll(tool.args.amount);
         case 'browser_evaluate': return await this.toolBrowserEvaluate(tool.args.expression);
         case 'browser_console': return await this.toolBrowserConsole();
@@ -7145,7 +7245,7 @@ ${task.trim()}`;
   }
 
   restoreMessages() {
-    this.view?.webview.postMessage({ type: 'restore', messages: this.messages, digest: this.sessionDigest || '' });
+    this.view?.webview.postMessage({ type: 'restore', messages: this._messagesForPanel(), digest: this.sessionDigest || '' });
   }
 
   // One-shot, non-streaming completion through the ACTIVE provider (not just Ollama).
@@ -7710,6 +7810,7 @@ mixinPrototype(NavyCoderViewProvider.prototype, WEB_SEARCH_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, DIAGNOSTICS_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, COMMAND_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, PLAN_METHODS);
+mixinPrototype(NavyCoderViewProvider.prototype, QuestionMethods.prototype);
 mixinPrototype(NavyCoderViewProvider.prototype, SupplyChainScanMethods.prototype);
 Object.assign(NavyCoderViewProvider.prototype, SLASH_COMMAND_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SKILL_METHODS);

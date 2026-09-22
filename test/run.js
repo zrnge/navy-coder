@@ -22,7 +22,7 @@ const { costEstimateSuite, providerFallbackSuite, cachingFallbackSuite, adaptive
 const { mcpSuite, mcpHttpSuite, mcpExtrasSuite } = require('./suite-mcp.js');
 const { approvalCancelSuite, approvalScopeSuite, settingsDefaultsSuite, diagnosticsSuite } = require('./suite-approval.js');
 const { dictationSuite, reviewRegressionSuite, slashCommandSuite, skillSuite, supplyChainSuite, webviewExitSuite } = require('./suite-ui.js');
-const { browserSuite } = require('./suite-browser.js');
+const { browserSuite, browserControlSuite } = require('./suite-browser.js');
 const { pngSuite } = require('./suite-visual.js');
 const { a11ySuite } = require('./suite-a11y.js');
 const { exportSuite } = require('./suite-export.js');
@@ -33,6 +33,8 @@ const { cliSuite } = require('./suite-cli.js');
 const { forgetProjectsSuite } = require('./suite-projects.js');
 const { navyDataDirSuite } = require('./suite-datadir.js');
 const { thinkingLevelsSuite } = require('./suite-thinking.js');
+const { screenshotsSuite } = require('./suite-screenshots.js');
+const { askUserSuite } = require('./suite-questions.js');
 
 // The pure-function and jsdom checks first: they need no mock and no temp
 // filesystem, so a failure there is the cheapest possible signal.
@@ -95,6 +97,7 @@ undoRedoSuite()
   .then(rewindSuite)
   .then(mcpExtrasSuite)
   .then(browserSuite)
+  .then(browserControlSuite)
   .then(webviewExitSuite)
   .then(chatPersistenceSuite)
   .then(compactContextSuite)
@@ -108,6 +111,8 @@ undoRedoSuite()
   .then(forgetProjectsSuite)
   .then(navyDataDirSuite)
   .then(thinkingLevelsSuite)
+  .then(screenshotsSuite)
+  .then(askUserSuite)
   .then(() => {
     uninstallVscodeMock();
     report();

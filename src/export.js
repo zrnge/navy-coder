@@ -51,8 +51,9 @@ const code = (s) => '`' + String(s).replace(/`/g, "'") + '`';
 function toolsSection(cards) {
   // Tool calls only. The diff, approval and reasoning cards a turn also keeps
   // (src/transcript-cards.js) are covered by the diffs below, or are the
-  // model's working rather than something it did.
-  const calls = Array.isArray(cards) ? cards.filter(c => c && c.tool) : [];
+  // model's working rather than something it did. A screenshot card names the
+  // tool that took it, so it is excluded by kind and written out below instead.
+  const calls = Array.isArray(cards) ? cards.filter(c => c && c.tool && c.kind !== 'image') : [];
   if (!calls.length) return [];
   const out = ['<details>', `<summary>${calls.length} tool call${calls.length === 1 ? '' : 's'}</summary>`, ''];
   for (const c of calls) {
@@ -67,6 +68,22 @@ function toolsSection(cards) {
     }
   }
   out.push('</details>', '');
+  return out;
+}
+
+// The screenshots a turn took, as Markdown images. The PNGs live in the
+// project's folder in the profile and are linked rather than embedded: a
+// playthrough's worth of base64 would be megabytes in a text file, and a
+// Markdown viewer follows the link.
+function shotsSection(cards) {
+  const shots = Array.isArray(cards) ? cards.filter(c => c && c.kind === 'image' && c.file) : [];
+  if (!shots.length) return [];
+  const out = [];
+  for (const s of shots) {
+    const alt = String(s.caption || 'Screenshot').replace(/[\[\]]/g, '').slice(0, 120).trim() || 'Screenshot';
+    const link = String(s.file).split('\\').join('/').replace(/ /g, '%20');
+    out.push(`![${alt}](${link})`, '');
+  }
   return out;
 }
 
@@ -159,10 +176,11 @@ async function buildExportMarkdown({ messages = [], digest = '', checkpoints = [
     const isUser = m.role === 'user';
     const text = String(m.text || '').trim();
     const tools = isUser ? [] : toolsSection(m.cards);
+    const shots = isUser ? [] : shotsSection(m.cards);
     const changes = isUser ? [] : await changesSection(m.meta, cps, projectRoot, read);
     const error = m.error ? [`_The turn ended on an error: ${String(m.error).trim()}_`, ''] : [];
-    if (!text && !tools.length && !changes.length && !error.length) continue;
-    lines.push((isUser ? '**You:** ' : '**Navy:** ') + text, '', ...tools, ...changes, ...error);
+    if (!text && !tools.length && !shots.length && !changes.length && !error.length) continue;
+    lines.push((isUser ? '**You:** ' : '**Navy:** ') + text, '', ...tools, ...shots, ...changes, ...error);
   }
   return lines.join('\n');
 }

@@ -99,6 +99,7 @@ const fileAttachInput = document.querySelector('#fileAttachInput');
 const imageLightbox = document.querySelector('#imageLightbox');
 const lightboxImg = document.querySelector('#lightboxImg');
 const lightboxClose = document.querySelector('#lightboxClose');
+const lightboxOpen = document.querySelector('#lightboxOpen');
 const lightboxBackdrop = document.querySelector('#lightboxBackdrop');
 const searchButton = document.querySelector('#searchButton');
 const exportButton = document.querySelector('#exportButton');
@@ -311,9 +312,16 @@ fileAttachInput?.addEventListener('change', (e) => {
 });
 
 // ── Lightbox ─────────────────────────────────────────────────────────────────
-function openLightbox(src) {
+// `file` is set for a picture that exists on disk - a screenshot Navy saved -
+// and offers to hand it to the editor's image viewer, which zooms and pans.
+// A pasted image passes none: it is in the composer, not in a file.
+let lightboxFile = '';
+
+function openLightbox(src, file = '') {
   if (!imageLightbox || !lightboxImg) return;
   lightboxImg.src = src;
+  lightboxFile = file || '';
+  lightboxOpen?.classList.toggle('hidden', !lightboxFile);
   imageLightbox.classList.remove('hidden');
 }
 
@@ -321,8 +329,13 @@ function closeLightbox() {
   if (!imageLightbox) return;
   imageLightbox.classList.add('hidden');
   lightboxImg.src = '';
+  lightboxFile = '';
+  lightboxOpen?.classList.add('hidden');
 }
 
+lightboxOpen?.addEventListener('click', () => {
+  if (lightboxFile) vscode.postMessage({ type: 'openImage', file: lightboxFile });
+});
 lightboxBackdrop?.addEventListener('click', closeLightbox);
 lightboxClose?.addEventListener('click', closeLightbox);
 document.addEventListener('keydown', (e) => {
@@ -1458,6 +1471,23 @@ window.addEventListener('message', (event) => {
     addPendingCommandCard(message.id, message.command);
   }
 
+  // Navy is asking something. The card takes the answer; the composer works
+  // too, and the extension treats what is typed there as the answer.
+  if (message.type === 'pendingQuestion') {
+    addQuestionCard(message.id, message.question, message.options || []);
+  }
+
+  if (message.type === 'questionResolved') {
+    settleQuestionCard(message.id, message.answer);
+  }
+
+  // The answer was typed rather than clicked, so the composer's optimistic
+  // bubble is not a message of its own - the card below already shows it.
+  if (message.type === 'answeredByTyping') {
+    const article = message.id && messagesEl.querySelector(`article[data-queue-id="${message.id}"]`);
+    if (article) article.remove();
+  }
+
   if (message.type === 'commandResolved') {
     const card = document.querySelector(`.command-card[data-command-id="${message.id}"]`);
     if (card) {
@@ -1667,6 +1697,12 @@ window.addEventListener('message', (event) => {
 
   if (message.type === 'auditResult') {
     messagesEl.appendChild(buildAuditCard(message));
+    scrollToBottom();
+  }
+
+  // A screenshot /playthrough just took, under the tool that took it.
+  if (message.type === 'toolImage') {
+    addImageCard(message);
     scrollToBottom();
   }
 
@@ -2970,6 +3006,10 @@ function replayDrawnCard(card) {
     finalizeThinking();
   } else if (card.kind === 'audit') {
     appendTurnCard(buildAuditCard(card, true));
+  } else if (card.kind === 'image') {
+    addImageCard(card);
+  } else if (card.kind === 'question') {
+    addQuestionCard('', card.question, card.options || [], card.answer || 'cancelled');
   }
 }
 
@@ -2997,6 +3037,53 @@ function replayApprovalCard(card) {
     status.textContent = card.status === 'approved' ? 'Approved'
       : card.status === 'rejected' ? 'Rejected by you' : 'Not decided';
   }
+}
+
+// A screenshot or visual diff as a card: a thumbnail, its caption, and the
+// full picture on a click. The extension saves the PNG and hands over a URI
+// the panel may load (src/screenshots.js).
+function addImageCard(card) {
+  const el = document.createElement('div');
+  el.className = 'shot-card';
+  const label = card.tool === 'browser_visual_check' ? 'Visual check' : 'Screenshot';
+  if (card.missing || !card.uri) {
+    el.className = 'shot-card shot-missing';
+    el.textContent = label + ' - no longer kept (Navy keeps the most recent ones)';
+    appendTurnCard(el);
+    return el;
+  }
+  const img = document.createElement('img');
+  img.className = 'shot-thumb';
+  img.src = card.uri;
+  img.alt = shotCaption(card.caption) || label;
+  img.title = 'Click to enlarge';
+  img.addEventListener('click', () => openLightbox(card.uri, card.file || ''));
+  // The file can go between the chat being drawn and the picture loading -
+  // pruning runs on every new screenshot. Say so rather than leave a broken
+  // image sitting in the transcript.
+  img.addEventListener('error', () => {
+    el.className = 'shot-card shot-missing';
+    el.textContent = label + ' - no longer kept (Navy keeps the most recent ones)';
+  });
+  el.appendChild(img);
+  const caption = document.createElement('div');
+  caption.className = 'shot-caption';
+  caption.textContent = shotCaption(card.caption) || label;
+  el.appendChild(caption);
+  appendTurnCard(el);
+  return el;
+}
+
+// The caption a tool wrote for the model, trimmed to something a person reads
+// under a picture: it opens by naming the tool, which the card already shows.
+function shotCaption(text) {
+  let t = String(text || '').replace(/^\[Screenshot from \S+\s*[—-]\s*/i, '').replace(/\]\s*$/, '').trim();
+  // A caption says what the picture is and then tells the model what to do
+  // with it. The card wants the first part only.
+  const stop = t.search(/[:.]\s/);
+  if (stop > 20) t = t.slice(0, stop);
+  if (t.length > 140) t = t.slice(0, 137) + '…';
+  return t ? t[0].toUpperCase() + t.slice(1) : '';
 }
 
 function diffNote(text) {
@@ -6201,6 +6288,110 @@ function markDiffResolved(card, approved) {
   } else {
     body.remove(); // rejected (or empty diff): collapse to the one-line summary
   }
+}
+
+// Navy's own question, with the readings it can see. Clicking one answers it;
+// "Something else" takes anything they are not among. The card settles into
+// what was chosen, and is kept with the turn, so a reopened chat still shows
+// the question and the answer that shaped what happened next.
+function addQuestionCard(id, question, options, settled) {
+  const card = document.createElement('div');
+  card.className = 'question-card';
+  card.dataset.questionId = id || '';
+
+  const head = document.createElement('div');
+  head.className = 'question-head';
+  head.textContent = String(question || '');
+  card.appendChild(head);
+
+  const list = document.createElement('div');
+  list.className = 'question-options';
+  card.appendChild(list);
+
+  const answer = (payload) => {
+    if (card.dataset.settled) return;
+    card.dataset.settled = '1';
+    vscode.postMessage({ type: 'answerQuestion', id, answer: payload });
+    settleQuestionCard(id, payload);
+  };
+
+  for (const option of options) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'question-option';
+    btn.dataset.label = option.label || '';
+    const label = document.createElement('span');
+    label.className = 'question-label';
+    label.textContent = option.label || '';
+    btn.appendChild(label);
+    if (option.recommended) {
+      const tag = document.createElement('span');
+      tag.className = 'question-tag';
+      tag.textContent = 'Recommended';
+      btn.appendChild(tag);
+    }
+    if (option.detail) {
+      const detail = document.createElement('span');
+      detail.className = 'question-detail';
+      detail.textContent = option.detail;
+      btn.appendChild(detail);
+    }
+    btn.addEventListener('click', () => answer({ label: option.label, detail: option.detail || '' }));
+    list.appendChild(btn);
+  }
+
+  // None of the above: the options are the model's reading of the request, and
+  // the person is the one who knows whether it read it right.
+  const other = document.createElement('div');
+  other.className = 'question-other';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'question-input';
+  input.placeholder = 'Something else…';
+  const send = document.createElement('button');
+  send.type = 'button';
+  send.className = 'question-send';
+  send.textContent = 'Answer';
+  const sendTyped = () => {
+    const text = input.value.trim();
+    if (text) answer({ text });
+  };
+  send.addEventListener('click', sendTyped);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } });
+  other.appendChild(input);
+  other.appendChild(send);
+  card.appendChild(other);
+
+  const status = document.createElement('div');
+  status.className = 'question-status';
+  card.appendChild(status);
+
+  appendTurnCard(card);
+  if (settled) settleQuestionCard(id, settled === 'cancelled' ? null : settled, card);
+  else {
+    userScrolledUp = false;
+    scrollToBottom();
+    input.focus();
+  }
+  return card;
+}
+
+// The card after the answer: the controls go, the chosen option stays marked,
+// and a cancelled question says so rather than sitting there looking live.
+function settleQuestionCard(id, answer, known) {
+  const card = known || (id && document.querySelector(`.question-card[data-question-id="${id}"]`));
+  if (!card) return;
+  card.dataset.settled = '1';
+  card.querySelector('.question-other')?.remove();
+  const status = card.querySelector('.question-status');
+  for (const btn of card.querySelectorAll('.question-option')) {
+    btn.disabled = true;
+    if (answer && answer.label && btn.dataset.label === answer.label) btn.classList.add('chosen');
+  }
+  if (!status) return;
+  if (!answer) status.textContent = 'No answer — Navy carried on with its own judgement.';
+  else if (answer.text) status.textContent = 'You answered: ' + answer.text;
+  else status.textContent = 'You chose: ' + (answer.label || '');
 }
 
 function addPendingCommandCard(id, command) {

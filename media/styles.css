@@ -4106,3 +4106,142 @@ textarea:focus-visible,
     border-color: GrayText;
   }
 }
+
+/* ── Screenshots in the chat ─────────────────────────────────── */
+/* A picture is the point of a playthrough, so the thumbnail is as wide as
+   the panel allows and bounded in height; clicking it opens the same
+   lightbox a pasted image opens in. */
+.shot-card {
+  margin: var(--card-margin);
+  border: 1px solid var(--border);
+  border-left: var(--card-rail) solid var(--gold);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+  overflow: hidden;
+}
+.shot-thumb {
+  display: block;
+  width: 100%;
+  max-height: 220px;
+  object-fit: cover;
+  object-position: top center;
+  cursor: zoom-in;
+  background: var(--vscode-editor-background);
+}
+.shot-caption {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+}
+.shot-card.shot-missing {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+/* Unthemed with the rest of the lightbox: it sits on the scrim. */
+.lightbox-open {
+  position: absolute;
+  top: 14px;
+  left: 18px;
+  padding: var(--space-2) var(--space-4);
+  background: rgba(30, 40, 55, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius);
+  color: #fff;
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  z-index: 2;
+}
+.lightbox-open:hover { background: rgba(60, 80, 110, 0.9); }
+.lightbox-open.hidden { display: none; }
+
+/* ── Navy asking a question ───────────────────────────────── */
+/* The options are the card: full-width targets in a narrow panel, each with
+   its own one-line reason, and the recommended one badged. */
+.question-card {
+  margin: var(--card-margin);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-left: var(--card-rail) solid var(--gold);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+}
+.question-head {
+  font-size: var(--fs-lg);
+  margin-bottom: var(--space-3);
+}
+.question-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.question-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--vscode-editor-background);
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-md);
+  cursor: pointer;
+}
+.question-option:hover:not(:disabled) { border-color: var(--gold); }
+.question-option:disabled { cursor: default; opacity: 0.75; }
+.question-option.chosen {
+  border-color: var(--gold);
+  opacity: 1;
+}
+.question-label { font-weight: 600; }
+.question-tag {
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--gold);
+  color: var(--gold);
+}
+.question-detail {
+  flex-basis: 100%;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.question-other {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.question-input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--vscode-input-background, var(--surface));
+  color: var(--vscode-input-foreground, var(--text));
+  font: inherit;
+  font-size: var(--fs-md);
+}
+.question-send {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--vscode-button-background, var(--gold));
+  color: var(--vscode-button-foreground, #fff);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.question-status {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.question-status:not(:empty) { margin-top: var(--space-3); }

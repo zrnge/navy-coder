@@ -562,14 +562,28 @@ async function browserSuite() {
   {
     const { TOOLS, TOOLS_API, TOOL_PROMPT } = require('../src/providers/tools.js');
     const names = new Set(TOOLS.map(t => t.name));
-    const browserTools = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_close', 'browser_accessibility', 'browser_visual_check'];
-    check('all twelve browser tools are declared in TOOLS', browserTools.every(n => names.has(n)));
+    const browserTools = ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type',
+      'browser_hover', 'browser_press', 'browser_upload', 'browser_wait', 'browser_viewport', 'browser_tabs',
+      'browser_dialog', 'browser_drag', 'browser_forward', 'browser_network',
+      'browser_scroll', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_close',
+      'browser_accessibility', 'browser_visual_check'];
+    check('every browser tool is declared in TOOLS', browserTools.every(n => names.has(n)),
+      browserTools.filter(n => !names.has(n)).join(', '));
     check('browser tools ride on the wire schema (TOOLS_API)', browserTools.every(n => TOOLS_API.some(t => t.function.name === n)));
     check('the tool prompt lists the browser tools', /browser_navigate/.test(TOOL_PROMPT) && /browser_screenshot/.test(TOOL_PROMPT));
+    check('...including the ones that reach the parts of a UI the others cannot',
+      /browser_hover/.test(TOOL_PROMPT) && /browser_upload/.test(TOOL_PROMPT) && /browser_viewport/.test(TOOL_PROMPT));
     const nav = TOOLS.find(t => t.name === 'browser_navigate');
     check('browser_navigate requires a url', nav.parameters.required.includes('url'));
     const type = TOOLS.find(t => t.name === 'browser_type');
-    check('browser_type requires ref + text', type.parameters.required.includes('ref') && type.parameters.required.includes('text'));
+    check('browser_type requires the text, and takes a ref or a selector for where',
+      type.parameters.required.includes('text') && !type.parameters.required.includes('ref')
+      && type.parameters.properties.selector && type.parameters.properties.ref);
+    check('every tool that acts on an element accepts a selector as well as a ref',
+      ['browser_click', 'browser_hover', 'browser_upload'].every(n => {
+        const p = TOOLS.find(x => x.name === n).parameters.properties;
+        return p.ref && p.selector;
+      }));
   }
 
   // ── The manifest declares the browser settings ─────────────────────────────
@@ -581,4 +595,352 @@ async function browserSuite() {
   }
 }
 
-module.exports = { browserSuite };
+
+// ── Driving a UI, not just a page ────────────────────────────────────────────
+// A dialog used to stall the whole session, a popup was never followed, an
+// iframe's controls were invisible, and there was no way to hover, press a key,
+// attach a file, drag, wait, or resize. Each of those is a thing a tester does
+// on the way to a bug, so each is checked here against the fake pipe, and
+// against a real Chrome in test/integration.
+async function browserControlSuite() {
+  console.log('\nbrowser: driving the whole UI:');
+  const { quadArea, keySpec, describeTarget, missingTarget } = browser;
+
+  // ── Pure helpers ───────────────────────────────────────────────────────────
+  check('a content quad\'s area is its real area', quadArea([0, 0, 10, 0, 10, 4, 0, 4]) === 40);
+  check('...and a collapsed one has none', quadArea([5, 5, 5, 5, 5, 5, 5, 5]) === 0);
+  check('a named key carries the code Chrome wants', keySpec('Escape').code2 === 27 && keySpec('escape').code === 'Escape');
+  check('a printable key carries its text, so it types', keySpec('a').text === 'a' && keySpec('a').code === 'KeyA');
+  check('an unknown key is refused rather than sent as nothing', keySpec('Fnord') === null);
+  check('a target names itself the way it was given',
+    describeTarget(7) === 'ref 7' && describeTarget({ selector: '#a' }) === '"#a"');
+  check('a stale ref and a selector that matches nothing say different things',
+    /stale/.test(missingTarget({ ref: 3 })) && /matches nothing/.test(missingTarget({ selector: '.x' })));
+
+  // ── A fake Chrome that records what it was asked to do ─────────────────────
+  const sentOf = (log, method) => log.filter(m => m.method === method);
+  const openBrowser = async (extra = () => undefined) => {
+    const log = [];
+    const fake = fakeChrome((msg) => {
+      log.push(msg);
+      const custom = extra(msg, log);
+      if (custom !== undefined) return custom;
+      return defaultHandler(msg);
+    });
+    const b = new Browser({ chromePath: '/fake/chrome', existsSync: () => true, spawn: () => fake.proc, navTimeout: 200, commandTimeout: 2000 });
+    await b.launch();
+    return { b, fake, log };
+  };
+
+  // ── Dialogs ────────────────────────────────────────────────────────────────
+  {
+    const { b, fake, log } = await openBrowser();
+    fake.emit4(fake.frame({ method: 'Page.javascriptDialogOpening', params: { type: 'confirm', message: 'delete it?' }, sessionId: 'S1' }));
+    await new Promise(r => setTimeout(r, 30));
+    const answered = sentOf(log, 'Page.handleJavaScriptDialog');
+    check('a dialog is answered instead of being left to stall the session',
+      answered.length === 1 && answered[0].params.accept === true, JSON.stringify(answered));
+    check('...and reported like any other page event',
+      b.drainEvents(false).some(e => e.kind === 'dialog' && /delete it\?/.test(e.text)));
+
+    b.setDialogPolicy({ accept: false, promptText: 'typed answer' });
+    fake.emit4(fake.frame({ method: 'Page.javascriptDialogOpening', params: { type: 'prompt', message: 'name?' }, sessionId: 'S1' }));
+    await new Promise(r => setTimeout(r, 30));
+    const second = sentOf(log, 'Page.handleJavaScriptDialog')[1];
+    check('a confirm can be cancelled, which is what tests what it guards', second.params.accept === false);
+    check('...and a prompt gets the answer the caller set', second.params.promptText === 'typed answer');
+
+    fake.emit4(fake.frame({ method: 'Page.javascriptDialogOpening', params: { type: 'beforeunload', message: '' }, sessionId: 'S1' }));
+    await new Promise(r => setTimeout(r, 30));
+    check('a beforeunload is always accepted, or the page could never be left',
+      sentOf(log, 'Page.handleJavaScriptDialog')[2].params.accept === true);
+    await b.close();
+  }
+
+  // ── Tabs ───────────────────────────────────────────────────────────────────
+  {
+    const { b, fake } = await openBrowser((msg) => {
+      if (msg.method === 'Runtime.evaluate' && msg.sessionId === 'S2') {
+        return { result: { value: { title: 'Popup Page', url: 'http://x.test/popup' } } };
+      }
+      return undefined;
+    });
+    check('the tab Navy opened is the only one listed at the start', b._tabs.length === 1);
+    fake.emit4(fake.frame({ method: 'Target.attachedToTarget', params: { sessionId: 'S2', targetInfo: { type: 'page', targetId: 'T2', url: 'http://x.test/popup' } } }));
+    await new Promise(r => setTimeout(r, 30));
+    check('a popup is attached and becomes the tab being driven',
+      b._tabs.length === 2 && b._sessionId === 'S2', JSON.stringify(b._tabs));
+    check('...and is announced, so the model knows where it now is',
+      b.drainEvents(false).some(e => e.kind === 'tab' && /new tab opened/.test(e.text)));
+    const tabs = await b.listTabs();
+    check('the tab list says which one is current', tabs.length === 2 && tabs[1].current === true && tabs[0].current === false);
+
+    fake.emit4(fake.frame({ method: 'Target.detachedFromTarget', params: { sessionId: 'S2' } }));
+    await new Promise(r => setTimeout(r, 30));
+    check('closing the current tab falls back to the one underneath',
+      b._tabs.length === 1 && b._sessionId === 'S1');
+
+    // A tab that was already open before Navy started is not part of the run.
+    b._ignoreTargets.add('T9');
+    fake.emit4(fake.frame({ method: 'Target.attachedToTarget', params: { sessionId: 'S9', targetInfo: { type: 'page', targetId: 'T9', url: 'about:blank' } } }));
+    await new Promise(r => setTimeout(r, 30));
+    check('the browser\'s own starting tab is left out of the run', b._tabs.length === 1);
+    await b.close();
+  }
+
+  // ── Frames ─────────────────────────────────────────────────────────────────
+  {
+    const rowsFor = { 1: 'Main button', 2: 'Child button', 5: 'Cross-origin button' };
+    const { b, fake } = await openBrowser((msg) => {
+      // A real frame tree, so the top frame is known to be the top frame.
+      if (msg.method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { id: msg.sessionId === 'S5' ? 'FRAME-OOP' : 'FRAME-MAIN' } } };
+      }
+      if (msg.method !== 'Runtime.evaluate' || !/__navyRefs/.test(msg.params.expression || '')) return undefined;
+      const label = rowsFor[msg.params.contextId] || 'unknown';
+      return { result: { value: { title: 'T', url: 'http://x.test/' + (msg.sessionId || 'main'), nodes: [{ ref: 0, role: 'button', text: label, x: 5, y: 5, act: true }] } } };
+    });
+    // The main frame, a same-origin child frame, and a cross-origin one.
+    const ctx = (id, frameId, sessionId) => fake.emit4(fake.frame({ method: 'Runtime.executionContextCreated', params: { context: { id, auxData: { frameId, isDefault: true } } }, ...(sessionId ? { sessionId } : {}) }));
+    ctx(1, 'FRAME-MAIN', 'S1');
+    ctx(2, 'FRAME-CHILD', 'S1');
+    fake.emit4(fake.frame({ method: 'Target.attachedToTarget', params: { sessionId: 'S5', targetInfo: { type: 'iframe', targetId: 'T5', url: 'http://other.test/' } }, sessionId: 'S1' }));
+    ctx(5, 'FRAME-OOP', 'S5');
+    await new Promise(r => setTimeout(r, 30));
+
+    const snap = await b.snapshot();
+    const texts = snap.nodes.map(n => n.text);
+    check('a snapshot covers every frame, not just the top one',
+      texts.includes('Main button') && texts.includes('Child button') && texts.includes('Cross-origin button'), JSON.stringify(texts));
+    check('...with the frame rows marked as such',
+      snap.nodes.find(n => n.text === 'Child button').frame && !snap.nodes.find(n => n.text === 'Main button').frame);
+    check('...and refs numbered across the whole page', snap.nodes.map(n => n.ref).join(',') === '0,1,2');
+    check('each ref remembers the frame it came from',
+      b._refs[2].sessionId === 'S5' && b._refs[1].contextId === 2 && b._refs[0].contextId === 1, JSON.stringify(b._refs));
+    await b.close();
+  }
+
+  // ── Clicking, typing, hovering, pressing, uploading ────────────────────────
+  {
+    const { b, log } = await openBrowser((msg) => {
+      if (msg.method === 'Runtime.evaluate' && /__navyRefs/.test(msg.params.expression || '')) {
+        return { result: { objectId: 'OBJ-' + (msg.sessionId || 'S1') } };
+      }
+      if (msg.method === 'DOM.getContentQuads') return { quads: [[10, 20, 30, 20, 30, 40, 10, 40]] };
+      if (msg.method === 'DOM.requestNode') return { nodeId: 77 };
+      if (msg.method === 'Runtime.callFunctionOn') {
+        const f = msg.params.functionDeclaration || '';
+        if (/tagName/.test(f)) return { result: { value: { tag: 'select', type: '' } } };
+        if (/options/.test(f)) return { result: { value: { ok: true, chosen: 'Bananas', value: 'b' } } };
+        return { result: { value: null } };
+      }
+      return undefined;
+    });
+    b._refs = [{ sessionId: 'S1', contextId: 1, index: 0 }];
+
+    const at = await b.click(0);
+    check('a click lands at the centre of the element\'s content quad', at.x === 20 && at.y === 30, JSON.stringify(at));
+    const mouse = sentOf(log, 'Input.dispatchMouseEvent');
+    check('...as a real move, press and release', mouse.some(m => m.params.type === 'mousePressed') && mouse.some(m => m.params.type === 'mouseReleased'));
+
+    log.length = 0;
+    await b.click(0, { button: 'right' });
+    check('a right-click is sent as one', sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.button === 'right' && m.params.type === 'mousePressed'));
+    log.length = 0;
+    await b.click(0, { clicks: 2 });
+    check('a double-click sends the second press with clickCount 2',
+      sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.type === 'mousePressed' && m.params.clickCount === 2));
+
+    // A <select> is chosen from, not typed into.
+    const chosen = await b.type(0, 'Bananas');
+    check('typing into a dropdown picks the matching option', chosen.select === true && chosen.chosen === 'Bananas', JSON.stringify(chosen));
+    check('...without sending keystrokes to it', !sentOf(log, 'Input.insertText').length);
+
+    // Hover: the pointer AND the forced pseudo-state, because a headed window
+    // ignores a synthetic move.
+    log.length = 0;
+    await b.hover(0);
+    check('hovering moves the pointer onto the element',
+      sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.type === 'mouseMoved' && m.params.x === 20));
+    const forced = sentOf(log, 'CSS.forcePseudoState');
+    check('...and forces :hover, which is the half that works in a visible window',
+      forced.length === 1 && forced[0].params.forcedPseudoClasses.join() === 'hover' && forced[0].params.nodeId === 77);
+    log.length = 0;
+    await b.clearHover();
+    check('letting go clears the forced state and takes the pointer off',
+      sentOf(log, 'CSS.forcePseudoState')[0].params.forcedPseudoClasses.length === 0
+      && sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.x === -1));
+
+    // Keys, with and without modifiers.
+    log.length = 0;
+    await b.press('Escape');
+    const esc = sentOf(log, 'Input.dispatchKeyEvent');
+    check('a named key is sent with its Windows virtual key code', esc[0].params.windowsVirtualKeyCode === 27 && esc[0].params.key === 'Escape');
+    check('...and released afterwards', esc[1].params.type === 'keyUp');
+    log.length = 0;
+    await b.press('Control+a');
+    const combo = sentOf(log, 'Input.dispatchKeyEvent')[0];
+    check('a shortcut carries the modifier bit', combo.params.modifiers === 2 && combo.params.key === 'a');
+    check('...and no text, or the shortcut would type a character instead', combo.params.text === undefined);
+    let keyErr = '';
+    try { await b.press('Hyper+x'); } catch (e) { keyErr = e.message; }
+    check('an unknown modifier is refused rather than silently dropped', /unknown modifier/.test(keyErr), keyErr);
+
+    await b.close();
+  }
+
+  // ── Uploads, waiting, viewport, network, drag ──────────────────────────────
+  {
+    let bodyText = 'loading';
+    const { b, log } = await openBrowser((msg) => {
+      if (msg.method === 'Runtime.evaluate') {
+        const e = msg.params.expression || '';
+        if (/__navyRefs/.test(e)) return { result: { objectId: 'OBJ' } };
+        if (/innerText/.test(e)) return { result: { value: bodyText.includes('ready') } };
+      }
+      if (msg.method === 'DOM.getContentQuads') return { quads: [[0, 0, 10, 0, 10, 10, 0, 10]] };
+      if (msg.method === 'Runtime.callFunctionOn') {
+        const f = msg.params.functionDeclaration || '';
+        if (/tagName/.test(f)) return { result: { value: { tag: 'input', type: 'file' } } };
+        if (/files/.test(f)) return { result: { value: { count: 1, names: ['a.png'] } } };
+        return { result: { value: null } };
+      }
+      return undefined;
+    });
+    b._refs = [{ sessionId: 'S1', contextId: 1, index: 0 }];
+
+    const up = await b.upload(0, ['C:\\ws\\a.png']);
+    const set = sentOf(log, 'DOM.setFileInputFiles');
+    check('a file input is filled through the DOM agent, the only way that works',
+      set.length === 1 && set[0].params.files[0] === 'C:\\ws\\a.png' && up.count === 1, JSON.stringify(set));
+
+    // Waiting returns as soon as the page catches up, and gives up otherwise.
+    setTimeout(() => { bodyText = 'ready'; }, 250);
+    const found = await b.waitFor({ text: 'ready', timeout: 3000 });
+    check('waiting returns when the page catches up', found.found === true && found.waitedMs < 3000, JSON.stringify(found));
+    bodyText = 'loading';
+    const gave = await b.waitFor({ text: 'ready', timeout: 600 });
+    check('...and gives up rather than hanging the turn', gave.found === false && gave.waitedMs >= 600, JSON.stringify(gave));
+
+    log.length = 0;
+    const vp = await b.setViewport({ width: 390, height: 844, mobile: true });
+    const metrics = sentOf(log, 'Emulation.setDeviceMetricsOverride')[0];
+    check('a viewport is set as device metrics, so the layout really changes',
+      metrics.params.width === 390 && metrics.params.mobile === true && vp.height === 844);
+    check('...with touch emulation for a mobile one',
+      sentOf(log, 'Emulation.setTouchEmulationEnabled')[0].params.enabled === true);
+    log.length = 0;
+    await b.captureFixed({ width: 1280, height: 800 });
+    const after = sentOf(log, 'Emulation.setDeviceMetricsOverride').pop();
+    check('a baseline capture puts the caller\'s viewport back rather than clearing it',
+      after.params.width === 390 && !sentOf(log, 'Emulation.clearDeviceMetricsOverride').length, JSON.stringify(after.params));
+    await b.clearViewport();
+    check('resetting clears the override', Boolean(sentOf(log, 'Emulation.clearDeviceMetricsOverride').length));
+
+    log.length = 0;
+    await b.setNetworkCondition('offline');
+    check('offline emulation is a real network condition, not a page trick',
+      sentOf(log, 'Network.emulateNetworkConditions')[0].params.offline === true);
+    await b.setNetworkCondition('slow');
+    check('...and slow means latency and a throttled pipe',
+      sentOf(log, 'Network.emulateNetworkConditions')[1].params.latency === 400);
+    let netErr = '';
+    try { await b.setNetworkCondition('potato'); } catch (e) { netErr = e.message; }
+    check('an unknown condition is refused', /offline, slow or normal/.test(netErr), netErr);
+
+    // Drag: mouse first, and the HTML5 events when the page starts a real drag.
+    b._refs = [{ sessionId: 'S1', contextId: 1, index: 0 }, { sessionId: 'S1', contextId: 1, index: 1 }];
+    log.length = 0;
+    const plain = await b.drag(0, 1);
+    const moves = sentOf(log, 'Input.dispatchMouseEvent').filter(m => m.params.type === 'mouseMoved');
+    check('a drag is a gesture, not a jump', moves.length >= 4 && plain.html5 === false, String(moves.length));
+    check('...bracketed by a press and a release',
+      sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.type === 'mousePressed')
+      && sentOf(log, 'Input.dispatchMouseEvent').some(m => m.params.type === 'mouseReleased'));
+    await b.close();
+  }
+
+  // ── The tool layer ─────────────────────────────────────────────────────────
+  {
+    const os = require('os');
+    const { ctrl } = sharedMock();
+    let provider, tmp;
+    try {
+      const { NavyCoderViewProvider } = require('../src/extension.js');
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-browser-ui-'));
+      provider = new NavyCoderViewProvider(makeContext(tmp));
+      provider.projectRoot = tmp;
+      provider.view = { webview: { postMessage: () => {} } };
+
+      for (const call of ['toolBrowserHover', 'toolBrowserPress', 'toolBrowserUpload', 'toolBrowserWait',
+        'toolBrowserViewport', 'toolBrowserTabs', 'toolBrowserDialog', 'toolBrowserDrag', 'toolBrowserForward', 'toolBrowserNetwork']) {
+        // Every one of them refuses cleanly before a browser exists.
+        const out = await provider[call]();
+        if (!/no page open/.test(String(out))) check(`${call} reports "no page open" before navigate`, false, String(out));
+      }
+      check('every new browser tool refuses cleanly before a page is open', true);
+
+      // A fake browser handle: the tool layer's own behaviour, without Chrome.
+      const calls = [];
+      provider._session.browser = {
+        running: true,
+        hover: async (t) => { calls.push(['hover', t]); },
+        press: async (k) => { calls.push(['press', k]); },
+        upload: async (t, files) => { calls.push(['upload', t, files]); return { count: files.length }; },
+        drag: async (a, z) => { calls.push(['drag', a, z]); return { html5: true }; },
+        type: async (t, text) => { calls.push(['type', t, text]); return { select: true, ok: false, options: ['Apples', 'Pears'] }; },
+        click: async (t, o) => { calls.push(['click', t, o]); return { x: 1, y: 2, clicks: o.clicks, button: o.button }; },
+        evaluate: async () => ({ title: 'T', url: 'http://x.test/' }),
+        setDialogPolicy: (p) => ({ accept: p.accept, promptText: p.promptText }),
+        listTabs: async () => ([{ index: 0, current: true, title: 'One', url: 'http://x.test/' }]),
+        snapshot: async () => ({ title: 'T', url: 'u', nodes: [
+          { ref: 0, role: 'button', text: 'Pay', x: 1, y: 1 },
+          { ref: 1, role: 'button', text: 'Card number', x: 1, y: 1, frame: 'http://pay.test/' },
+        ] }),
+      };
+
+      const snap = await provider.toolBrowserSnapshot();
+      check('the outline tells the model which rows are inside an iframe',
+        /\(in iframe: http:\/\/pay\.test\/\)/.test(snap) && /1 iframe/.test(snap), snap);
+
+      check('an element can be named by selector where the outline has no row for it',
+        /"#drop"/.test(await provider.toolBrowserHover(null, '#drop')), await provider.toolBrowserHover(null, '#drop'));
+      check('...and a tool with neither says what it needs',
+        /ref .*or a CSS selector/.test(await provider.toolBrowserHover()));
+
+      const dd = await provider.toolBrowserClick(3, null, 'right', 2);
+      check('a right double-click is passed through as one', /2× right-Clicked ref 3/.test(dd), dd);
+      check('an invalid button is refused', /left, right or middle/.test(await provider.toolBrowserClick(1, null, 'foot')));
+
+      const noOption = await provider.toolBrowserType(1, 'Cherries');
+      check('a dropdown without the wanted option reports the real ones',
+        /no option matching "Cherries"/.test(noOption) && /"Apples"/.test(noOption), noOption);
+
+      // The file for an upload has to be in the workspace: the page it goes to
+      // is a website, so anything else would be a way off the machine.
+      fs.writeFileSync(path.join(tmp, 'shot.png'), 'x');
+      const good = await provider.toolBrowserUpload(1, 'shot.png');
+      check('a workspace file can be attached to a file input', /Attached shot\.png/.test(good), good);
+      const outside = await provider.toolBrowserUpload(1, path.join(os.tmpdir(), 'elsewhere.txt'));
+      check('a file outside the workspace is refused', /Error:/.test(outside), outside);
+      const missing = await provider.toolBrowserUpload(1, 'nope.png');
+      check('a file that does not exist is refused', /does not exist/.test(missing), missing);
+
+      check('the dialog policy says which way it will answer',
+        /dismissed \(Cancel\)/.test(await provider.toolBrowserDialog(false)));
+      check('the tab list marks the current tab', /\(current\)/.test(await provider.toolBrowserTabs('list')));
+      check('an unknown tab action is refused', /list, switch or close/.test(await provider.toolBrowserTabs('sideways', 0)));
+      check('a drag reports whether the page took it as an HTML5 one',
+        /as an HTML5 drag/.test(await provider.toolBrowserDrag(0, 1)), await provider.toolBrowserDrag(0, 1));
+      check('browser_wait needs something to wait for', /text to wait for/.test(await provider.toolBrowserWait()));
+      check('browser_viewport needs a size, or a reset', /width and a height/.test(await provider.toolBrowserViewport()));
+      provider._session.browser = null;
+    } finally {
+      ctrl.reset?.();
+      try { provider?.dispose?.(); } catch {}
+      try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+module.exports = { browserSuite, browserControlSuite };

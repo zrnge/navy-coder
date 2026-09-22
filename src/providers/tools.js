@@ -436,6 +436,30 @@ const TOOLS = [
   // meaningful during a /playthrough turn; the first browser_* call launches the
   // browser lazily, and browser_close (or ending the chat) tears it down.
   {
+    name: 'ask_user',
+    description: 'Ask the user a question and wait for their answer, offering 2-4 concrete options they can click. Use it when the request genuinely could mean different things and the readings would lead to DIFFERENT work — which of several components they mean, which approach to take, what a term refers to in this project — and say which option you recommend. The answer comes back as the tool result and the turn carries on. Do NOT use it for anything you can settle yourself by reading the code, for permission to do ordinary work you were already asked to do, or to confirm a plan: make routine judgement calls and get on with it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'One clear question, in plain language.' },
+        options: {
+          type: 'array',
+          description: '2-4 distinct answers to choose from. The user can also type something else.',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'The choice itself, a few words.' },
+              detail: { type: 'string', description: 'One line on what this option means or costs.' },
+              recommended: { type: 'boolean', description: 'Mark the one you would pick, on at most one option.' }
+            },
+            required: ['label']
+          }
+        }
+      },
+      required: ['question', 'options']
+    }
+  },
+  {
     name: 'browser_navigate',
     description: 'Open the browser (launching it on first use) and load a URL, waiting for the page to finish loading. Only http(s) and localhost are allowed. Returns the resulting page title and URL. Call this first to start a playthrough.',
     parameters: {
@@ -446,7 +470,7 @@ const TOOLS = [
   },
   {
     name: 'browser_snapshot',
-    description: 'Return a compact, numbered outline of what is on the current page: interactive controls (links, buttons, inputs), headings, and anything that looks like an error or alert. Each row has a [ref] number you pass to browser_click / browser_type. Call this to see the page structure before clicking or typing; re-call it after the page changes, because refs go stale on navigation or re-render.',
+    description: 'Return a compact, numbered outline of what is on the current page: interactive controls (links, buttons, inputs), headings, and anything that looks like an error or alert. Covers every frame, so controls inside an iframe are listed too and marked as such. Each row has a [ref] number you pass to browser_click / browser_type / browser_hover. Call this to see the page structure before acting; re-call it after the page changes, because refs go stale on navigation or re-render.',
     parameters: { type: 'object', properties: {} }
   },
   {
@@ -456,24 +480,144 @@ const TOOLS = [
   },
   {
     name: 'browser_click',
-    description: 'Click an element by its [ref] from the most recent browser_snapshot. Dispatches a real mouse click at the element centre (triggering hover/focus), then waits briefly for any resulting navigation or re-render.',
+    description: 'Click an element by its [ref] from the most recent browser_snapshot, or by CSS selector. Dispatches a real mouse click at the element centre, then waits briefly for any resulting navigation or re-render. Use button="right" for a context menu and clicks=2 for a double-click.',
     parameters: {
       type: 'object',
-      properties: { ref: { type: 'number', description: 'The ref number of the element to click, from browser_snapshot.' } },
-      required: ['ref']
+      properties: {
+        ref: { type: 'number', description: 'The ref number from the last browser_snapshot.' },
+        selector: { type: 'string', description: 'A CSS selector instead of a ref, for an element the outline does not list (a drop zone, a plain-div menu, a canvas). Searched in every frame.' },
+        button: { type: 'string', description: 'left (default), right or middle.' },
+        clicks: { type: 'number', description: '2 for a double-click. Default 1.' }
+      },
+      required: []
     }
   },
   {
     name: 'browser_type',
-    description: 'Type text into an input/textarea by its [ref] from the most recent browser_snapshot. Clears the field first, then types as real keyboard input. Set submit=true to press Enter afterward (e.g. to submit a search or form).',
+    description: 'Type text into an input, textarea or contenteditable by its [ref] or a CSS selector. Clears the field first, then types as real keyboard input. Set submit=true to press Enter afterward (e.g. to submit a search or form). On a <select> this chooses the matching option instead, by value or label — which is the only way to set one, since its list is drawn by the browser.',
     parameters: {
       type: 'object',
       properties: {
-        ref: { type: 'number', description: 'The ref number of the field, from browser_snapshot.' },
-        text: { type: 'string', description: 'The text to type.' },
+        ref: { type: 'number', description: 'The ref number from the last browser_snapshot.' },
+        selector: { type: 'string', description: 'A CSS selector instead of a ref, for an element the outline does not list (a drop zone, a plain-div menu, a canvas). Searched in every frame.' },
+        text: { type: 'string', description: 'The text to type, or the option to choose in a dropdown.' },
         submit: { type: 'boolean', description: 'Press Enter after typing (default false).' }
       },
-      required: ['ref', 'text']
+      required: ['text']
+    }
+  },
+  {
+    name: 'browser_hover',
+    description: 'Hover an element by [ref] or CSS selector, and keep it hovered until the next click, hover or navigation. This is what opens a menu, tooltip or toolbar that only exists under the pointer — snapshot afterwards to get refs for whatever appeared.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: { type: 'number', description: 'The ref number from the last browser_snapshot.' },
+        selector: { type: 'string', description: 'A CSS selector instead of a ref, for an element the outline does not list (a drop zone, a plain-div menu, a canvas). Searched in every frame.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_press',
+    description: 'Press a key on the focused element: "Escape", "Tab", "Shift+Tab", "Enter", "ArrowDown", "Control+a", or any single character. Use it for keyboard-only paths — closing a modal, walking a listbox, an app shortcut — and to check the page responds to them at all.',
+    parameters: {
+      type: 'object',
+      properties: { key: { type: 'string', description: 'The key, optionally with Alt/Control/Meta/Shift, e.g. "Escape" or "Control+k".' } },
+      required: ['key']
+    }
+  },
+  {
+    name: 'browser_upload',
+    description: 'Attach a file from this workspace to a file input, by [ref] or CSS selector. The browser file picker is an OS window nothing can drive, so this is the only way to test an upload. The file must be in the workspace.',
+    parameters: {
+      type: 'object',
+      properties: {
+        ref: { type: 'number', description: 'The ref number from the last browser_snapshot. Pick the "file-input" row.' },
+        selector: { type: 'string', description: 'A CSS selector instead of a ref, for an element the outline does not list (a drop zone, a plain-div menu, a canvas). Searched in every frame.' },
+        path: { type: 'string', description: 'Workspace-relative path of the file to attach.' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'browser_wait',
+    description: 'Wait until text appears on the page (or a CSS selector matches), up to a timeout. Use it after an action that loads or renders asynchronously instead of assuming it finished; set gone=true to wait for something to disappear, such as a spinner.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to wait for anywhere in the page body.' },
+        selector: { type: 'string', description: 'A CSS selector to wait for instead of text.' },
+        gone: { type: 'boolean', description: 'Wait for it to disappear rather than appear.' },
+        timeout: { type: 'number', description: 'Milliseconds to wait before giving up (default 10000).' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_viewport',
+    description: 'Resize the page to given dimensions, so responsive layouts can actually be tested — 390x844 is a phone, 768x1024 a tablet. Pass mobile=true to emulate touch as well. Stays until changed or reset, and survives browser_visual_check. Screenshot afterwards and look for overlap, cut-off text and controls too small to tap.',
+    parameters: {
+      type: 'object',
+      properties: {
+        width: { type: 'number', description: 'Viewport width in CSS pixels.' },
+        height: { type: 'number', description: 'Viewport height in CSS pixels.' },
+        mobile: { type: 'boolean', description: 'Emulate a mobile device (touch events, mobile layout).' },
+        reset: { type: 'boolean', description: 'Go back to the real window size.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_tabs',
+    description: 'List the open tabs, or switch to / close one by index. A link with target="_blank" or a window.open opens a tab Navy follows automatically and starts driving, so use this to get back to the one you came from.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'list (default), switch or close.' },
+        index: { type: 'number', description: 'Which tab, for switch and close.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_dialog',
+    description: 'Decide how the page\'s alert(), confirm() and prompt() dialogs are answered from now on. They are accepted by default; pass accept=false to take Cancel instead, which is how you test what a confirm is guarding. Every dialog is reported by browser_console either way.',
+    parameters: {
+      type: 'object',
+      properties: {
+        accept: { type: 'boolean', description: 'true clicks OK (default), false clicks Cancel.' },
+        text: { type: 'string', description: 'What to answer a prompt() with.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_drag',
+    description: 'Drag one element onto another, each given as a [ref] or CSS selector. Covers both HTML5 drag-and-drop and the mousedown/mousemove kind. Check the result afterwards: a drag that did nothing looks exactly like one that was refused.',
+    parameters: {
+      type: 'object',
+      properties: {
+        from: { type: 'number', description: 'Ref of the element to drag.' },
+        to: { type: 'number', description: 'Ref of the element to drop it on.' },
+        fromSelector: { type: 'string', description: 'CSS selector to drag, instead of a ref.' },
+        toSelector: { type: 'string', description: 'CSS selector to drop on, instead of a ref.' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'browser_forward',
+    description: 'Go forward in the browser history, the other half of browser_back. Returns the resulting page title and URL.',
+    parameters: { type: 'object', properties: {} }
+  },
+  {
+    name: 'browser_network',
+    description: 'Emulate the connection: "offline" to cut it, "slow" for 400ms latency at ~400kbps, "normal" to restore it. Use it to check what the app does when a request cannot complete — a real failure mode most sites handle badly.',
+    parameters: {
+      type: 'object',
+      properties: { condition: { type: 'string', description: 'offline, slow or normal.' } },
+      required: ['condition']
     }
   },
   {
@@ -501,7 +645,7 @@ const TOOLS = [
   },
   {
     name: 'browser_back',
-    description: 'Navigate back to the previous page in the browser history. Returns the resulting page title and URL.',
+    description: 'Navigate back to the previous page in the browser history. Returns the resulting page title and URL, and says when there was nothing to go back to.',
     parameters: { type: 'object', properties: {} }
   },
   {
@@ -615,7 +759,7 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 When you need to call a tool, emit one XML block and WAIT for the result before continuing.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_scroll, browser_evaluate, browser_console, browser_back, browser_close, browser_accessibility, browser_visual_check, remember, forget, finish.
+Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, ask_user, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_hover, browser_press, browser_upload, browser_drag, browser_tabs, browser_wait, browser_viewport, browser_network, browser_dialog, browser_scroll, browser_evaluate, browser_console, browser_back, browser_forward, browser_close, browser_accessibility, browser_visual_check, remember, forget, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
@@ -640,7 +784,8 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.
 17. COMMAND ACCURACY — check before assuming: run_command executes through the exact shell named in CURRENT ENVIRONMENT above, which is configurable and is NOT always the platform default — write commands in THAT dialect, not whatever you'd default to. Its own builtins always exist and need no checking (cmd.exe: dir, cd, type, del, copy, move, mkdir, echo, set; sh/bash: ls, cd, cat, rm, cp, mv, mkdir, echo, export; PowerShell: Get-ChildItem, Set-Location, Get-Content, Remove-Item, Copy-Item, Move-Item, New-Item, Write-Output, $env:). A third-party CLI (git, node, npm, python, rg, jq, docker, etc.) may or may not be installed or on PATH — if you haven't already confirmed it works earlier this turn, check it first with the probe your shell uses — "where <tool>" (cmd.exe), "command -v <tool>" (sh/bash), or "Get-Command <tool>" (PowerShell) — before depending on it, so a failure tells you "not installed" instead of wasting an attempt on a guess. If a command still fails with "not recognized"/"command not found", that means the tool isn't available — don't retry the same command, find or install an alternative.
 18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from cmd.exe per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.
-19. DELEGATION (independent investigations can go out TOGETHER in one response, up to 4, and run concurrently — a sub-agent cannot delegate further): for a broad investigation you don't need to keep the raw detail of — "how does X work here", "find every place Y is used and summarize the pattern" — prefer delegate_research over doing it yourself with many read/search calls: you get back only the written conclusion instead of filling your own context with files you won't need again. Do NOT delegate anything that needs to WRITE, run a command, or that's simple enough to resolve in 1-2 tool calls yourself — delegation has overhead and the sub-agent can't act on what it finds.`
+19. ASK WHEN IT REALLY IS AMBIGUOUS: if the request could mean two different things and they lead to different work — which component, which approach, which of several matching files — call ask_user with 2-4 concrete options and mark the one you recommend, instead of picking one silently and spending the turn on it. It is a real question with real options, not "shall I proceed?". Ask ONCE, act on the answer, and do not ask about anything you could settle yourself by reading the code, or for permission to do the work you were already asked to do. If nobody answers, choose the most reasonable option, say which and why, and carry on.
+20. DELEGATION (independent investigations can go out TOGETHER in one response, up to 4, and run concurrently — a sub-agent cannot delegate further): for a broad investigation you don't need to keep the raw detail of — "how does X work here", "find every place Y is used and summarize the pattern" — prefer delegate_research over doing it yourself with many read/search calls: you get back only the written conclusion instead of filling your own context with files you won't need again. Do NOT delegate anything that needs to WRITE, run a command, or that's simple enough to resolve in 1-2 tool calls yourself — delegation has overhead and the sub-agent can't act on what it finds.`
 
 // The core-tier system prompt is TOOL_PROMPT with the "Available tools:" line
 // rewritten to the core set, plus an explicit account of what's withheld and

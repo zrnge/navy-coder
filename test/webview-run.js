@@ -1280,6 +1280,207 @@ function diffSuite() {
   w.close();
 }
 
+// ── Screenshots in the chat ────────────────────────────────────────
+// A playthrough's whole point is what the page looked like. The picture used
+// to go to the model and nowhere else, so the chat showed a list of tool names.
+function screenshotCardSuite() {
+  console.log('\nscreenshots in the chat:');
+
+  const shot = {
+    type: 'toolImage', tool: 'browser_screenshot', callId: 'c1',
+    file: 'C:/Users/x/.navy-coder/app-1234/screenshots/s.png',
+    uri: 'vscode-webview://navy/shot.png',
+    caption: '[Screenshot from browser_screenshot \u2014 the checkout page after submit]',
+  };
+
+  let w = run([
+    { type: 'start' },
+    { type: 'toolCall', tool: 'browser_screenshot', args: {}, callId: 'c1' },
+    { type: 'toolResult', tool: 'browser_screenshot', result: '[Screenshot captured at 1280x800]', callId: 'c1' },
+    shot,
+    { type: 'chunk', text: 'The checkout page looks right.' },
+    { type: 'done' },
+  ]);
+  const thumb = w.document.querySelector('.shot-thumb');
+  check('the screenshot is shown in the chat, as a thumbnail', thumb !== null);
+  check('...loading the file the extension saved, not base64 in the message',
+    thumb?.getAttribute('src') === shot.uri, thumb?.getAttribute('src'));
+  check('...captioned with what the tool saw, without the part addressed to the model',
+    (w.document.querySelector('.shot-caption')?.textContent || '') === 'The checkout page after submit',
+    w.document.querySelector('.shot-caption')?.textContent);
+  check('...under the tool that took it, above the reply',
+    /shot-card/.test(JSON.stringify(w.transcript())) && w.document.querySelector('.shot-card') !== null);
+
+  // Click to enlarge, in the panel's own lightbox - the one a pasted image
+  // opens in, so Escape, the backdrop and the close button already work.
+  const box = w.document.querySelector('#imageLightbox');
+  const openBtn = w.document.querySelector('#lightboxOpen');
+  check('nothing is open until the thumbnail is clicked', box.classList.contains('hidden'));
+  thumb.dispatchEvent(new w.window.Event('click'));
+  check('clicking the thumbnail opens the full picture', !box.classList.contains('hidden'));
+  check('...at full size, from the same file',
+    w.document.querySelector('#lightboxImg')?.getAttribute('src') === shot.uri);
+
+  // The editor's image viewer zooms and pans, which a card in a panel cannot.
+  check('...offering the editor, which is where it can be zoomed', !openBtn.classList.contains('hidden'));
+  openBtn.dispatchEvent(new w.window.Event('click', { bubbles: true }));
+  check('the full picture can be opened in the editor',
+    w.sent.some(m => m.type === 'openImage' && m.file === shot.file), JSON.stringify(w.sent));
+
+  w.document.dispatchEvent(new w.window.KeyboardEvent('keydown', { key: 'Escape' }));
+  check('Escape closes the full picture', box.classList.contains('hidden'));
+
+  // A pasted image is not a file, so it is not offered to the editor.
+  w.window.eval('openLightbox("data:image/png;base64,iVBOR")');
+  check('a pasted image opens in the same lightbox, without that offer',
+    !box.classList.contains('hidden') && openBtn.classList.contains('hidden'));
+  w.document.querySelector('#lightboxBackdrop').dispatchEvent(new w.window.Event('click'));
+  check('clicking away closes it', box.classList.contains('hidden'));
+  w.close();
+
+  // A reopened chat: the card is saved with the turn and redrawn from it.
+  w = run([{
+    type: 'restore',
+    messages: [
+      { role: 'user', text: 'check the checkout page' },
+      { role: 'assistant', text: 'Looks right.', cards: [{ tool: 'browser_screenshot', args: {}, result: 'ok' }, { kind: 'image', ...shot }] },
+    ],
+  }]);
+  check('a reopened chat shows the screenshot again',
+    w.document.querySelector('.shot-thumb')?.getAttribute('src') === shot.uri);
+  w.close();
+
+  // Screenshots prune themselves, so an old chat will have gaps.
+  w = run([{
+    type: 'restore',
+    messages: [{ role: 'assistant', text: 'Looked at it.', cards: [{ kind: 'image', tool: 'browser_screenshot', file: shot.file, missing: true }] }],
+  }]);
+  check('one that is no longer kept says so rather than showing a broken image',
+    w.document.querySelector('.shot-thumb') === null
+    && /no longer kept/.test(w.document.querySelector('.shot-missing')?.textContent || ''),
+    w.document.querySelector('.shot-card')?.textContent);
+  w.close();
+
+  // A visual check draws the same card, and is named for what it is.
+  w = run([{ type: 'start' }, { ...shot, tool: 'browser_visual_check', caption: '' }]);
+  check('a visual check\'s picture is labelled as one',
+    (w.document.querySelector('.shot-caption')?.textContent || '') === 'Visual check');
+  w.close();
+
+  // Captions are written for the model: they say what the picture is and then
+  // what to do about it. Only the first part belongs under a thumbnail.
+  w = run([{ type: 'start' }, {
+    ...shot, tool: 'browser_visual_check',
+    caption: '[Screenshot from browser_visual_check \u2014 this is a DIFF of "home" against its baseline, not a screenshot: the baseline is washed out to pale grey and every changed pixel is solid red. Judge whether the red areas are a regression.]',
+  }]);
+  check('a caption keeps what the picture is and drops the instructions to the model',
+    (w.document.querySelector('.shot-caption')?.textContent || '')
+      === 'This is a DIFF of "home" against its baseline, not a screenshot',
+    w.document.querySelector('.shot-caption')?.textContent);
+  w.close();
+}
+
+// ── Navy asking a question ──────────────────────────────────────
+// The card a request that could mean two things ends up as: the readings, the
+// one Navy would pick, and a box for the answer none of them covers.
+function questionCardSuite() {
+  console.log('\nquestion cards:');
+
+  const question = {
+    type: 'pendingQuestion', id: 'q1', question: 'Which login should I fix?',
+    options: [
+      { label: 'The web one', detail: 'src/web/login.js', recommended: true },
+      { label: 'The CLI one', detail: 'src/cli/auth.js' },
+    ],
+  };
+
+  let w = run([{ type: 'start' }, question]);
+  const card = w.document.querySelector('.question-card');
+  check('a question is drawn as a card in the conversation', card !== null);
+  check('...with the question itself', /Which login should I fix\?/.test(card?.textContent || ''));
+  const options = [...w.document.querySelectorAll('.question-option')];
+  check('...one button per option', options.length === 2);
+  check('...each with the detail that tells them apart',
+    /src\/web\/login\.js/.test(options[0].textContent) && /src\/cli\/auth\.js/.test(options[1].textContent));
+  check('...and the recommendation marked, so there is an obvious default',
+    /Recommended/.test(options[0].textContent) && !/Recommended/.test(options[1].textContent));
+
+  options[1].dispatchEvent(new w.window.Event('click'));
+  check('clicking an option answers the question',
+    w.sent.some(m => m.type === 'answerQuestion' && m.id === 'q1' && m.answer.label === 'The CLI one'), JSON.stringify(w.sent));
+  check('...and the card settles on what was chosen',
+    /You chose: The CLI one/.test(w.document.querySelector('.question-status')?.textContent || ''));
+  check('...with the controls gone, so it cannot be answered twice',
+    w.document.querySelector('.question-other') === null && options[0].disabled === true);
+  options[0].dispatchEvent(new w.window.Event('click'));
+  check('...and a late click sends nothing', w.sent.filter(m => m.type === 'answerQuestion').length === 1);
+  w.close();
+
+  // None of the above: the options are Navy's reading, not the person's.
+  w = run([{ type: 'start' }, question]);
+  const input = w.document.querySelector('.question-input');
+  input.value = 'neither, the admin one';
+  w.document.querySelector('.question-send').dispatchEvent(new w.window.Event('click'));
+  check('an answer none of the options covers can be typed into the card',
+    w.sent.some(m => m.type === 'answerQuestion' && m.answer.text === 'neither, the admin one'), JSON.stringify(w.sent));
+  check('...and is shown as the answer', /You answered: neither, the admin one/.test(w.document.querySelector('.question-status')?.textContent || ''));
+  w.close();
+
+  w = run([{ type: 'start' }, question]);
+  const box = w.document.querySelector('.question-input');
+  box.value = 'the admin one';
+  box.dispatchEvent(new w.window.KeyboardEvent('keydown', { key: 'Enter' }));
+  check('Enter in that box sends it too', w.sent.some(m => m.type === 'answerQuestion' && m.answer.text === 'the admin one'));
+  w.close();
+
+  // An empty box must not answer with nothing.
+  w = run([{ type: 'start' }, question]);
+  w.document.querySelector('.question-send').dispatchEvent(new w.window.Event('click'));
+  check('an empty box answers nothing', !w.sent.some(m => m.type === 'answerQuestion'));
+  w.close();
+
+  // Stop, or a closed panel: the extension says the question is over.
+  w = run([{ type: 'start' }, question, { type: 'questionResolved', id: 'q1', answer: null }]);
+  check('a cancelled question says so rather than sitting there looking live',
+    /No answer/.test(w.document.querySelector('.question-status')?.textContent || ''),
+    w.document.querySelector('.question-card')?.textContent);
+  check('...and takes its controls with it', w.document.querySelector('.question-other') === null);
+  w.close();
+
+  // Answered from the composer: the extension settles the card and drops the
+  // bubble the composer drew, so the answer appears in one place.
+  w = createWebview();
+  w.post({ type: 'start' });
+  w.post(question);
+  const article = w.document.createElement('article');
+  article.className = 'message';
+  article.dataset.queueId = 'q7';
+  w.document.querySelector('#messages').appendChild(article);
+  w.post({ type: 'answeredByTyping', id: 'q7' });
+  check('a typed answer does not also leave a message bubble behind',
+    w.document.querySelector('article[data-queue-id="q7"]') === null);
+  w.post({ type: 'questionResolved', id: 'q1', answer: { text: 'the admin one' } });
+  check('...it lands on the card instead',
+    /You answered: the admin one/.test(w.document.querySelector('.question-status')?.textContent || ''));
+  w.close();
+
+  // A reopened chat: the question and its answer are part of what happened.
+  w = run([{
+    type: 'restore',
+    messages: [
+      { role: 'user', text: 'fix the login' },
+      { role: 'assistant', text: 'Fixed it.', cards: [{ kind: 'question', status: 'answered', question: 'Which login?', options: [{ label: 'The web one' }, { label: 'The CLI one' }], answer: { label: 'The CLI one' } }] },
+    ],
+  }]);
+  const restored = w.document.querySelector('.question-card');
+  check('a reopened chat shows the question that was asked', /Which login\?/.test(restored?.textContent || ''));
+  check('...and the answer that shaped what happened next',
+    /You chose: The CLI one/.test(w.document.querySelector('.question-status')?.textContent || ''));
+  check('...with no live controls on it', w.document.querySelector('.question-other') === null
+    && [...w.document.querySelectorAll('.question-option')].every(b => b.disabled));
+  w.close();
+}
+
 // ── Custom slash commands ───────────────────────────────────────────────────
 // The composer half: merging the files the extension found with the built-ins,
 // and expanding a command that was typed out rather than picked from the menu.
@@ -3712,6 +3913,8 @@ highlightSuite();
 tableSuite();
 speechSuite();
 diffSuite();
+screenshotCardSuite();
+questionCardSuite();
 
 // Shut every jsdom window still open before reporting. main.js arms a 250ms
 // self-watchdog interval in each one, so a window a test forgot to close keeps

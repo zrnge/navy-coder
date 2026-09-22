@@ -39,6 +39,9 @@ const WRITE_TOOL_METHODS = [
   'toolDeleteFile', 'toolRenameFile', 'toolRenameSymbol', 'toolRemember', 'toolForget',
 ];
 const READ_ONLY_REFUSAL = 'Refused: this is a headless Navy run, which is read-only — it never changes files or saved memory. Report what you would change instead.';
+// There is no panel and nobody watching, so a question would wait for an
+// answer that is never coming and take the whole run down with it.
+const NO_ONE_TO_ASK = 'Refused: this is a headless Navy run, with nobody to ask. Choose the most reasonable reading yourself, say in your report which you chose and why, and carry on.';
 
 function apiKeyFromEnv(secretKey, env) {
   const m = /^navy\.apiKey(?:\.(.+))?$/.exec(String(secretKey || ''));
@@ -319,6 +322,9 @@ function startHeadless({ root, settings = {}, env = process.env, note = () => {}
   const provider = new NavyCoderViewProvider(createHeadlessContext({ storageDir, env }));
   provider.log = log;
   provider.projectRoot = root;
+  // Nobody is watching a headless run, so a question would wait for an answer
+  // that never comes and hang the whole job on it.
+  provider.toolAskUser = async () => NO_ONE_TO_ASK;
   // Read-only: the tools that change files are gone, and so is the one path
   // that writes code without a tool (applying a reply's code blocks).
   for (const name of WRITE_TOOL_METHODS) {
@@ -373,5 +379,5 @@ function startHeadless({ root, settings = {}, env = process.env, note = () => {}
 
 module.exports = {
   createVscodeShim, installVscode, createHeadlessContext, createHeadlessView, startHeadless,
-  apiKeyFromEnv, describeCall, WRITE_TOOL_METHODS, READ_ONLY_REFUSAL, KEY_ENV,
+  apiKeyFromEnv, describeCall, WRITE_TOOL_METHODS, READ_ONLY_REFUSAL, NO_ONE_TO_ASK, KEY_ENV,
 };

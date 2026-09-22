@@ -162,6 +162,9 @@ function snapshotScript(max) {
       if (el.getAttribute && (el.getAttribute('role') || el.getAttribute('onclick') != null)) return true;
       if (el.tabIndex >= 0 && tag !== 'body') return true;
       if (el.isContentEditable) return true;
+      // A drag source is usually a plain div, which nothing else here would
+      // list - and an element nobody can name is an element nobody can drag.
+      if (el.draggable === true) return true;
       return false;
     };
     const noteworthy = (el) => {
@@ -192,6 +195,64 @@ function snapshotScript(max) {
     window.__navyRefs = refs;
     return { title: document.title, url: location.href, nodes: out };
   })()`;
+}
+
+// What the caller asked for, and what to say when it is not there. A ref that
+// no longer resolves means the page moved on; a selector that matches nothing
+// is usually a wrong guess at the markup.
+function describeTarget(target) {
+  if (target && typeof target === 'object' && target.selector) return `"${target.selector}"`;
+  if (typeof target === 'string') return `"${target}"`;
+  const ref = target && typeof target === 'object' ? target.ref : target;
+  return `ref ${ref}`;
+}
+
+function missingTarget(target) {
+  const what = describeTarget(target);
+  return what.startsWith('"')
+    ? `${what} matches nothing on the page — check the markup with browser_evaluate, or use a ref from browser_snapshot.`
+    : `${what} is stale — call browser_snapshot again to get fresh refs.`;
+}
+
+// The area of a content quad, so a zero-sized or collapsed box is not taken
+// for a clickable one. Shoelace formula over the four corners.
+function quadArea(q) {
+  let area = 0;
+  for (let i = 0; i < 8; i += 2) {
+    const x1 = q[i], y1 = q[i + 1], x2 = q[(i + 2) % 8], y2 = q[(i + 3) % 8];
+    area += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(area) / 2;
+}
+
+// The keys a tester actually presses. `code2` is the Windows virtual key code,
+// which Chrome wants on every key event; `text` is what a printable key inserts.
+const KEYS = {
+  Enter: { key: 'Enter', code: 'Enter', code2: 13, text: '\r' },
+  Tab: { key: 'Tab', code: 'Tab', code2: 9 },
+  Escape: { key: 'Escape', code: 'Escape', code2: 27 },
+  Backspace: { key: 'Backspace', code: 'Backspace', code2: 8 },
+  Delete: { key: 'Delete', code: 'Delete', code2: 46 },
+  ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', code2: 38 },
+  ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', code2: 40 },
+  ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', code2: 37 },
+  ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', code2: 39 },
+  Home: { key: 'Home', code: 'Home', code2: 36 },
+  End: { key: 'End', code: 'End', code2: 35 },
+  PageUp: { key: 'PageUp', code: 'PageUp', code2: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', code2: 34 },
+  Space: { key: ' ', code: 'Space', code2: 32, text: ' ' },
+};
+
+// A named key, or any single character ("a", "/", "7").
+function keySpec(name) {
+  const n = String(name || '');
+  const named = Object.keys(KEYS).find(k => k.toLowerCase() === n.toLowerCase());
+  if (named) return KEYS[named];
+  if ([...n].length !== 1) return null;
+  const upper = n.toUpperCase();
+  const code = /[a-z]/i.test(n) ? 'Key' + upper : (/[0-9]/.test(n) ? 'Digit' + n : '');
+  return { key: n, code, code2: upper.charCodeAt(0), text: n };
 }
 
 // ── Accessibility checks ─────────────────────────────────────────────────────
@@ -494,6 +555,28 @@ class Browser {
     this._targetId = null;
     this._events = [];           // captured console / exceptions / failed requests
     this._loadWaiters = [];      // resolvers fired by Page.loadEventFired
+
+    // Tabs. A site that opens a popup or a target=_blank link used to leave the
+    // driver looking at the page it came from, with no way to reach the new one.
+    // Every page target is attached as it appears and the newest becomes the
+    // current one, which is what the tester would be looking at.
+    this._tabs = [];             // [{ sessionId, targetId, opener }], in the order they opened
+    this._ignoreTargets = new Set(); // tabs that were open before Navy's own, never part of the run
+    // Frames. A same-origin iframe is another execution context in this target;
+    // a cross-origin one is a target of its own. Both are walked by snapshot(),
+    // so a control inside an iframe has a ref like any other.
+    this._frameTargets = new Map();  // iframe sessionId -> { targetId, parentSessionId }
+    this._contexts = new Map();      // sessionId -> Map(contextId -> { id, frameId, isDefault })
+    this._refs = [];                 // snapshot ref -> { sessionId, contextId, index }
+    this._domReady = new Set();      // sessions where DOM.enable/getDocument has run
+    // How the next alert/confirm/prompt is answered. Nothing answering them at
+    // all was worse than any default: the dialog blocks the renderer, and every
+    // command after it times out until the browser is closed.
+    this._dialog = { accept: true, promptText: '' };
+    this._forcedHover = null;    // { sessionId, nodeId } - see hover()
+    this._viewport = null;       // a viewport set by the caller, re-applied after captureFixed
+    this._dragWaiters = [];      // callbacks fed by Input.dragIntercepted, see drag()
+    this.downloadDir = null;
     this._closed = false;
     this._launched = false;
   }
@@ -556,10 +639,45 @@ class Browser {
     const { sessionId } = await this._send('Target.attachToTarget', { targetId, flatten: true });
     this._sessionId = sessionId;
 
-    await this._send('Page.enable', {}, sessionId);
-    await this._send('Runtime.enable', {}, sessionId);
-    await this._send('Log.enable', {}, sessionId);
-    await this._send('Network.enable', {}, sessionId);
+    this._tabs = [{ sessionId, targetId, opener: null }];
+    await this._enableDomains(sessionId);
+
+    // Chrome's own starting tab is not part of the test - the playthrough
+    // happens in the target created above - so everything already open is
+    // remembered and left out of the tab list.
+    try {
+      const { targetInfos } = await this._send('Target.getTargets');
+      for (const t of targetInfos || []) {
+        if (t.type === 'page' && t.targetId !== targetId) this._ignoreTargets.add(t.targetId);
+      }
+    } catch { /* an empty ignore set only means one extra row */ }
+
+    // Anything this page opens - a popup, a cross-origin iframe - attaches as it
+    // is created, so it can be snapshotted and driven rather than being a blank
+    // the driver cannot see into. A cross-origin iframe is reported to the page
+    // that holds it; a new tab is reported at the browser level, which is why
+    // both are asked for.
+    await this._send('Target.setAutoAttach',
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId).catch(() => {});
+    await this._send('Target.setAutoAttach',
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
+
+    // Downloads land in the throwaway profile and are reported like any other
+    // page event, so "clicking Export downloads a file" is a checkable claim.
+    this.downloadDir = path.join(this.userDataDir, 'downloads');
+    try { fs.mkdirSync(this.downloadDir, { recursive: true }); } catch { /* reported as no download */ }
+    await this._send('Browser.setDownloadBehavior',
+      { behavior: 'allow', downloadPath: this.downloadDir, eventsEnabled: true }).catch(() => {});
+  }
+
+  // The domains every page-ish session needs: Page for loads and dialogs,
+  // Runtime for console and execution contexts, Log and Network for the errors
+  // a user never sees.
+  async _enableDomains(sessionId, { network = true } = {}) {
+    await this._send('Page.enable', {}, sessionId).catch(() => {});
+    await this._send('Runtime.enable', {}, sessionId).catch(() => {});
+    await this._send('Log.enable', {}, sessionId).catch(() => {});
+    if (network) await this._send('Network.enable', {}, sessionId).catch(() => {});
     await this._send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
   }
 
@@ -579,10 +697,10 @@ class Browser {
       else resolve(msg.result || {});
       return;
     }
-    if (msg.method) this._onEvent(msg.method, msg.params || {});
+    if (msg.method) this._onEvent(msg.method, msg.params || {}, msg.sessionId || null);
   }
 
-  _onEvent(method, params) {
+  _onEvent(method, params, sessionId = null) {
     switch (method) {
       case 'Page.loadEventFired': {
         const waiters = this._loadWaiters;
@@ -615,6 +733,111 @@ class Browser {
         if (!params.canceled) this._record('network', `Request failed: ${params.errorText || 'unknown'} (${params.type || ''})`);
         break;
       }
+
+      // A dialog stops the renderer until it is answered. Answer it the way the
+      // caller asked (accept, by default, as a user clicking OK), and record it:
+      // an alert or a confirm IS part of what the page did.
+      case 'Page.javascriptDialogOpening': {
+        const kind = params.type || 'dialog';
+        const text = String(params.message || '').slice(0, 300);
+        this._record('dialog', `${kind}: ${text}${this._dialog.accept ? ' [accepted]' : ' [dismissed]'}`);
+        const answer = { accept: kind === 'beforeunload' ? true : this._dialog.accept };
+        if (kind === 'prompt') answer.promptText = String(this._dialog.promptText || '');
+        this._send('Page.handleJavaScriptDialog', answer, sessionId || this._sessionId).catch(() => {});
+        break;
+      }
+
+      // A new tab, or an iframe that runs in its own process.
+      case 'Target.attachedToTarget': {
+        const info = params.targetInfo || {};
+        if (info.type === 'page') this._adoptTab(params.sessionId, info, sessionId);
+        else if (info.type === 'iframe') this._adoptFrameTarget(params.sessionId, info, sessionId);
+        break;
+      }
+      // A tab that arrives only as a discovery event (an older Chrome, or a
+      // target the auto-attach did not cover) is attached by hand.
+      case 'Target.targetCreated': {
+        const info = params.targetInfo || {};
+        if (info.type === 'page' && !this._ignoreTargets.has(info.targetId)
+          && !this._tabs.some(t => t.targetId === info.targetId) && info.targetId !== this._targetId) {
+          this._send('Target.attachToTarget', { targetId: info.targetId, flatten: true })
+            .then(({ sessionId: sid }) => { if (sid) this._adoptTab(sid, info, null); })
+            .catch(() => { /* it may have gone already */ });
+        }
+        break;
+      }
+      case 'Target.detachedFromTarget': {
+        this._forgetSession(params.sessionId);
+        break;
+      }
+
+      // Which execution contexts exist is what makes a same-origin iframe
+      // reachable: each frame has its own, and snapshot() walks all of them.
+      case 'Runtime.executionContextCreated': {
+        const c = params.context || {};
+        const key = sessionId || this._sessionId;
+        if (!this._contexts.has(key)) this._contexts.set(key, new Map());
+        this._contexts.get(key).set(c.id, { id: c.id, frameId: c.auxData?.frameId || '', isDefault: c.auxData?.isDefault !== false });
+        break;
+      }
+      case 'Runtime.executionContextDestroyed': {
+        this._contexts.get(sessionId || this._sessionId)?.delete(params.executionContextId);
+        break;
+      }
+      case 'Runtime.executionContextsCleared': {
+        this._contexts.get(sessionId || this._sessionId)?.clear();
+        break;
+      }
+
+      case 'Input.dragIntercepted': {
+        for (const w of this._dragWaiters) { try { w(params.data); } catch { /* the drag falls back to mouse events */ } }
+        break;
+      }
+      case 'Browser.downloadWillBegin': {
+        this._record('download', `started: ${params.suggestedFilename || params.url || 'file'}`);
+        break;
+      }
+      case 'Browser.downloadProgress': {
+        if (params.state === 'completed') this._record('download', `completed (${params.totalBytes || 0} bytes)`);
+        else if (params.state === 'canceled') this._record('download', 'canceled');
+        break;
+      }
+    }
+  }
+
+  // A new tab: enabled, remembered, and made the current one - a popup takes
+  // the foreground for a person, so it does for the driver too.
+  _adoptTab(sessionId, info, opener) {
+    if (!sessionId || this._ignoreTargets.has(info.targetId)) return;
+    if (this._tabs.some(t => t.sessionId === sessionId || t.targetId === info.targetId)) return;
+    this._tabs.push({ sessionId, targetId: info.targetId, opener: opener || null });
+    this._sessionId = sessionId;
+    this._record('tab', `a new tab opened: ${info.url || 'about:blank'} (now the current tab)`);
+    this._enableDomains(sessionId).catch(() => {});
+    this._send('Target.setAutoAttach',
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId).catch(() => {});
+  }
+
+  _adoptFrameTarget(sessionId, info, parentSessionId) {
+    if (!sessionId || this._frameTargets.has(sessionId)) return;
+    this._frameTargets.set(sessionId, { targetId: info.targetId, parentSessionId: parentSessionId || this._sessionId });
+    this._enableDomains(sessionId, { network: false }).catch(() => {});
+  }
+
+  // A tab or frame went away. If the current tab closed, fall back to the most
+  // recent one still open rather than leaving every command pointed at nothing.
+  _forgetSession(sessionId) {
+    if (!sessionId) return;
+    this._frameTargets.delete(sessionId);
+    this._contexts.delete(sessionId);
+    this._domReady.delete(sessionId);
+    const i = this._tabs.findIndex(t => t.sessionId === sessionId);
+    if (i === -1) return;
+    this._tabs.splice(i, 1);
+    if (this._sessionId === sessionId) {
+      const next = this._tabs[this._tabs.length - 1];
+      this._sessionId = next ? next.sessionId : null;
+      if (next) this._record('tab', 'the current tab closed; back to the previous one');
     }
   }
 
@@ -682,6 +905,8 @@ class Browser {
   }
 
   async navigate(url) {
+    await this.clearHover();
+    this._refs = [];
     // Resolve on whichever comes first: the load event, or the timeout for a page
     // that never fires one (a stalled subresource, an SPA that never completes).
     // Both paths clean up after themselves — an uncleared timer would keep the
@@ -725,52 +950,467 @@ class Browser {
     return res.data; // base64 PNG
   }
 
+  // Every frame, not just the top one. A same-origin iframe is another
+  // execution context in this target and a cross-origin one is a target of its
+  // own; either way its controls had no row here, so no ref, so no way to click
+  // them - which ruled out most embedded checkouts, sign-ins and players. Refs
+  // are numbered across the whole page and remember which frame they came from.
   async snapshot(max = 150) {
-    return this.evaluate(snapshotScript(max));
+    const worlds = await this._worlds();
+    this._refs = [];
+    const nodes = [];
+    let top = null;
+    for (const w of worlds) {
+      if (nodes.length >= max) break;
+      let res = null;
+      try { res = await this._evaluateIn(w, snapshotScript(max - nodes.length)); } catch { continue; }
+      if (!res || !Array.isArray(res.nodes)) continue;
+      if (!top) top = res;
+      for (const n of res.nodes) {
+        const ref = this._refs.length;
+        this._refs.push({ sessionId: w.sessionId, contextId: w.contextId, index: n.ref });
+        nodes.push(w.frame ? { ...n, ref, frame: res.url || 'iframe' } : { ...n, ref });
+      }
+    }
+    return { title: (top && top.title) || '', url: (top && top.url) || '', nodes };
   }
 
-  // Resolve a ref to its live element's centre, scroll it into view, and return
-  // the point. Returns null when the ref is stale (the DOM changed since the last
-  // snapshot) so callers can tell the model to snapshot again.
-  async _refPoint(ref) {
-    return this.evaluate(`(() => {
-      const el = (window.__navyRefs || [])[${Number(ref)}];
-      if (!el) return null;
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      const r = el.getBoundingClientRect();
-      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), tag: el.tagName.toLowerCase() };
-    })()`);
+  // The execution contexts a snapshot walks: the current tab's frames, then any
+  // cross-origin iframe attached under it. A session whose contexts we never saw
+  // (an old mock, a page that loaded before Runtime.enable) still gets one world
+  // with no contextId, which evaluates in its default world exactly as before.
+  async _worlds() {
+    const out = [];
+    const sessions = [this._sessionId, ...this._frameSessionsUnder(this._sessionId)];
+    for (const sessionId of sessions) {
+      if (!sessionId) continue;
+      const known = [...(this._contexts.get(sessionId) || new Map()).values()].filter(c => c.isDefault);
+      if (!known.length) {
+        out.push({ sessionId, contextId: null, frame: sessionId !== this._sessionId });
+        continue;
+      }
+      let mainFrameId = '';
+      try { mainFrameId = (await this._send('Page.getFrameTree', {}, sessionId)).frameTree?.frame?.id || ''; } catch { /* keep the order we have */ }
+      known.sort((a, b) => Number(b.frameId === mainFrameId) - Number(a.frameId === mainFrameId));
+      known.forEach((c, i) => {
+        // Everything outside this tab's own top frame is "in a frame". Without a
+        // frame tree to say which that is, the first context of the session is
+        // the page itself - it is the one that existed before any iframe did.
+        const inFrame = sessionId !== this._sessionId || (mainFrameId ? c.frameId !== mainFrameId : i > 0);
+        out.push({ sessionId, contextId: c.id, frame: inFrame });
+      });
+    }
+    return out;
   }
 
-  async click(ref) {
-    const pt = await this._refPoint(ref);
-    if (!pt) throw new Error(`ref ${ref} is stale — call browser_snapshot again to get fresh refs.`);
+  // Cross-origin iframes attached under a tab, including nested ones.
+  _frameSessionsUnder(sessionId) {
+    const out = [];
+    const want = new Set([sessionId]);
+    for (let pass = 0; pass < 4; pass++) {
+      for (const [sid, info] of this._frameTargets) {
+        if (out.includes(sid) || !want.has(info.parentSessionId)) continue;
+        out.push(sid);
+        want.add(sid);
+      }
+    }
+    return out;
+  }
+
+  async _evaluateIn(world, expression) {
+    const params = { expression, returnByValue: true, userGesture: true };
+    if (world.contextId) params.contextId = world.contextId;
+    const res = await this._send('Runtime.evaluate', params, world.sessionId);
+    if (res.exceptionDetails) {
+      throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluation failed');
+    }
+    return res.result?.value;
+  }
+
+  // A ref back to the live element it stands for. Refs from before the frame
+  // walk (and from a caller that never snapshotted) resolve in the current
+  // tab's default world, which is what they always meant.
+  _refEntry(ref) {
+    return this._refs[Number(ref)] || { sessionId: this._sessionId, contextId: null, index: Number(ref) };
+  }
+
+  // An element by ref, or by CSS selector for anything the outline does not
+  // list - a drop zone, a plain-div menu trigger, a canvas. Selectors are tried
+  // in every frame, so one inside an iframe resolves too.
+  async _resolveTarget(target) {
+    // A bare number or numeric string is a ref, as every caller used to pass;
+    // a bare string is a selector; an object may name either.
+    const t = target && typeof target === 'object' ? target
+      : (typeof target === 'string' && !/^\d+$/.test(target.trim()) ? { selector: target } : { ref: target });
+    if (t.selector && String(t.selector).trim()) return this._resolveSelector(String(t.selector).trim());
+    if (t.ref == null || t.ref === '' || isNaN(Number(t.ref))) {
+      throw new Error('give a ref from browser_snapshot, or a CSS selector.');
+    }
+    return this._resolveRef(t.ref);
+  }
+
+  async _resolveSelector(selector) {
+    for (const w of await this._worlds()) {
+      const params = { expression: `document.querySelector(${JSON.stringify(selector)})` };
+      if (w.contextId) params.contextId = w.contextId;
+      let res;
+      try { res = await this._send('Runtime.evaluate', params, w.sessionId); } catch { continue; }
+      if (res.exceptionDetails) throw new Error(`"${selector}" is not a valid CSS selector.`);
+      if (res.result?.objectId && res.result?.subtype !== 'null') {
+        return { sessionId: w.sessionId, contextId: w.contextId, objectId: res.result.objectId, selector };
+      }
+    }
+    return null;
+  }
+
+  async _resolveRef(ref) {
+    const r = this._refEntry(ref);
+    if (!r.sessionId) return null;
+    const params = { expression: `(window.__navyRefs || [])[${Number(r.index)}] || null` };
+    if (r.contextId) params.contextId = r.contextId;
+    const res = await this._send('Runtime.evaluate', params, r.sessionId);
+    const objectId = res.result?.objectId;
+    if (!objectId || res.result?.subtype === 'null') return null;
+    return { ...r, objectId };
+  }
+
+  // DOM.getContentQuads, DOM.requestNode and DOM.setFileInputFiles all need the
+  // DOM agent to hold a document first - without the getDocument they hang
+  // rather than fail, which costs a command timeout each.
+  async _ensureDom(sessionId) {
+    if (!sessionId || this._domReady.has(sessionId)) return;
+    await this._send('DOM.enable', {}, sessionId).catch(() => {});
+    await this._send('DOM.getDocument', { depth: 1 }, sessionId).catch(() => {});
+    this._domReady.add(sessionId);
+  }
+
+  // Where to click. Content quads come back in the coordinates of the session
+  // that owns the node, which is also the session the input goes to - so a
+  // control inside an iframe needs no arithmetic here. Falls back to the
+  // element's own rect for a node the DOM agent will not measure.
+  async _pointFor(node) {
+    await this._ensureDom(node.sessionId);
+    await this._send('DOM.scrollIntoViewIfNeeded', { objectId: node.objectId }, node.sessionId).catch(() => {});
+    let quads = null;
+    try { quads = (await this._send('DOM.getContentQuads', { objectId: node.objectId }, node.sessionId)).quads; } catch { /* fall through */ }
+    const quad = (quads || []).find(q => Array.isArray(q) && q.length === 8 && quadArea(q) > 1);
+    if (quad) {
+      return { x: Math.round((quad[0] + quad[2] + quad[4] + quad[6]) / 4), y: Math.round((quad[1] + quad[3] + quad[5] + quad[7]) / 4) };
+    }
+    const rect = await this._callOn(node, 'function() { this.scrollIntoView({ block: "center", inline: "center" });'
+      + ' const r = this.getBoundingClientRect();'
+      + ' return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; }');
+    return rect || null;
+  }
+
+  // Run a function with the element as `this`, in its own frame.
+  async _callOn(node, functionDeclaration, args = []) {
+    const res = await this._send('Runtime.callFunctionOn', {
+      objectId: node.objectId, functionDeclaration,
+      arguments: args.map(value => ({ value })), returnByValue: true, userGesture: true,
+    }, node.sessionId);
+    if (res.exceptionDetails) throw new Error(res.exceptionDetails.exception?.description || 'call failed');
+    return res.result?.value;
+  }
+
+  async _nodeInfo(node) {
+    return (await this._callOn(node, 'function() { return { tag: (this.tagName || "").toLowerCase(), type: (this.type || "") }; }')) || { tag: '', type: '' };
+  }
+
+  // `button` and `clicks` are what a context menu and a double-click need; both
+  // used to be unreachable, so anything behind them went untested.
+  async click(target, { button = 'left', clicks = 1 } = {}) {
+    const node = await this._resolveTarget(target);
+    if (!node) throw new Error(missingTarget(target));
+    const pt = await this._pointFor(node);
+    if (!pt) throw new Error(`${describeTarget(target)} has no clickable area on screen — snapshot again, or scroll it into view.`);
+    await this.clearHover();
     await new Promise(r => setTimeout(r, 60));
-    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
-      await this._send('Input.dispatchMouseEvent', {
-        type, x: pt.x, y: pt.y, button: 'left',
-        clickCount: type === 'mouseMoved' ? 0 : 1, buttons: type === 'mousePressed' ? 1 : 0,
-      }, this._sessionId);
+    await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, button: 'none', buttons: 0 }, node.sessionId);
+    const held = button === 'right' ? 2 : (button === 'middle' ? 4 : 1);
+    for (let n = 1; n <= Math.max(1, Math.min(3, Number(clicks) || 1)); n++) {
+      await this._send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pt.x, y: pt.y, button, clickCount: n, buttons: held }, node.sessionId);
+      await this._send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pt.x, y: pt.y, button, clickCount: n, buttons: 0 }, node.sessionId);
     }
     await new Promise(r => setTimeout(r, 300)); // let a click-driven nav/render begin
-    return pt;
+    return { ...pt, button, clicks: Math.max(1, Number(clicks) || 1) };
   }
 
-  async type(ref, text, submit = false) {
-    const pt = await this._refPoint(ref);
-    if (!pt) throw new Error(`ref ${ref} is stale — call browser_snapshot again to get fresh refs.`);
+  async type(target, text, submit = false) {
+    const node = await this._resolveTarget(target);
+    if (!node) throw new Error(missingTarget(target));
+    // A native <select> cannot be typed into: clicking one opens a list the
+    // page does not draw and CDP mouse events cannot walk. Choosing the option
+    // is what the tester meant, so that is what typing into one does.
+    const info = await this._nodeInfo(node).catch(() => ({ tag: '' }));
+    if (info.tag === 'select') return this.selectOption(node, text);
+
+    const pt = await this._pointFor(node);
+    if (!pt) throw new Error(`${describeTarget(target)} has no clickable area on screen — snapshot again, or scroll it into view.`);
     // Focus by clicking, clear any existing value, then insert as real input.
-    await this._send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pt.x, y: pt.y, button: 'left', clickCount: 1, buttons: 1 }, this._sessionId);
-    await this._send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: 1, buttons: 0 }, this._sessionId);
-    await this.evaluate(`(() => { const el = (window.__navyRefs||[])[${Number(ref)}]; if (el && 'value' in el) el.value=''; })()`);
-    await this._send('Input.insertText', { text: String(text) }, this._sessionId);
+    await this._send('Input.dispatchMouseEvent', { type: 'mousePressed', x: pt.x, y: pt.y, button: 'left', clickCount: 1, buttons: 1 }, node.sessionId);
+    await this._send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pt.x, y: pt.y, button: 'left', clickCount: 1, buttons: 0 }, node.sessionId);
+    await this._callOn(node, 'function() { if ("value" in this) this.value = ""; else if (this.isContentEditable) this.textContent = ""; }').catch(() => {});
+    await this._send('Input.insertText', { text: String(text) }, node.sessionId);
     if (submit) {
-      for (const type of ['keyDown', 'keyUp']) {
-        await this._send('Input.dispatchKeyEvent', { type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' }, this._sessionId);
-      }
+      await this.press('Enter', node.sessionId);
       await new Promise(r => setTimeout(r, 400));
     }
     return pt;
+  }
+
+  // Choose an option of a <select>: by value, then by exact label, then by a
+  // contained label. Reports the options back when none of them matches, so the
+  // caller can pick a real one instead of guessing again.
+  async selectOption(nodeOrTarget, want) {
+    const node = nodeOrTarget && typeof nodeOrTarget === 'object' && nodeOrTarget.objectId
+      ? nodeOrTarget : await this._resolveTarget(nodeOrTarget);
+    if (!node) throw new Error(missingTarget(nodeOrTarget));
+    const out = await this._callOn(node, `function(want) {
+      const w = String(want);
+      const opts = Array.from(this.options || []);
+      const text = (o) => (o.text || '').trim();
+      const m = opts.find(o => o.value === w) || opts.find(o => text(o) === w)
+        || opts.find(o => text(o).toLowerCase().includes(w.toLowerCase()));
+      if (!m) return { ok: false, options: opts.map(text).slice(0, 25) };
+      this.value = m.value;
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, chosen: text(m), value: m.value };
+    }`, [String(want)]);
+    await new Promise(r => setTimeout(r, 200));
+    return { select: true, ...(out || { ok: false, options: [] }) };
+  }
+
+  // Hovering is two different things at once. The mouse move is what a page's
+  // own mouseover/mouseenter handlers listen for; the forced :hover is what
+  // CSS-only menus need, and it is the only one that works in a headed window,
+  // where the hover state follows the real cursor rather than a synthetic move.
+  async hover(target) {
+    const node = await this._resolveTarget(target);
+    if (!node) throw new Error(missingTarget(target));
+    const pt = await this._pointFor(node);
+    if (!pt) throw new Error(`${describeTarget(target)} has no area on screen to hover — snapshot again, or scroll it into view.`);
+    await this.clearHover();
+    await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, button: 'none', buttons: 0 }, node.sessionId);
+    try {
+      await this._ensureDom(node.sessionId);
+      await this._send('CSS.enable', {}, node.sessionId).catch(() => {});
+      const { nodeId } = await this._send('DOM.requestNode', { objectId: node.objectId }, node.sessionId);
+      if (nodeId) {
+        await this._send('CSS.forcePseudoState', { nodeId, forcedPseudoClasses: ['hover'] }, node.sessionId);
+        this._forcedHover = { sessionId: node.sessionId, nodeId };
+      }
+    } catch { /* the move alone still fires the page's own handlers */ }
+    await new Promise(r => setTimeout(r, 250));
+    return pt;
+  }
+
+  // Let go of a forced :hover. Anything that moves on - a click, a navigation,
+  // a capture for a baseline - clears it, so no screen is drawn hovered by
+  // accident.
+  async clearHover() {
+    const held = this._forcedHover;
+    if (!held) return;
+    this._forcedHover = null;
+    await this._send('CSS.forcePseudoState', { nodeId: held.nodeId, forcedPseudoClasses: [] }, held.sessionId).catch(() => {});
+    // The pointer is still sitting on the element, and where the pointer sits
+    // is the other half of :hover - so moving on means moving it off, the way
+    // a person's hand does.
+    await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: -1, y: -1 }, held.sessionId).catch(() => {});
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  // A key, optionally with modifiers ("Escape", "Tab", "Shift+Tab", "Control+a").
+  // Enter was the only key that could be sent, through type(submit) - so
+  // anything a keyboard user does, from dismissing a dialog to walking a
+  // listbox with the arrows, could not be tested at all.
+  async press(combo, sessionId = null) {
+    const target = sessionId || this._sessionId;
+    const parts = String(combo || '').split('+').map(s => s.trim()).filter(Boolean);
+    const keyName = parts.pop() || '';
+    let modifiers = 0;
+    for (const m of parts) {
+      const k = m.toLowerCase();
+      if (k === 'alt') modifiers |= 1;
+      else if (k === 'control' || k === 'ctrl') modifiers |= 2;
+      else if (k === 'meta' || k === 'cmd' || k === 'command') modifiers |= 4;
+      else if (k === 'shift') modifiers |= 8;
+      else throw new Error(`unknown modifier "${m}" — use Alt, Control, Meta or Shift.`);
+    }
+    const spec = keySpec(keyName);
+    if (!spec) throw new Error(`unknown key "${keyName}" — use a single character or one of: ${Object.keys(KEYS).join(', ')}.`);
+    const base = { modifiers, key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.code2, nativeVirtualKeyCode: spec.code2 };
+    // A plain printable key also carries its text, which is what makes it type;
+    // with Ctrl or Meta held it must not, or the shortcut inserts a character.
+    const text = spec.text && !(modifiers & 2) && !(modifiers & 4) ? spec.text : undefined;
+    await this._send('Input.dispatchKeyEvent', { ...base, type: text ? 'keyDown' : 'rawKeyDown', ...(text ? { text } : {}) }, target);
+    await this._send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, target);
+    await new Promise(r => setTimeout(r, 200));
+    return { pressed: combo };
+  }
+
+  // Put a real file into a file input. The browser's own picker is an OS window
+  // nothing here can reach, so this is the only way an upload gets tested.
+  async upload(target, files) {
+    const node = await this._resolveTarget(target);
+    if (!node) throw new Error(missingTarget(target));
+    const info = await this._nodeInfo(node).catch(() => ({ tag: '', type: '' }));
+    if (info.tag !== 'input' || info.type !== 'file') {
+      throw new Error(`${describeTarget(target)} is a <${info.tag || '?'}>, not a file input — snapshot and pick the "file-input" row.`);
+    }
+    await this._ensureDom(node.sessionId);
+    await this._send('DOM.setFileInputFiles', { files, objectId: node.objectId }, node.sessionId);
+    await new Promise(r => setTimeout(r, 200));
+    return await this._callOn(node, 'function() { return { count: this.files.length, names: Array.from(this.files).map(f => f.name) }; }');
+  }
+
+  // Wait for the page to catch up rather than guessing with a fixed pause: an
+  // app that renders after a fetch was tested by sleeping and hoping.
+  async waitFor({ text = '', selector = '', gone = false, timeout = 10000 } = {}) {
+    const started = Date.now();
+    const limit = Math.max(500, Math.min(60000, Number(timeout) || 10000));
+    const expr = selector
+      ? `!!document.querySelector(${JSON.stringify(selector)})`
+      : `(document.body ? document.body.innerText : '').includes(${JSON.stringify(String(text))})`;
+    const want = !gone;
+    for (;;) {
+      let seen = false;
+      try { seen = Boolean(await this.evaluate(expr)); } catch { seen = false; }
+      if (seen === want) return { found: true, waitedMs: Date.now() - started };
+      if (Date.now() - started >= limit) return { found: false, waitedMs: Date.now() - started };
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  // A viewport that stays put, so a page can be walked at phone width. Kept on
+  // the instance because captureFixed overrides the metrics for its baseline
+  // and has to put this back rather than clear it.
+  async setViewport({ width = 1280, height = 800, mobile = false } = {}) {
+    const w = Math.max(200, Math.min(4096, Math.round(Number(width) || 1280)));
+    const h = Math.max(200, Math.min(4096, Math.round(Number(height) || 800)));
+    this._viewport = { width: w, height: h, mobile: Boolean(mobile) };
+    await this._send('Emulation.setDeviceMetricsOverride', { ...this._viewport, deviceScaleFactor: 1 }, this._sessionId);
+    await this._send('Emulation.setTouchEmulationEnabled', { enabled: Boolean(mobile), maxTouchPoints: mobile ? 5 : 0 }, this._sessionId).catch(() => {});
+    await new Promise(r => setTimeout(r, 250)); // the resize's layout
+    return { ...this._viewport };
+  }
+
+  async clearViewport() {
+    this._viewport = null;
+    await this._send('Emulation.clearDeviceMetricsOverride', {}, this._sessionId).catch(() => {});
+    await this._send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 }, this._sessionId).catch(() => {});
+    return { reset: true };
+  }
+
+  // The open tabs, newest last, with the current one marked.
+  async listTabs() {
+    const out = [];
+    for (let i = 0; i < this._tabs.length; i++) {
+      const t = this._tabs[i];
+      let info = null;
+      try {
+        const res = await this._send('Runtime.evaluate', { expression: '({ title: document.title, url: location.href })', returnByValue: true }, t.sessionId);
+        info = res.result?.value || null;
+      } catch { /* a tab mid-navigation still gets a row */ }
+      out.push({ index: i, current: t.sessionId === this._sessionId, title: info?.title || '', url: info?.url || '' });
+    }
+    return out;
+  }
+
+  async switchTab(index) {
+    const t = this._tabs[Number(index)];
+    if (!t) throw new Error(`there is no tab ${index} — call browser_tabs() to list them.`);
+    this._sessionId = t.sessionId;
+    this._refs = [];
+    return await this.evaluate('({ title: document.title, url: location.href })');
+  }
+
+  async closeTab(index) {
+    const t = this._tabs[Number(index)];
+    if (!t) throw new Error(`there is no tab ${index} — call browser_tabs() to list them.`);
+    if (this._tabs.length === 1) throw new Error('that is the only tab — use browser_close to end the session.');
+    await this._send('Target.closeTarget', { targetId: t.targetId }).catch(() => {});
+    this._forgetSession(t.sessionId);
+    return await this.listTabs();
+  }
+
+  // How the next dialogs are answered. A confirm() guarding a delete is a real
+  // path to test, and it needs Cancel as much as OK.
+  setDialogPolicy({ accept = true, promptText = '' } = {}) {
+    this._dialog = { accept: Boolean(accept), promptText: String(promptText || '') };
+    return { ...this._dialog };
+  }
+
+  // Offline and slow connections: what a user on a train sees.
+  async setNetworkCondition(condition) {
+    const c = String(condition || 'normal').toLowerCase();
+    const presets = {
+      offline: { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+      slow: { offline: false, latency: 400, downloadThroughput: 50 * 1024, uploadThroughput: 20 * 1024 },
+      normal: { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
+    };
+    if (!presets[c]) throw new Error(`unknown condition "${condition}" — use offline, slow or normal.`);
+    await this._send('Network.emulateNetworkConditions', presets[c], this._sessionId);
+    return { condition: c };
+  }
+
+  // Forward, the other half of back(): a tester who goes back to check
+  // something then wants to carry on where they were.
+  async forward() {
+    const hist = await this._send('Page.getNavigationHistory', {}, this._sessionId);
+    const idx = hist.currentIndex;
+    let moved = false;
+    if (idx < (hist.entries || []).length - 1) {
+      await this._send('Page.navigateToHistoryEntry', { entryId: hist.entries[idx + 1].id }, this._sessionId);
+      await new Promise(r => setTimeout(r, 600));
+      moved = true;
+    }
+    const info = await this.evaluate('({ title: document.title, url: location.href })');
+    return { ...(info || {}), moved };
+  }
+
+  // Drag one element onto another. Two different mechanisms answer to "drag":
+  // HTML5 drag-and-drop, which needs real drag events, and the mousedown/
+  // mousemove/mouseup that every JS drag library listens for. The HTML5 path is
+  // tried first, and its own interception tells us whether the page wanted it.
+  async drag(fromTarget, toTarget) {
+    const from = await this._resolveTarget(fromTarget);
+    const to = await this._resolveTarget(toTarget);
+    if (!from) throw new Error(missingTarget(fromTarget));
+    if (!to) throw new Error(missingTarget(toTarget));
+    const a = await this._pointFor(from);
+    const b = await this._pointFor(to);
+    if (!a || !b) throw new Error('one of those elements has no area on screen — snapshot again, or scroll it into view.');
+    const session = from.sessionId;
+
+    let data = null;
+    const onIntercept = (d) => { data = d; };
+    this._dragWaiters.push(onIntercept);
+    try {
+      await this._send('Input.setInterceptDrags', { enabled: true }, session).catch(() => {});
+      await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: a.x, y: a.y, button: 'none', buttons: 0 }, session);
+      await this._send('Input.dispatchMouseEvent', { type: 'mousePressed', x: a.x, y: a.y, button: 'left', clickCount: 1, buttons: 1 }, session);
+      // A few steps, because a single jump is not a gesture any library reads.
+      for (let i = 1; i <= 4; i++) {
+        const x = Math.round(a.x + ((b.x - a.x) * i) / 4);
+        const y = Math.round(a.y + ((b.y - a.y) * i) / 4);
+        await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left', buttons: 1 }, session);
+        await new Promise(r => setTimeout(r, 40));
+      }
+      if (data) {
+        // The page started an HTML5 drag: finish it as one.
+        for (const type of ['dragEnter', 'dragOver', 'drop']) {
+          await this._send('Input.dispatchDragEvent', { type, x: b.x, y: b.y, data }, session).catch(() => {});
+        }
+      }
+      await this._send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: b.x, y: b.y, button: 'left', clickCount: 1, buttons: 0 }, session);
+      await new Promise(r => setTimeout(r, 300));
+      return { from: a, to: b, html5: Boolean(data) };
+    } finally {
+      this._dragWaiters = this._dragWaiters.filter(w => w !== onIntercept);
+      await this._send('Input.setInterceptDrags', { enabled: false }, session).catch(() => {});
+    }
   }
 
   async scroll(amount = 600) {
@@ -826,6 +1466,7 @@ class Browser {
   // ring from the one Tab drew, and the next click or type moves both to where
   // it needs them anyway.
   async captureFixed({ width = 1280, height = 800 } = {}) {
+    await this.clearHover();
     await this._send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: -1, y: -1 }, this._sessionId).catch(() => {});
     const was = await this.evaluate('(() => { const a = document.activeElement;'
       + ' if (a && a !== document.body && typeof a.blur === "function") a.blur();'
@@ -837,7 +1478,14 @@ class Browser {
       await new Promise(r => setTimeout(r, 350)); // the resize's layout and paint
       return await this.screenshot();
     } finally {
-      await this._send('Emulation.clearDeviceMetricsOverride', {}, this._sessionId).catch(() => {});
+      // Back to whatever the caller had - a viewport set with setViewport is
+      // part of the test (a phone-width run), not something a capture may drop.
+      if (this._viewport) {
+        await this._send('Emulation.setDeviceMetricsOverride',
+          { ...this._viewport, deviceScaleFactor: 1 }, this._sessionId).catch(() => {});
+      } else {
+        await this._send('Emulation.clearDeviceMetricsOverride', {}, this._sessionId).catch(() => {});
+      }
       if (was && (was.x || was.y)) {
         await this.evaluate(`window.scrollTo(${Number(was.x) || 0}, ${Number(was.y) || 0})`).catch(() => {});
       }
@@ -895,5 +1543,6 @@ class Browser {
 
 module.exports = {
   Browser, chromeCandidates, firstExisting, launchArgs, drainFrames, snapshotScript, INTERACTIVE_TAGS,
+  quadArea, keySpec, KEYS, describeTarget, missingTarget,
   parseCssColor, blendOver, relativeLuminance, contrastRatio, a11yAuditScript, FOCUS_DESCRIBE_SCRIPT, analyzeFocusStops,
 };

@@ -123,6 +123,31 @@ function recordTranscriptCard(session, message) {
       ids.delete(message.id);
       return;
     }
+    case 'pendingQuestion': {
+      const record = {
+        kind: 'question', status: 'pending',
+        question: String(message.question || '').slice(0, APPROVAL_TEXT_MAX),
+        options: (message.options || []).slice(0, 4),
+      };
+      log.push(record);
+      if (message.id && ids) ids.set(message.id, record);
+      return;
+    }
+    case 'questionResolved': {
+      const record = ids && ids.get(message.id);
+      if (!record) return;
+      record.status = message.answer ? 'answered' : 'cancelled';
+      if (message.answer) record.answer = message.answer;
+      ids.delete(message.id);
+      return;
+    }
+    case 'toolImage': {
+      // A screenshot or visual diff shown in the chat: the card keeps the
+      // file's path, and the extension turns it into a URI the panel may load
+      // each time the chat is redrawn (_messagesForPanel in extension.js).
+      log.push({ kind: 'image', tool: message.tool, file: message.file, caption: String(message.caption || '') });
+      return;
+    }
     case 'thinkingChunk': {
       // One block per turn, placed where the reasoning started - which is how
       // the transcript draws it: every later chunk goes into the same block.

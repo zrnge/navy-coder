@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "Local-first AI coding agent that asks before it acts: approve every diff and command, zero runtime dependencies, /audit supply-chain scans and /playthrough browser QA. Ollama, LM Studio or your own key.",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
