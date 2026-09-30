@@ -9,7 +9,7 @@ to touch for the two most common changes.
 ```bash
 npm install          # devDependencies only — see the invariant below
 npm run check        # parses every JS file under src/ media/ test/ eval/
-npm test             # 2,815 tests, no network, no API keys
+npm test             # 2,903 tests, no network, no API keys
 npm run build        # esbuild bundle into dist/
 ```
 
@@ -23,6 +23,16 @@ changes to `src/extension.js` need the host restarting.
 If F5 ever offers to *"find a Markdown extension in the Marketplace"*, it is
 debugging the focused file instead of the extension — pick **Run Extension** in
 the Run and Debug panel once, and F5 will keep using it.
+
+**Run Extension** is an attach, not the usual `extensionHost` launch: a task
+(`tools/dev-host.js`) opens the Development Host paused on `127.0.0.1:9333`, and
+the debugger attaches to that address. The usual launch makes VS Code's
+debugger find the host through `localhost`, and on some Windows machines that
+never connects — the window says *"Extension host did not start in 10
+seconds"* and Navy's code never runs. The reasoning is at the top of
+`.vscode/launch.json`. Stopping the debugger leaves the Development Host open;
+close it before the next F5. **Run Extension (standard launch)** is still there
+for comparison, and <kbd>Ctrl</kbd>+<kbd>F5</kbd> on it runs without a debugger.
 
 ## Three rules that aren't negotiable
 
@@ -85,6 +95,8 @@ Everything from `retrieval.js` down is **mixed into `NavyCoderViewProvider.proto
 | `src/diagnostics.js` | ~180 | The exportable bug-report bundle, and the redaction that makes it safe to paste |
 | `src/plan.js` | ~130 | Task plans: validation, the block the model reads back, the incomplete-plan note |
 | `src/questions.js` | ~130 | `ask_user`: what counts as a question, the wait for an answer, a typed answer, and cancelling one that will never be answered |
+| `src/problems.js` | ~130 | The Problems panel as the model reads it: every error and warning in the project, grouped by file, worst first, and what the panel cannot see |
+| `src/turn-history.js` | ~110 | Earlier turns as the model gets them: an unfinished turn keeps its boundary, and a seeded command's brief is not replayed as the person's words |
 | `src/providers/errors.js` | ~160 | Error classification — decides both the user-facing advice and whether a failure is fallback-worthy |
 | `src/providers/mcp.js` | ~420 | MCP client, stdio and streamable HTTP: tools, resources and prompts |
 | `src/providers/embeddings.js` | ~75 | Embedding calls and cosine similarity |
@@ -200,6 +212,8 @@ Two suites, both run by `npm test`:
   | `suite-thinking.js` | Thinking levels: the mapping per provider, a refused level stepping down and being remembered, the setting |
   | `suite-screenshots.js` | Screenshots in the chat: saved in the profile and pruned, the card kept with its turn, a pruned one marked, and only Navy's own files openable |
   | `suite-questions.js` | `ask_user`: what a question must be, waiting and answering, a typed answer, cancelling, and the card kept with the turn |
+  | `suite-problems.js` | The Problems panel: grouping and order, severity and folder filters, files outside the project, the cap, and the note on what the panel cannot see |
+  | `suite-turns.js` | Turn history: unfinished turns keep their boundary, seeded briefs replayed as what was typed, the wrap-up before the step cap, how a turn ended |
 
   The files sit flat in `test/` rather than in a subdirectory on purpose: every
   suite uses `require('../src/...')` and `path.join(__dirname, '..')`, and a

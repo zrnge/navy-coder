@@ -198,11 +198,13 @@ const TOOLS = [
   },
   {
     name: 'get_diagnostics',
-    description: 'Get all LSP errors and warnings for the current file or a specific file. Use this to see TypeScript errors, linting issues, etc. NOTE: this only reports what an installed language extension found — it returns nothing for a language the user has no extension for, which is NOT the same as the file being valid. Use check_syntax when you need a definitive answer.',
+    description: 'Read the errors and warnings VS Code shows in its Problems panel — TypeScript errors, lint findings, anything an installed language extension reports. By default for one file (the one named, or the active editor). With scope "workspace" it reads the WHOLE panel across the project, grouped by file, worst first — the quickest way to find what the editor already knows is broken. The panel covers only what language extensions have analysed (usually the open files), so for the whole project also run its own checker with run_command. NOTE: this only reports what an installed language extension found — nothing for a language with no extension installed, which is NOT the same as valid. Use check_syntax when you need a definitive answer for a file.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path to get diagnostics for. Omit for the currently active file.' }
+        path: { type: 'string', description: 'A file to read diagnostics for (omit for the active file). With scope "workspace", a folder to narrow the panel to.' },
+        scope: { type: 'string', description: '"file" (default) or "workspace" for the whole Problems panel.' },
+        severity: { type: 'string', description: 'For the workspace: "error", "warning" (errors and warnings, the default) or "all".' }
       },
       required: []
     }

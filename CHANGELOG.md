@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.3.8] - 2026-09-30
+
+A greeting that started a playthrough and what was behind it, and Navy reading
+the whole Problems panel.
+
+### Added
+
+- **Navy reads the whole Problems panel.** `get_diagnostics` read one file - the
+  one named, or the active editor. With `scope: "workspace"` it now reads
+  everything VS Code's Problems panel holds for the project: every error and
+  warning, grouped by file, worst file first, each with its position and rule
+  (`ts 2322`, `eslint no-unused-vars`), capped so a flood of warnings cannot
+  bury the errors. A `path` narrows it to a folder, `severity` to errors only or
+  out to hints. With no file open, a plain `get_diagnostics` now answers with the
+  whole panel rather than "No active file open."
+
+  The panel only lists what language extensions have analysed - for
+  JavaScript/TypeScript, ESLint and Python, normally the files open in an editor
+  - so "No problems have been detected" with nothing open says little, and every
+  answer says as much. Opening the files in the background does not fill it in:
+  tried against a real VS Code, TypeScript reported nothing for documents opened
+  but not shown. What covers a whole project is its own checker, so the answer
+  points there, and it runs through `run_command` - a lint script is the
+  project's code executing, so it stays behind the command-approval gate rather
+  than inside a read-only tool.
+- **`/problems`** does all of that in one go: reads the Problems panel, runs the
+  project's own checker for the rest of the tree, groups what both found by root
+  cause, and fixes the errors first, checking again after each fix.
+
+### Fixed
+
+- **"hi" after an unfinished turn restarted that turn.** A `/playthrough` that
+  ran out of steps before writing its report was saved with no reply, and the
+  replay left a reply-less turn out entirely - an empty assistant message is
+  refused by some providers. That removed the turn boundary with it: the
+  playthrough's 7,000-character brief ("you have full autonomy ... begin now")
+  and the next message reached the model as two user messages in a row, which
+  read as one. So "hi" restarted the playthrough. A turn that did not finish is
+  now replayed with one plain sentence saying so and why - out of steps after N
+  tool calls, stopped, timed out, or failed - including one that wrote some
+  narration before it was cut off, and one that failed before anything was
+  saved at all. Two user messages never reach the model back to back, and the
+  old request reads as over. The greeting rule already in the prompt could
+  never apply before, because the model never saw "hi" on its own.
+- **A seeded command's brief no longer poses as your message.** `/playthrough`
+  expands into a long brief, and that brief was saved as what you typed: it
+  rode along in every later turn of the chat, it was the message a reopened
+  chat showed you, it named the tab, and an export quoted it as yours. The chat
+  now keeps what you typed (`/playthrough localhost:3000 ...`) and holds the
+  brief apart as the turn's instruction. It goes back to the model only for a
+  request that continues that same unfinished work - the Continue buttons,
+  through any number of them in a row - since a playthrough cannot be finished
+  without its instructions. Chats saved before this read the same way when
+  reopened, and neither the compacted summary of an older chat nor the Rewind
+  list carries the brief any more. `/playthrough` also shows up in the chat as
+  your message once Navy accepts it, where before it drew nothing.
+- **A long turn is told to wrap up before it is cut off.** In the last six
+  steps before the step limit (`navy.maxToolIterations`), the model is told -
+  once - to stop exploring, close the browser and write its reply with what it
+  has. The playthrough behind this report spent all 100 steps exploring and
+  delivered not one finding. A turn that runs out anyway, is stopped, or times
+  out is saved saying which, and a reopened chat and an export show that under
+  the turn rather than a run of cards that simply stops.
+- **Screenshots past a turn's card limit are no longer saved without their
+  tool.** Tool cards stop being saved after 60 in a turn; the thumbnails
+  carried on, so a long playthrough came back with dozens of pictures and
+  nothing above them. A thumbnail is now kept only under a tool card that was.
+
 ## [0.3.7] - 2026-09-22
 
 Screenshots in the chat, a playthrough that can drive the whole UI, and Navy

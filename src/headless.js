@@ -346,7 +346,7 @@ function startHeadless({ root, settings = {}, env = process.env, note = () => {}
       let timer;
       const timedOut = new Promise((_, reject) => {
         timer = setTimeout(() => {
-          try { provider.abortController?.abort(); } catch { /* already over */ }
+          try { provider._session.abortReason = 'timeout'; provider.abortController?.abort(); } catch { /* already over */ }
           reject(new Error(`the run took longer than ${Math.round(timeoutMs / 60000)} minutes and was stopped`));
         }, timeoutMs);
       });

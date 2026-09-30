@@ -18,6 +18,7 @@
 const path = require('path');
 const crypto = require('crypto');
 const { unifiedDiff, splitLines } = require('./text-diff.js');
+const { shownText, endedNote } = require('./turn-history.js');
 
 const EXPORT_DIFF_MAX_LINES = 400;          // per file; the +/- counts always cover the whole change
 const EXPORT_DIFF_MAX_FILE_LINES = 20000;   // on either side; a bigger file is named, not diffed
@@ -174,11 +175,13 @@ async function buildExportMarkdown({ messages = [], digest = '', checkpoints = [
   for (const m of messages) {
     if (!m) continue;
     const isUser = m.role === 'user';
-    const text = String(m.text || '').trim();
+    const text = shownText(m).trim();
     const tools = isUser ? [] : toolsSection(m.cards);
     const shots = isUser ? [] : shotsSection(m.cards);
     const changes = isUser ? [] : await changesSection(m.meta, cps, projectRoot, read);
-    const error = m.error ? [`_The turn ended on an error: ${String(m.error).trim()}_`, ''] : [];
+    const note = isUser ? '' : endedNote(m);
+    const error = m.error ? [`_The turn ended on an error: ${String(m.error).trim()}_`, '']
+      : (note ? [`_${note}_`, ''] : []);
     if (!text && !tools.length && !shots.length && !changes.length && !error.length) continue;
     lines.push((isUser ? '**You:** ' : '**Navy:** ') + text, '', ...tools, ...shots, ...changes, ...error);
   }

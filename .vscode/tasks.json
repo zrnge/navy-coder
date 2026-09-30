@@ -1,5 +1,5 @@
 {
-  // Backs the preLaunchTask in launch.json. Declared explicitly rather than
+  // Backs the preLaunchTasks in launch.json. Declared explicitly rather than
   // relying on npm-script auto-detection, which a contributor can have turned
   // off (npm.autoDetect) — in which case F5 would fail on a missing task.
   "version": "2.0.0",
@@ -11,6 +11,27 @@
       "group": { "kind": "build", "isDefault": true },
       "label": "npm: build",
       "detail": "esbuild bundle into dist/"
+    },
+    {
+      // Builds, then opens the Development Host paused on 127.0.0.1:9333 for
+      // "Run Extension" to attach to. See tools/dev-host.js.
+      "label": "navy: open Development Host",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/tools/dev-host.js", "${execPath}", "${workspaceFolder}", "9333"],
+      "dependsOn": ["npm: build"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent" }
+    },
+    {
+      // Same, with every other installed extension disabled.
+      "label": "navy: open Development Host (only Navy)",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/tools/dev-host.js", "${execPath}", "${workspaceFolder}", "9333", "--disable-extensions"],
+      "dependsOn": ["npm: build"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "silent" }
     }
   ]
 }

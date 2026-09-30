@@ -34,6 +34,7 @@ function beginTurnCards(session, cardLog) {
   if (!session) return;
   session.turnCards = cardLog;
   session.turnCardIds = new Map();
+  session.turnCardCalls = new Set();   // callIds whose tool card was kept
   session.turnThinking = null;
   session.turnDiffChars = 0;
 }
@@ -42,6 +43,7 @@ function endTurnCards(session) {
   if (!session) return;
   session.turnCards = null;
   session.turnCardIds = null;
+  session.turnCardCalls = null;
   session.turnThinking = null;
   session.turnDiffChars = 0;
 }
@@ -145,6 +147,12 @@ function recordTranscriptCard(session, message) {
       // A screenshot or visual diff shown in the chat: the card keeps the
       // file's path, and the extension turns it into a URI the panel may load
       // each time the chat is redrawn (_messagesForPanel in extension.js).
+      //
+      // It belongs under the tool that took it, so it is kept only when that
+      // tool's card was: past the turn's card cap the tool cards stop being
+      // saved, and the thumbnails used to carry on - a long playthrough came
+      // back with dozens of pictures and nothing above them.
+      if (message.callId && session.turnCardCalls && !session.turnCardCalls.has(message.callId)) return;
       log.push({ kind: 'image', tool: message.tool, file: message.file, caption: String(message.caption || '') });
       return;
     }

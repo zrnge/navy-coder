@@ -1481,6 +1481,72 @@ function questionCardSuite() {
   w.close();
 }
 
+// ── Unfinished turns and seeded commands ──────────────────────────────
+// /playthrough is shown as what was typed, a Continue says it continues, and
+// a turn that ran out of steps says so when the chat is reopened.
+function unfinishedTurnSuite() {
+  console.log('\nunfinished turns and /playthrough:');
+
+  let w = createWebview();
+  const send = (text) => {
+    const p = w.document.querySelector('#prompt');
+    p.value = text;
+    p.dispatchEvent(new w.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  };
+  send('/playthrough localhost:3000 check the cart');
+  const started = w.sent.find(m => m.type === 'runPlaythrough');
+  check('/playthrough still starts a playthrough', Boolean(started) && started.url === 'localhost:3000 check the cart', JSON.stringify(w.sent));
+  check('...drawing no message until the extension has accepted it',
+    w.document.querySelectorAll('.message.user').length === 0);
+  w.post({ type: 'seededPrompt', text: '/playthrough localhost:3000 check the cart', queueId: started?.queueId });
+  const bubble = [...w.document.querySelectorAll('.message.user')].pop();
+  check('...then the message the chat saves, as the reopened chat will show it',
+    /\/playthrough localhost:3000 check the cart/.test(bubble?.textContent || ''), bubble && bubble.textContent);
+  check('...with an id, so it can queue and be cancelled like any other prompt',
+    Boolean(started?.queueId) && bubble?.dataset.queueId === started.queueId);
+  w.close();
+
+  // Continue carries on the unfinished turn, and says so - that is what gets
+  // a seeded turn its brief back.
+  w = run([{ type: 'start' }, { type: 'done' }, { type: 'capReached', steps: 100 }]);
+  const cont = w.document.querySelector('.continue-btn');
+  cont?.dispatchEvent(new w.window.Event('click'));
+  check('Continue after the step limit is sent as a continuation',
+    w.sent.some(m => m.type === 'ask' && m.continues === true), JSON.stringify(w.sent));
+  w.close();
+
+  w = run([{ type: 'start' }, { type: 'done' }, { type: 'errorContinue' }]);
+  w.document.querySelector('.continue-btn')?.dispatchEvent(new w.window.Event('click'));
+  check('...and so is Continue after a provider error',
+    w.sent.some(m => m.type === 'ask' && m.continues === true), JSON.stringify(w.sent));
+  w.close();
+
+  // A reopened chat says how a turn with no reply ended.
+  w = run([{ type: 'restore', messages: [
+    { role: 'user', text: '/playthrough' },
+    { role: 'assistant', text: 'Let me check the footer.', meta: { ended: 'cap', steps: 100 }, endedNote: 'This turn ran out of steps after 100 tool calls before it finished.', cards: [{ tool: 'browser_navigate', args: { url: 'http://x' }, result: 'ok' }] },
+  ] }]);
+  check('a reopened turn that ran out of steps says so under its cards - even one that wrote something',
+    /ran out of steps after 100 tool calls before it finished/.test(w.document.querySelector('#messages').textContent));
+  w.close();
+
+  w = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'do it' },
+    { role: 'assistant', text: '', meta: { ended: 'stopped' }, endedNote: 'This turn was stopped before it finished.', cards: [{ tool: 'read_file', args: { path: 'a' }, result: 'x' }] },
+  ] }]);
+  check('...and one that was stopped says that', /was stopped before it finished/.test(w.document.querySelector('#messages').textContent));
+  w.close();
+
+  // The wording is the extension's; the panel does not work it out itself.
+  w = run([{ type: 'restore', messages: [
+    { role: 'user', text: 'do it' },
+    { role: 'assistant', text: '', meta: { ended: 'cap', steps: 3 }, cards: [{ tool: 'read_file', args: { path: 'a' }, result: 'x' }] },
+  ] }]);
+  check('...from the note the extension sends, not from the panel guessing at meta',
+    !/ran out of steps/.test(w.document.querySelector('#messages').textContent));
+  w.close();
+}
+
 // ── Custom slash commands ───────────────────────────────────────────────────
 // The composer half: merging the files the extension found with the built-ins,
 // and expanding a command that was typed out rather than picked from the menu.
@@ -1529,6 +1595,17 @@ function slashCommandSuite() {
     check('slash: picking it puts ITS prompt in the box',
       w.document.querySelector('#prompt').value === 'Fix it OUR way.',
       w.document.querySelector('#prompt').value);
+
+    // /problems: the Problems panel, then the project's own checker, then fixes.
+    type(w, '/problems');
+    const problemsRow = [...w.document.querySelectorAll('#slashDropdown .slash-item')].find(i => i.dataset.cmd === '/problems');
+    check('slash: /problems is offered', Boolean(problemsRow));
+    problemsRow?.dispatchEvent(new w.window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    const problemsPrompt = w.document.querySelector('#prompt').value;
+    check('slash: /problems reads the whole Problems panel',
+      /get_diagnostics with scope "workspace"/.test(problemsPrompt), problemsPrompt.slice(0, 120));
+    check('slash: ...and runs the project\'s own checker, since the panel only covers analysed files',
+      /run the project's own checker/.test(problemsPrompt) && /run_command/.test(problemsPrompt));
 
     // The built-in list must survive a reload of the custom one.
     w.post({ type: 'slashCommands', commands: [] });
@@ -3915,6 +3992,7 @@ speechSuite();
 diffSuite();
 screenshotCardSuite();
 questionCardSuite();
+unfinishedTurnSuite();
 
 // Shut every jsdom window still open before reporting. main.js arms a 250ms
 // self-watchdog interval in each one, so a window a test forgot to close keeps

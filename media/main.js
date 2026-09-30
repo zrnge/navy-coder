@@ -1291,7 +1291,7 @@ window.addEventListener('message', (event) => {
       btn.remove();
       const p = 'Continue the task — the previous turn was interrupted by a provider error. Pick up exactly where you left off; files already changed are done, do not redo them.';
       addMessage('user', p);
-      vscode.postMessage({ type: 'ask', prompt: p });
+      vscode.postMessage({ type: 'ask', prompt: p, continues: true });
     });
     messagesEl.appendChild(btn);
     scrollToBottom();
@@ -1306,7 +1306,7 @@ window.addEventListener('message', (event) => {
       btn.remove();
       const continuePrompt = 'Continue the task — you were cut off at the step limit. Pick up exactly where you left off and finish what you started.';
       addMessage('user', continuePrompt);
-      vscode.postMessage({ type: 'ask', prompt: continuePrompt });
+      vscode.postMessage({ type: 'ask', prompt: continuePrompt, continues: true });
     });
     messagesEl.appendChild(btn);
     scrollToBottom();
@@ -1469,6 +1469,14 @@ window.addEventListener('message', (event) => {
       activeTermCard.statusEl.className = 'term-status running';
     }
     addPendingCommandCard(message.id, message.command);
+  }
+
+  // A seeded command the extension accepted (/playthrough), as the message the
+  // chat saves for it.
+  if (message.type === 'seededPrompt') {
+    const article = addMessage('user', String(message.text || ''), [], 0, Date.now());
+    if (article && message.queueId) article.dataset.queueId = message.queueId;
+    scrollToBottom();
   }
 
   // Navy is asking something. The card takes the answer; the composer works
@@ -2269,6 +2277,7 @@ const SLASH_COMMANDS = [
   { cmd: '/pr-review',       label: 'PR Review',     iconName: 'pr-review',  desc: 'Review a pull request',                   prompt: '' },
   { cmd: '/refactor',        label: 'Refactor',      iconName: 'refactor', desc: 'Refactor for clarity and performance',    prompt: 'Refactor this code for better readability, maintainability, and performance. Keep behaviour identical.' },
   { cmd: '/docs',            label: 'Docs',          iconName: 'docs', desc: 'Add documentation and comments',          prompt: 'Add clear JSDoc/docstring comments to all public functions and classes in the active file. First read_file to see its current content. Keep comments concise, accurate, and focused on WHY not WHAT. Then apply the changes with apply_edit.' },
+  { cmd: '/problems',        label: 'Problems',      iconName: 'debug', desc: 'Find and fix what the Problems panel reports', prompt: 'Find the bugs this project already has reported against it. Call get_diagnostics with scope "workspace" to read the whole Problems panel. The panel only covers files the editor has analysed - usually the open ones - so also run the project\'s own checker for the whole tree with run_command: look at package.json scripts, tsconfig.json or pyproject.toml to pick it (for example npm run lint, npx tsc --noEmit, ruff check). Group everything found by root cause - one bad import or type often causes many errors. Fix the errors first, one root cause at a time: read the code around each before editing, and check again afterwards that they are gone. Then the warnings, only where the fix is clear and safe. End with what you fixed, what is left, and why.' },
   { cmd: '/debug',           label: 'Debug',         iconName: 'debug', desc: 'Help diagnose the current problem',        prompt: 'Help me debug this. Start by calling get_diagnostics on the active file, then read_file to see the code, then run_tests if a test suite exists. Identify the root cause and apply a fix.' },
   { cmd: '/search',          label: 'Web Search',    iconName: 'web', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
   { cmd: '/run',             label: 'Run Project',   iconName: 'run',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
@@ -2774,10 +2783,16 @@ function sendPrompt() {
   // discovers and serves the local project (or says it isn't a web project).
   if (prompt === '/playthrough' || prompt.startsWith('/playthrough ')) {
     const url = prompt.slice('/playthrough'.length).trim();
+    // No bubble yet: the extension draws it (seededPrompt) once it has accepted
+    // the command, with exactly the text the chat saves - so a refused one (no
+    // folder open, a file:// URL) leaves nothing behind, and the reopened chat
+    // shows the same message this one does. The id lets it queue and cancel
+    // like any other prompt.
+    const queueId = 'q' + (++queueSeq) + '_' + Date.now();
     promptInput.value = '';
     promptInput.style.height = 'auto';
     updateSendButton();
-    vscode.postMessage({ type: 'runPlaythrough', url });
+    vscode.postMessage({ type: 'runPlaythrough', url, queueId });
     return;
   }
 
@@ -3224,6 +3239,10 @@ function renderHistoryItem(item) {
     // A turn that failed after doing some work is saved with the error it
     // ended on, so a reopened chat still says why it stopped.
     if (item.error) addMessage('error', item.error);
+    // One that did not finish for another reason says that too, rather than
+    // leaving a run of cards that simply stops. The extension words it
+    // (endedNote in src/turn-history.js), the same way the export does.
+    else if (item.endedNote) addSystemMessage(String(item.endedNote));
   }
 }
 

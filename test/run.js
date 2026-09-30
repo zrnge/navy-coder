@@ -35,6 +35,8 @@ const { navyDataDirSuite } = require('./suite-datadir.js');
 const { thinkingLevelsSuite } = require('./suite-thinking.js');
 const { screenshotsSuite } = require('./suite-screenshots.js');
 const { askUserSuite } = require('./suite-questions.js');
+const { turnHistorySuite, turnReviewSuite } = require('./suite-turns.js');
+const { problemsSuite } = require('./suite-problems.js');
 
 // The pure-function and jsdom checks first: they need no mock and no temp
 // filesystem, so a failure there is the cheapest possible signal.
@@ -113,6 +115,9 @@ undoRedoSuite()
   .then(thinkingLevelsSuite)
   .then(screenshotsSuite)
   .then(askUserSuite)
+  .then(turnHistorySuite)
+  .then(turnReviewSuite)
+  .then(problemsSuite)
   .then(() => {
     uninstallVscodeMock();
     report();

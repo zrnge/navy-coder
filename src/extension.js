@@ -47,6 +47,11 @@ const { saveScreenshot } = require('./screenshots.js');
 const { THINKING_LEVELS, normalizeThinkingLevel } = require('./thinking.js');
 // Asking the person when the request could mean more than one thing.
 const { QuestionMethods } = require('./questions.js');
+// Earlier turns as the model gets them: unfinished ones keep their boundary,
+// and a seeded command's brief is not replayed as the person's own words.
+const { historyForModel, shownText, endedNote } = require('./turn-history.js');
+// The Problems panel across the whole workspace.
+const { formatProblems } = require('./problems.js');
 
 // Diff, approval and reasoning cards, saved with the turn that drew them - see
 // src/transcript-cards.js.
@@ -468,6 +473,10 @@ const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, WITHHEL
 // keeps in their repo. Persisting raw tool output would put whole file bodies
 // (read_file), whole diffs and whole search results into it, several times over.
 const CARD_LOG_MAX = 60;             // cards recorded per turn
+// Steps before the cap at which a turn is told to stop and write its reply. A
+// playthrough that spent all 100 on exploring ended with no report at all -
+// 12 minutes of work and not one finding delivered.
+const WRAP_UP_STEPS = 6;
 const CARD_RESULT_MAX = 400;         // enough for any preview line the cards show
 const CARD_TERM_RESULT_MAX = 4000;   // run_command/run_tests print real output in the card
 // The only argument keys the cards actually display (addToolCallCard). Anything
@@ -957,7 +966,8 @@ class NavyCoderViewProvider {
             this.view?.webview.postMessage({ type: 'answeredByTyping', id: message.queueId || '' });
             break;
           }
-          await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || [], message.queueId || '');
+          await this.askNavy(message.prompt, Boolean(message.includeContext), message.model, message.attachedFiles, message.images || [], message.queueId || '',
+            { continues: Boolean(message.continues) });
           break;
         case 'answerQuestion':
           this.resolveQuestion(message.id, message.answer || null);
@@ -1040,7 +1050,7 @@ class NavyCoderViewProvider {
           await this.runProjectAudit(Boolean(message.deep));
           break;
         case 'runPlaythrough':
-          await this.runPlaythrough(String(message.url || ''));
+          await this.runPlaythrough(String(message.url || ''), message.queueId || '');
           break;
         case 'reviewSlashCommand': {
           // Approving runs it immediately: the user typed the command, read the
@@ -2355,7 +2365,7 @@ class NavyCoderViewProvider {
       .filter(([, s]) => s.projectRoot === root)
       .map(([id, s]) => {
         const first = s.messages.find(m => m.role === 'user' && typeof m.text === 'string' && m.text.trim());
-        const text = first?.text.trim() || '';
+        const text = (first ? shownText(first) : '').trim();
         const name = text ? (text.length > 40 ? text.slice(0, 40) + '…' : text) : 'New Chat';
         return { id, name, root: s.projectRoot, busy: s.isBusy, active: id === this.activeSessionId };
       });
@@ -3002,6 +3012,16 @@ class NavyCoderViewProvider {
   // of showing a broken picture.
   _messagesForPanel() {
     return this.messages.map((m) => {
+      // A chat saved before seeded briefs were kept apart shows what was typed,
+      // not the brief it expanded into.
+      if (m && m.role === 'user') {
+        const shown = shownText(m);
+        return shown === m.text ? m : { ...m, text: shown };
+      }
+      // A turn that did not finish says so under its cards - worded once, in
+      // src/turn-history.js, for this and for the export alike.
+      const note = m && m.role === 'assistant' ? endedNote(m) : '';
+      if (note) m = { ...m, endedNote: note };
       if (!Array.isArray(m.cards) || !m.cards.some(c => c && c.kind === 'image')) return m;
       return {
         ...m,
@@ -3286,7 +3306,11 @@ class NavyCoderViewProvider {
     });
   }
 
-  async askNavy(prompt, includeContext, selectedModel, attachedFiles = [], images = [], queueId = '') {
+  // opts.shown - what the person typed, when `prompt` is a seeded brief built
+  //   from it (/playthrough). Saved as the turn's text; the brief is kept as
+  //   its `instruction`. See src/turn-history.js.
+  // opts.continues - this request carries on the previous unfinished turn.
+  async askNavy(prompt, includeContext, selectedModel, attachedFiles = [], images = [], queueId = '', opts = {}) {
     if (!prompt.trim()) return;
 
     // Queue while busy so the user can keep typing freely. queueId is the
@@ -3294,7 +3318,7 @@ class NavyCoderViewProvider {
     // what lets that bubble carry a working Cancel button (see
     // cancelQueuedMessage) and what identifies the prompt when it starts.
     if (this.isBusy) {
-      this.messageQueue.push({ prompt, includeContext, selectedModel, attachedFiles, images, queueId });
+      this.messageQueue.push({ prompt, includeContext, selectedModel, attachedFiles, images, queueId, opts });
       this.view?.webview.postMessage({ type: 'queued', id: queueId, position: this.messageQueue.length });
       return;
     }
@@ -3316,7 +3340,7 @@ class NavyCoderViewProvider {
     // running tab A's queued message against tab B's messages, checkpoints
     // and projectRoot, landing its file writes in the wrong project.
     const boundSession = sessionContext.getStore() ?? this.activeSessionId;
-    return sessionContext.run(boundSession, () => this._askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images));
+    return sessionContext.run(boundSession, () => this._askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images, opts || {}));
   }
 
   // Tries the configured primary provider first, exactly like a plain
@@ -3384,7 +3408,7 @@ class NavyCoderViewProvider {
     this._session.fallbackNotices.push(text);
   }
 
-  async _askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images) {
+  async _askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images, opts = {}) {
     this.isBusy = true;
     this._session.fallbackNotices = []; // per-turn; folded into the persisted reply below
     this._sendSessionList(); // tab strip's busy spinner reflects this session's turn starting
@@ -3672,19 +3696,18 @@ class NavyCoderViewProvider {
       }
     }
 
-    for (const item of this.messages) {
-      // Exactly what was said, and nothing else. What each turn DID is real
-      // and the model needs it — but it must NOT ride along on an assistant
-      // message: a model reads its own prior turns as examples of how it
-      // writes, so a note appended there becomes a format it copies. Once it
-      // is copying the shape it invents the contents too, reporting files it
-      // never touched. That record is in the system prompt now — _historyLedger.
-      // A turn saved for its cards alone - stopped or failed before it wrote a
-      // reply - has nothing to say to the model, and an empty assistant turn
-      // is refused outright by some providers.
-      if (item.role === 'assistant' && !String(item.text || '').trim()) continue;
-      messages.push({ role: item.role, content: item.text });
-    }
+    // Exactly what was said, and nothing else. What each turn DID is real and
+    // the model needs it — but it must NOT ride along on an assistant message:
+    // a model reads its own prior turns as examples of how it writes, so a note
+    // appended there becomes a format it copies. Once it is copying the shape
+    // it invents the contents too, reporting files it never touched. That
+    // record is in the system prompt now — _historyLedger.
+    //
+    // A turn that ended without a reply is replayed as one sentence saying so,
+    // rather than dropped: dropping it fused the request before it with the
+    // next message, which is how "hi" became a second /playthrough. See
+    // src/turn-history.js.
+    messages.push(...historyForModel(this.messages, { continues: Boolean(opts.continues) }));
 
     const userText = userParts.join('\n\n---\n\n');
     if (Array.isArray(images) && images.length > 0) {
@@ -3707,8 +3730,12 @@ class NavyCoderViewProvider {
       .map(p => String(p).replace(/^.*[\\/]/, ''));
     this.messages.push({
       role: 'user',
-      text: prompt,
       ts: Date.now(),
+      text: opts.shown || prompt,
+      ...(opts.shown ? { instruction: prompt } : {}),
+      // A Continue carries on the unfinished turn before it; kept so the next
+      // Continue can walk back through it to the brief that work started from.
+      ...(opts.continues ? { continues: true } : {}),
       ...(attachedNames.length ? { attachments: attachedNames } : {}),
       ...(images?.length ? { images: images.length } : {}),
       // See rewindToMessage in src/undo.js. Small and per-turn: a string that
@@ -3738,11 +3765,17 @@ class NavyCoderViewProvider {
       // One controller for the entire turn so Stop cancels both the current
       // stream AND any tool-loop iteration that follows it.
       this.abortController = new AbortController();
+      // Why it was aborted, when it is: a timeout is not the person pressing
+      // Stop, and a turn saved without a reply says which (meta.ended).
+      turnSession.abortReason = '';
       // Watchdog: abort if a SINGLE model call hangs for 3 minutes. Reset every
       // iteration so long multi-step tasks that are making progress are never killed.
       const resetWatchdog = () => {
         clearTimeout(this._watchdog);
-        this._watchdog = setTimeout(() => this.abortController?.abort(), 180_000);
+        this._watchdog = setTimeout(() => {
+          turnSession.abortReason = 'timeout';
+          this.abortController?.abort();
+        }, 180_000);
       };
       resetWatchdog();
 
@@ -3791,13 +3824,17 @@ class NavyCoderViewProvider {
       // after its own card, as it does on screen, rather than ahead of it.
       const cardsByCall = new Map();
       let toolCards = 0;
+      let toolCallsMade = 0;   // every call, past the card cap too - see meta.steps
       const postToolCall = (tool, args, callId) => {
+        toolCallsMade++;
         this.view?.webview.postMessage({ type: 'toolCall', tool, args, callId });
         if (callId && toolCards < CARD_LOG_MAX) {
           toolCards++;
           const record = makeCardRecord(tool, args, '');
           cardLog.push(record);
           cardsByCall.set(callId, record);
+          // A thumbnail is kept only under a tool card that was kept.
+          turnSession.turnCardCalls?.add(callId);
         }
       };
       const postToolResult = (tool, args, result, callId) => {
@@ -3820,6 +3857,7 @@ class NavyCoderViewProvider {
       let falseClaimNudges = 0; // corrections spent on a report that named files it never wrote
       let hallucinationWarned = false; // still claimed success after the nudge — tell the user
       let planContinueCount = 0; // bounded auto-continue when the model quits mid-plan
+      let wrapUpSent = false;    // the "N steps left" warning, sent once - see WRAP_UP_STEPS
       // Only worth running the hallucination guard at all if the user's request
       // could plausibly have wanted a file created/changed — avoids false
       // positives on purely informational turns (computed once; the prompt text
@@ -3881,6 +3919,19 @@ class NavyCoderViewProvider {
         // Model-facing code ignores unknown meta keys, and _turnLedgerParts
         // never reads it, so this costs the context window nothing.
         if (this.currentTurnId) meta.turnId = this.currentTurnId;
+        // A turn that did not finish says how it ended: out of steps, stopped,
+        // timed out, or failed. Whether or not it wrote anything - a turn cut
+        // off at the cap usually did, the narration beside its last tool call,
+        // and that is not a reply. The replay turns it into a sentence the
+        // model reads (src/turn-history.js); a reopened chat and an export say
+        // it under the turn.
+        const ended = error ? 'error'
+          : this.abortController?.signal.aborted ? (turnSession.abortReason === 'timeout' ? 'timeout' : 'stopped')
+          : hitCap ? 'cap' : '';
+        if (ended) {
+          meta.ended = ended;
+          if (toolCallsMade) meta.steps = toolCallsMade;
+        }
 
         // Fallback notices ride along in the persisted text so a reloaded
         // session still shows that a different provider (and a different
@@ -4466,6 +4517,21 @@ class NavyCoderViewProvider {
           last.content = String(last.content) + nudge;
         }
 
+        // Running out of steps: said while there is still room to write the
+        // reply. Without it a long run - a playthrough above all - explored
+        // right up to the cap and ended with nothing to show for it. Said on
+        // the first tool results inside the window rather than at one exact
+        // step, so an iteration that left early (a nudge, a reply with no
+        // tools) cannot skip it.
+        const stepsLeft = maxIterations - (iteration + 1);
+        if (!wrapUpSent && stepsLeft <= WRAP_UP_STEPS && maxIterations > WRAP_UP_STEPS * 2 && toolResults.length > 0) {
+          wrapUpSent = true;
+          const last = toolResults[toolResults.length - 1];
+          last.content = String(last.content) + `\n\n[SYSTEM: This turn will be cut off in ${stepsLeft} more steps. Stop exploring now. `
+            + 'Close anything you opened (browser_close, if a browser is open), then write your reply with what you have — '
+            + 'including, plainly, what you did not get to. A turn that runs out of steps without a reply delivers nothing.]';
+        }
+
         for (const tr of toolResults) {
           messages.push(tr);
         }
@@ -4546,7 +4612,7 @@ class NavyCoderViewProvider {
           // askNavy then puts this prompt BACK in the queue, and without its own
           // id it would be re-queued as an anonymous entry: no Cancel button on a
           // bubble that is genuinely waiting again, and nothing for Stop to name.
-          this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || [], next.queueId || '')
+          this.askNavy(next.prompt, next.includeContext, next.selectedModel, next.attachedFiles, next.images || [], next.queueId || '', next.opts || {})
             .catch(e => this._reportTurnFailure(e, 'queued message'));
         });
       }
@@ -4698,7 +4764,9 @@ class NavyCoderViewProvider {
   async _digestFor(host, model, dropped) {
     // Mechanical digest — always available, zero latency, used as the fallback.
     const lines = dropped.map(m => {
-      const head = (m.text || '').replace(/\s+/g, ' ').slice(0, 120);
+      // What was typed, not a seeded brief - which would otherwise be written
+      // into the digest, and so into the system prompt of every later turn.
+      const head = shownText(m).replace(/\s+/g, ' ').slice(0, 120);
       if (!head) return '';
       if (m.role === 'user') return '- User: ' + head;
       const files = m.meta?.files?.length ? ` [changed: ${m.meta.files.join(', ')}]` : '';
@@ -4713,7 +4781,7 @@ class NavyCoderViewProvider {
     try {
       this.view?.webview.postMessage({ type: 'statusText', text: 'Condensing history…' });
       const excerpt = dropped
-        .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + (m.text || '').slice(0, 600))
+        .map(m => (m.role === 'user' ? 'User: ' : 'Navy: ') + shownText(m).slice(0, 600))
         .join('\n').slice(0, 12000);
       const summary = await this._completeOnce(host, model, [
         { role: 'system', content: 'You compress coding-assistant conversation history. Summarize the excerpt into at most 10 terse bullet lines covering: decisions made, files created/changed and why, problems found and their status (fixed/open), and user preferences. No preamble — output only the bullets.' },
@@ -5210,7 +5278,7 @@ class NavyCoderViewProvider {
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
-        case 'get_diagnostics': return await this.toolGetDiagnostics(tool.args.path);
+        case 'get_diagnostics': return await this.toolGetDiagnostics(tool.args.path, tool.args);
         case 'check_syntax': return await this.toolCheckSyntax(tool.args.path);
         case 'fetch_url': return await this.toolFetchUrl(tool.args.url);
         case 'get_terminal_output': return await this.toolGetTerminalOutput(tool.args.lines);
@@ -5833,13 +5901,22 @@ class NavyCoderViewProvider {
     });
   }
 
-  async toolGetDiagnostics(filePath) {
+  // One file (the one named, or the active editor), or - with scope
+  // "workspace" - the whole Problems panel. See src/problems.js.
+  async toolGetDiagnostics(filePath, opts = {}) {
+    const scope = String((opts && opts.scope) || '').toLowerCase();
+    if (scope === 'workspace') {
+      return this._workspaceProblems({ folder: filePath, severity: opts.severity });
+    }
     let targetUri;
     if (filePath) {
       targetUri = vscode.Uri.file(this.resolveWorkspacePath(filePath));
     } else {
       const editor = vscode.window.activeTextEditor;
-      if (!editor) return 'No active file open.';
+      // Nothing open is exactly when the whole panel is the useful answer.
+      if (!editor) {
+        return this._workspaceProblems({ severity: opts && opts.severity, lead: 'No file is open, so this is the whole Problems panel.' });
+      }
       targetUri = editor.document.uri;
     }
     const diags = vscode.languages.getDiagnostics(targetUri);
@@ -5855,6 +5932,25 @@ class NavyCoderViewProvider {
       const col = d.range.start.character + 1;
       return `[${sev}] line ${line}:${col} — ${d.message}${d.source ? ' (' + d.source + ')' : ''}`;
     }).join('\n');
+  }
+
+  // The Problems panel across the project. `folder` narrows it to a folder (or
+  // one file) of the project.
+  async _workspaceProblems({ folder = '', severity = '', lead = '' } = {}) {
+    const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    let rel = '';
+    if (folder && root) {
+      // Named the way VS Code names the files it reports: relative to the
+      // project as opened, not through any symlink's real path.
+      const abs = path.isAbsolute(folder) ? folder : path.resolve(root, folder);
+      rel = path.relative(root, abs).split(path.sep).join('/');
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        return `Error: ${folder} is outside this project (${root}). The Problems panel can be narrowed to a folder or file inside it, or read whole without a path.`;
+      }
+    }
+    return formatProblems(vscode.languages.getDiagnostics(), {
+      root, folder: rel, severity: severity || 'warning', lead,
+    });
   }
 
   // Is an external command available on PATH? Cached per session — this is used

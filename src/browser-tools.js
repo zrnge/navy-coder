@@ -501,7 +501,7 @@ class BrowserToolMethods {
   // serves it, and drives it, or tells the user it isn't a web project at all.
   // The browser launches lazily on the first browser_* call, so this method does
   // no I/O beyond deciding which prompt to seed.
-  async runPlaythrough(rawArg) {
+  async runPlaythrough(rawArg, queueId = '') {
     const arg = String(rawArg || '').trim().replace(/^['"]|['"]$/g, '');
 
     // The one input we refuse outright: an explicit non-http(s) scheme
@@ -516,8 +516,16 @@ class BrowserToolMethods {
     // rides along as a hint. Testing the whole argument would send this to
     // project-discovery with a prompt insisting no URL was given.
     const [first, ...rest] = arg.split(/\s+/).filter(Boolean);
+    // The brief is thousands of characters telling the model it has full
+    // autonomy. It runs this turn; the chat keeps what was typed - see
+    // src/turn-history.js for why the two are kept apart.
+    const seeded = { shown: arg ? `/playthrough ${arg}` : '/playthrough' };
+    // The person's message appears once the command is accepted, as the text
+    // the chat saves - see the /playthrough branch in media/main.js.
+    const showIt = () => this.view?.webview.postMessage({ type: 'seededPrompt', text: seeded.shown, queueId });
     if (first && this._argIsExplicitUrl(first)) {
-      await this.askNavy(this._playthroughPrompt(this._normalizePlaythroughUrl(first), rest.join(' ')), false, null, [], []);
+      showIt();
+      await this.askNavy(this._playthroughPrompt(this._normalizePlaythroughUrl(first), rest.join(' ')), false, null, [], [], queueId, seeded);
       return;
     }
 
@@ -527,7 +535,8 @@ class BrowserToolMethods {
       this.view?.webview.postMessage({ type: 'error', message: 'Navy: open a project folder before running /playthrough (or pass a URL, e.g. /playthrough http://localhost:3000).' });
       return;
     }
-    await this.askNavy(this._playthroughDiscoverPrompt(arg), false, null, [], []);
+    showIt();
+    await this.askNavy(this._playthroughDiscoverPrompt(arg), false, null, [], [], queueId, seeded);
   }
 
   // The shared half of both prompts: the header, the browser toolset, the probe

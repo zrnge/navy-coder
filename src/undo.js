@@ -24,6 +24,7 @@ const vscode = require('vscode');
 const path = require('path');
 const crypto = require('crypto');
 const { sessionContext } = require('./session-context.js');
+const { shownText } = require('./turn-history.js');
 
 class UndoMethods {
   // Central checkpoint push: clears redo (a fresh operation invalidates redo
@@ -213,7 +214,7 @@ class UndoMethods {
       type: 'rewound',
       index,
       files: undone.files,
-      prompt: target.text || '',
+      prompt: shownText(target),
     });
     this._sendSessionList();
     this._afterUndoRedo();
@@ -237,7 +238,7 @@ class UndoMethods {
       points.slice().reverse().map(({ m, i }) => {
         const impact = this._rewindImpact(i);
         return {
-          label: (m.text || '').replace(/\s+/g, ' ').slice(0, 70) || '(empty message)',
+          label: shownText(m).replace(/\s+/g, ' ').slice(0, 70) || '(empty message)',
           description: `discards ${impact.turns} turn${impact.turns === 1 ? '' : 's'}`
             + (impact.files.length ? `, ${impact.files.length} file${impact.files.length === 1 ? '' : 's'} changed` : ''),
           index: i,

@@ -120,7 +120,7 @@ Navy runs an autonomous tool-use loop. The full tool set:
 
 | Category | Tools |
 |---|---|
-| Read | `read_file`, `read_lines`, `list_files`, `search_files`, `search_codebase`, `search_docs`, `find_relevant_files` (keyword + semantic + LSP), `find_symbol`, `find_references`, `get_diagnostics`, `check_syntax` |
+| Read | `read_file`, `read_lines`, `list_files`, `search_files`, `search_codebase`, `search_docs`, `find_relevant_files` (keyword + semantic + LSP), `find_symbol`, `find_references`, `get_diagnostics` (one file, or the whole Problems panel), `check_syntax` |
 | Write | `write_file`, `apply_edit`, `edit_line`, `delete_line`, `insert_after_line`, `delete_file`, `rename_file`, `rename_symbol` (structural, LSP-backed with a text fallback) |
 | Shell | `run_command`, `run_tests` (auto-detected runner), `run_project`, `start_process` / `read_process_output` / `kill_process`, `get_terminal_output` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_blame` |
@@ -138,7 +138,7 @@ Every file-mutating tool goes through the diff approval gate (unless `navy.appro
 
 ## Slash Commands
 
-Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/security`, `/audit` (supply-chain scan), `/playthrough` (visual browser test), `/commit` and a dozen more.
+Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/problems` (everything the Problems panel and the project's own checker report), `/security`, `/audit` (supply-chain scan), `/playthrough` (visual browser test), `/commit` and a dozen more.
 
 **You can add your own.** A command is a markdown file: the filename is what you type, the body is the prompt.
 
@@ -215,7 +215,7 @@ npx github:zrnge/navy-coder playthrough http://localhost:3000 --provider anthrop
 Or as a GitHub Action:
 
 ```yaml
-- uses: zrnge/navy-coder@v0.3.7
+- uses: zrnge/navy-coder@v0.3.8
   with:
     command: audit
     args: --exclude "test/fixtures/**"
@@ -224,7 +224,7 @@ Or as a GitHub Action:
     npm ci
     npm start &
     until curl -s http://localhost:3000 > /dev/null; do sleep 1; done
-- uses: zrnge/navy-coder@v0.3.7
+- uses: zrnge/navy-coder@v0.3.8
   with:
     command: playthrough
     url: http://localhost:3000
@@ -333,7 +333,7 @@ Also available and only reachable via the Command Palette (`Ctrl+Shift+P` / `Cmd
 ```
 npm install
 npm run check   # syntax
-npm test        # 2,815 tests: extension host + webview, no network or API keys needed
+npm test        # 2,903 tests: extension host + webview, no network or API keys needed
 npm run build
 ```
 

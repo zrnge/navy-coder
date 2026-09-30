@@ -3,18 +3,43 @@
   // press F5, and without a configuration here VS Code falls back to "debug the
   // active file" — which prompts to install a Markdown debugger if a .md file
   // happens to be focused, and never launches Navy at all.
+  //
+  // Why "Run Extension" is an attach rather than the usual "extensionHost"
+  // launch: that launch makes VS Code's debugger reach the Extension
+  // Development Host at http://localhost:<port> - hard-coded - and on some
+  // Windows machines that path of the debugger (js-debug 1.117, VS Code 1.139)
+  // never connects. It races 127.0.0.1 against [::1], the IPv6 half is refused
+  // within a millisecond, and the pair fails together on every retry, so the
+  // host sits paused on its first line until "Extension host did not start in
+  // 10 seconds". Navy's code never runs. It reproduces in a clean VS Code with
+  // no other extensions installed; the same debugger attaching by the literal
+  // address 127.0.0.1 connects every time.
+  //
+  // So a task opens the Development Host paused on 127.0.0.1:9333
+  // (tools/dev-host.js), and F5 attaches to that address and lets it run.
+  // Breakpoints in activate() still hit. Stopping the debugger leaves the
+  // window open - close it before the next F5, or the task will say it is
+  // still there.
   "version": "0.2.0",
   "configurations": [
-    
     {
       "name": "Run Extension",
-      "type": "extensionHost",
-      "request": "launch",
-      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
-      // package.json `main` is ./dist/extension.js, which is gitignored and only
-      // exists after a build — so the build runs first or the host loads nothing.
-      "preLaunchTask": "npm: build",
-      "outFiles": ["${workspaceFolder}/dist/**/*.js"]
+      "type": "node",
+      "request": "attach",
+      "preLaunchTask": "navy: open Development Host",
+      // The literal address, never "localhost" - see the top of this file.
+      "address": "127.0.0.1",
+      "port": 9333,
+      // The host is waiting on its first line for exactly this.
+      "continueOnAttach": true,
+      // Covers the window opening; the attach retries until the port answers.
+      "timeout": 30000,
+      // "Reload Window" in the Development Host restarts its extension host,
+      // paused again on the same port: reconnect and let it run, for a while.
+      "restart": { "delay": 1000, "maxAttempts": 30 },
+      // package.json `main` is ./dist/extension.js, built by the task first.
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "skipFiles": ["<node_internals>/**"]
     },
     {
       // Same, but with every OTHER installed extension disabled (the development
@@ -23,12 +48,24 @@
       // extension host crashes this is the one-click way to find out whose fault
       // it is: still crashes here = Navy, stops crashing = one of the others.
       "name": "Run Extension (only Navy, no other extensions)",
+      "type": "node",
+      "request": "attach",
+      "preLaunchTask": "navy: open Development Host (only Navy)",
+      "address": "127.0.0.1",
+      "port": 9333,
+      "continueOnAttach": true,
+      "timeout": 30000,
+      "restart": { "delay": 1000, "maxAttempts": 30 },
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "skipFiles": ["<node_internals>/**"]
+    },
+    {
+      // The launch VS Code generates for an extension. Works where the
+      // debugger's localhost path does; kept so the two can be compared.
+      "name": "Run Extension (standard launch)",
       "type": "extensionHost",
       "request": "launch",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}",
-        "--disable-extensions"
-      ],
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
       "preLaunchTask": "npm: build",
       "outFiles": ["${workspaceFolder}/dist/**/*.js"]
     },
