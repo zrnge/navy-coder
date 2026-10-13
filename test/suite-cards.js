@@ -40,15 +40,39 @@ async function transcriptCardsSuite() {
   recordTranscriptCard(s, { type: 'commandResolved', id: 'c2', approved: false });
   check('cards: ...and so does a refused one', log[3].status === 'rejected');
   recordTranscriptCard(s, { type: 'thinkingChunk', text: 'weigh ' });
-  recordTranscriptCard(s, { type: 'toolCall', tool: 'read_file', args: {} });
   recordTranscriptCard(s, { type: 'thinkingChunk', text: 'options' });
-  const thinking = log.filter(c => c.kind === 'thinking');
-  check('cards: a turn\'s reasoning is one card, where it began, as the transcript draws it',
-    thinking.length === 1 && thinking[0].text === 'weigh options' && log[4] === thinking[0]);
+  check('cards: one stretch of reasoning, however many chunks, is one card',
+    log.filter(c => c.kind === 'thinking').length === 1 && log[4].text === 'weigh options');
+  // The turn loop saves a tool card into the same log when the tool is called
+  // (postToolCall in extension.js); the recorder leaves tool messages to it.
+  recordTranscriptCard(s, { type: 'toolCall', tool: 'read_file', args: {} });
   check('cards: tool messages are left to the turn loop, which logs those', log.length === 5);
+  log.push({ tool: 'read_file', args: {}, result: 'x' });
+  recordTranscriptCard(s, { type: 'thinkingChunk', text: 'then edit' });
+  let thinking = log.filter(c => c.kind === 'thinking');
+  check('cards: reasoning after a SAVED tool card is a new card, where it happened — not added to the first',
+    thinking.length === 2 && thinking[0].text === 'weigh options' && thinking[1].text === 'then edit' && log[6] === thinking[1]);
+
+  // What a reopened chat cannot show must not split the reasoning either: the
+  // text written mid-turn is not saved, and nor are tool cards past the turn's
+  // save limit. A block for each left dozens of Thinking blocks stacked with
+  // nothing between them.
+  recordTranscriptCard(s, { type: 'chunk', text: 'Here is what I found.' });
+  recordTranscriptCard(s, { type: 'thinkingChunk', text: 'and more' });
+  recordTranscriptCard(s, { type: 'toolCall', tool: 'read_file', args: {} });   // past the limit: no card saved
+  recordTranscriptCard(s, { type: 'thinkingChunk', text: 'still more' });
+  thinking = log.filter(c => c.kind === 'thinking');
+  check('cards: reasoning with nothing SAVED between it stays one card, so a reopened chat does not stack empty blocks',
+    thinking.length === 2, String(thinking.length));
+  check('...each stretch set apart by a blank line',
+    thinking[1].text === 'then edit\n\nand more\n\nstill more', JSON.stringify(thinking[1].text));
+  check('...while chunks of one stretch run on as they streamed',
+    thinking[0].text === 'weigh options');
+
   recordTranscriptCard(s, { type: 'thinkingChunk', text: 'z'.repeat(THINKING_CARD_MAX) });
-  check('cards: reasoning is bounded, and says when it was cut',
-    thinking[0].text.length === THINKING_CARD_MAX && thinking[0].truncated === true);
+  const allThinking = log.filter(c => c.kind === 'thinking');
+  check('cards: reasoning is bounded for the whole turn, across its blocks, and says when it was cut',
+    allThinking.reduce((n, c) => n + c.text.length, 0) === THINKING_CARD_MAX && allThinking[1].truncated === true);
 
   // The diffs of one turn share a budget; past it, a diff keeps its counts only.
   const base = Array.from({ length: 400 }, (_, i) => 'line ' + i + ' ' + 'y'.repeat(70));

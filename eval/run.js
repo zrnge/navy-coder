@@ -129,11 +129,16 @@ function runNodeIn(dir, file, source, timeout = 10000) {
   });
 }
 
-function makeCheckContext(dir, task, reply) {
+// `extra` carries what only a multi-turn or approval task needs:
+//   replies   - every turn's reply, in order (`reply` is the last one)
+//   proposals - the file of every diff the user was asked to approve
+function makeCheckContext(dir, task, reply, extra = {}) {
   const read = (f) => { try { return fs.readFileSync(path.join(dir, f), 'utf8'); } catch { return null; } };
   return {
     dir,
     reply: reply || '',
+    replies: extra.replies || [reply || ''],
+    proposals: extra.proposals || [],
     seed: task.files,
     read,
     exists: (f) => fs.existsSync(path.join(dir, f)),
@@ -168,14 +173,26 @@ async function runTask(task, cfg, vscodeMock) {
     // Skip the real wsl.exe probe — irrelevant to scoring, costs time per task.
     provider._wslCache = { available: false };
 
-    const chunks = [];
+    let chunks = [];
     // Token accounting rides on the same tokenCount messages the cost gauge
     // uses — prompt tokens across a whole task is the direct measure of what a
     // config change (e.g. the reduced tool set) actually saves, where pass/fail
     // alone can't distinguish "same result, cheaper" from "no effect".
     const tokens = { prompt: 0, completion: 0, modelCalls: 0 };
+    // Every diff the user was asked to approve, by file: what a person sitting
+    // at the panel would have seen, which is an outcome in its own right when
+    // the task is about what happens after they say no.
+    const proposals = [];
     provider.view = { webview: { postMessage: (m) => {
       if (m.type === 'chunk' && m.text) chunks.push(m.text);
+      else if (m.type === 'pendingDiff') proposals.push(String(m.path || '').replace(/\\/g, '/').replace(/^.*\//, ''));
+      // Nobody is at the panel to click an answer, and an unanswered ask_user
+      // would hold the turn until it timed out. A task can say what the person
+      // would type (`answer`); otherwise the question is cancelled, which tells
+      // the model to choose for itself and say which — what Navy promises then.
+      else if (m.type === 'pendingQuestion') {
+        setImmediate(() => provider.resolveQuestion(m.id, task.answer ? { text: task.answer } : null));
+      }
       else if (m.type === 'tokenCount') { tokens.prompt += m.prompt || 0; tokens.completion += m.completion || 0; tokens.modelCalls++; }
     } } };
 
@@ -197,6 +214,10 @@ async function runTask(task, cfg, vscodeMock) {
       // --config overrides land LAST so they win over the harness defaults.
       ...cfg.config,
     });
+    // Navy reads its thinking level once, when it is created - before the
+    // config above existed - so `--config thinkingLevel=max` was ignored and
+    // every run measured the default. Applied here so the arm says what it ran.
+    if (cfg.config.thinkingLevel) provider.thinkingLevel = String(cfg.config.thinkingLevel);
 
     // Without this, Ollama runs at its own small default num_ctx and silently
     // truncates the prompt — an eval then measures truncation, not the model
@@ -209,30 +230,51 @@ async function runTask(task, cfg, vscodeMock) {
       try { await provider.fetchModelContext(cfg.host, cfg.model, cfg.apiKey); } catch {}
     }
 
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; provider.abortController?.abort(); }, cfg.timeout);
-    let turnError = null;
-    try {
-      await provider.askNavy(task.prompt, false, null, [], []);
-    } catch (e) {
-      turnError = e;
-    } finally {
-      clearTimeout(timer);
+    // The file the user has open, for tasks about what Navy does with it.
+    if (task.activeFile) {
+      const fsPath = path.join(dir, task.activeFile);
+      vscodeMock.vscode.window.activeTextEditor = {
+        document: { fileName: fsPath, languageId: path.extname(fsPath).slice(1) || 'plaintext', uri: { fsPath } },
+      };
     }
 
-    if (timedOut) return { id: task.id, category: task.category, status: 'ERROR', reason: `timed out after ${cfg.timeout / 1000}s`, ms: Date.now() - started };
-    if (turnError) return { id: task.id, category: task.category, status: 'ERROR', reason: 'turn threw: ' + turnError.message, ms: Date.now() - started };
+    // One chat, one or more turns. A task with `turns` runs each in order in
+    // the same session, which is the only way to see what a follow-up ("now
+    // make it…", "thanks!") does with the turn before it. `rejectWrites` on a
+    // turn answers every diff it proposes with Reject, as a person would.
+    const turns = task.turns || [{ prompt: task.prompt }];
+    const replies = [];
+    for (const turn of turns) {
+      Object.assign(vscodeMock.ctrl.config, { approvalMode: turn.rejectWrites ? 'ask-always' : 'auto-approve' });
+      vscodeMock.ctrl.nextInfo = turn.rejectWrites ? 'Reject' : undefined;
+      chunks = [];
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; provider.abortController?.abort(); }, cfg.timeout);
+      let turnError = null;
+      try {
+        await provider.askNavy(turn.prompt, false, null, [], []);
+      } catch (e) {
+        turnError = e;
+      } finally {
+        clearTimeout(timer);
+      }
 
-    const reply = chunks.join('');
-    // A provider-level failure surfaces as an error message in the transcript
-    // rather than a throw — classify it as ERROR so a bad API key or a rate
-    // limit is never scored as "the model failed the task".
-    if (/API key rejected|rate limit hit|no quota for this model|can't reach the server|is having a temporary problem/i.test(reply)) {
-      const line = reply.split('\n').find(l => l.trim()) || 'provider error';
-      return { id: task.id, category: task.category, status: 'ERROR', reason: 'provider: ' + line.slice(0, 120), ms: Date.now() - started };
+      if (timedOut) return { id: task.id, category: task.category, status: 'ERROR', reason: `timed out after ${cfg.timeout / 1000}s`, ms: Date.now() - started };
+      if (turnError) return { id: task.id, category: task.category, status: 'ERROR', reason: 'turn threw: ' + turnError.message, ms: Date.now() - started };
+
+      const turnReply = chunks.join('');
+      // A provider-level failure surfaces as an error message in the transcript
+      // rather than a throw — classify it as ERROR so a bad API key or a rate
+      // limit is never scored as "the model failed the task".
+      if (/API key rejected|rate limit hit|no quota for this model|can't reach the server|is having a temporary problem/i.test(turnReply)) {
+        const line = turnReply.split('\n').find(l => l.trim()) || 'provider error';
+        return { id: task.id, category: task.category, status: 'ERROR', reason: 'provider: ' + line.slice(0, 120), ms: Date.now() - started };
+      }
+      replies.push(turnReply);
     }
+    const reply = replies[replies.length - 1] || '';
 
-    const ctx = makeCheckContext(dir, task, reply);
+    const ctx = makeCheckContext(dir, task, reply, { replies, proposals });
     let verdict;
     try { verdict = await task.check(ctx); }
     catch (e) { return { id: task.id, category: task.category, status: 'ERROR', reason: 'checker threw: ' + e.message, ms: Date.now() - started }; }
@@ -247,6 +289,9 @@ async function runTask(task, cfg, vscodeMock) {
   } catch (e) {
     return { id: task.id, category: task.category, status: 'ERROR', reason: 'harness: ' + e.message, ms: Date.now() - started };
   } finally {
+    // The mock is shared by every task: leave it as the next one expects.
+    vscodeMock.vscode.window.activeTextEditor = undefined;
+    vscodeMock.ctrl.nextInfo = undefined;
     if (provider) {
       clearTimeout(provider._cpSaveTimer);
       clearTimeout(provider._watchdog);
@@ -254,7 +299,16 @@ async function runTask(task, cfg, vscodeMock) {
       clearInterval(provider._heartbeat);
       try { provider.mcp?.stop(); } catch {}
     }
-    if (!cfg.keep) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+    if (!cfg.keep) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      // Navy keeps each project's chats and memory under ~/.navy-coder, keyed
+      // by the project folder - so every task left a folder there for a temp
+      // repo that no longer exists. Removed with the repo it belongs to.
+      try {
+        const { projectDataDir } = require(path.join(ROOT, 'src', 'data-dir.js'));
+        fs.rmSync(projectDataDir(dir), { recursive: true, force: true });
+      } catch {}
+    }
     else console.log(`      kept: ${dir}`);
   }
 }

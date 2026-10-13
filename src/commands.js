@@ -20,6 +20,13 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const { workspaceIsTrusted } = require('./workspace.js');
 const { UNTRUSTED_REFUSAL } = require('./trust.js');
+const { foldPath } = require('./paths.js');
+
+// Same command, written the same way give or take spacing and case.
+function sameCommand(a, b) {
+  const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return Boolean(a && b) && norm(a) === norm(b);
+}
 
 // Matches the handful of OS/toolchain error strings that mean "a path in
 // this command doesn't actually exist" (cmd.exe, POSIX shells, and common
@@ -286,6 +293,33 @@ class CommandMethods {
     return null;
   }
 
+  // A process still running `command` for this project, in any chat of this
+  // window: { id, entry } or null. run_project and start_process each checked
+  // only their own name - run_project its one slot, start_process the id it
+  // was given - so `start_process("navy-dev", "npm run dev")` and then
+  // `run_project` (which detects `npm run dev` itself) started a second dev
+  // server beside the first, fighting it for the port, and the task dock
+  // showed both.
+  _findRunningCommand(command, root) {
+    const sessions = this.sessions?.size ? [...this.sessions.values()] : [this._session];
+    for (const s of sessions) {
+      if (!s?.bgProcesses) continue;
+      if (root && s.projectRoot && foldPath(s.projectRoot) !== foldPath(root)) continue;
+      for (const [id, entry] of s.bgProcesses) {
+        if (entry?.proc && sameCommand(entry.command, command)) return { id, entry };
+      }
+    }
+    return null;
+  }
+
+  // What the model is told instead of starting a second copy.
+  _alreadyRunningMessage(command, found) {
+    const where = found.entry.url ? ` at ${found.entry.url}` : '';
+    const by = found.id === '__run_project__' ? 'started by run_project' : `as background process "${found.id}"`;
+    return `Already running: "${command}" is running${where}, ${by}. Use that one - a second copy would fight it for the same port. `
+      + `read_process_output("${found.id}") shows its output; to restart it, kill_process("${found.id}") first.`;
+  }
+
   async toolRunProject(command = null) {
     if (!workspaceIsTrusted()) return UNTRUSTED_REFUSAL('start the project');
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -293,6 +327,10 @@ class CommandMethods {
 
     const cmd = command || this.detectRunCommand();
     if (!cmd) return 'Error: Could not auto-detect how to run this project. Provide an explicit command (e.g. "npm start", "python app.py").';
+
+    // Before asking anyone to approve it: a duplicate is not worth a prompt.
+    const running = this._findRunningCommand(cmd, root);
+    if (running && running.id !== '__run_project__') return this._alreadyRunningMessage(cmd, running);
 
     if (!this._commandsAutoApproved()) {
       const choice = await vscode.window.showInformationMessage(
@@ -440,6 +478,9 @@ class CommandMethods {
     const prior = this.bgProcesses.get(id);
     if (prior?.proc) return `Error: a process named "${id}" is already running.`;
     if (prior) this.bgProcesses.delete(id); // previous run exited — allow id reuse
+    const sameRoot = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null;
+    const running = this._findRunningCommand(command, sameRoot);
+    if (running) return this._alreadyRunningMessage(command, running);
 
     if (!this._commandsAutoApproved()) {
       const choice = await vscode.window.showInformationMessage(
@@ -458,7 +499,8 @@ class CommandMethods {
     const resolved = await this._maybeWrapForSandbox({ ...this._shellSpec(command), cwd: root });
     if (resolved.refused) return resolved.message;
 
-    const entry = { proc: null, stdout: '', stderr: '', exitCode: null, startedAt: Date.now() };
+    // `command` is kept so a later start of the same thing can find this one.
+    const entry = { proc: null, stdout: '', stderr: '', exitCode: null, startedAt: Date.now(), command };
 
     if (persistRoot && this._persistBgEnabled()) {
       // See the persist branch of toolRunProject for why this needs a real

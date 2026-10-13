@@ -44,12 +44,13 @@ const { workspaceIsTrusted } = require('./workspace.js');
 const { projectDataDir, navyDataHome } = require('./data-dir.js');
 // /playthrough's screenshots, kept as files so the chat can show them.
 const { saveScreenshot } = require('./screenshots.js');
-const { THINKING_LEVELS, normalizeThinkingLevel } = require('./thinking.js');
+const { THINKING_LEVELS, normalizeThinkingLevel, ollamaThink } = require('./thinking.js');
 // Asking the person when the request could mean more than one thing.
 const { QuestionMethods } = require('./questions.js');
 // Earlier turns as the model gets them: unfinished ones keep their boundary,
 // and a seeded command's brief is not replayed as the person's own words.
-const { historyForModel, shownText, endedNote } = require('./turn-history.js');
+const { historyForModel, shownText, endedNote, seededInstruction } = require('./turn-history.js');
+const { unifiedDiff } = require('./text-diff.js');
 // The Problems panel across the whole workspace.
 const { formatProblems } = require('./problems.js');
 
@@ -459,7 +460,8 @@ function makeToolResultMessage(tool, result, isNative) {
 
 
 // Tool definitions — used both for the XML-fallback prompt and for native Ollama tool calling.
-const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, WITHHELD_TOOLS } = require('./providers/tools.js');
+const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, WITHHELD_TOOLS,
+  BROWSER_TOOL_NAMES, TOOLS_API_STANDARD, TOOL_PROMPT_STANDARD } = require('./providers/tools.js');
 
 // ── Replayable record of a turn's tool cards ────────────────────────────────
 // A session used to persist only role + text, so reopening a chat replaced
@@ -477,6 +479,28 @@ const CARD_LOG_MAX = 60;             // cards recorded per turn
 // playthrough that spent all 100 on exploring ended with no report at all -
 // 12 minutes of work and not one finding delivered.
 const WRAP_UP_STEPS = 6;
+// Rounds without an update_plan after which the plan is shown to the model
+// again. Often enough to stop a long turn drifting from it, rare enough that
+// the transcript does not fill with copies.
+const PLAN_RESTATE_EVERY = 5;
+
+// The three tool tiers (see _toolTier): what each is told, sent, and can
+// unlock with request_more_tools. null schemas means "everything" (TOOLS_API).
+const TIER_PROMPT = { core: TOOL_PROMPT_CORE, standard: TOOL_PROMPT_STANDARD, full: TOOL_PROMPT };
+const TIER_API = { core: TOOLS_API_CORE, standard: TOOLS_API_STANDARD, full: null };
+const TIER_WITHHELD = {
+  core: WITHHELD_TOOLS.map(t => t.name),
+  standard: [...BROWSER_TOOL_NAMES],
+  full: [],
+};
+// The brief /playthrough seeds a turn with, in the panel and in CI alike.
+const PLAYTHROUGH_PREFIX = '[SYSTEM — PLAYTHROUGH MODE]';
+// Model families that reason before answering, for _turnTemperature. A miss
+// is caught anyway once the model streams reasoning; this covers the first call.
+const REASONING_MODEL_NAMES = /(deepseek-(?:r1|v3\.[1-9]|v4)|qwq|qwen3|gpt-oss|magistral|phi4-reasoning|exaone-deep|kimi-k\d|glm-[45]|thinking|reason)/i;
+// How many times one turn may have its reasoning stopped for looping before
+// Navy ends the turn rather than retrying.
+const REASONING_LOOP_RETRIES = 1;
 const CARD_RESULT_MAX = 400;         // enough for any preview line the cards show
 const CARD_TERM_RESULT_MAX = 4000;   // run_command/run_tests print real output in the card
 // The only argument keys the cards actually display (addToolCallCard). Anything
@@ -2727,6 +2751,7 @@ class NavyCoderViewProvider {
       });
       if (!res.ok) return;
       const data = await res.json();
+      this._recordOllamaThinking(model, data);
       const modelInfo = (data && typeof data.model_info === 'object' && data.model_info) || {};
 
       // Ollama reports the window under an ARCHITECTURE-prefixed key —
@@ -2753,6 +2778,82 @@ class NavyCoderViewProvider {
 
       this._applyContextWindow(detected, true);
     } catch (_) {}
+  }
+
+  // What the previous turn actually changed, and what its last check said -
+  // taken from the diff and command cards that turn saved. When the person
+  // follows up with "it still doesn't work", the model used to see only its own
+  // reply and a ledger line saying it "wrote cart.js": not WHAT it changed, so
+  // it could make the same failed change again, or undo the one that helped.
+  // Bounded, and only the turn just before this one.
+  _previousTurnRecord() {
+    const prev = [...this.messages].reverse().find(m => m.role === 'assistant');
+    const cards = Array.isArray(prev?.cards) ? prev.cards : [];
+    const BUDGET = 3500;
+    let used = 0;
+    const diffs = [];
+    const add = (name, body) => {
+      const text = `--- ${name}\n${body}`;
+      if (used + text.length > BUDGET) { if (!diffs.at(-1)?.startsWith('(and more')) diffs.push('(and more changes, not shown)'); return; }
+      diffs.push(text);
+      used += text.length;
+    };
+    // From the undo checkpoints first: each file's text before the turn's first
+    // write to it, against the file now - the turn's net change, and recorded
+    // however Navy runs (the diff cards are recorded only by the panel).
+    const turnId = prev?.meta?.turnId;
+    const before = new Map();
+    for (const cp of (turnId && this.checkpoints) || []) {
+      if (cp.turnId === turnId && cp.kind === 'edit' && typeof cp.originalText === 'string' && !before.has(cp.filePath)) {
+        before.set(cp.filePath, cp.originalText);
+      }
+    }
+    const root = this.projectRoot || '';
+    for (const [filePath, original] of before) {
+      let now = null;
+      try { now = fs.readFileSync(filePath, 'utf8'); } catch { /* deleted since */ }
+      const name = root ? path.relative(root, filePath) : path.basename(filePath);
+      if (now === null) { add(name, '(deleted since)'); continue; }
+      const d = unifiedDiff(original, now, { maxLines: 120 });
+      add(name, !d ? '(rewritten in full - too much changed to show line by line)' : d.text || '(no net change)');
+    }
+    if (!before.size) {
+      for (const c of cards) {
+        if (c.kind !== 'diff' || c.status !== 'applied') continue;
+        add(c.path, c.rewritten ? '(rewritten in full - too much changed to show line by line)'
+          : c.dropped || !c.hunks ? '(changed - not recorded)' : String(c.hunks));
+      }
+    }
+    const check = [...cards].reverse().find(c => c.tool === 'run_command' || c.tool === 'run_tests');
+    let checkLine = '';
+    if (check && typeof check.result === 'string' && /^Exit code: \d+/.test(check.result)) {
+      const cmd = check.args?.command || check.args?.filter || check.tool;
+      const exit = check.result.match(/^Exit code: (\d+)/)[1];
+      const tail = check.result.slice(-600).trim();
+      checkLine = `Its last check: \`${cmd}\` exited ${exit}${exit !== '0' ? '. End of its output:\n' + tail : '.'}`;
+    }
+    if (!diffs.length && !checkLine) return '';
+    return '## What the previous turn changed (recorded by Navy - NOT your words; if this request follows up on it, build on or undo these changes deliberately rather than repeating them)\n'
+      + (diffs.length ? '```diff\n' + diffs.join('\n') + '\n```\n' : '')
+      + checkLine;
+  }
+
+  // What Ollama says the model can do about thinking, from the same /api/show
+  // answer: `capabilities` lists "thinking" for a model that reasons, and
+  // `thinking.values` (newer Ollama) the levels it takes, e.g. false/low/high/
+  // max. ollamaThink maps Navy's thinking level onto exactly these - see
+  // src/thinking.js. Nothing recorded means an older Ollama, and the name list
+  // there still applies.
+  _recordOllamaThinking(model, data) {
+    const caps = Array.isArray(data?.capabilities) ? data.capabilities : null;
+    if (!model || !caps) return;
+    const info = data?.thinking?.thinking || data?.thinking || null;
+    if (!this._ollamaThinking) this._ollamaThinking = new Map();
+    this._ollamaThinking.set(model, {
+      supported: caps.includes('thinking'),
+      values: Array.isArray(info?.values) ? info.values : null,
+      def: info?.default,
+    });
   }
 
   // Single place where "what window did the provider report" (`max`) becomes
@@ -3212,7 +3313,16 @@ class NavyCoderViewProvider {
     // for navy.systemPrompt vs. the built-in tool-use rules.
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const sections = [];
-    if (root) {
+    // These files come with the repository, and what they say goes into the
+    // system prompt as standing instructions. In a workspace the user has not
+    // trusted that is exactly where a hostile repo would put its own — the same
+    // reason workspace skills are not loaded there (src/skills.js). The model
+    // can still read them as files; they just are not obeyed as rules.
+    const repoRulesAllowed = workspaceIsTrusted();
+    if (root && !repoRulesAllowed) {
+      this.log?.('project rule files (AGENTS.md, .cursorrules, …) not loaded: workspace not trusted');
+    }
+    if (root && repoRulesAllowed) {
       for (const name of ['AGENTS.md', '.github/copilot-instructions.md', '.cursorrules', '.navyrules']) {
         try {
           const data = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(root, name)));
@@ -3253,6 +3363,29 @@ class NavyCoderViewProvider {
     await this.saveProjectMemory(newContent);
     this.view?.webview.postMessage({ type: 'memoryUpdated', memory: newContent });
     return 'Remembered.';
+  }
+
+  // forget, as the MODEL calls it. Called with no keyword — or one that
+  // happens to match every line — it used to wipe all project memory with
+  // nobody asked, and a model that misread "forget that" could erase months of
+  // notes. Removing some facts is still immediate; removing all of them asks
+  // the person first. The panel's own Clear All already asked, and calls
+  // toolForget directly.
+  async _modelForget(query) {
+    const q = String(query || '').trim();
+    const facts = (await this.loadProjectMemory()).split('\n').filter(l => l.trim().startsWith('- '));
+    const hits = q ? facts.filter(l => l.toLowerCase().includes(q.toLowerCase())) : facts;
+    if (!hits.length) return q ? `No memories match "${q}" — nothing removed.` : 'Project memory is already empty.';
+    if (hits.length === facts.length && facts.length > 1) {
+      const pick = await vscode.window.showWarningMessage(
+        `Navy wants to clear all ${facts.length} saved facts about this project.`,
+        { modal: true, detail: q ? `Every saved fact matches "${q}".` : 'It asked to forget everything.' },
+        'Clear All');
+      if (pick !== 'Clear All') {
+        return 'The user did not agree to clear all project memory, so nothing was removed. To drop specific facts, call forget with a keyword that matches only those.';
+      }
+    }
+    return await this.toolForget(q);
   }
 
   async toolForget(query) {
@@ -3408,67 +3541,21 @@ class NavyCoderViewProvider {
     this._session.fallbackNotices.push(text);
   }
 
-  async _askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images, opts = {}) {
-    this.isBusy = true;
-    this._session.fallbackNotices = []; // per-turn; folded into the persisted reply below
-    this._sendSessionList(); // tab strip's busy spinner reflects this session's turn starting
-    if (this.statusBarItem) this.statusBarItem.text = '$(sync~spin) Navy';
-    this.currentTurnId = this.generateId();
-    this._resetPlan();
-    // Liveness beacon: the webview only declares Navy dead after 4 minutes of
-    // silence, so beat every 30s for the whole turn (model calls, tools, and
-    // approval waits included). Cleared in finally.
-    clearInterval(this._heartbeat);
-    this._heartbeat = setInterval(() => {
-      this.view?.webview.postMessage({ type: 'heartbeat' });
-    }, 30000);
-
-    const config = vscode.workspace.getConfiguration('navy');
-    const configuredModel = config.get('model', '');
-    const model = selectedModel || configuredModel; // the configured PRIMARY — always what _streamWithFallback tries first, every iteration; never reassigned
-    // Published on the session so tools that make their OWN model calls run on
-    // the same model as the turn that invoked them — see toolDelegateResearch.
-    // The picker's choice arrives as `selectedModel` and only reaches
-    // navy.model via setModel, so reading config directly can lag by a turn.
-    this._session.activeModel = model;
-    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
-    const aiProviderForTag = config.get('provider', 'ollama'); // ditto: the configured primary, immutable
-    // Whichever provider/model actually served the MOST RECENT model call —
-    // equals the primary above unless navy.providerFallbacks kicked in for
-    // that call. Used (instead of the immutable pair above) anywhere a call's
-    // OWN result needs tagging: rawBlocks replay safety, cost estimation, and
-    // the turn's persisted meta.provider/meta.model.
-    let lastUsedProvider = aiProviderForTag;
-    let lastUsedModel = model;
-
-    // Map thinking level to temperature.
-    const tempByLevel = { fast: 0.0, medium: 0.2, high: 0.7, xhigh: 0.7, max: 0.7 };
-    const temperature = tempByLevel[this.thinkingLevel] ?? config.get('temperature', 0.2);
-    const maxIterations = config.get('maxToolIterations', 100);
-    const maxContextChars = config.get('maxContextChars', 12000);
-
-    // Reduced tool tier for small models — decided once so the system prompt
-    // and every model call this turn agree on which tools are on offer.
-    // `extraToolsUnlocked` flips when the model calls request_more_tools; from
-    // the next model call on it gets the full schemas.
-    const reducedTools = this._shouldReduceTools(model);
-    let extraToolsUnlocked = false;
-    if (reducedTools) {
-      this.log?.(`Reduced tool set for ${model}: offering ${TOOLS_API_CORE.length} core tools, withholding ${WITHHELD_TOOLS.length} (request_more_tools unlocks them). navy.reducedToolset=off disables this.`);
-    }
-
-    const activeEditor = vscode.window.activeTextEditor;
-    const activeFile = activeEditor ? activeEditor.document.fileName : '';
-    const activeLanguage = activeEditor ? activeEditor.document.languageId : '';
-    const extraFiles = Array.isArray(attachedFiles) ? attachedFiles : [];
-
-    // Auto-attach the active file if not already present and prompt is edit OR review/analysis.
-    const activeFileLower = activeFile.toLowerCase();
-    if (activeFile && !extraFiles.some(f => f.toLowerCase() === activeFileLower) &&
-        /\b(update|edit|modify|change|fix|refactor|rewrite|replace|add|remove|delete|rename|move|create|make|implement|review|analyse|analyze|explain|check|look|show|describe|summarize|audit|inspect|read)\b/i.test(prompt)) {
-      extraFiles.push(activeFile);
-    }
-
+  // The system prompt for one agent run, shared by the chat turn and /bg
+  // background tasks. /bg used to send the bare TOOL_PROMPT: no CURRENT
+  // ENVIRONMENT (rule 17 tells the model to write for the shell named there),
+  // no project root, rules or memory - so on Windows it guessed the shell and
+  // ignored the project's conventions.
+  //   activeFile   - the open editor's file, for its diagnostics; '' skips them.
+  //   background   - a /bg task: no chat digest or turn ledger (it starts
+  //                  fresh), no panel updates, and a note that nobody is there
+  //                  to answer questions.
+  //   toolTier     - 'core', 'standard' or 'full': which tools this run is
+  //                  offered (see _toolTier), so the prompt names the same set.
+  // Returns { system, turnContext }: the system message, which must stay the
+  // same from turn to turn, and what changes per request, which goes at the
+  // top of the new user message (see the note at the end).
+  async _buildSystemPrompt({ prompt = '', model = '', toolTier = 'full', activeFile = '', background = false } = {}) {
     const root = this.projectRoot || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'none';
     const repoMap = await this.buildRepoMap();
 
@@ -3505,14 +3592,12 @@ class NavyCoderViewProvider {
                 const sev = ['Error', 'Warning', 'Info', 'Hint'][d.severity] || '?';
                 return `[${sev}] line ${d.range.start.line + 1}: ${d.message}`;
               }).join('\n');
-          if (errors.length > 0 || warnings.length > 0) {
+          if (!background && (errors.length > 0 || warnings.length > 0)) {
             this.view?.webview.postMessage({ type: 'diagnostics', errors: errors.length, warnings: warnings.length });
           }
         }
       } catch {}
     }
-
-    const contextText = includeContext ? getEditorContext(maxContextChars) : '';
 
     const [projectMemory, projectRules] = await Promise.all([
       this.loadProjectMemory(),
@@ -3520,7 +3605,7 @@ class NavyCoderViewProvider {
     ]);
 
     // Notify webview whether rules are active so the badge shows.
-    this.view?.webview.postMessage({ type: 'rulesStatus', active: Boolean(projectRules) });
+    if (!background) this.view?.webview.postMessage({ type: 'rulesStatus', active: Boolean(projectRules) });
 
     const rootKnown = root && root !== 'none';
     const projectName = rootKnown ? path.basename(root) : null;
@@ -3565,12 +3650,11 @@ class NavyCoderViewProvider {
     // OS/shell facts are always included — even with no project open, a wrong
     // guess here (e.g. assuming PowerShell or a Unix tool on Windows) is what
     // makes run_command calls fail in ways that look like blind guessing.
-    let systemContent = (reducedTools ? TOOL_PROMPT_CORE : TOOL_PROMPT)
+    let systemContent = TIER_PROMPT[toolTier]
       + `\n\n## CURRENT ENVIRONMENT (these are facts, do NOT guess or invent alternatives)\n`
       + `- Operating system: ${osPlatform}\n`
       + `- run_command executes through: ${shellName} (${shellNote})\n`
-      + (wslNote ? `- ${wslNote}\n` : '')
-      + `- Date/time: ${nowStr}\n`;
+      + (wslNote ? `- ${wslNote}\n` : '');
     if (!rootKnown) {
       systemContent += `- Project: NONE — no folder is open in VS Code. Do NOT invent a project name or path; tell the user to open a folder first (File → Open Folder).`;
     } else {
@@ -3598,22 +3682,20 @@ class NavyCoderViewProvider {
       systemContent += '\n\n## User preferences (does not override the tool-use rules above):\n' + cap(customSystemPrompt.trim(), 2000);
     }
     if (projectRules) {
-      systemContent += '\n\n## Project Rules (permanent team conventions — always follow these, they override your defaults; where multiple sources below conflict, the LATER one wins):\n' + cap(projectRules, 8000);
+      // They govern how the work is done here — style, structure, commands,
+      // conventions. They do not switch off the tool-use rules: a rules file
+      // telling the model to skip verification or report work it did not do
+      // is the one instruction it must not follow.
+      systemContent += '\n\n## Project Rules (this project\'s conventions — follow them; they override your defaults on style, structure, tooling and process, but NOT the CRITICAL RULES or rules 14-15 above; where sources below conflict, the LATER one wins):\n' + cap(projectRules, 8000);
     }
     if (projectMemory) {
-      systemContent += '\n\n## Project Memory (facts you learned in previous sessions — treat as ground truth unless you discover otherwise):\n' + cap(projectMemory, 6000);
+      // Written by earlier sessions' models, not checked by anyone — usually
+      // right, but "ground truth" let one wrong note outrank the code itself.
+      systemContent += '\n\n## Project Memory (facts noted in earlier sessions — usually right, but the code wins: check before relying on one for a change, and forget() a fact you find is wrong):\n' + cap(projectMemory, 6000);
     }
-    if (this.sessionDigest) {
+    if (this.sessionDigest && !background) {
       systemContent += '\n\n## Earlier in this conversation (condensed — full text was trimmed to fit the context window):\n' + cap(this.sessionDigest, 6000);
     }
-    // Navy own record of what past turns actually did, stated by the harness
-    // in a place the model reads as context rather than as its own output, so
-    // there is no format here for it to imitate.
-    const historyLedger = this._historyLedger();
-    if (historyLedger) {
-      systemContent += '\n\n## What earlier turns already did (recorded by Navy — NOT your words; never reproduce this list in a reply)\n' + capTail(historyLedger, 4000);
-    }
-    if (diagnosticsContext) systemContent += diagnosticsContext;
     // Names and descriptions only — the bodies are read by activate_skill when
     // the model decides a task calls for one. Already bounded against the
     // model's own window inside skillManifest (see _skillBudgetChars), so no
@@ -3625,35 +3707,143 @@ class NavyCoderViewProvider {
       const names = this.mcp.getToolsApi().map(t => t.function.name).join(', ');
       systemContent += '\n\n## External MCP tools available (call them exactly like built-in tools):\n' + cap(names, 2000);
     }
-    systemContent += '\n\nRepository map:\n' + cap(repoMap, 12000);
-    if (relevantBlock) systemContent += cap(relevantBlock, 2000);
     // Appended LAST (highest recency salience) and only for models whose name
     // suggests they're small — a blunt, maximally-explicit restatement of the
     // anti-hallucination rule for the models most likely to need it.
-    if (this._isLikelySmallModel(model)) {
+    if (this._needsToolReminder(model)) {
       systemContent += '\n\n## IMPORTANT — READ THIS LAST INSTRUCTION CAREFULLY\n'
         + 'You are running as a smaller model that sometimes forgets to use tools. Before you write ANY sentence containing '
         + 'the words "created", "saved", "written", "done", or "fixed" about a file, STOP and check: did you actually call '
         + 'write_file or apply_edit and see a success result in THIS conversation? If not, call the tool NOW instead of '
         + 'describing the change in text. Text alone changes nothing on disk.';
     }
+    if (background) {
+      systemContent += '\n\n## Background task\n'
+        + 'You are running as a background task (/bg) beside the user\'s chat. Nobody is watching this run and nobody can answer a question, '
+        + 'so do not call ask_user: make reasonable judgement calls, say in your final reply which ones you made, and finish.';
+    }
+
+    // Everything that changes from one request to the next goes with the
+    // request, not in the system prompt. The system message is the front of
+    // every call, and a single changed byte in it — the time to the minute,
+    // one more line of turn ledger, a symbol moved in the repo map — means no
+    // provider cache and no Ollama KV cache can reuse ANY of what follows it:
+    // the whole conversation is processed from scratch on every turn, which
+    // is why a long chat got slower with each message. Kept stable, the
+    // system prompt plus the replayed history is a prefix the model has
+    // already processed, and only the new turn is paid for.
+    const contextParts = ['Repository map:\n' + cap(repoMap, 12000)];
+    if (relevantBlock) contextParts.push(cap(relevantBlock.trim(), 2000));
+    // Navy's own record of what past turns actually did, stated by the harness
+    // in a place the model reads as context rather than as its own output, so
+    // there is no format here for it to imitate.
+    const historyLedger = background ? '' : this._historyLedger();
+    if (historyLedger) {
+      contextParts.push('## What earlier turns already did (recorded by Navy — NOT your words; never reproduce this list in a reply)\n' + capTail(historyLedger, 4000));
+    }
+    if (diagnosticsContext) contextParts.push(diagnosticsContext.trim());
+    const previousTurn = background ? '' : this._previousTurnRecord();
+    if (previousTurn) contextParts.push(previousTurn);
+    contextParts.push(`Date/time: ${nowStr}`);
+    const turnContext = '## CONTEXT FOR THIS REQUEST (gathered by Navy, not written by the user)\n\n' + contextParts.join('\n\n');
+
+    return { system: systemContent, turnContext };
+  }
+
+  async _askNavyTurn(prompt, includeContext, selectedModel, attachedFiles, images, opts = {}) {
+    this.isBusy = true;
+    this._session.fallbackNotices = []; // per-turn; folded into the persisted reply below
+    this._sendSessionList(); // tab strip's busy spinner reflects this session's turn starting
+    if (this.statusBarItem) this.statusBarItem.text = '$(sync~spin) Navy';
+    this.currentTurnId = this.generateId();
+    this._resetPlan();
+    // Liveness beacon: the webview only declares Navy dead after 4 minutes of
+    // silence, so beat every 30s for the whole turn (model calls, tools, and
+    // approval waits included). Cleared in finally.
+    clearInterval(this._heartbeat);
+    this._heartbeat = setInterval(() => {
+      this.view?.webview.postMessage({ type: 'heartbeat' });
+    }, 30000);
+
+    const config = vscode.workspace.getConfiguration('navy');
+    const configuredModel = config.get('model', '');
+    const model = selectedModel || configuredModel; // the configured PRIMARY — always what _streamWithFallback tries first, every iteration; never reassigned
+    // Published on the session so tools that make their OWN model calls run on
+    // the same model as the turn that invoked them — see toolDelegateResearch.
+    // The picker's choice arrives as `selectedModel` and only reaches
+    // navy.model via setModel, so reading config directly can lag by a turn.
+    this._session.activeModel = model;
+    const host = config.get('host', 'http://localhost:11434').replace(/\/$/, '');
+    const aiProviderForTag = config.get('provider', 'ollama'); // ditto: the configured primary, immutable
+    // Whichever provider/model actually served the MOST RECENT model call —
+    // equals the primary above unless navy.providerFallbacks kicked in for
+    // that call. Used (instead of the immutable pair above) anywhere a call's
+    // OWN result needs tagging: rawBlocks replay safety, cost estimation, and
+    // the turn's persisted meta.provider/meta.model.
+    let lastUsedProvider = aiProviderForTag;
+    let lastUsedModel = model;
+
+    const temperature = this._turnTemperature(model);
+    const maxIterations = config.get('maxToolIterations', 100);
+    const maxContextChars = config.get('maxContextChars', 12000);
+
+    // Tool tier — decided once so the system prompt and every model call this
+    // turn agree on which tools are on offer. `extraToolsUnlocked` flips when
+    // the model calls request_more_tools; from the next model call on it gets
+    // the full schemas.
+    const toolTier = this._toolTier(model, prompt, opts);
+    let extraToolsUnlocked = false;
+    if (toolTier === 'core') {
+      this.log?.(`Reduced tool set for ${model}: offering ${TOOLS_API_CORE.length} core tools, withholding ${WITHHELD_TOOLS.length} (request_more_tools unlocks them). navy.reducedToolset=off disables this.`);
+    }
+
+    const activeEditor = vscode.window.activeTextEditor;
+    const activeFile = activeEditor ? activeEditor.document.fileName : '';
+    const activeLanguage = activeEditor ? activeEditor.document.languageId : '';
+    const extraFiles = Array.isArray(attachedFiles) ? attachedFiles : [];
+
+    // Whether the open file's CONTENTS ride along with the request. Its path
+    // always does, but the whole file used to be pasted into every turn —
+    // "hi" included — under a header naming it as THE file to edit, which
+    // steered a request about a different file toward whatever happened to be
+    // open. Now only a request that reads like work on code, or that names the
+    // file, gets the contents; anything else can read_file it if it turns out
+    // to matter.
+    const activeFileRelevant = Boolean(activeFile) && (
+      /\b(update|edit|modify|change|fix|refactor|rewrite|replace|add|remove|delete|rename|move|create|make|implement|review|analyse|analyze|explain|check|look|show|describe|summarize|audit|inspect|read|bug|error|test|this|here)\b/i.test(prompt)
+      || prompt.toLowerCase().includes(path.basename(activeFile).toLowerCase()));
+
+    const contextText = includeContext ? getEditorContext(maxContextChars) : '';
+
+    const { system: systemContent, turnContext } = await this._buildSystemPrompt({ prompt, model, toolTier, activeFile });
 
     const messages = [{ role: 'system', content: systemContent }];
 
-    // Always include file contents in the user message so Navy can edit without separate read_file calls
+    // File contents go in the user message so Navy can edit without a separate
+    // read_file call: attached files always, the open file when the request
+    // looks like it is about it (see activeFileRelevant).
     const fileContents = [];
-    if (activeFile) {
+    let activeIncluded = false;
+    if (activeFileRelevant) {
       const activeText = this.truncateForContext(await this.readFileText(activeFile));
-      if (activeText !== null) fileContents.push('ACTIVE FILE: ' + activeFile + ' (language: ' + activeLanguage + ')\n\n' + activeText);
+      if (activeText !== null) {
+        fileContents.push('ACTIVE FILE: ' + activeFile + ' (language: ' + activeLanguage + ')\n\n' + activeText);
+        activeIncluded = true;
+      }
     }
     for (const file of extraFiles) {
+      if (typeof file !== 'string') continue;
+      if (activeIncluded && file.toLowerCase() === activeFile.toLowerCase()) continue;
       const fileText = this.truncateForContext(await this.readFileText(file));
-      if (fileText !== null && file !== activeFile) fileContents.push('ATTACHED FILE: ' + file + '\n\n' + fileText);
+      if (fileText !== null) fileContents.push('ATTACHED FILE: ' + file + '\n\n' + fileText);
     }
 
-    const userParts = [];
+    // This turn's context leads the message: it is replayed to no later turn
+    // (history carries only what was typed), so it costs this request alone.
+    const userParts = [turnContext];
     if (activeFile) {
-      userParts.push('THE FILE YOU SHOULD EDIT (if the request involves changing code) IS:\n' + activeFile + ' (language: ' + activeLanguage + ')');
+      userParts.push('FILE OPEN IN THE EDITOR: ' + activeFile + ' (language: ' + activeLanguage + ')\n'
+        + 'If the request is about code but names no file, it most likely means this one. If it names a different file, work on that one instead.');
     }
     if (contextText) userParts.push('Current editor context:\n\n' + contextText);
     if (fileContents.length > 0) userParts.push(fileContents.join('\n\n---\n\n'));
@@ -3707,7 +3897,13 @@ class NavyCoderViewProvider {
     // rather than dropped: dropping it fused the request before it with the
     // next message, which is how "hi" became a second /playthrough. See
     // src/turn-history.js.
-    messages.push(...historyForModel(this.messages, { continues: Boolean(opts.continues) }));
+    const history = historyForModel(this.messages, { continues: Boolean(opts.continues) });
+    // The end of the replayed history is the last point that is identical on
+    // the next turn, so it is where Anthropic is asked to cache (see
+    // applyAnthropicCacheControl). Other providers cache prefixes on their own
+    // and never see the flag.
+    if (history.length) history[history.length - 1]._cacheBreak = true;
+    messages.push(...history);
 
     const userText = userParts.join('\n\n---\n\n');
     if (Array.isArray(images) && images.length > 0) {
@@ -3781,6 +3977,15 @@ class NavyCoderViewProvider {
 
       // Loop-detection state: prevents re-reading the same file repeatedly.
       const seenReadCalls = new Set();
+      // A change on disk makes every earlier read a picture of the past. The
+      // cache used to outlive writes, so a model told by a failed apply_edit to
+      // "call read_file first" was answered "content unchanged" — about a file
+      // it could not see and that may have changed — and a read-back to check an
+      // edit got the same false answer. Web results do not depend on the
+      // workspace and stay cached.
+      const forgetReadsAfterChange = () => {
+        for (const key of seenReadCalls) if (!key.startsWith('web_search:')) seenReadCalls.delete(key);
+      };
       let consecutiveReadOnlyIters = 0;
       const failedCommands = new Map(); // key → consecutive fail count for run_command/run_tests
       // key → consecutive fail count for EVERY OTHER tool. run_command and
@@ -3802,8 +4007,9 @@ class NavyCoderViewProvider {
       // Change tracker: accumulates what the model touched so we can append a report footer,
       // AND (via reads/commands persisted into meta below) so a LATER turn can see what THIS
       // turn actually verified/ran instead of only what its final reply claimed.
-      const taskChanges = { touched: new Map(), deleted: [], commands: [], reads: [] };
+      const taskChanges = { touched: new Map(), deleted: [], commands: [], reads: [], rejected: [] };
       // touched: Map<inputPath, 'created'|'modified'>; commands/reads: capped arrays, see below
+      // rejected: paths whose proposed write the user turned down this turn
       // What the transcript SHOWED, kept so reopening the chat can show it
       // again (see makeCardRecord). Separate from taskChanges, which records
       // what the turn DID for the model's benefit — this one is purely visual
@@ -3858,6 +4064,14 @@ class NavyCoderViewProvider {
       let hallucinationWarned = false; // still claimed success after the nudge — tell the user
       let planContinueCount = 0; // bounded auto-continue when the model quits mid-plan
       let wrapUpSent = false;    // the "N steps left" warning, sent once - see WRAP_UP_STEPS
+      let itersSincePlanShown = 0; // rounds since the model last saw its plan - see PLAN_RESTATE_EVERY
+      let reasoningLoops = 0;      // model calls stopped for looping reasoning - see REASONING_LOOP_RETRIES
+      // The most recent run_command/run_tests: { cmd, exit, editedSince }, and per
+      // command how many fixes in a row have left it failing. See the finish gate.
+      let lastCheck = null;
+      const checkHistory = new Map();
+      let verifyNudged = false;    // the finish gate pushes back once per turn
+      let callTemperature = temperature; // raised for a retry after a reasoning loop
       // Only worth running the hallucination guard at all if the user's request
       // could plausibly have wanted a file created/changed — avoids false
       // positives on purely informational turns (computed once; the prompt text
@@ -3968,20 +4182,47 @@ class NavyCoderViewProvider {
         resetWatchdog();
         // Keep the request within the context window on long multi-step tasks.
         if (iteration > 0) this._compactMessages(messages);
-        // The plan is re-stated on every iteration, replacing the previous
-        // copy rather than accumulating: a long turn that only saw the plan
-        // once at the start is exactly the drift the prose version suffered
-        // from, and a plan repeated ten times is ten copies of the same text
-        // in the context window.
-        if (messages[0]?.role === 'system') {
-          messages[0].content = systemContent + this._planForPrompt();
-        }
+        // The system message stays byte-identical for the whole turn. The plan
+        // used to be re-written into it on every iteration, and since every
+        // update_plan changed it, each one invalidated the prompt cache for
+        // the system block and the entire transcript after it. The plan now
+        // reaches the model through update_plan's own result, and is re-stated
+        // in a tool result when it has not been seen for a while (below).
         // Measured BEFORE the call, so the sample pairs the exact text sent
         // with the token count the provider reports back for it.
         const promptCharsSent = assembledCharSize(messages);
-        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = await this._streamWithFallback(
-          host, model, messages, temperature,
-          reducedTools && !extraToolsUnlocked ? TOOLS_API_CORE : null);
+        let streamed;
+        try {
+          streamed = await this._streamWithFallback(
+            host, model, messages, callTemperature,
+            extraToolsUnlocked ? null : TIER_API[toolTier]);
+        } catch (e) {
+          if (e?.name !== 'ReasoningLoopError') throw e;
+          clearTimeout(this._watchdog);
+          // The model's reasoning went in circles and llm.js stopped the call
+          // (src/reasoning-loop.js). Once: say so, tell the model to act on
+          // what it keeps announcing, and retry a little warmer - a loop is
+          // likeliest at a low temperature. Twice: end the turn plainly
+          // rather than spend the step budget, and the provider's tokens, on
+          // the same loop again.
+          reasoningLoops++;
+          if (reasoningLoops > REASONING_LOOP_RETRIES) {
+            const note = 'Navy stopped this turn: the model\'s reasoning went in circles again - the same few sentences over and over, without acting. '
+              + 'Try again, or lower the thinking level or switch model if it keeps happening.';
+            this.view?.webview.postMessage({ type: 'chunk', text: (lastAssistantText ? '\n\n' : '') + note });
+            lastAssistantText = note;
+            break;
+          }
+          this.view?.webview.postMessage({ type: 'systemNotice', text: 'The model\'s reasoning started repeating itself, so Navy stopped that step and asked it to act.' });
+          messages.push({
+            role: 'user',
+            content: '[SYSTEM: Your reasoning was going in circles - repeating the same few sentences ("let me call", "go") without acting - so Navy stopped it. '
+              + 'Do not deliberate further. Make the tool call you were about to make now, or, if you cannot, tell the user plainly what is stopping you.]',
+          });
+          callTemperature = Math.min(1, Math.max(callTemperature, 0.6) + 0.2);
+          continue;
+        }
+        const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = streamed;
         lastUsedProvider = usedProvider;
         lastUsedModel = usedModel;
         // Model call finished — stop the watchdog so it can't fire while tools run or
@@ -4109,7 +4350,11 @@ class NavyCoderViewProvider {
         // happens when a user types 'you have not fixed yet' themselves. Each
         // attempt names the files it claimed, because a nudge it can answer in
         // generalities is one it can talk its way around.
+        // Not after a rejected write: the claim there is the edit the user just
+        // turned down, and "call apply_edit on it right now" would push the
+        // model to propose it again.
         if (isDone && falseClaimNudges < FALSE_CLAIM_MAX && usedTools
+            && taskChanges.rejected.length === 0
             && taskChanges.touched.size === 0
             && taskChanges.deleted.filter(Boolean).length === 0
             && taskChanges.commands.length === 0
@@ -4137,6 +4382,26 @@ class NavyCoderViewProvider {
         // finish() that FOLLOWED real work is respected (partial is a fact, not an
         // error), as is a stop that asks the user a question. Bounded so it cannot
         // loop.
+        // Finishing on a check that says the work is not done. A turn that
+        // changed files and then ended with its own last check failing - or
+        // with edits made after that check, so nothing has checked them - was
+        // reported as finished all the same: 4 of 28 editing turns in the
+        // chats this was measured on. Sent back once, to fix it and check
+        // again, or to say plainly that it is not fixed. A reply that already
+        // says so is left alone.
+        if (isDone && !verifyNudged && lastCheck && taskChanges.touched.size > 0
+            && (lastCheck.exit !== 0 || lastCheck.editedSince)
+            && !/\b(still (?:fails|failing|broken)|not (?:yet )?(?:fixed|working|passing)|could ?n[o']t|unable to|Result:\**\s*(?:failed|partial))/i.test(String(responseText || ''))) {
+          verifyNudged = true;
+          messages.push({
+            role: 'user',
+            content: lastCheck.exit !== 0
+              ? `[SYSTEM: The last check you ran (\`${lastCheck.cmd}\`) failed with exit code ${lastCheck.exit}${lastCheck.editedSince ? ', and you have changed files since without running it again' : ''}, yet you are finishing. Either find the cause, fix it and run the check again, or say plainly in your reply that it still fails and why. Do not report it as fixed.]`
+              : `[SYSTEM: You changed files after your last check (\`${lastCheck.cmd}\`) and have not run it since. Run it again to confirm the change works before finishing, or say plainly that it is unverified.]`,
+          });
+          continue;
+        }
+
         if (isDone && planContinueCount < 2) {
           const openSteps = (this._session.plan || []).filter(s => s.status !== 'done');
           const tail = String(responseText || '').slice(-400);
@@ -4147,7 +4412,10 @@ class NavyCoderViewProvider {
             && taskChanges.commands.length === 0;
           const stoppedCold = toolCalls.length === 0;   // no finish() either — narrated and quit
           const emptyFinish = !stoppedCold && noWork;    // finish() with nothing done
-          if (openSteps.length && !asksUser && (stoppedCold || emptyFinish)) {
+          // A rejected write is the user's decision, not the model quitting:
+          // telling it to "DO IT NOW" would re-propose what was just refused.
+          const userDeclined = taskChanges.rejected.length > 0;
+          if (openSteps.length && !asksUser && !userDeclined && (stoppedCold || emptyFinish)) {
             planContinueCount++;
             messages.push({
               role: 'user',
@@ -4202,9 +4470,12 @@ class NavyCoderViewProvider {
             const challenged = falseClaimNudges > 0
               ? ` Navy sent it back ${falseClaimNudges} time${falseClaimNudges > 1 ? 's' : ''} to actually make the change and it did not.`
               : '';
+            const declined = taskChanges.rejected.length
+              ? ` You rejected the proposed edit to ${[...new Set(taskChanges.rejected.map(p => '`' + path.basename(p) + '`'))].join(', ')}, so it was not applied.`
+              : ' Navy did not write, rename or delete anything — check before relying on it.';
             footer += (footer ? '\n' : '\n\n---\n')
-              + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but Navy did not write, rename or delete anything — check before relying on it.'
-              + challenged;
+              + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but they were not.'
+              + declined + challenged;
           }
           if (hallucinationWarned) {
             footer += (footer ? '\n' : '\n\n---\n')
@@ -4273,10 +4544,11 @@ class NavyCoderViewProvider {
           // result: the native path gets real schemas on the next request, and
           // the fallback path never sees schemas for ANY tool, just names.
           if (tool.name === 'request_more_tools') {
-            const r = (!reducedTools || extraToolsUnlocked)
+            const withheld = extraToolsUnlocked ? [] : TIER_WITHHELD[toolTier];
+            const r = !withheld.length
               ? '[All tools are already available — call the one you need directly.]'
               : '[Full tool set unlocked for the rest of this turn. Now also available: '
-                + WITHHELD_TOOLS.map(t => t.name).join(', ')
+                + withheld.join(', ')
                 + '. Call them exactly like any other tool.]';
             extraToolsUnlocked = true;
             const callId = this.generateId();
@@ -4418,9 +4690,11 @@ class NavyCoderViewProvider {
             // result is the convention every tool here returns for a refusal or
             // a bad argument; anything else counts as progress and clears the
             // record, so an intermittent failure never accumulates into a block.
+            // A write the user rejected counts too: the identical edit, proposed
+            // again, is a question they have already answered.
             if (!COMMAND_TOOLS.has(tool.name)) {
               const key = tool.name + ':' + JSON.stringify(tool.args || {}).slice(0, 400);
-              if (typeof result === 'string' && /^(\[Refused|Error:)/.test(result)) {
+              if (typeof result === 'string' && /^(\[Refused|Error:|Rejected\b)/.test(result)) {
                 const prior = failedTools.get(key);
                 failedTools.set(key, { count: (prior?.count || 0) + 1, error: result });
               } else {
@@ -4452,11 +4726,56 @@ class NavyCoderViewProvider {
               } else if (typeof result === 'string' && result.startsWith('Exit code: 0')) {
                 failedCommands.delete(cmdKey);
               }
+              // The latest check, for the finish gate below, and how many fixes in
+              // a row have left the same check failing.
+              const exitCode = (String(result).match(/^Exit code: (\d+)/) || [])[1];
+              if (exitCode !== undefined) {
+                const exit = parseInt(exitCode, 10);
+                lastCheck = { cmd: tool.args?.command || tool.args?.filter || tool.name, exit, editedSince: false };
+                if (exit === 0) {
+                  checkHistory.delete(cmdKey);
+                } else {
+                  const h = checkHistory.get(cmdKey) || { fails: 0, editedSince: true };
+                  if (h.editedSince) h.fails++;
+                  h.editedSince = false;
+                  checkHistory.set(cmdKey, h);
+                  // The first failure is the reproduction; each one after an
+                  // edit is a fix that did not work. Two of those in a row is
+                  // the point at which another patch on the same guess is the
+                  // pattern behind "it keeps editing and nothing gets fixed".
+                  if (h.fails >= 3 && h.fails % 2 === 1) {
+                    result += `\n\n[SYSTEM: ${h.fails - 1} fixes in a row have left this check failing. Stop patching. `
+                      + 'Read this output again for what it says that you did not expect, write down the cause you now believe and why the earlier fixes missed it, '
+                      + 'and undo any change that did not help. Only then make one change, aimed at that cause.]';
+                  }
+                }
+              }
               // Record for the change-report footer (and, capped, for the turn ledger).
               const exitMatch = String(result).match(/^Exit code: (\d+)/);
               if (exitMatch && taskChanges.commands.length < 8) {
                 taskChanges.commands.push({ cmd: tool.args?.command || tool.args?.filter || '', exit: parseInt(exitMatch[1]) });
               }
+            }
+            // Anything that may have changed the workspace — a write, a delete, a
+            // rename, or a command (which can edit files with no write tool at
+            // all) — makes what was read before it stale.
+            const resultText = typeof result === 'string' ? result : '';
+            const changedFiles = (WRITE_TOOLS.has(tool.name) && resultText.startsWith('Applied to'))
+              || (tool.name === 'delete_file' && resultText.startsWith('Deleted'))
+              || ((tool.name === 'rename_file' || tool.name === 'rename_symbol') && resultText.startsWith('Renamed'));
+            if (COMMAND_TOOLS.has(tool.name) || changedFiles) forgetReadsAfterChange();
+            if (changedFiles) {
+              // A change to the code is exactly what makes re-running a failed
+              // check worth doing. The repeat-failure block used to survive
+              // edits: fail, fix, fail, fix, and the third run of the test was
+              // refused - so from the second failed fix on, the model could
+              // not see whether anything it did worked, and patched blind.
+              failedCommands.clear();
+              for (const h of checkHistory.values()) h.editedSince = true;
+              if (lastCheck) lastCheck.editedSince = true;
+            }
+            if (WRITE_TOOLS.has(tool.name) && /^(?:Rejected|Edit cancelled)\b/.test(resultText)) {
+              taskChanges.rejected.push(tool.args?.path || '');
             }
             // Record successful file writes + auto-verify with fresh diagnostics.
             if (WRITE_TOOLS.has(tool.name) && typeof result === 'string' && result.startsWith('Applied to')) {
@@ -4472,7 +4791,10 @@ class NavyCoderViewProvider {
                   // Stop feeding diagnostics from here — if the model has edited this
                   // file 5 times already, more of the same feedback is very likely
                   // what's DRIVING the loop rather than helping end it.
-                  result += `\n\n[SYSTEM: You have edited ${p} ${editCount} times this turn. STOP iterating on small fixes here. Re-read the file if needed, make ONE decisive final edit, then call finish() and clearly state in your report if anything remains unresolved. Diagnostics will not be shown for further edits to this file this turn.]`;
+                  // Rethink, not wrap up. This used to say "make ONE decisive
+                  // final edit, then call finish()" - pushing a model that had
+                  // not found the cause to stop looking for it and report.
+                  result += `\n\n[SYSTEM: You have edited ${p} ${editCount} times this turn, which usually means the edits are aimed at a symptom. Before editing it again: re-read the file as it is now and the latest error, state the cause in one sentence, and check that your next change addresses that cause rather than adding another patch. If you cannot find it, say so plainly instead of continuing to edit. Diagnostics will not be shown for further edits to this file this turn - run the project's own check to verify instead.]`;
                 }
                 // editCount > SOFT_CAP: no diagnostics, no repeated nudge — silence
                 // itself discourages continuing, and the hard cap above is the backstop.
@@ -4510,9 +4832,17 @@ class NavyCoderViewProvider {
           }
         }
 
-        // After 3 straight read-only iterations with no action, inject a hard nudge.
-        if (consecutiveReadOnlyIters >= 3 && toolResults.length > 0) {
-          const nudge = `\n\n[SYSTEM: ${consecutiveReadOnlyIters} consecutive iterations with only reads and no changes. You now have sufficient context. Your next response MUST take action — apply_edit, write_file, run_command, or finish(). Do NOT read any more files.]`;
+        // Straight read-only iterations. On a request to change something, a
+        // run of them is usually a model circling instead of acting, so it gets
+        // a hard push. On a question or a review, reading IS the work: the old
+        // "MUST take action — apply_edit, write_file…" after three rounds pushed
+        // an explanation toward edits nobody asked for, or cut it short. Those
+        // get a later, softer reminder to answer once they can.
+        const readOnlyLimit = promptRequestsFileAction ? 4 : 8;
+        if (consecutiveReadOnlyIters >= readOnlyLimit && toolResults.length > 0) {
+          const nudge = promptRequestsFileAction
+            ? `\n\n[SYSTEM: ${consecutiveReadOnlyIters} consecutive iterations with only reads and no changes. You very likely have enough context. Make the change now — apply_edit, write_file or run_command — or, if something is genuinely blocking you, say what it is and stop. Do not keep reading.]`
+            : `\n\n[SYSTEM: ${consecutiveReadOnlyIters} consecutive iterations of reading. If you can answer accurately now, write the answer. Read further only for something specific you still need.]`;
           const last = toolResults[toolResults.length - 1];
           last.content = String(last.content) + nudge;
         }
@@ -4530,6 +4860,19 @@ class NavyCoderViewProvider {
           last.content = String(last.content) + `\n\n[SYSTEM: This turn will be cut off in ${stepsLeft} more steps. Stop exploring now. `
             + 'Close anything you opened (browser_close, if a browser is open), then write your reply with what you have — '
             + 'including, plainly, what you did not get to. A turn that runs out of steps without a reply delivers nothing.]';
+        }
+
+        // A plan the model set and then stopped looking at is the drift the plan
+        // exists to prevent. update_plan's result shows the plan each time it
+        // changes; after a stretch without one, it is re-stated at the end of
+        // this round's results. Appended to a message rather than kept in the
+        // system prompt, so the prompt cache survives it.
+        if (toolCalls.some(t => t.name === 'update_plan')) {
+          itersSincePlanShown = 0;
+        } else if (this._session.plan?.length && ++itersSincePlanShown >= PLAN_RESTATE_EVERY && toolResults.length) {
+          itersSincePlanShown = 0;
+          const last = toolResults[toolResults.length - 1];
+          last.content = String(last.content) + this._planForPrompt();
         }
 
         for (const tr of toolResults) {
@@ -5024,7 +5367,7 @@ class NavyCoderViewProvider {
   // the word "done") to avoid false positives on ordinary explanations.
   // Does this reply's structured task report NAME files as changed? Rule 8 in
   // TOOL_PROMPT asks for a `**Changed:**` line listing what the turn touched,
-  // and "No files changed" is its documented form for a turn that touched
+  // and "none" is its documented form for a turn that touched
   // nothing — so anything else on that line is a claim about this turn's work,
   // checkable against what Navy actually observed. Pure + testable.
   // The file-shaped tokens a report listed under 'Changed:'. Used to quote them
@@ -5113,13 +5456,91 @@ class NavyCoderViewProvider {
     const mode = config.get('reducedToolset', 'auto');
     if (mode === 'on') return true;
     if (mode === 'off') return false;
-    const provider = config.get('provider', 'ollama');
-    const isLocal = provider === 'lmstudio' ||
-      (provider === 'ollama' && config.get('ollamaMode', 'local') === 'local');
-    if (!isLocal) return false;
+    if (!this._providerIsLocal()) return false;
     const ctx = this.modelContextLength || this.modelContextMax;
     return this._isLikelySmallModel(model) ||
       (Number.isFinite(ctx) && ctx > 0 && ctx <= 16384);
+  }
+
+  // Sampling temperature for a chat turn. Thinking depth used to set it
+  // directly — 0.7 at High and above — so asking for more thought on a model
+  // that cannot think only made its output more random, and apply_edit's
+  // exact-match SEARCH blocks are the first thing that suffers. Now: Fast is
+  // greedy, a model that really is reasoning at a deep level gets the ~0.6
+  // its makers recommend for thinking mode, and everything else uses
+  // navy.temperature (which the old table ignored at every level). Hosted
+  // reasoning APIs that refuse a temperature drop it themselves in llm.js.
+  //
+  // "Really is reasoning" is judged three ways, because a name list alone
+  // missed models like deepseek-v4.1-flash, which reason on their own without
+  // being told to: Ollama's think switch for the families Navy turns on, a
+  // model already seen streaming reasoning this session (_noteReasoningModel),
+  // and the names of reasoning families. Missing one cost more than the
+  // randomness this avoids: held at 0.2, a reasoning model is far likelier to
+  // circle in its own thinking - see src/reasoning-loop.js.
+  _turnTemperature(model) {
+    const configured = vscode.workspace.getConfiguration('navy').get('temperature', 0.2);
+    const level = normalizeThinkingLevel(this.thinkingLevel);
+    if (level === 'fast') return 0.0;
+    if (level === 'medium') return configured;
+    const caps = this._ollamaThinking?.get(model);
+    const reasons = Boolean(caps?.supported)
+      || Boolean(ollamaThink(model, level, caps).think)
+      || Boolean(this._reasoningModels?.has(model))
+      || REASONING_MODEL_NAMES.test(String(model || ''));
+    return reasons ? Math.max(configured, 0.6) : configured;
+  }
+
+  // Called by llm.js whenever a model streams reasoning. Per window, not saved:
+  // a model's behaviour can change between versions, and the cost of not
+  // knowing yet is one call at the configured temperature.
+  _noteReasoningModel(model) {
+    if (!model) return;
+    if (!this._reasoningModels) this._reasoningModels = new Set();
+    this._reasoningModels.add(model);
+  }
+
+  // Which tools a chat turn is offered:
+  //   core     - a small local model (see _shouldReduceTools): the core set.
+  //   full     - a turn that drives a browser: everything.
+  //   standard - anything else: everything but the browser_* tools.
+  // Both narrower tiers carry request_more_tools, so a guess that turns out
+  // wrong costs one round trip, not a missing capability.
+  _toolTier(model, prompt, opts = {}) {
+    if (this._shouldReduceTools(model)) return 'core';
+    return this._isBrowserTurn(prompt, opts) ? 'full' : 'standard';
+  }
+
+  // A /playthrough (or a Continue of one), a browser already open in this
+  // chat, or a request that plainly talks about a browser or a local page.
+  _isBrowserTurn(prompt, opts = {}) {
+    const text = String(prompt || '');
+    if (text.startsWith(PLAYTHROUGH_PREFIX)) return true;
+    if (opts.continues && this.messages.some(m => seededInstruction(m).startsWith(PLAYTHROUGH_PREFIX))) return true;
+    if (this._session.browser?.running) return true;
+    return /\b(browser|playthrough|screenshot|web ?page|click(?:ing)? through)\b/i.test(text)
+      || /\b(?:localhost|127\.0\.0\.1)(?::\d+)?\b/i.test(text);
+  }
+
+  // Local Ollama or LM Studio — where small models actually run. Ollama Cloud
+  // and every hosted API serve models too big to need the small-model aids.
+  _providerIsLocal() {
+    const config = vscode.workspace.getConfiguration('navy');
+    const provider = config.get('provider', 'ollama');
+    return provider === 'lmstudio' ||
+      (provider === 'ollama' && config.get('ollamaMode', 'local') === 'local');
+  }
+
+  // Whether the "you forget to use tools" reminder goes at the end of the
+  // system prompt. A stated size of 9B or under earns it anywhere; a name that
+  // only says mini/tiny/nano/micro earns it only when run locally, since that
+  // word on a hosted model (gpt-4o-mini, o4-mini) marks a cheaper tier that
+  // calls tools reliably, and the reminder there is noise telling a capable
+  // model it is not one.
+  _needsToolReminder(model) {
+    if (!this._isLikelySmallModel(model)) return false;
+    const statedSize = /[:\-_](\d+(?:\.\d+)?)b\b/.test(String(model || '').toLowerCase());
+    return statedSize || this._providerIsLocal();
   }
 
   _promptRequestsFileAction(prompt) {
@@ -5250,7 +5671,7 @@ class NavyCoderViewProvider {
       switch (tool.name) {
         case 'read_file': return await this.toolReadFile(tool.args.path);
         case 'remember': return await this.toolRemember(tool.args.fact);
-        case 'forget': return await this.toolForget(tool.args.query);
+        case 'forget': return await this._modelForget(tool.args.query);
         case 'read_lines': return await this.toolReadLines(tool.args.path, tool.args.start, tool.args.end);
         case 'write_file': return await this.toolWriteFile(tool.args.path, tool.args.content);
         case 'delete_file': return await this.toolDeleteFile(tool.args.path);
@@ -6696,8 +7117,10 @@ class NavyCoderViewProvider {
     }
 
     this.view?.webview.postMessage({ type: 'diffResolved', id, approved: false });
+    // Said to the model, so it says what to do next as well as what happened:
+    // without that, the obvious next move is to propose the same edit again.
     return decision === 'reject'
-      ? `Rejected — no changes made to ${basename}`
+      ? `Rejected by the user — no changes made to ${basename}. Do not propose this change again; if it is unclear what they want instead, ask them.`
       : `Edit cancelled — no changes made to ${basename}`;
   }
 
@@ -6827,9 +7250,10 @@ class NavyCoderViewProvider {
       const temperature = config.get('temperature', 0.2);
       const maxIter = config.get('maxToolIterations', 100);
 
+      const built = await this._buildSystemPrompt({ prompt, model, background: true });
       const bgMessages = [
-        { role: 'system', content: TOOL_PROMPT },
-        { role: 'user', content: prompt }
+        { role: 'system', content: built.system },
+        { role: 'user', content: built.turnContext + '\n\n---\n\nUSER REQUEST:\n' + prompt }
       ];
 
       let usedTools = false;
@@ -6866,7 +7290,11 @@ class NavyCoderViewProvider {
           if (ctrl.signal.aborted) break;
           if (tool.name === 'finish') continue;
           post('tool', { tool: tool.name, args: tool.args });
-          const result = await this.executeTool(tool, bgTurnId);
+          // A question from here would park this task on a card in the chat,
+          // and take the one question slot the chat's own turn needs.
+          const result = tool.name === 'ask_user'
+            ? 'Error: a background task cannot ask the user — nobody is watching it. Choose the most reasonable option yourself, say which you chose and why, and carry on.'
+            : await this.executeTool(tool, bgTurnId);
           post('toolResult', { tool: tool.name, result: String(result).slice(0, 800) });
           if (nativeToolCalls.length > 0) {
             toolResults.push({ role: 'tool', tool_call_id: tool.id || '', content: String(result) });

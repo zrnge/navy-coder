@@ -1,5 +1,214 @@
 # Changelog
 
+## [0.3.9] - 2026-10-13
+
+Long chats no longer slow down with every message, each round of thinking shows
+where it happened, and Navy's instructions stop contradicting themselves.
+
+### Added
+
+- **The eval covers more than one auto-approved prompt.** A task can now run
+  several turns in one chat, reject every diff a turn proposes, open a file in
+  the editor, and answer `ask_user` (which used to hang the task until it timed
+  out). It records how often you would have been asked to approve each file.
+  Eight new tasks use this: a question answered three files deep past a decoy,
+  several edits to one file, the open file not being the target and being it,
+  a request in Spanish, a rejected edit, a follow-up that says "it", and
+  "thanks!" after a finished task. The checker self-test now runs in CI on
+  every push, and an eval run no longer leaves a folder in `~/.navy-coder` for
+  every task it ran.
+
+- **Debugging tasks in the eval.** Four tasks where the first plausible patch
+  is not the fix: a cause in a different file from the symptom, a second bug
+  the test does not show, a race between concurrent callers, and a fix that must
+  not break the other tests. Each checker also runs cases the test does not, so
+  a patch fitted to the visible test fails. `--config thinkingLevel=...` now
+  takes effect; it was read before the config was set, and ignored.
+
+### Changed
+
+- **Navy debugs instead of patching.** Measured across real chats, 18 of 28
+  turns that edited files edited the same file three times or more - fixes
+  aimed at a symptom, stacked one on another. The prompt now sets out how to fix
+  a bug: reproduce it, trace the wrong value to where it first goes wrong, state
+  the cause before editing, make the smallest change that fixes that cause, and
+  run the same check again. When two fixes in a row leave the same check
+  failing, Navy tells the model to stop patching, undo what did not help and
+  rethink the cause; after five edits to one file it asks for the cause again,
+  where it used to ask for "one decisive final edit" and a finish.
+- **A turn does not end on its own failing check.** A turn that changed files
+  and finished with its last check failing - or with edits made after it - was
+  reported as done: 4 of 28 editing turns. It is sent back once, to fix it and
+  check again or to say plainly that it still fails.
+- **A follow-up sees what the last turn changed.** "It still doesn't work" used
+  to reach a model that knew only that it had "written cart.js". The request now
+  carries the previous turn's changes as a diff, and what its last check said,
+  so it can build on them or undo them rather than repeat them.
+- **Browser tools load when a turn needs them.** The 22 `browser_*` tools were
+  about a third of the tool definitions sent with every request, used only by a
+  playthrough. An ordinary turn now leaves them out and can load them with
+  `request_more_tools`; `/playthrough`, a Continue of one, a chat with a browser
+  already open, or a request that talks about a browser, a screenshot or a
+  localhost page gets them from the start. The playthrough brief says how to
+  load them on the reduced tool set for small models.
+- **The plan stays out of the system prompt.** It was rewritten into the system
+  message on every step, and every `update_plan` changed it - throwing away the
+  prompt cache for the whole turn so far. The plan now reaches the model through
+  `update_plan`'s own result, and is shown again after five steps without one.
+- **Clearing all project memory asks first.** `forget()` with no keyword, or one
+  that matches every saved fact, wiped them without asking. Removing some facts
+  is still immediate; removing all of them asks you. Saved facts are no longer
+  presented as "ground truth": the code wins, and a fact found wrong should be
+  forgotten.
+
+### Fixed
+
+- **The same dev server could be started twice.** `run_project` and
+  `start_process` each checked only their own name for something already
+  running, so `start_process("navy-dev", "npm run dev")` followed by
+  `run_project` - which detects `npm run dev` itself - started a second server
+  beside the first, fighting it for the port, with both in the task dock.
+  Starting a command that is already running for the project, in any chat of
+  the window and under either tool, is now refused with which process has it
+  and how to restart it.
+- **The thinking level did nothing for many Ollama models.** Navy set Ollama's
+  `think` only for model names on a short list, so `deepseek-v4.1-flash` and
+  others ran at their default whatever level was chosen - Max included. Navy now
+  reads what Ollama reports for the model (its capabilities and thinking
+  levels) and sends the matching level: Max sends `max` to a model that offers
+  it, and the deepest level it has, no deeper than asked, otherwise.
+- **A test could not be re-run after the second failed fix.** Navy blocks a
+  command that fails twice in a row, so a model does not repeat it unchanged -
+  but the count survived edits. Fail, fix, fail, fix, and the third run of the
+  test was refused: from then on the model could not see whether its fixes
+  worked. A change to any file now resets it.
+- **Long chats got slower with every message.** The system prompt, which opens
+  every request, changed on every turn: it carried the time to the minute, the
+  record of what earlier turns did (one line longer each turn), the open file's
+  diagnostics, this request's likely-relevant files, and a repo map whose symbol
+  outlines move after every edit. Nothing after a changed byte can come from a
+  cache - neither a provider's prompt cache nor Ollama's reuse of what it has
+  already processed - so every turn made the model read the whole conversation
+  again from the start. The system prompt now stays the same from turn to turn, and what
+  changes per request travels with the request instead, in a "context for this
+  request" block at the top of the new message. Earlier turns are replayed
+  exactly as before, so only the new turn has to be read. On Anthropic the end of
+  the earlier conversation is also marked for caching, so the next turn reads it
+  from cache rather than paying for it again. Some local models' own chat
+  templates put the system prompt at the end of the conversation rather than the
+  start - Mistral's does - and for those the prompt cannot be reused whatever
+  Navy sends.
+- **The chat stopped following live output.** A scroll is reported a frame
+  after it happens. When Navy scrolled to the bottom and more output landed
+  before that report was handled - a diff card, a tool row, a long chunk - the
+  panel measured against the new, taller content, decided you had scrolled up,
+  and stopped following until you scrolled down yourself. Now only something you
+  do - the wheel, a touch, a scrolling key, dragging the scrollbar - stops it;
+  the panel's own scrolling and content growing can only keep it going. Content
+  that grows on its own, such as a screenshot finishing loading, is followed
+  too, except right after you click to open something, so a block you open to
+  read stays in view. Jumping to a search match or to a running task's card
+  counts as leaving the bottom, as jumping from the outline already did.
+- **Thinking shows where it happened.** A turn's reasoning went into one block
+  at the top of the turn, and every later round of thinking - after a read, an
+  edit, a search - was added to that same block. To see what Navy thought before
+  its last edit you had to scroll back to where the turn began. Each stretch of
+  reasoning is now its own block, in order among the tool steps and replies:
+  think, plan, read, think, edit, think, search. A reopened chat shows the same
+  blocks in the same places; saved reasoning keeps its 8,000-character limit per
+  turn, shared across the blocks.
+- **Re-reading a file after editing it said "already retrieved".** Repeat reads
+  in a turn are answered from a cache, and the cache outlived writes. Reading a
+  file back to check an edit got "content unchanged" - untrue - and an
+  `apply_edit` that missed its match told the model to "call read_file first",
+  which hit the same wall. Line-number edits had no way to get fresh numbers
+  after an earlier edit moved them. Any write, delete, rename or command now
+  clears what was read before it.
+- **A rejected edit was proposed again.** After you rejected a diff, a report
+  still listing that file under `Changed:` set off the check for invented
+  changes, which sent the model back up to three times to "call apply_edit on it
+  right now". Rejections are now recorded: neither that check nor the
+  unfinished-plan nudge fires after one, the model is told not to propose the
+  change again, an identical rejected edit counts toward the repeated-failure
+  block, and the footer says you rejected it rather than calling the report
+  made up.
+- **Navy's instructions contradicted themselves.** "Ambiguous: reply in one
+  sentence, no tools" against "ambiguous: ask with `ask_user`"; "emit one XML
+  block" against "batch your reads", with the XML format never given;
+  `finish()` required where it is not offered as a tool; a Done/Changed/Result
+  report demanded even for a one-line answer; and `run_command` described as
+  "only when the user explicitly asks" while other rules said to verify with it.
+  Each now says one thing: greetings get a sentence and ambiguity gets a
+  question, tools go through the function-calling interface, a finished reply
+  simply stops, the report is for change requests only, and commands are for
+  checking your own work too (still behind approval). A new rule says what to
+  do after a rejected edit.
+- **Questions were pushed toward edits.** After three rounds of reading the
+  model was told it "MUST take action - apply_edit, write_file ... Do NOT read
+  any more files", which cut explanations and reviews short or turned them into
+  edits nobody asked for. That push now applies only to requests that ask for a
+  change, after four rounds; a question gets a gentler "answer once you can"
+  after eight.
+- **`/bg` tasks ran on a bare prompt.** A background task got none of the
+  environment (rule 17 told it to write for a shell it was never told about, so
+  on Windows it guessed), no project root, rules or memory. It now gets the same
+  prompt as the chat, is told nobody is watching, and an `ask_user` from it is
+  refused rather than parking the task on a question card.
+- **The open file was named as the file to edit.** Every request carried "THE
+  FILE YOU SHOULD EDIT IS" the open file, plus its whole contents - "hi"
+  included - which steered a request about another file toward whatever was
+  open. The open file is now named as just that, with a note that a request
+  naming a different file means that file, and its contents are included only
+  when the request looks like it is about it.
+- **`navy.temperature` was ignored.** Each thinking level set its own
+  temperature, and High and above used 0.7, which made models that cannot think
+  more random rather than more thoughtful - exact-match edits suffer first. Fast
+  is still 0; everything else uses `navy.temperature`, and a model that is
+  actually reasoning at a deep level gets the 0.6 its makers recommend. A model
+  counts as reasoning by its family name, or as soon as it streams reasoning -
+  so one that thinks without being told to, like `deepseek-v4.1-flash`, is not
+  held at a low temperature that makes reasoning loops likelier.
+- **Reasoning that goes in circles is stopped.** A model could loop inside its
+  own thinking - "Let me call. OK. I'll call it. Go." over and over - announcing
+  a tool call and never making it, until the three-minute watchdog ended the
+  whole turn, with every repeated token billed. Navy now watches the reasoning
+  as it streams. When it turns into the same few sentences repeating, or one
+  passage repeated word for word, that one model call is stopped, the chat says
+  so, and the model is told to make the call it keeps announcing and retried a
+  little warmer. If it loops again, the turn ends with a plain message.
+- **Long chats were slow to open.** Every card drawn while reopening a chat
+  refreshed the message-navigation arrows, which measure the scrollbar and so
+  make the browser lay out the whole chat - once per card, hundreds of times.
+  Measured in Chrome on a 30-turn chat: 11.8 seconds to open, 9.5 of them in
+  that refresh. It now runs at most once a frame, and the check for whether the
+  chat is empty no longer counts every message to find one: the same chat opens
+  in 0.65 seconds. The same refresh ran for every streamed chunk of a live
+  reply, so long turns are smoother too.
+- **The panel stalled for seconds during long turns.** An applied diff kept its
+  whole diff in the page - up to 400 rows - merely clipped to a short preview,
+  so a turn that applied many edits carried tens of thousands of hidden
+  elements, and each update froze the panel for one to seven seconds. An
+  applied diff now keeps only its preview; the full diff is built when you
+  expand it and removed when you collapse it. Finished batches of tool steps
+  also fold into their "N steps" summary as soon as the next batch starts,
+  rather than staying open until the turn ends.
+- **Hosted "mini" models were told they forget to use tools.** The small-model
+  reminder matched any name containing "mini", so `gpt-4o-mini` and `o4-mini`
+  got it. It now goes to a stated size of 9B or under, or to a mini/tiny/nano
+  model running locally.
+- **The WSL rule named cmd.exe** even when commands run through PowerShell.
+
+### Security
+
+- **Repository rule files are not obeyed in an untrusted workspace.**
+  `AGENTS.md`, `.github/copilot-instructions.md`, `.cursorrules` and
+  `.navyrules` were added to the system prompt as rules that "override your
+  defaults" even in a workspace you had not trusted - where a hostile repository
+  would put its own instructions - while workspace skills were already blocked
+  there. They now load only in a trusted workspace, and even there they govern
+  conventions and process, not Navy's core rules on tool use, verification and
+  not claiming changes it did not make.
+
 ## [0.3.8] - 2026-09-30
 
 A greeting that started a playthrough and what was behind it, and Navy reading

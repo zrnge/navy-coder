@@ -422,6 +422,31 @@ async function persistentBgProcessSuite() {
     check('toolKillProcess: removes the persisted entry from the manifest too, not just bgProcesses', !manifest.some(r => r.id === 'longrun'));
     await vscode.workspace.getConfiguration().update('persistBackgroundProcesses', false);
 
+    // ── One dev server per project. start_process and run_project each
+    // checked only their own name, so the same `npm run dev` could be started
+    // by one and then the other: two servers, both in the task dock.
+    {
+      const devCmd = writeNodeScript('devserver.js', 'setInterval(()=>{}, 1000);');
+      await provider.toolStartProcess('navy-dev', devCmd);
+      const dupRun = await provider.toolRunProject(devCmd);
+      check('one server: run_project refuses a command start_process is already running',
+        /^Already running/.test(dupRun) && /"navy-dev"/.test(dupRun) && !provider.bgProcesses.get('__run_project__'), dupRun);
+      const dupStart = await provider.toolStartProcess('dev-again', devCmd);
+      check('one server: start_process refuses the same command under another name',
+        /^Already running/.test(dupStart) && !provider.bgProcesses.get('dev-again'), dupStart);
+      await provider.toolKillProcess('navy-dev');
+      const fresh = await provider.toolStartProcess('dev-again', devCmd);
+      check('one server: once it is stopped, it can be started again', /started/i.test(fresh) && Boolean(provider.bgProcesses.get('dev-again')?.proc), fresh);
+      await provider.toolKillProcess('dev-again');
+
+      const devCmd2 = writeNodeScript('devserver2.js', 'setInterval(()=>{}, 1000);');
+      await provider.toolRunProject(devCmd2);
+      const afterRun = await provider.toolStartProcess('second', devCmd2);
+      check('one server: start_process refuses what run_project is already running',
+        /^Already running/.test(afterRun) && /started by run_project/.test(afterRun) && !provider.bgProcesses.get('second'), afterRun);
+      await provider.toolKillProcess('__run_project__');
+    }
+
     // ── _withBgManifestLock genuinely serializes concurrent callers for the
     // SAME project (sibling chat tabs can legitimately start/stop persisted
     // processes at the same time — this is the actual fix for the lost-

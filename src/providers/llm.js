@@ -2,6 +2,10 @@ const { TOOLS_API, TOOLS } = require('./tools.js');
 const { openAiCompatBase, ollamaHost, ollamaAuthHeaders, ANTHROPIC_BASE, GEMINI_NATIVE_BASE } = require('./endpoints.js');
 // Navy's five thinking levels and what each provider is sent for them.
 const thinking = require('../thinking.js');
+const { ReasoningLoopGuard, ReasoningLoopError } = require('../reasoning-loop.js');
+// The loop guard of each model call in flight, keyed by that call's signal -
+// the one thing every provider path already has in hand. See emitThinking.
+const callGuards = new WeakMap();
 const vscode = require('vscode');
 const https = require('https');
 
@@ -64,7 +68,50 @@ async function fetchWithRetry(url, init) {
   // `toolsApiOverride`, when given, replaces the built-in TOOLS_API for this
   // call (MCP tools are still appended) — the turn loop passes the reduced core
   // set here for small models, see _shouldReduceTools in extension.js.
+  // Each model call gets its own abort, chained to the caller's, so the
+  // reasoning-loop guard can stop THIS call without stopping the turn: Stop
+  // still reaches the call through the chain, and a call stopped for looping
+  // comes back as a ReasoningLoopError the turn can handle - not as the
+  // AbortError that means the person pressed Stop.
   async function streamAssistant(provider, host, model, messages, temperature, signal = null, onChunk = null, override = null, toolsApiOverride = null) {
+    const parent = signal || provider.abortController?.signal || null;
+    const call = new AbortController();
+    const onParentAbort = () => call.abort(parent.reason);
+    if (parent) {
+      if (parent.aborted) call.abort(parent.reason);
+      else parent.addEventListener('abort', onParentAbort, { once: true });
+    }
+    const guard = new ReasoningLoopGuard(() => call.abort());
+    callGuards.set(call.signal, { guard, model });
+    try {
+      const result = await streamAssistantCall(provider, host, model, messages, temperature, call.signal, onChunk, override, toolsApiOverride);
+      // The loop can be spotted in the last piece of a stream that has already
+      // been read to the end, so the abort had nothing left to stop: the
+      // response is still the looping one, and is not used.
+      if (guard.tripped && !parent?.aborted) throw new ReasoningLoopError(model);
+      return result;
+    } catch (e) {
+      if (e?.name === 'ReasoningLoopError') throw e;
+      if (guard.tripped && !parent?.aborted) throw new ReasoningLoopError(model);
+      throw e;
+    } finally {
+      parent?.removeEventListener('abort', onParentAbort);
+    }
+  }
+
+  // Reasoning streamed by any provider goes through here: to the panel, to
+  // this call's loop guard, and to the provider's record of which models
+  // really reason (see _turnTemperature in extension.js).
+  function emitThinking(provider, signal, text) {
+    if (!text) return;
+    provider.view?.webview.postMessage({ type: 'thinkingChunk', text });
+    const entry = signal && callGuards.get(signal);
+    if (!entry) return;
+    provider._noteReasoningModel?.(entry.model);
+    entry.guard.feed(text);
+  }
+
+  async function streamAssistantCall(provider, host, model, messages, temperature, signal = null, onChunk = null, override = null, toolsApiOverride = null) {
     const config = vscode.workspace.getConfiguration('navy');
     // aiProvider drives the secrets lookup key below, so overriding it here
     // is sufficient — no separate branch needed for the apiKey fetch itself.
@@ -102,7 +149,7 @@ async function fetchWithRetry(url, init) {
     // Ollama uses a separate `images` field (base64 strings, no data-URI prefix) rather than
     // the OpenAI content-array format, so convert any vision messages here.
     // Also strip _rawBlocks/_rawBlocksProvider (Anthropic/Gemini-only replay state).
-    const ollamaMessages = messages.map(({ _rawBlocks, _rawBlocksProvider, ...msg }) => {
+    const ollamaMessages = messages.map(({ _rawBlocks, _rawBlocksProvider, _cacheBreak, ...msg }) => {
       if (!Array.isArray(msg.content)) return msg;
       const texts = [];
       const imgs = [];
@@ -128,7 +175,7 @@ async function fetchWithRetry(url, init) {
     // gpt-oss takes a level and ignores true/false; the others take on or off.
     {
       const asked = thinking.normalizeThinkingLevel(provider.thinkingLevel);
-      const { think, used } = thinking.ollamaThink(model, asked);
+      const { think, used } = thinking.ollamaThink(model, asked, provider._ollamaThinking?.get(model));
       if (think !== undefined) {
         ollamaBody.think = think;
         thinking.noteThinkingLimit(provider, model, asked, used);
@@ -171,7 +218,7 @@ async function fetchWithRetry(url, init) {
         // the panel's collapsible block, and keep the status line moving so the UI
         // doesn't look frozen while it thinks.
         if (event.message?.thinking) {
-          provider.view?.webview.postMessage({ type: 'thinkingChunk', text: event.message.thinking });
+          emitThinking(provider, signal, event.message.thinking);
           if (!event.message?.content) provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
         }
         const content = event.message?.content || '';
@@ -220,18 +267,24 @@ async function fetchWithRetry(url, init) {
     const outTools = tools.length
       ? tools.map((t, i) => i === tools.length - 1 ? { ...t, ...cc } : t)
       : tools;
-    const outMsgs = messages.slice();
-    if (outMsgs.length) {
-      const last = { ...outMsgs[outMsgs.length - 1] };
-      if (typeof last.content === 'string' && last.content) {
-        last.content = [{ type: 'text', text: last.content, ...cc }];
-      } else if (Array.isArray(last.content) && last.content.length) {
-        const blocks = last.content.slice();
+    const mark = (m) => {
+      const out = { ...m };
+      if (typeof out.content === 'string' && out.content) {
+        out.content = [{ type: 'text', text: out.content, ...cc }];
+      } else if (Array.isArray(out.content) && out.content.length) {
+        const blocks = out.content.slice();
         blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], ...cc };
-        last.content = blocks;
+        out.content = blocks;
       }
-      outMsgs[outMsgs.length - 1] = last;
-    }
+      return out;
+    };
+    // _cacheBreak marks the end of the replayed history: the part of this
+    // request the NEXT turn will repeat byte for byte. A breakpoint there is
+    // what lets turn N+1 read the whole earlier conversation from cache; the
+    // one on the last message only ever helps the next call within this turn.
+    // Tools + system + history end + last message is four, Anthropic's limit.
+    const outMsgs = messages.map(({ _cacheBreak, ...m }, i) =>
+      (_cacheBreak && i < messages.length - 1) || i === messages.length - 1 ? mark(m) : m);
     return { system, tools: outTools, messages: outMsgs };
   }
 
@@ -294,6 +347,11 @@ async function fetchWithRetry(url, init) {
           anthropicMessages.push({ role: msg.role === 'assistant' ? 'assistant' : 'user', content: String(content) });
         }
       }
+      // Whatever the branches above made of it, the cache hint goes on the
+      // Anthropic message this one ended up in.
+      if (msg._cacheBreak && msg.role !== 'system' && anthropicMessages.length) {
+        anthropicMessages[anthropicMessages.length - 1]._cacheBreak = true;
+      }
     }
 
     // Merge consecutive same-role messages — Anthropic 400s when roles don't alternate.
@@ -304,6 +362,10 @@ async function fetchWithRetry(url, init) {
       if (prev && prev.role === m.role) {
         const toBlocks = (c) => Array.isArray(c) ? c : [{ type: 'text', text: String(c) }];
         prev.content = [...toBlocks(prev.content), ...toBlocks(m.content)];
+        // The merged message now ends with m's content, so a break at the end
+        // of m is a break at the end of the merge; one at the end of prev
+        // would now sit mid-message, and is dropped.
+        prev._cacheBreak = Boolean(m._cacheBreak);
       } else {
         mergedMessages.push(m);
       }
@@ -338,8 +400,11 @@ async function fetchWithRetry(url, init) {
     const maxTokensFor = (adaptive) => (capMaxTokens || !supportsThinking || !thinking.isDeep(thinkingLevel))
       ? baseMaxTokens : (adaptive ? 64000 : 32000);
 
-    // Prompt caching: system + tools + newest message become cache breakpoints.
+    // Prompt caching: system + tools + end of history + newest message become
+    // cache breakpoints. The uncached fallback sends the same messages with the
+    // internal _cacheBreak flag removed.
     const cached = applyAnthropicCacheControl(systemText, anthropicTools, mergedMessages);
+    const uncachedMessages = mergedMessages.map(({ _cacheBreak, ...m }) => m);
 
     // Newer model generations reject the legacy thinking shape ({type:'enabled',
     // budget_tokens}) and reject `temperature` outright, wanting
@@ -352,7 +417,7 @@ async function fetchWithRetry(url, init) {
         model,
         max_tokens: maxTokensFor(useAdaptive),
         stream: true,
-        messages: withCaching ? cached.messages : mergedMessages,
+        messages: withCaching ? cached.messages : uncachedMessages,
         tools: withCaching ? cached.tools : anthropicTools,
       };
       // A budget must stay under max_tokens, with room left for the answer.
@@ -497,7 +562,7 @@ async function fetchWithRetry(url, init) {
           // Surface the reasoning so the panel can show it in a collapsible block
           // (streamed, not stored on the turn). onChunk callers only want the
           // answer text, so this goes straight to the webview.
-          if (delta.thinking) provider.view?.webview.postMessage({ type: 'thinkingChunk', text: delta.thinking });
+          if (delta.thinking) emitThinking(provider, signal, delta.thinking);
         }
         if (delta?.type === 'signature_delta' && raw?.type === 'thinking') {
           raw.signature = delta.signature || '';
@@ -536,9 +601,10 @@ async function fetchWithRetry(url, init) {
 
     const body = {
       model,
-      // _rawBlocks/_rawBlocksProvider are Anthropic/Gemini-only replay state — never
-      // send them to OpenAI-compat APIs.
-      messages: messages.map(({ _rawBlocks, _rawBlocksProvider, ...m }) => m),
+      // _rawBlocks/_rawBlocksProvider are Anthropic/Gemini-only replay state, and
+      // _cacheBreak an Anthropic-only cache hint — never send them to
+      // OpenAI-compat APIs, some of which reject unknown message fields.
+      messages: messages.map(({ _rawBlocks, _rawBlocksProvider, _cacheBreak, ...m }) => m),
       stream: true,
       tools: toolsApi
     };
@@ -778,7 +844,7 @@ async function fetchWithRetry(url, init) {
             provider.view?.webview.postMessage({ type: 'statusText', text: 'Reasoning…' });
           }
           // A thought part carries its reasoning text in `part.text` — surface it.
-          if (typeof part.text === 'string' && part.text) provider.view?.webview.postMessage({ type: 'thinkingChunk', text: part.text });
+          if (typeof part.text === 'string' && part.text) emitThinking(provider, signal, part.text);
           rawBlocks.push(part);
         } else if (typeof part.text === 'string') {
           text += part.text;

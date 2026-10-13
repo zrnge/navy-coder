@@ -343,6 +343,22 @@ async function robustnessSuite() {
     check('cache: string content converted to block', Array.isArray(strOut.messages[0].content) && strOut.messages[0].content[0].text === 'hello');
     const emptyOut = applyAnthropicCacheControl('S', [], [{ role: 'user', content: '' }]);
     check('cache: empty content left untouched (no invalid empty block)', emptyOut.messages[0].content === '');
+
+    // The end of the replayed history is a fourth breakpoint — what the next
+    // turn repeats byte for byte — and the internal flag never reaches the API.
+    const histOut = applyAnthropicCacheControl('SYS', tools, [
+      { role: 'user', content: 'turn 1' },
+      { role: 'assistant', content: 'reply 1', _cacheBreak: true },
+      { role: 'user', content: 'turn 2' },
+    ]);
+    const histCC = JSON.stringify(histOut).split('"cache_control"').length - 1;
+    check('cache: the end of history is a breakpoint too — four in all, the API limit',
+      histCC === 4 && Boolean(histOut.messages[1].content[0].cache_control));
+    check('cache: the _cacheBreak flag is stripped from what is sent',
+      !JSON.stringify(histOut).includes('_cacheBreak'));
+    const lastOut = applyAnthropicCacheControl('S', [], [{ role: 'user', content: 'only', _cacheBreak: true }]);
+    check('cache: a flagged LAST message is not marked twice',
+      JSON.stringify(lastOut).split('"cache_control"').length - 1 === 2);
   }
 
   // webview-html module is pure and self-contained
@@ -499,7 +515,9 @@ async function writeLoopGuardSuite() {
 
     const writeResults = posted.filter(m => m.type === 'toolResult' && m.tool === 'write_file').map(m => m.result);
     check('write-loop: all 11 attempts produced a result', writeResults.length === 11);
-    check('write-loop: soft-cap nudge fires exactly at edit #5', /STOP iterating/.test(writeResults[4]) && !/STOP iterating/.test(writeResults[3]));
+    check('write-loop: soft-cap nudge fires exactly at edit #5', /aimed at a symptom/.test(writeResults[4]) && !/aimed at a symptom/.test(writeResults[3]));
+    check('write-loop: ...and it asks for the cause, not for one decisive final edit and finish()',
+      /state the cause in one sentence/.test(writeResults[4]) && !/decisive final edit/.test(writeResults[4]));
     check('write-loop: diagnostics silent after the soft cap (edits 6-10)', writeResults.slice(5, 10).every(r => !/POST-EDIT DIAGNOSTICS/.test(r)));
     check('write-loop: 11th attempt hard-blocked', /^\[Blocked:/.test(writeResults[10]));
     check('write-loop: blocked attempt did not touch the file', fs.readFileSync(path.join(tmp, 'index.html'), 'utf8') === 'content-10');
@@ -615,13 +633,41 @@ async function reducedToolsetSuite() {
       parseToolCalls('<tool name="read_file">{not json</tool>')
         .some(c => c.name === '__parse_error__'));
 
-    // Control: a big local model gets the full set and the full prompt.
+    // Control: a big local model on an ordinary turn gets the standard tier —
+    // everything but the browser tools, plus the way to load them.
+    const { TOOLS_API_STANDARD, BROWSER_TOOL_NAMES } = require('../src/providers/tools.js');
+    const toolNames = (req) => (req?.tools || []).map(t => t.function.name);
+    const sysOf = (req) => req?.messages?.find(m => m.role === 'system')?.content || '';
     const captured2 = [];
     global.fetch = queueOllamaFetch([{ text: 'ok' }], captured2);
     await provider.askNavy('hello there', false, 'qwen2.5-coder:32b', [], []);
-    check('full-tier turn: all schemas, full prompt',
-      captured2[0]?.tools?.length === TOOLS_API.length &&
-      !/Reduced tool set/.test(captured2[0]?.messages?.find(m => m.role === 'system')?.content || ''));
+    check('standard-tier turn: every schema but the browser ones, and request_more_tools',
+      captured2[0]?.tools?.length === TOOLS_API_STANDARD.length
+        && !toolNames(captured2[0]).some(n => BROWSER_TOOL_NAMES.has(n))
+        && toolNames(captured2[0]).includes('request_more_tools')
+        && toolNames(captured2[0]).includes('apply_edit'),
+      toolNames(captured2[0]).join(','));
+    check('standard-tier turn: the prompt says the browser tools exist and how to load them',
+      /Browser tools \(not loaded this turn\)/.test(sysOf(captured2[0]))
+        && !/Reduced tool set/.test(sysOf(captured2[0]))
+        && !/^Available tools: .*browser_navigate/m.test(sysOf(captured2[0])));
+
+    // A playthrough is the turn the browser tools exist for: all of them, up front.
+    const captured3 = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], captured3);
+    await provider.askNavy('[SYSTEM — PLAYTHROUGH MODE]\nPlay through http://localhost:3000', false, 'qwen2.5-coder:32b', [], [], '', { shown: '/playthrough localhost:3000' });
+    check('playthrough turn: the full set, browser tools included',
+      captured3[0]?.tools?.length === TOOLS_API.length && toolNames(captured3[0]).includes('browser_navigate'));
+
+    // A standard turn that turns out to need a browser loads it in one step.
+    const captured4 = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'request_more_tools', args: {} }] },
+      { text: 'ok' },
+    ], captured4);
+    await provider.askNavy('what does the login form do?', false, 'qwen2.5-coder:32b', [], []);
+    check('standard tier: request_more_tools loads the browser tools for the next call',
+      !toolNames(captured4[0]).includes('browser_navigate') && toolNames(captured4[1]).includes('browser_navigate'));
   } catch (e) {
     check('reduced toolset suite ran', false, e.stack || e.message);
   } finally {
@@ -911,6 +957,363 @@ async function hallucinationSuite() {
     await provider.askNavy('hello', false, 'gpt-oss-120b', [], []);
     const sysBig = captured[0]?.messages?.find(m => m.role === 'system')?.content || '';
     check('small-model reinforcement absent for a large model', !sysBig.includes('READ THIS LAST INSTRUCTION'));
+
+    // ── A write makes earlier reads stale. The read cache used to outlive
+    // writes, so reading a file back after editing it answered "content
+    // unchanged" — false — and a failed apply_edit's "call read_file first"
+    // led straight into the same wall.
+    const toolMsgs = (req) => (req?.messages || []).filter(m => m.role === 'tool').map(m => String(m.content));
+    fs.writeFileSync(path.join(tmp, 'stale.js'), 'before');
+    const staleCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'stale.js', content: 'after' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
+      { text: 'Checked.' },
+    ], staleCap);
+    await provider.askNavy('update stale.js', false, null, [], []);
+    const readBack = toolMsgs(staleCap[3]).pop() || '';
+    check('reading a file back after writing it returns the new content, not "already retrieved"',
+      /after/.test(readBack) && !/Already retrieved/.test(readBack), readBack.slice(0, 200));
+
+    // ...while a repeat read with nothing changed in between is still caught.
+    const dupCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
+      { text: 'It says after.' },
+    ], dupCap);
+    await provider.askNavy('what is in stale.js?', false, null, [], []);
+    check('an unchanged file read twice is still answered from the cache',
+      /Already retrieved/.test(toolMsgs(dupCap[2]).pop() || ''));
+
+    // ── A rejected edit is the user's answer. The false-claim guard used to see
+    // "Changed: x" with nothing written and send the model back to "call
+    // apply_edit on x right now" — re-proposing exactly what was turned down.
+    posted.length = 0;
+    ctrl.config.approvalMode = 'ask-always';
+    ctrl.nextInfo = 'Reject';
+    fs.writeFileSync(path.join(tmp, 'declined.js'), 'original');
+    const rejCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'declined.js', content: 'proposed' } }] },
+      { text: '**Done:** rewrote it.\n**Changed:** declined.js\n**Result:** succeeded' },
+    ], rejCap);
+    await provider.askNavy('rewrite declined.js', false, null, [], []);
+    ctrl.config.approvalMode = 'auto-approve';
+    ctrl.nextInfo = undefined;
+    check('a rejected write is not applied', read('declined.js') === 'original');
+    check('the model is not sent back to redo an edit the user rejected',
+      rejCap.length === 2, 'requests=' + rejCap.length);
+    check('the rejection tells the model not to propose it again',
+      /Rejected by the user[\s\S]*Do not propose this change again/.test(toolMsgs(rejCap[1]).pop() || ''));
+    check('...and the footer says the user rejected it, rather than calling the report a fabrication',
+      posted.some(m => m.type === 'chunk' && /You rejected the proposed edit to `declined\.js`/.test(m.text || '')));
+
+    // ── Reading is the work on a question. Three rounds of reads used to earn
+    // "MUST take action — apply_edit, write_file…", pushing an explanation
+    // toward edits nobody asked for.
+    for (const n of ['q1.js', 'q2.js', 'q3.js']) fs.writeFileSync(path.join(tmp, n), n);
+    const qCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'q1.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'q2.js' } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'q3.js' } }] },
+      { text: 'Here is how it works.' },
+    ], qCap);
+    await provider.askNavy('explain how the q modules relate', false, null, [], []);
+    check('a question is not told to make edits after a few reads',
+      !qCap.some(req => toolMsgs(req).some(t => /MUST take action|Make the change now/.test(t))));
+
+    const sysOf = (req) => req?.messages?.find(m => m.role === 'system')?.content || '';
+    const userOf = (req) => String((req?.messages || []).filter(m => m.role === 'user').pop()?.content || '');
+
+    // ── The system message is identical on every call of a turn. The plan
+    // used to be rewritten into it each iteration, so every update_plan threw
+    // away the prompt cache for the whole transcript.
+    const planCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'look', status: 'in_progress' }, { step: 'act' }] } }] },
+      { toolCalls: [{ name: 'read_file', args: { path: 'q1.js' } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'look', status: 'done' }, { step: 'act', status: 'done' }] } }] },
+      { text: 'All done.' },
+    ], planCap);
+    await provider.askNavy('look then act on q1.js', false, null, [], []);
+    check('the system message does not change between the calls of one turn',
+      planCap.length === 4 && planCap.every(r => sysOf(r) === sysOf(planCap[0])) && !/YOUR CURRENT PLAN/.test(sysOf(planCap[3])));
+    check('...and the plan still reaches the model, through update_plan\'s own result',
+      toolMsgs(planCap[1]).some(t => /\[>\] 1\. look/.test(t)));
+
+    // ── Long chats got slower with every message because the system prompt
+    // changed every turn (the time, the growing turn ledger, the repo map), and
+    // nothing after a changed byte can come from a cache: each turn re-read
+    // the whole conversation. The system message must now be identical turn
+    // after turn, and each request must repeat the previous one's history
+    // exactly, so only the new turn is new.
+    provider.messages = [];
+    const cache1 = [], cache2 = [], cache3 = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'grown.js', content: 'function grown() {}\n' } }] },
+      { text: 'Wrote it.' },
+    ], cache1);
+    await provider.askNavy('create grown.js with an empty function grown', false, null, [], []);
+    provider._repoMapCache = null; // as if the 30 s cache ran out: the map is rebuilt, and now lists grown.js
+    global.fetch = queueOllamaFetch([{ text: 'It does nothing.' }], cache2);
+    await provider.askNavy('what does the function in grown.js do?', false, null, [], []);
+    global.fetch = queueOllamaFetch([{ text: 'Nothing else.' }], cache3);
+    await provider.askNavy('anything else in it?', false, null, [], []);
+    check('the system message is byte-identical from turn to turn',
+      sysOf(cache1[0]) === sysOf(cache2[0]) && sysOf(cache2[0]) === sysOf(cache3[0]));
+    check('...and holds none of what changes per turn',
+      !/Date\/time:|What earlier turns already did|Repository map:/.test(sysOf(cache2[0])));
+    check('what changes reaches the new request instead: the ledger, the rebuilt repo map, the time',
+      /What earlier turns already did/.test(userOf(cache2[0])) && /grown\.js/.test(userOf(cache2[0])) && /Date\/time:/.test(userOf(cache2[0])));
+    const before = cache2[0].messages.slice(0, -1);
+    check('turn 3 repeats turn 2\'s request exactly up to the new message — the part a cache can reuse',
+      JSON.stringify(cache3[0].messages.slice(0, before.length)) === JSON.stringify(before),
+      JSON.stringify(cache3[0].messages.slice(0, before.length)).slice(0, 200));
+    check('the internal cache flag never reaches a non-Anthropic provider',
+      !JSON.stringify(cache3[0]).includes('_cacheBreak'));
+
+    // ── The open file: its path always, its contents only when the request
+    // looks like it is about it, and never under "THE FILE YOU SHOULD EDIT".
+    fs.writeFileSync(path.join(tmp, 'open.js'), 'const OPEN_MARKER = 1;');
+    vscode.window.activeTextEditor = { document: { fileName: path.join(tmp, 'open.js'), languageId: 'javascript', uri: { fsPath: path.join(tmp, 'open.js') } } };
+    const hiCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'Hi!' }], hiCap);
+    await provider.askNavy('hi', false, null, [], []);
+    const fixCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'Looked.' }], fixCap);
+    await provider.askNavy('fix the bug here', false, null, [], []);
+    vscode.window.activeTextEditor = undefined;
+    check('a greeting is not sent the open file\'s contents',
+      !/OPEN_MARKER/.test(userOf(hiCap[0])) && /FILE OPEN IN THE EDITOR: .*open\.js/.test(userOf(hiCap[0])));
+    check('a request about code is sent them',
+      /OPEN_MARKER/.test(userOf(fixCap[0])));
+    check('the open file is no longer announced as THE file to edit',
+      !/THE FILE YOU SHOULD EDIT/.test(userOf(fixCap[0])));
+
+    // ── Repository rule files are not obeyed in an untrusted workspace — the
+    // same line workspace skills already had.
+    fs.writeFileSync(path.join(tmp, 'AGENTS.md'), 'RULES_MARKER: always do X.');
+    const trustedCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], trustedCap);
+    await provider.askNavy('hello', false, null, [], []);
+    vscode.workspace.isTrusted = false;
+    const untrustedCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], untrustedCap);
+    await provider.askNavy('hello', false, null, [], []);
+    vscode.workspace.isTrusted = true;
+    fs.rmSync(path.join(tmp, 'AGENTS.md'));
+    check('AGENTS.md reaches the prompt in a trusted workspace, scoped below the core rules',
+      /RULES_MARKER/.test(sysOf(trustedCap[0])) && /NOT the CRITICAL RULES/.test(sysOf(trustedCap[0])));
+    check('...and not in an untrusted one', !/RULES_MARKER/.test(sysOf(untrustedCap[0])));
+
+    // ── /bg gets the same environment and project facts as the chat, and is
+    // told nobody can answer it.
+    const bgCap = [];
+    global.fetch = queueOllamaFetch([{ toolCalls: [{ name: 'ask_user', args: { question: 'Which?', options: ['a', 'b'] } }] }, { text: 'Chose a.' }], bgCap);
+    await provider.runBackgroundTask('bg-test', 'tidy the readme');
+    check('a background task gets CURRENT ENVIRONMENT and the project root',
+      /CURRENT ENVIRONMENT/.test(sysOf(bgCap[0])) && sysOf(bgCap[0]).includes(tmp) && /## Background task/.test(sysOf(bgCap[0])));
+    check('...and its ask_user is answered with a refusal instead of parking it on a card',
+      provider.pendingQuestions.size === 0 && toolMsgs(bgCap[1]).some(t => /background task cannot ask/.test(t)));
+
+    // ── Clearing ALL memory asks first; clearing some does not.
+    await provider.toolRemember('the app uses vite');
+    await provider.toolRemember('tests run with vitest');
+    ctrl.nextWarning = undefined; // the person dismisses the question
+    const keep = await provider._modelForget('');
+    check('forget with no keyword asks, and a refusal removes nothing',
+      /did not agree/.test(keep) && /vitest/.test(await provider.loadProjectMemory()));
+    const some = await provider._modelForget('vitest');
+    const left = await provider.loadProjectMemory();
+    check('forget with a keyword removes just those facts, without asking',
+      /Removed/.test(some) && !/vitest/.test(left) && /vite\b/.test(left));
+    ctrl.nextWarning = 'Clear All';
+    await provider.toolRemember('another fact');
+    await provider._modelForget('');
+    ctrl.nextWarning = undefined;
+    check('...and an agreed clear-all does clear', !/- \[/.test(await provider.loadProjectMemory()));
+
+    // ── The "you forget tools" reminder: a stated small size anywhere, a
+    // "mini" name only when run locally.
+    const savedProvider = ctrl.config.provider;
+    ctrl.config.provider = 'openai';
+    check('reminder: a hosted gpt-4o-mini is not told it is a small model', provider._needsToolReminder('gpt-4o-mini') === false);
+    check('reminder: a stated 7b size earns it on any provider', provider._needsToolReminder('llama-3.1-7b') === true);
+    ctrl.config.provider = 'ollama';
+    check('reminder: a local phi3-mini earns it', provider._needsToolReminder('phi3-mini') === true);
+    ctrl.config.provider = savedProvider;
+
+    // ── Temperature follows navy.temperature; deep thinking only warms a
+    // model that is really thinking.
+    const savedLevel = provider.thinkingLevel;
+    provider.thinkingLevel = 'fast';
+    check('temperature: Fast is greedy', provider._turnTemperature('qwen2.5-coder:32b') === 0);
+    provider.thinkingLevel = 'max';
+    check('temperature: Max on a model that cannot think keeps navy.temperature',
+      provider._turnTemperature('qwen2.5-coder:32b') === 0.2);
+    check('temperature: Max on a thinking model uses its thinking-mode temperature',
+      provider._turnTemperature('qwen3:32b') === 0.6);
+    // ── Fixing a bug: check, fix, check again. ────────────────────────────
+    // The repeat-failure block survived edits, so the third run of a failing
+    // test - after a second fix - was refused, and the model patched blind.
+    const savedCmdMode = ctrl.config.commandApproval;
+    ctrl.config.commandApproval = 'auto-approve';
+    provider.messages = [];
+    const FAIL = 'node -e "process.exit(1)"';
+    const fixLoopCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: 'attempt 1' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: 'attempt 2' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { text: 'I could not make it pass: the check still fails.' },
+    ], fixLoopCap);
+    await provider.askNavy('fix the failing check', false, null, [], []);
+    const runResults = fixLoopCap.slice(1).map(r => toolMsgs(r).pop() || '').filter((t, i) => i % 2 === 0);
+    check('fixing: a check is re-run after each fix, not refused after two failures',
+      runResults.length === 3 && runResults.every(t => /^Exit code: 1/.test(t)) && !runResults.some(t => /^\[Blocked/.test(t)),
+      JSON.stringify(runResults.map(t => t.slice(0, 40))));
+    check('fixing: two fixes that leave the check failing bring a rethink, not another patch',
+      /2 fixes in a row have left this check failing. Stop patching/.test(runResults[2] || '') && !/fixes in a row/.test(runResults[1] || ''));
+
+    // ── Finishing on a failing check gets one push back. ─────────────────
+    provider.messages = [];
+    const gateCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'gate.js', content: 'v1' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { text: '**Done:** fixed it.\n**Changed:** gate.js\n**Result:** succeeded' },
+      { text: '**Result:** failed - the check still fails because the input is never parsed.' },
+    ], gateCap);
+    await provider.askNavy('fix the gate', false, null, [], []);
+    check('finish gate: a turn ending on its own failing check is sent back once',
+      gateCap.length === 4 && /failed with exit code 1, yet you are finishing/.test(JSON.stringify(gateCap[3]?.messages || [])),
+      'requests=' + gateCap.length);
+    check('finish gate: ...and an honest "still fails" reply is accepted',
+      /still fails/.test(provider.messages[provider.messages.length - 1]?.text || ''));
+    const honestCap = [];
+    provider.messages = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'gate.js', content: 'v2' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { text: 'This is not fixed yet: the check still fails.' },
+    ], honestCap);
+    await provider.askNavy('fix the gate again', false, null, [], []);
+    check('finish gate: a reply that already says it still fails is not sent back', honestCap.length === 3, 'requests=' + honestCap.length);
+
+    // ── What the previous turn changed reaches a follow-up. ─────────────
+    fs.writeFileSync(path.join(tmp, 'follow.js'), 'const rate = 10;\n');
+    provider.messages = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'apply_edit', args: { path: 'follow.js', search: 'const rate = 10;', replace: 'const rate = 0.1;' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { text: 'Changed the rate; the check still fails.' },
+    ]);
+    await provider.askNavy('fix the rate in follow.js', false, null, [], []);
+    const followCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'Looking again.' }], followCap);
+    await provider.askNavy('it still does not work', false, null, [], []);
+    const followMsg = userOf(followCap[0]);
+    check('follow-up: the request shows what the previous turn changed, as a diff',
+      /What the previous turn changed/.test(followMsg) && /-const rate = 10;/.test(followMsg) && /\+const rate = 0\.1;/.test(followMsg),
+      followMsg.slice(0, 300));
+    check('follow-up: ...and what its last check said', /Its last check: `node -e "process\.exit\(1\)"` exited 1/.test(followMsg));
+    ctrl.config.commandApproval = savedCmdMode;
+
+    // ── Thinking levels from what Ollama says the model supports. ────────
+    const { ollamaThink } = require('../src/thinking.js');
+    const dsCaps = { supported: true, values: [false, 'low', 'high', 'max'], def: 'high' };
+    check('think: Max sends "max" to a model that offers it',
+      ollamaThink('deepseek-v4.1-flash:cloud', 'max', dsCaps).think === 'max');
+    check('think: Extra high takes the deepest level not above it, and says so',
+      ollamaThink('x', 'xhigh', dsCaps).think === 'high' && ollamaThink('x', 'xhigh', dsCaps).used === 'high');
+    check('think: Fast takes the lightest level; Medium leaves the default',
+      ollamaThink('x', 'fast', dsCaps).think === 'low' && ollamaThink('x', 'medium', dsCaps).think === undefined);
+    check('think: a model that does not think is sent nothing, whatever its name',
+      ollamaThink('qwen3:8b', 'max', { supported: false, values: null }).think === undefined);
+    check('think: on/off-only thinking is switched on for deep levels',
+      ollamaThink('x', 'high', { supported: true, values: null }).think === true);
+    provider._recordOllamaThinking('deepseek-v4.1-flash:cloud', {
+      capabilities: ['completion', 'thinking', 'tools'],
+      thinking: { thinking: { values: [false, 'low', 'high', 'max'], default: 'high' } },
+    });
+    const thinkCap = [];
+    const savedThink = provider.thinkingLevel;
+    provider.thinkingLevel = 'max';
+    provider.messages = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], thinkCap);
+    await provider.askNavy('hello', false, 'deepseek-v4.1-flash:cloud', [], []);
+    provider.thinkingLevel = savedThink;
+    check('think: Navy actually sends think:"max" for it — before, it sent nothing and the model ran at its default',
+      thinkCap[0]?.think === 'max', JSON.stringify(thinkCap[0]?.think));
+
+    // A reasoning model the name list misses is recognised once it reasons.
+    provider.thinkingLevel = 'max';
+    check('temperature: an unknown model starts at navy.temperature', provider._turnTemperature('mystery-model:cloud') === 0.2);
+    provider._noteReasoningModel('mystery-model:cloud');
+    check('temperature: ...and once seen streaming reasoning, gets the thinking-mode temperature',
+      provider._turnTemperature('mystery-model:cloud') === 0.6);
+    check('temperature: deepseek-v4.1-flash is known as a reasoning model from the first call',
+      provider._turnTemperature('deepseek-v4.1-flash:cloud') === 0.6);
+    provider.thinkingLevel = savedLevel;
+
+    // ── Reasoning that goes in circles. The screenshot: "Let me call. OK.
+    // I'll call it. Go." over and over inside one Thinking block, until the
+    // turn ran out. The call is stopped as soon as the loop shows, retried
+    // once with a nudge to act, and the turn ends plainly if it loops again.
+    const { looksLikeReasoningLoop, ReasoningLoopGuard } = require('../src/reasoning-loop.js');
+    const LOOP = Array.from({ length: 300 }, (_, i) =>
+      ['Let me call.', 'OK.', 'I\'ll call it.', 'Go.', 'Let me write.', 'Calling.'][i % 6]).join('\n\n');
+    const GENUINE = Array.from({ length: 80 }, (_, i) =>
+      `Step ${i}: the parser reads token ${i * 7}, so line ${i + 3} needs a guard for ${['nulls', 'empty arrays', 'unicode', 'tabs'][i % 4]}.`).join(' ');
+    const PASSAGE = ('I need to write the whole server file now with the routes, the middleware, the error handler and the '
+      + 'startup code, then call write_file with all of it in one go so nothing is left half done. ').repeat(8);
+    check('loop: the screenshot\'s short repeating sentences are a loop', looksLikeReasoningLoop(LOOP));
+    check('loop: a long passage repeated word for word is a loop', looksLikeReasoningLoop(PASSAGE));
+    check('loop: long, varied reasoning is not', !looksLikeReasoningLoop(GENUINE));
+    check('loop: too little reasoning to judge is not', !looksLikeReasoningLoop(LOOP.slice(0, 800)));
+    let trips = 0;
+    const guard = new ReasoningLoopGuard(() => trips++);
+    for (let i = 0; i < LOOP.length; i += 40) guard.feed(LOOP.slice(i, i + 40));
+    check('loop: the guard trips while it streams, and only once', guard.tripped && trips === 1);
+
+    const thinkingEvent = (thinking, content = '') =>
+      ({ message: { role: 'assistant', content, thinking }, done: true, prompt_eval_count: 5, eval_count: 5 });
+    const scripted = (events, cap) => async (url, init) => {
+      if (cap && init?.body) cap.push(JSON.parse(init.body));
+      const evt = events.shift();
+      if (!evt) throw new Error('scripted fetch exhausted');
+      return { ok: true, status: 200, body: makeOneShotBody(evt), text: async () => '' };
+    };
+    provider.messages = [];
+    posted.length = 0;
+    const loopCap = [];
+    global.fetch = scripted([thinkingEvent(LOOP), thinkingEvent('Read the file, then answer.', 'Here is the answer.')], loopCap);
+    await provider.askNavy('explain the server', false, null, [], []);
+    check('loop: a looping call is stopped and retried once',
+      loopCap.length === 2, 'requests=' + loopCap.length);
+    check('loop: ...with a nudge to act on what it kept announcing',
+      /reasoning was going in circles/.test(JSON.stringify(loopCap[1]?.messages || [])));
+    check('loop: ...a little warmer than before',
+      loopCap[1]?.options?.temperature > loopCap[0]?.options?.temperature,
+      `${loopCap[0]?.options?.temperature} -> ${loopCap[1]?.options?.temperature}`);
+    check('loop: ...the chat is told why',
+      posted.some(m => m.type === 'systemNotice' && /reasoning started repeating itself/.test(m.text)));
+    check('loop: ...and the turn finishes with the real answer',
+      /Here is the answer\./.test(provider.messages[provider.messages.length - 1]?.text || ''));
+
+    posted.length = 0;
+    const twiceCap = [];
+    global.fetch = scripted([thinkingEvent(LOOP), thinkingEvent(LOOP)], twiceCap);
+    await provider.askNavy('explain the server again', false, null, [], []);
+    check('loop: looping again ends the turn instead of retrying forever',
+      twiceCap.length === 2, 'requests=' + twiceCap.length);
+    check('loop: ...and says so in the reply that is saved',
+      /went in circles again/.test(provider.messages[provider.messages.length - 1]?.text || ''));
   } catch (e) {
     check('hallucination suite ran', false, e.stack || e.message);
   } finally {
@@ -993,7 +1396,12 @@ async function toolLedgerSuite() {
     await provider.askNavy('do the second task', false, null, [], []);
     const sentMessages = captured[0]?.messages || [];
     const turn1Reply = sentMessages.find(m => m.role === 'assistant' && /read source\.js and wrote out\.js/.test(m.content || ''));
-    const sys = sentMessages.find(m => m.role === 'system')?.content || '';
+    // In the new request's own message, not the system prompt: the ledger grows
+    // every turn, and in the system prompt that growth made every turn
+    // reprocess the whole conversation instead of reusing the cached prefix.
+    const sys = String([...sentMessages].reverse().find(m => m.role === 'user')?.content || '');
+    check('turn ledger: kept out of the system prompt, which must not change between turns',
+      !/What earlier turns already did/.test(sentMessages.find(m => m.role === 'system')?.content || ''));
     check('turn ledger: reaches the model on the NEXT turn', /What earlier turns already did/.test(sys));
     check('turn ledger: names the exact file that was read', /read_file\(source\.js\)/.test(sys));
     check('turn ledger: names the exact file that was written', /wrote out\.js/.test(sys));
@@ -1011,7 +1419,7 @@ async function toolLedgerSuite() {
     check('turn ledger: the assistant message is exactly what was said',
       turn1Reply?.content === 'Done — read source.js and wrote out.js.',
       JSON.stringify(turn1Reply?.content || ''));
-    check('turn ledger: the system prompt tells the model not to reproduce it',
+    check('turn ledger: the request tells the model not to reproduce it',
       /never reproduce this list in a reply/.test(sys));
 
     // And it must not show up in the webview — main.js's own rendering of

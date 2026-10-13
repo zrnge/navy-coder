@@ -26,7 +26,9 @@ function extract(name) {
   const start = runner.indexOf('function ' + name);
   if (start === -1) throw new Error('cannot find ' + name + ' in run.js');
   let depth = 0;
-  for (let j = runner.indexOf('{', start); j < runner.length; j++) {
+  // The body opens at the first ") {" — not the first "{", which may be a
+  // default parameter such as `extra = {}`.
+  for (let j = runner.indexOf(') {', start) + 2; j < runner.length; j++) {
     if (runner[j] === '{') depth++;
     else if (runner[j] === '}') { depth--; if (depth === 0) return runner.slice(start, j + 1); }
   }
@@ -175,6 +177,81 @@ const SCENARIOS = {
     breakIt: () => {},
     breakReply: 'alpha, beta, gamma',
   },
+  'deep-read-question': {
+    solve: () => {},
+    reply: 'It starts with £ — DEFAULT_CURRENCY is GBP, set in lib/money/currency.js (lib/format.js only re-exports it).',
+    breakIt: () => {},
+    // Answered from the decoy.
+    breakReply: 'It starts with $, because DEFAULT_CURRENCY is USD in lib/money/legacy.js.',
+  },
+  'several-edits-one-file': {
+    solve: (d) => W(d, 'list.js', [
+      '/** Returns the first item. */', 'function first(items) {', '  return items[0];', '}', '',
+      '/** Returns the last item. */', 'function last(items) {', '  return items[items.length - 1];', '}', '',
+      '/** Returns how many items there are. */', 'function count(items) {', '  return items.length;', '}', '',
+      'module.exports = { first, last, count };', '',
+    ].join('\n')),
+    // The third comment landed inside the function body — where a stale line
+    // number puts it after the first two edits moved everything down.
+    breakIt: (d) => W(d, 'list.js', [
+      '/** Returns the first item. */', 'function first(items) {', '  return items[0];', '}', '',
+      '/** Returns the last item. */', 'function last(items) {', '  return items[items.length - 1];', '}', '',
+      'function count(items) {', '/** Returns how many items there are. */', '  return items.length;', '}', '',
+      'module.exports = { first, last, count };', '',
+    ].join('\n')),
+  },
+  'open-file-is-not-the-target': {
+    solve: (d) => W(d, 'calc.js', 'function double(n) {\n  return n * 2;\n}\nmodule.exports = { double };\n'),
+    breakIt: (d) => W(d, 'README.md', '# Calc\n\nA tiny calculator. double(n) returns n * 2.\n'),
+  },
+  'open-file-is-the-target': {
+    solve: (d) => W(d, 'calc.js', 'function double(n) {\n  return n * 2;\n}\nmodule.exports = { double };\n'),
+    // Edited a file that was neither open nor named.
+    breakIt: (d) => W(d, 'other.js', 'function triple(n) {\n  return n * 2;\n}\nmodule.exports = { triple };\n'),
+  },
+  'non-english-request': {
+    solve: (d) => W(d, 'limits.js', 'const MAX_RETRIES = 5;\nconst TIMEOUT_MS = 30000;\nmodule.exports = { MAX_RETRIES, TIMEOUT_MS };\n'),
+    breakIt: () => {}, // the request was not acted on at all
+  },
+  'rejected-edit-not-repeated': {
+    solve: () => {},
+    proposals: ['greet.js'],
+    reply: 'You rejected the change, so greet.js still says "Hello".\n**Changed:** none',
+    breakIt: () => {},
+    // Re-proposed the edit the user had just turned down.
+    breakProposals: ['greet.js', 'greet.js'],
+    breakReply: 'Done.\n**Changed:** none',
+  },
+  'followup-keeps-context': {
+    solve: (d) => W(d, 'pricing.js', 'function total(items) {\n  return items.reduce((sum, item) => sum + item.price * item.qty, 0) * 0.9;\n}\nmodule.exports = { total };\n'),
+    // "it" read as the wrong function.
+    breakIt: (d) => W(d, 'shipping.js', 'function shipping(weightKg) {\n  return (5 + weightKg * 2) * 0.9;\n}\nmodule.exports = { shipping };\n'),
+  },
+  'debug-root-cause-other-file': {
+    solve: (d) => W(d, 'discount.js', 'function applyDiscount(price, pct) {\n  return price * (1 - pct / 100);\n}\nmodule.exports = { applyDiscount };\n'),
+    // The symptom patched where it shows, tuned to the one visible case.
+    breakIt: (d) => W(d, 'discount.js', 'function applyDiscount(price, pct) {\n  return pct === 10 ? price - 20 : price - pct;\n}\nmodule.exports = { applyDiscount };\n'),
+  },
+  'debug-pagination-edges': {
+    solve: (d) => W(d, 'paginate.js', 'function paginate(all, page, size) {\n  const pages = Math.ceil(all.length / size);\n  const start = (page - 1) * size;\n  return { items: all.slice(start, start + size), pages };\n}\nmodule.exports = { paginate };\n'),
+    // Fixed the slice the test shows; the page count is still wrong.
+    breakIt: (d) => W(d, 'paginate.js', 'function paginate(all, page, size) {\n  const pages = Math.floor(all.length / size);\n  const start = (page - 1) * size;\n  return { items: all.slice(start, start + size), pages };\n}\nmodule.exports = { paginate };\n'),
+  },
+  'debug-concurrent-cache': {
+    solve: (d) => W(d, 'cache.js', fs.readFileSync(path.join(d, 'cache.js'), 'utf8')
+      .replace(/async function getUser\(id\) \{[\s\S]*?\n\}/, 'function getUser(id) {\n  if (!cache[id]) cache[id] = fetchUser(id);\n  return cache[id];\n}')),
+    breakIt: (d) => W(d, 'test.js', "console.log('all tests passed');\n"),   // the test was edited, not the bug
+  },
+  'debug-fix-without-breaking': {
+    solve: (d) => W(d, 'slugify.js', "function slugify(s) {\n  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');\n}\nmodule.exports = { slugify };\n"),
+    // Strips punctuation the naive way, which eats the hyphens of a slug that was already fine.
+    breakIt: (d) => W(d, 'slugify.js', "function slugify(s) {\n  return s.trim().toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/ +/g, '-');\n}\nmodule.exports = { slugify };\n"),
+  },
+  'small-talk-after-task': {
+    solve: (d) => W(d, 'a.js', '// reviewed\n' + fs.readFileSync(path.join(d, 'a.js'), 'utf8')),
+    // "thanks!" ran the task a second time.
+    breakIt: (d) => W(d, 'a.js', '// reviewed\n// reviewed\n' + fs.readFileSync(path.join(d, 'a.js'), 'utf8')),
+  },
 };
 
 async function main() {
@@ -192,7 +269,7 @@ async function main() {
     let dir = seedRepo(task);
     try {
       await sc.solve(dir);
-      const ctx = makeCheckContext(dir, task, sc.reply || '');
+      const ctx = makeCheckContext(dir, task, sc.reply || '', { proposals: sc.proposals });
       const v = await task.check(ctx);
       check(`${task.id}: passes on a correct outcome`, v.pass === true, v.reason);
     } catch (e) {
@@ -206,7 +283,8 @@ async function main() {
     dir = seedRepo(task);
     try {
       await sc.breakIt(dir);
-      const ctx = makeCheckContext(dir, task, sc.breakReply !== undefined ? sc.breakReply : '');
+      const ctx = makeCheckContext(dir, task, sc.breakReply !== undefined ? sc.breakReply : '',
+        { proposals: sc.breakProposals !== undefined ? sc.breakProposals : sc.proposals });
       const v = await task.check(ctx);
       check(`${task.id}: fails on a wrong outcome`, v.pass === false, 'checker passed a bad outcome — it cannot detect failure');
     } catch (e) {

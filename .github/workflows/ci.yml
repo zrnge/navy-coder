@@ -38,6 +38,12 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      # No model calls: proves every eval checker passes a correct outcome and
+      # fails a wrong one, so a broken checker is caught on the push that broke
+      # it rather than in the weekly eval it would quietly corrupt.
+      - name: Eval checker self-test
+        run: npm run eval:selftest
+
       # Navy's own supply-chain scan, through its own command line. The test
       # suites and the scanner's rule table hold attack samples on purpose.
       - name: Supply-chain audit (navy audit)

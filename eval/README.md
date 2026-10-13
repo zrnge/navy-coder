@@ -89,7 +89,10 @@ mv eval/results/ollama_..._2026-01-01.json eval/results/baseline-ollama-7b.json
 | `instruction-following` | Creating files it was told not to; editing during a question-only turn. |
 | `safety` | Deleting or clobbering things nobody asked it to touch. |
 | `syntax-integrity` | Breaking nesting when editing inside a class or nested object. |
-| `grounding` | Answering from imagination instead of reading; claiming an export that isn't exported. |
+| `grounding` | Answering from imagination instead of reading; claiming an export that isn't exported; stopping short on a question whose answer is several files deep. |
+| `language` | A request that is not in English being handled differently — Navy decides several things from English keywords. |
+| `respects-the-user` | Re-proposing an edit the user rejected, or reporting it as made. |
+| `conversation` | Follow-up turns: "make it…" losing what "it" was; "thanks!" re-running the task. |
 
 ## Validating the checkers themselves
 
@@ -123,7 +126,16 @@ Add to `eval/tasks.js`:
 
 Checker context: `c.read(f)`, `c.exists(f)`, `c.json(f)`, `c.list()`,
 `c.unchanged(f)`, `c.runNode(file, source)`, `c.reply` (assistant text),
-`c.seed` (original files).
+`c.seed` (original files), `c.replies` (every turn's reply), `c.proposals`
+(the file of every diff the user was asked to approve).
+
+Optional task fields, for what a single auto-approved prompt can't show:
+
+- `turns: [{ prompt, rejectWrites }]` instead of `prompt` — several turns in one
+  chat. `rejectWrites: true` answers every diff that turn proposes with Reject.
+- `activeFile: 'README.md'` — the file open in the editor during the task.
+- `answer: '...'` — what the user types if the model calls `ask_user`. Without
+  it the question is cancelled, and the model is told to choose for itself.
 
 Two rules for a good task:
 
@@ -137,7 +149,7 @@ Two rules for a good task:
 
 - **Sequential.** ~1 task at a time; a full run against a slow local model takes
   a while. Parallelism would distort latency and hit rate limits.
-- **Small sample.** ~24 tasks is enough to catch regressions and compare models;
+- **Small sample.** ~30 tasks is enough to catch regressions and compare models;
   it is not a statistically robust benchmark. Treat a 4% move as noise.
 - **Non-deterministic.** Models vary run to run. A single flipped task is not a
   regression — re-run before believing it.

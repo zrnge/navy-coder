@@ -545,7 +545,7 @@ class BrowserToolMethods {
   _playthroughCommon() {
     return `You have FULL AUTONOMY: submit forms, follow links, and trigger real actions as needed to exercise the site. (The user was warned this runs against a live browser; you do not need to ask permission for each interaction.)
 
-Tools available to you (a real Chrome window is open and visible):
+Tools available to you (a real Chrome window opens on the first browser_navigate). If the browser_* tools are not in your tool list yet, call request_more_tools first — it loads them:
 - browser_navigate(url) — go to a page.
 - browser_snapshot() — numbered outline of interactive elements + headings + alerts, across every frame (rows inside an iframe say so); the [ref] numbers feed click/type/hover. Re-snapshot after every navigation or page change (refs go stale). Anything it does not list — a drop zone, a plain-div menu, a canvas — can be addressed by CSS selector instead of a ref on any of these tools.
 - browser_screenshot() — SEE the page as an image. Take one on each important screen and actually look: layout, alignment, overlap, cut-off/overflowing text, contrast, broken images, responsiveness. (If you cannot see images, say so and lean on snapshot + evaluate.)

@@ -643,6 +643,171 @@ function bubbleSuite() {
   check('thinking: while streaming the card is marked live (drives the spinning wheel)',
     wt2.document.querySelector('.think-block')?.classList.contains('think-live') === true);
   wt2.close();
+
+  // A turn that thinks, plans and reads, thinks again and edits, thinks again
+  // and searches, then answers. Each stretch of reasoning is its own block,
+  // where it happened. It used to be one block at the top of the turn holding
+  // all three, so the reasoning behind the last step was a long scroll above it.
+  const flowWithThinking = (w) => [...w.document.querySelectorAll(
+    '.message.assistant .think-block, .message.assistant .activity-log, .message.assistant .message-bubble')]
+    .filter(n => !n.classList.contains('message-bubble') || n.textContent.trim())
+    .map(n => n.classList.contains('think-block') ? 'think:' + n.querySelector('.think-content').textContent
+      : n.classList.contains('activity-log') ? 'tools' : 'text:' + n.textContent.trim());
+  const wt3 = run([
+    { type: 'start' },
+    { type: 'thinkingChunk', text: 'Plan ' }, { type: 'thinkingChunk', text: 'first.' },
+    { type: 'toolCall', tool: 'update_plan', args: { steps: [] }, callId: 'p1' },
+    { type: 'toolResult', tool: 'update_plan', result: 'Plan updated', callId: 'p1' },
+    { type: 'toolCall', tool: 'read_file', args: { path: 'a.js' }, callId: 'r1' },
+    { type: 'toolResult', tool: 'read_file', result: 'x', callId: 'r1' },
+    { type: 'thinkingChunk', text: 'Now edit.' },
+    { type: 'toolCall', tool: 'apply_edit', args: { path: 'a.js' }, callId: 'e1' },
+    { type: 'toolResult', tool: 'apply_edit', result: 'Applied to a.js', callId: 'e1' },
+    { type: 'thinkingChunk', text: 'Search callers.' },
+    { type: 'toolCall', tool: 'search_codebase', args: { query: 'a' }, callId: 's1' },
+    { type: 'toolResult', tool: 'search_codebase', result: 'a.js:1', callId: 's1' },
+    { type: 'chunk', text: 'Done.' },
+    { type: 'done' },
+  ]);
+  check('thinking: each stretch of reasoning is its own block, in order among the work',
+    JSON.stringify(flowWithThinking(wt3)) === JSON.stringify(
+      ['think:Plan first.', 'tools', 'think:Now edit.', 'tools', 'think:Search callers.', 'tools', 'text:Done.']),
+    JSON.stringify(flowWithThinking(wt3)));
+  check('thinking: every finished block is settled, none left spinning',
+    wt3.document.querySelectorAll('.think-block').length === 3 && wt3.document.querySelectorAll('.think-live').length === 0);
+  wt3.close();
+
+  // Finished batches of tool steps fold into their summary as soon as the next
+  // batch starts, not only when the turn ends, so a long turn does not keep
+  // every row of every batch laid out.
+  const wf = run([
+    { type: 'start' },
+    { type: 'toolCall', tool: 'read_file', args: { path: 'a.js' }, callId: 'a1' },
+    { type: 'toolResult', tool: 'read_file', result: 'x', callId: 'a1' },
+    { type: 'toolCall', tool: 'search_codebase', args: { query: 'q' }, callId: 'a2' },   // still running
+    { type: 'thinkingChunk', text: 'Next.' },
+    { type: 'toolCall', tool: 'read_file', args: { path: 'b.js' }, callId: 'b1' },
+  ]);
+  const folded = (l) => Boolean(l.querySelector('.activity-log-collapsed'));
+  let logs = [...wf.document.querySelectorAll('.message.assistant .activity-log')];
+  check('steps: a batch with a step still running is not folded when the next batch starts',
+    logs.length === 2 && !folded(logs[0]) && !folded(logs[1]), logs.map(l => (folded(l) ? 'folded' : 'open')).join(','));
+  wf.post({ type: 'toolResult', tool: 'read_file', result: 'y', callId: 'b1' });
+  wf.post({ type: 'toolResult', tool: 'search_codebase', result: 'a.js:1', callId: 'a2' });
+  wf.post({ type: 'thinkingChunk', text: 'Then.' });
+  wf.post({ type: 'toolCall', tool: 'read_file', args: { path: 'c.js' }, callId: 'c1' });
+  logs = [...wf.document.querySelectorAll('.message.assistant .activity-log')];
+  check('steps: once finished, earlier batches fold into their summary as the next batch starts',
+    logs.length === 3 && folded(logs[0]) && folded(logs[1]) && !folded(logs[2]) && /2 steps/.test(logs[0].textContent),
+    logs.map(l => (folded(l) ? 'folded' : 'open')).join(','));
+  wf.close();
+
+  // Reasoning that resumes after the model has written to the user is a new
+  // block too, below that text.
+  const wt4 = run([
+    { type: 'start' },
+    { type: 'thinkingChunk', text: 'Look first.' },
+    { type: 'chunk', text: 'Let me check.' },
+    { type: 'thinkingChunk', text: 'It is fine.' },
+    { type: 'chunk', text: 'All good.' },
+    { type: 'done' },
+  ]);
+  check('thinking: reasoning after a reply starts a new block below it',
+    JSON.stringify(flowWithThinking(wt4)) === JSON.stringify(
+      ['think:Look first.', 'text:Let me check.', 'think:It is fine.', 'text:All good.']),
+    JSON.stringify(flowWithThinking(wt4)));
+  wt4.close();
+
+  // The reported screenshot, live: between rounds of reasoning the model
+  // printed text that renders to nothing — here a tool call as JSON, which the
+  // panel hides. That opened an empty, invisible answer bubble after the
+  // Thinking block, and every round started a new block: a column of Thinking
+  // blocks with nothing visible between them.
+  const wt7 = run([
+    { type: 'start' },
+    { type: 'thinkingChunk', text: 'Round one.' },
+    { type: 'chunk', text: '{"name": "read_file", "arguments": {"path": "a.js"}}' },
+    { type: 'thinkingChunk', text: 'Round two.' },
+    { type: 'chunk', text: '{"name": "read_file", "arguments": {"path": "b.js"}}' },
+    { type: 'thinkingChunk', text: 'Round three.' },
+    { type: 'chunk', text: 'The answer.' },
+    { type: 'done' },
+  ]);
+  check('thinking: reasoning with nothing VISIBLE between it stays one block — no column of empty Thinking blocks',
+    wt7.document.querySelectorAll('.think-block').length === 1,
+    String(wt7.document.querySelectorAll('.think-block').length));
+  check('thinking: ...its rounds set apart by a blank line, and the answer still lands below it',
+    JSON.stringify(flowWithThinking(wt7)) === JSON.stringify(
+      ['think:Round one.\n\nRound two.\n\nRound three.', 'text:The answer.']),
+    JSON.stringify(flowWithThinking(wt7)));
+  wt7.close();
+
+  // A reopened chat draws the saved blocks the same way.
+  const wt5 = run([{
+    type: 'restore',
+    messages: [
+      { role: 'user', text: 'fix it' },
+      { role: 'assistant', text: 'Fixed.', cards: [
+        { kind: 'thinking', text: 'Read it first.' },
+        { tool: 'read_file', args: { path: 'a.js' }, result: 'x' },
+        { kind: 'thinking', text: 'Edit line 2.' },
+        { tool: 'apply_edit', args: { path: 'a.js' }, result: 'Applied to a.js' },
+      ] },
+    ],
+  }]);
+  check('thinking: a reopened chat shows each saved block where it happened',
+    JSON.stringify(flowWithThinking(wt5)) === JSON.stringify(
+      ['think:Read it first.', 'tools', 'think:Edit line 2.', 'tools', 'text:Fixed.']),
+    JSON.stringify(flowWithThinking(wt5)));
+  wt5.close();
+
+  // The reported screenshot: a chat saved with a Thinking record per round,
+  // where the tool cards between them were past the turn's save limit, came
+  // back as a column of Thinking blocks with nothing between them. Records
+  // with nothing drawn between them are one block when reopened — which also
+  // repairs chats already saved that way.
+  const wt6 = run([{
+    type: 'restore',
+    messages: [
+      { role: 'user', text: 'build it' },
+      { role: 'assistant', text: 'Built.', cards: [
+        { kind: 'thinking', text: 'Round one.' },
+        { tool: 'read_file', args: { path: 'a.js' }, result: 'x' },
+        { kind: 'thinking', text: 'Round two.' },
+        { kind: 'thinking', text: 'Round three.' },
+        { kind: 'thinking', text: 'Round four.' },
+      ] },
+    ],
+  }]);
+  check('thinking: saved blocks with nothing between them reopen as ONE block, not a stack',
+    JSON.stringify(flowWithThinking(wt6)) === JSON.stringify(
+      ['think:Round one.', 'tools', 'think:Round two.\n\nRound three.\n\nRound four.', 'text:Built.']),
+    JSON.stringify(flowWithThinking(wt6)));
+  check('thinking: ...and every reopened block is settled, none spinning',
+    wt6.document.querySelectorAll('.think-live').length === 0);
+  wt6.close();
+
+  // Reopening a long chat took 11.8 seconds for 30 turns in Chrome: every card
+  // drawn refreshed the navigation arrows, which measure the scrollbar and so
+  // lay out the whole chat - hundreds of full layouts. The refresh is now once
+  // a frame. Frames here are queued, as in a browser, and the measuring counted.
+  const wr = createWebview();
+  const queued = [];
+  wr.window.requestAnimationFrame = (cb) => { queued.push(cb); return queued.length; };
+  let measured = 0;
+  const msgs = wr.document.querySelector('#messages');
+  Object.defineProperty(msgs, 'offsetWidth', { get: () => { measured++; return 300; }, configurable: true });
+  const longChat = [];
+  for (let t = 0; t < 10; t++) {
+    longChat.push({ role: 'user', text: 'turn ' + t });
+    longChat.push({ role: 'assistant', text: 'done ' + t, cards: Array.from({ length: 20 }, (_, k) =>
+      ({ tool: 'read_file', args: { path: 'f' + k + '.js' }, result: 'x' })) });
+  }
+  wr.post({ type: 'restore', messages: longChat });
+  while (queued.length) queued.shift()(0);
+  check('restore: reopening a long chat measures the layout a handful of times, not once per card',
+    measured <= 3, 'measured ' + measured + ' times for 200 cards');
+  wr.close();
   // The whole open card reads as clickable-to-fold, so its content shows a
   // pointer cursor when open — no button to hunt for, no scroll back up.
   const thinkCss = require('fs').readFileSync(require('path').join(__dirname, '..', 'media', 'styles.css'), 'utf8');
@@ -789,12 +954,20 @@ function bubbleSuite() {
     removedRow?.querySelector('code')?.textContent === 'b' && removedRow?.querySelectorAll('.diff-ln')[0]?.textContent.trim() === '3'
     && addedRow?.querySelector('code')?.textContent === 'B' && addedRow?.querySelectorAll('.diff-ln')[1]?.textContent.trim() === '3',
     diffCards[0]?.innerHTML.slice(0, 400));
+  // An applied diff keeps only its preview rows in the page; the whole diff,
+  // with its "N unchanged lines" markers, is built when it is expanded.
+  check('restore: an applied diff holds only its preview until expanded — no hidden full diff in the page',
+    !diffCards[0]?.querySelector('.diff-skip') && diffCards[0]?.querySelectorAll('.diff-line').length <= 12);
+  diffCards[0]?.querySelector('.diff-expand-btn')?.dispatchEvent(new w6.window.Event('click'));
   const skipped = [...(diffCards[0]?.querySelectorAll('.diff-skip') || [])].map(e => e.textContent.trim());
   check('restore: ...with the unchanged lines before and after counted, as a live card counts them',
     skipped.some(t => t.endsWith(' 1 unchanged line') || t === '1 unchanged line') && skipped.some(t => t.endsWith('16 unchanged lines')),
     JSON.stringify(skipped));
   check('restore: an applied diff keeps its preview and the toggle to the whole diff, a rejected one collapses',
     Boolean(diffCards[0]?.querySelector('.diff-expand-btn')) && !diffCards[1]?.querySelector('.diff-body'));
+  diffCards[0]?.querySelector('.diff-expand-btn')?.dispatchEvent(new w6.window.Event('click'));
+  check('restore: collapsing the diff again takes the full diff back out of the page',
+    !diffCards[0]?.querySelector('.diff-skip') && diffCards[0]?.querySelector('.diff-body')?.classList.contains('preview'));
   const editRow = [...d6.querySelectorAll('.activity-row')].find(r => r.textContent.includes('client.js'));
   check('restore: a diff card sits under the tool that made it, as it did live',
     Boolean(editRow && diffCards[0]) && Boolean(editRow.compareDocumentPosition(diffCards[0]) & w6.window.Node.DOCUMENT_POSITION_FOLLOWING));
@@ -2499,6 +2672,9 @@ function jumpLatestSuite() {
   const messages = w.document.querySelector('#messages');
   Object.defineProperty(messages, 'scrollHeight', { value: 1000, configurable: true });
   Object.defineProperty(messages, 'clientHeight', { value: 200, configurable: true });
+  // A wheel first: only a scroll the reader made counts as leaving the bottom
+  // (see the scroll handler in main.js).
+  messages.dispatchEvent(new w.window.Event('wheel'));
   messages.scrollTop = 0;
   messages.dispatchEvent(new w.window.Event('scroll'));
   check('scrolling away reveals it', !btn.hidden);
@@ -2524,6 +2700,68 @@ function jumpLatestSuite() {
 
   btn.dispatchEvent(new w.window.Event('click'));
   check('pressing it returns to the bottom and hides again', btn.hidden);
+  w.close();
+
+  followSuite();
+}
+
+// The live chat stopped following "sometimes". A scroll event arrives a frame
+// after the scroll that caused it; output that landed in between made the
+// panel's own scroll-to-bottom look like the reader scrolling up, and from then
+// on nothing followed. Only the reader's own gestures may stop following now.
+function followSuite() {
+  console.log('\nscroll: the live chat keeps following until the reader leaves:');
+  const w = createWebview();
+  const messages = w.document.querySelector('#messages');
+  const btn = w.document.querySelector('#jumpLatest');
+  let height = 1000;
+  Object.defineProperty(messages, 'scrollHeight', { get: () => height, configurable: true });
+  Object.defineProperty(messages, 'clientHeight', { value: 200, configurable: true });
+  const scrollEvent = () => messages.dispatchEvent(new w.window.Event('scroll'));
+
+  w.post({ type: 'start' });
+  w.post({ type: 'chunk', text: 'first part' });
+  check('following: a chunk scrolls to the bottom', messages.scrollTop === height, String(messages.scrollTop));
+
+  // The race: the panel scrolled to 1000, then a big card made the content
+  // 1600 tall before that scroll's event was handled.
+  height = 1600;
+  scrollEvent();
+  check('following: a scroll event measured after new output landed is not the reader leaving',
+    btn.hidden, 'jump button shown');
+  check('...and the panel catches up to the new bottom', messages.scrollTop === 1600, String(messages.scrollTop));
+  // A tool row scrolls at once; a chunk's scroll waits for its throttled render.
+  height = 1700;
+  w.post({ type: 'toolCall', tool: 'read_file', args: { path: 'a.js' }, callId: 'f1' });
+  check('...and keeps following what comes next', messages.scrollTop === 1700, String(messages.scrollTop));
+
+  // The reader scrolls up with the wheel: that stops following.
+  messages.dispatchEvent(new w.window.Event('wheel'));
+  messages.scrollTop = 300;
+  scrollEvent();
+  check('a wheel scroll away from the bottom stops following', !btn.hidden);
+  height = 1900;
+  w.post({ type: 'toolCall', tool: 'read_file', args: { path: 'b.js' }, callId: 'f2' });
+  check('...and new output leaves the reader where they are', messages.scrollTop === 300, String(messages.scrollTop));
+
+  // Back to the bottom by hand: following resumes.
+  messages.dispatchEvent(new w.window.Event('wheel'));
+  messages.scrollTop = 1700;
+  scrollEvent();
+  check('scrolling back to the bottom resumes following', btn.hidden);
+  height = 2200;
+  w.post({ type: 'toolCall', tool: 'read_file', args: { path: 'c.js' }, callId: 'f3' });
+  check('...so what comes next is followed again', messages.scrollTop === 2200, String(messages.scrollTop));
+
+  // Dragging the scrollbar is the reader too. A press on the bar lands on the
+  // scroller itself, right of its content box.
+  const press = new w.window.MouseEvent('pointerdown', { bubbles: true });
+  Object.defineProperty(press, 'offsetX', { value: 9999 });
+  messages.dispatchEvent(press);
+  messages.scrollTop = 500;
+  scrollEvent();
+  w.window.dispatchEvent(new w.window.MouseEvent('pointerup'));
+  check('dragging the scrollbar away from the bottom stops following', !btn.hidden);
   w.close();
 }
 
@@ -2755,6 +2993,7 @@ function msgStepSuite() {
     !d.querySelector('#messages #msgPrev') && !d.querySelector('#messages #msgNext'));
   check('…in the wrapper that holds it', !!d.querySelector('.messages-wrap > #msgPrev')
     && !!d.querySelector('.messages-wrap > #msgNext'));
+  messages.dispatchEvent(new w.window.Event('wheel'));
   messages.scrollTop = 0;
   messages.dispatchEvent(new w.window.Event('scroll'));
 
@@ -2808,6 +3047,7 @@ function msgStepSuite() {
   // at. Walk the whole scroll range and require both to be present throughout.
   const absent = [];
   for (const pos of [0, 150, 300, 600, 900, 1200]) {
+    messages.dispatchEvent(new w.window.Event('wheel'));
     messages.scrollTop = pos;
     messages.dispatchEvent(new w.window.Event('scroll'));
     if (prev.hidden || next.hidden) absent.push(pos);

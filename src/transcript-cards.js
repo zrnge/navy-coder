@@ -36,6 +36,8 @@ function beginTurnCards(session, cardLog) {
   session.turnCardIds = new Map();
   session.turnCardCalls = new Set();   // callIds whose tool card was kept
   session.turnThinking = null;
+  session.turnThinkingChars = 0;
+  session.turnThinkingGap = false;
   session.turnDiffChars = 0;
 }
 
@@ -45,6 +47,8 @@ function endTurnCards(session) {
   session.turnCardIds = null;
   session.turnCardCalls = null;
   session.turnThinking = null;
+  session.turnThinkingChars = 0;
+  session.turnThinkingGap = false;
   session.turnDiffChars = 0;
 }
 
@@ -156,20 +160,53 @@ function recordTranscriptCard(session, message) {
       log.push({ kind: 'image', tool: message.tool, file: message.file, caption: String(message.caption || '') });
       return;
     }
+    // A tool call or a reply between two stretches of reasoning: noted, so
+    // the next stretch is set apart from this one by a blank line. Whether it
+    // also starts a new block is decided by what the SAVED log holds - below.
+    case 'toolCall':
+    case 'chunk':
+      if (session.turnThinking && (message.type === 'toolCall' || String(message.text || '').trim())) {
+        session.turnThinkingGap = true;
+      }
+      return;
     case 'thinkingChunk': {
-      // One block per turn, placed where the reasoning started - which is how
-      // the transcript draws it: every later chunk goes into the same block.
+      // One block per stretch of reasoning, in place among the turn's other
+      // cards - the transcript draws it the same way. It used to be one block
+      // per turn, so every later round of reasoning was added to the block at
+      // the very top, and reading what the model thought before its last edit
+      // meant scrolling back to where the turn began.
+      //
+      // A new block only when something that is SAVED came after the last
+      // one: a tool card, a diff, an approval. Not everything shown live is
+      // saved - tool cards stop after CARD_LOG_MAX in a turn, and the text the
+      // model writes mid-turn is not kept at all - and starting a block for
+      // those left a reopened chat with dozens of Thinking blocks stacked with
+      // nothing between them. Stretches with nothing saved between them stay
+      // one block, apart by a blank line.
       const text = String(message.text || '');
       if (!text) return;
       let record = session.turnThinking;
+      if (record && log[log.length - 1] !== record) record = null;
+      let lead = '';
       if (!record) {
         record = { kind: 'thinking', text: '' };
         session.turnThinking = record;
         log.push(record);
+      } else if (session.turnThinkingGap && record.text) {
+        lead = '\n\n';
       }
-      const room = THINKING_CARD_MAX - record.text.length;
-      if (text.length > room) record.truncated = true;
-      if (room > 0) record.text += text.slice(0, room);
+      session.turnThinkingGap = false;
+      // One allowance for all of a turn's reasoning together, as before: split
+      // into blocks, a long turn would otherwise save many times the cap.
+      const used = session.turnThinkingChars || 0;
+      const room = THINKING_CARD_MAX - used;
+      const piece = lead + text;
+      if (piece.length > room) record.truncated = true;
+      if (room > 0) {
+        const kept = piece.slice(0, room);
+        record.text += kept;
+        session.turnThinkingChars = used + kept.length;
+      }
       return;
     }
     default:

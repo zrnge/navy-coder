@@ -563,7 +563,9 @@ function stepSearch(dir) {
   _searchIdx = (_searchIdx + dir + _searchMatches.length) % _searchMatches.length;
   const el = _searchMatches[_searchIdx];
   el.classList.add('search-current');
+  userScrolledUp = true; // an explicit jump: the live chat must not pull the reader off the match
   el.scrollIntoView?.({ block: 'center' });
+  updateJumpLatest();
   setSearchCount((_searchIdx + 1) + ' of ' + _searchMatches.length);
 }
 
@@ -682,6 +684,10 @@ function stepMessage(dir) {
   // Exactly the top of the message, with no slack — landing a few pixels short
   // leaves the previous message's last line on screen, which reads as having
   // arrived in the wrong place.
+  // The reader's own move, like the wheel: without this the scroll it causes
+  // looks like content shifting under a follower, and is "corrected" straight
+  // back to the bottom (see the scroll handler).
+  noteUserScroll();
   messagesEl.scrollTop += messageOffsetWithin(list[next]);
   // Stepping is deliberate movement, so autoscroll must not haul the reader back
   // down mid-reply — unless they stepped onto the last turn, which is the same
@@ -1101,12 +1107,78 @@ jumpLatestBtn?.addEventListener('click', () => {
   updateJumpLatest();
 });
 
+// Following the live chat. Only the reader can stop it; the panel's own
+// scrolling and content changing size can only keep it going.
+//
+// The scroll handler used to decide "scrolled up" from position alone, and a
+// scroll event is delivered a frame after the scroll that caused it. Navy
+// scrolls to the bottom, a diff card or a long chunk lands before that event
+// is handled, and the handler measures against the new, taller content: more
+// than 40px from the bottom, so "the user scrolled up", and every later
+// scrollToBottom() stood still. That is the "sometimes it stops following" -
+// it needed output to arrive in exactly that gap. Now a scroll counts as the
+// reader leaving only when they did something that scrolls: the wheel, a
+// touch, a scrolling key, or dragging the scrollbar.
+const NEAR_BOTTOM_PX = 40;
+const USER_SCROLL_WINDOW_MS = 500;   // how long after a gesture its scroll events count as theirs
+let _lastUserScrollAt = 0;
+let _draggingScrollbar = false;
+const distanceFromBottom = () => messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+const noteUserScroll = () => { _lastUserScrollAt = Date.now(); };
+messagesEl.addEventListener('wheel', noteUserScroll, { passive: true });
+messagesEl.addEventListener('touchstart', noteUserScroll, { passive: true });
+messagesEl.addEventListener('touchmove', noteUserScroll, { passive: true });
+messagesEl.addEventListener('keydown', (e) => {
+  if (['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' '].includes(e.key)) noteUserScroll();
+});
+// A press on the scrollbar itself lands on the scroller, to the right of its
+// content box; a press on a message lands on the message.
+messagesEl.addEventListener('pointerdown', (e) => {
+  if (e.target === messagesEl && e.offsetX >= messagesEl.clientWidth) { _draggingScrollbar = true; noteUserScroll(); }
+});
+window.addEventListener('pointerup', () => { _draggingScrollbar = false; });
+
 messagesEl.addEventListener('scroll', () => {
-  const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
-  userScrolledUp = !nearBottom;
+  const nearBottom = distanceFromBottom() < NEAR_BOTTOM_PX;
+  const byReader = _draggingScrollbar || Date.now() - _lastUserScrollAt < USER_SCROLL_WINDOW_MS;
+  if (nearBottom) userScrolledUp = false;            // back at the bottom, however it got there: follow again
+  else if (byReader) userScrolledUp = true;          // they scrolled away: leave them there
+  else if (!userScrolledUp) scrollToBottom();        // the content moved, not the reader: catch up
   updateJumpLatest();
   updateChatNav();
 });
+
+// Content that grows on its own - a screenshot finishing loading, a block
+// re-rendering taller - adds height without anyone calling scrollToBottom, so
+// a follower was left short of the end until the next chunk, and at the end
+// of a turn there may be no next chunk. Every message is watched for size.
+// Not right after a click or key press in the chat, though: that is the
+// reader opening a Thinking block or a diff to read it, and pinning the view
+// to the bottom would scroll what they just opened out of sight.
+let _lastReaderInputAt = 0;
+messagesEl.addEventListener('pointerdown', () => { _lastReaderInputAt = Date.now(); });
+messagesEl.addEventListener('keydown', () => { _lastReaderInputAt = Date.now(); });
+// Opening something to read it, while following, counts as stopping to read:
+// if it pushed the end out of view, stay on it and offer the jump button.
+messagesEl.addEventListener('toggle', (e) => {
+  if (e.target?.tagName !== 'DETAILS' || !e.target.open || userScrolledUp) return;
+  requestAnimationFrame(() => {
+    if (distanceFromBottom() >= NEAR_BOTTOM_PX) { userScrolledUp = true; updateJumpLatest(); }
+  });
+}, true);
+if (typeof ResizeObserver === 'function' && typeof MutationObserver === 'function') {
+  const _growthObserver = new ResizeObserver(() => {
+    if (userScrolledUp || Date.now() - _lastReaderInputAt < USER_SCROLL_WINDOW_MS) return;
+    if (distanceFromBottom() >= 1) scrollToBottom();
+  });
+  for (const child of messagesEl.children) _growthObserver.observe(child);
+  new MutationObserver((records) => {
+    for (const r of records) {
+      for (const n of r.addedNodes) if (n.nodeType === 1) _growthObserver.observe(n);
+      for (const n of r.removedNodes) if (n.nodeType === 1) _growthObserver.unobserve(n);
+    }
+  }).observe(messagesEl, { childList: true });
+}
 
 // ── Webview self-watchdog ────────────────────────────────────────────────────
 // The panel runs in its own renderer, so when it stalls nothing reaches the
@@ -2099,7 +2171,9 @@ function renderTaskDock() {
     label.addEventListener('click', () => {
       const card = runningTasks.get(key)?.cardEl;
       if (!card || !card.isConnected) return;   // a recovered row has no card
+      userScrolledUp = true; // an explicit jump, not a follow-the-stream scroll
       card.scrollIntoView({ block: 'center' });
+      updateJumpLatest();
       card.classList.add('outline-target');
       setTimeout(() => card.classList.remove('outline-target'), 1600);
     });
@@ -2915,7 +2989,10 @@ function setBusy(busy) {
 function updateWelcome() {
   // Count cards too — a tools-only turn has no .message article, and the welcome
   // screen must not reappear in the middle of an active conversation.
-  const hasMessages = messagesEl.querySelectorAll('.message, .diff-card, .command-card, .term-card, .run-project-card, .activity-log').length > 0;
+  // querySelector, not querySelectorAll().length: only whether there is one
+  // matters, and this runs for every card - counting the whole transcript each
+  // time cost 1.5 seconds of reopening a long chat.
+  const hasMessages = Boolean(messagesEl.querySelector('.message, .diff-card, .command-card, .term-card, .run-project-card, .activity-log'));
   welcomeEl.classList.toggle('hidden', hasMessages);
 }
 
@@ -3016,9 +3093,15 @@ function replayDrawnCard(card) {
   } else if (card.kind === 'approval') {
     replayApprovalCard(card);
   } else if (card.kind === 'thinking') {
-    appendThinking((card.text || '')
+    // Left open, so a saved block that follows with nothing drawn in between
+    // joins this one: appendThinking only starts a new block once something
+    // else is on screen. A chat saved while every round of reasoning was its
+    // own record - including rounds whose tool cards were past the save limit -
+    // otherwise reopened as a stack of empty-looking Thinking blocks. Closed
+    // by the next thing drawn, or at the end of the turn (renderAssistantTurn).
+    const joining = Boolean(activeThinkingEl) && activeAssistantMessage?.lastElementChild === activeThinkingEl;
+    appendThinking((joining ? '\n\n' : '') + (card.text || '')
       + (card.truncated ? '\n\n[The rest of the reasoning was not kept when the chat was saved.]' : ''));
-    finalizeThinking();
   } else if (card.kind === 'audit') {
     appendTurnCard(buildAuditCard(card, true));
   } else if (card.kind === 'image') {
@@ -3203,6 +3286,7 @@ function renderAssistantTurn(item) {
   activeThinkingContentEl = null;
 
   for (const card of cards) replayCard(card);
+  finalizeThinking();   // a Thinking block left open by the replay (see replayDrawnCard)
   if (item.text) { appendAssistantText(item.text); flushAssistantText(); }
   collapseToolProgress();
 
@@ -4287,6 +4371,30 @@ function appendThinking(text) {
     activeAssistantBubble = activeAssistantMessage.querySelector('.message-bubble');
     _primaryBubble = activeAssistantBubble;
   }
+  // One block per stretch of reasoning. If anything has been drawn since this
+  // block — a tool row, a diff, prose — the model has moved on, and this is a
+  // new round of thinking: close the old block where it stands and start
+  // another below what came between. It used to be one block for the whole
+  // turn, pinned at the top, so the reasoning behind the last edit of a long
+  // turn sat with the first, a long scroll above the work it explained.
+  //
+  // "Drawn" means something you can see. Text that renders to nothing - a
+  // tool call the model printed as JSON, which is hidden - still opens an
+  // answer bubble, empty and invisible, after this block; counting that as
+  // activity started a new Thinking block on every round, and a long turn
+  // became a column of Thinking blocks with nothing between them. With only
+  // blanks after it, the block continues: moved below them so it stays last,
+  // with the next answer text opening its own bubble below it.
+  if (activeThinkingEl && activeAssistantMessage.lastElementChild !== activeThinkingEl) {
+    if (onlyBlankAfter(activeThinkingEl)) {
+      activeAssistantMessage.appendChild(activeThinkingEl);
+      _needNewBubble = true;
+      _streamPre = null;
+      if (activeThinkingContentEl?.textContent) activeThinkingContentEl.textContent += '\n\n';
+    } else {
+      finalizeThinking();
+    }
+  }
   if (!activeThinkingEl) {
     // The activity log already shows a spinning "Thinking" placeholder for every
     // turn. Once real reasoning arrives, THIS card owns that indicator — so drop
@@ -4322,13 +4430,11 @@ function appendThinking(text) {
     });
     details.appendChild(summary);
     details.appendChild(content);
-    // Above the answer — the model thinks before it writes. insertBefore keeps
-    // it under the message header and over whatever bubble comes next.
-    if (activeAssistantBubble && activeAssistantBubble.parentNode === activeAssistantMessage) {
-      activeAssistantMessage.insertBefore(details, activeAssistantBubble);
-    } else {
-      activeAssistantMessage.appendChild(details);
-    }
+    // Where it happened: after everything drawn so far, with the bubble before
+    // it sealed so the answer that follows opens below it, and the next tool
+    // activity starting a fresh log below it too — the same placement every
+    // other card in a turn gets (appendTurnCard).
+    appendTurnCard(details);
     activeThinkingEl = details;
     activeThinkingContentEl = content;
   }
@@ -4336,8 +4442,25 @@ function appendThinking(text) {
   scrollToBottom();
 }
 
-// The reasoning is done: stop the live pulse and settle the label. Called when
-// the turn ends. A block that never got content is dropped.
+// True when nothing visible follows `el` in its message: only answer bubbles
+// that rendered to nothing and activity logs holding no tool rows. See
+// appendThinking for why invisible elements must not split a Thinking block.
+function onlyBlankAfter(el) {
+  for (let n = el.nextElementSibling; n; n = n.nextElementSibling) {
+    if (n.classList.contains('message-bubble')) {
+      if (n.textContent.trim() || n.querySelector('img, pre, table, .code-block')) return false;
+    } else if (n.classList.contains('activity-log')) {
+      if (n.querySelector('.activity-row:not(.thinking-row)')) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// This stretch of reasoning is done: stop the live pulse and settle the label.
+// Called when a new stretch begins after other activity (see appendThinking)
+// and when the turn ends. A block that never got content is dropped.
 function finalizeThinking() {
   if (!activeThinkingEl) return;
   if (!activeThinkingContentEl || !activeThinkingContentEl.textContent.trim()) {
@@ -4659,13 +4782,25 @@ function updateMemoryPanel(mem) {
 // rAF-batched scroll pinning: at most one scroll write per frame, synced to paint,
 // so streaming chunks and card insertions never cause competing scroll jumps.
 let _scrollPending = false;
+// The arrows are refreshed at most once a frame. updateChatNav measures the
+// scrollbar and the messages, which makes the browser lay out the whole chat,
+// and scrollToBottom runs for every card drawn - so reopening a long chat laid
+// it out again for each of its hundreds of cards: measured at 9.5 of the 11.8
+// seconds a 30-turn chat took to reopen. Batched, it is laid out once.
+let _chatNavPending = false;
+function scheduleChatNav() {
+  if (_chatNavPending) return;
+  _chatNavPending = true;
+  requestAnimationFrame(() => { _chatNavPending = false; updateChatNav(); });
+}
+
 function scrollToBottom() {
   // Every site that appends content calls this, so it is also the one place
   // that reliably knows something arrived — including while the reader is away.
   // A new message can turn a one-message chat into a navigable one, and can
   // re-enable Next for someone sitting on what used to be the last message, so
   // the arrows are refreshed here rather than inside the scrolled-away branch.
-  updateChatNav();
+  scheduleChatNav();
   if (userScrolledUp) { noteContentWhileAway(); return; }
   if (_scrollPending) return;
   _scrollPending = true;
@@ -5844,6 +5979,16 @@ function getOrCreateActivityLog() {
     // the response it belongs to, not floating between turns in the stream.
     const parent = activeAssistantMessage || messagesEl;
     parent.appendChild(log);
+    // The batches before this one are finished: fold them into their "✓ N
+    // steps" summary now rather than when the turn ends. A closed summary is
+    // not laid out, and a long turn kept every row of every batch on screen -
+    // with diffs and cards between them, the panel stalled for seconds on each
+    // update. A batch with a step still running is left open.
+    for (const prev of allActivityLogEls) {
+      if (prev.dataset.folded || prev.querySelector('.activity-row.running')) continue;
+      collapseOneActivityLog(prev);
+      prev.dataset.folded = '1';   // folded once; re-folding every batch on each new one made a turn quadratic
+    }
     allActivityLogEls.push(log);
     currentActivityRowEl = null;
     _needNewActivityLog = false;
@@ -5887,7 +6032,7 @@ function collapseToolProgress() {
   // Every segment the turn produced — not just the current/latest one — so a
   // turn with tool activity in more than one place ends with each batch
   // collapsed in place, not just the last.
-  for (const log of allActivityLogEls) collapseOneActivityLog(log);
+  for (const log of allActivityLogEls) if (!log.dataset.folded) collapseOneActivityLog(log);
   allActivityLogEls = [];
   currentActivityRowEl = null;
   activityRowsById.clear();
@@ -6275,6 +6420,10 @@ function buildDiffCard(id, filePath, html, added, removed) {
   return card;
 }
 
+// Changed lines an applied diff keeps in the page — more than its 160px
+// preview shows, so the preview looks exactly as it did.
+const DIFF_PREVIEW_ROWS = 12;
+
 // A decided diff: the buttons go, the status says which way it went, and an
 // applied change keeps a compact preview with a toggle to the whole diff. The
 // live diffResolved message and a restored card both settle a card this way.
@@ -6294,14 +6443,27 @@ function markDiffResolved(card, approved) {
   if (approved && changedRows > 0) {
     // Keep a compact preview of the change (added/removed lines only) with a
     // toggle to reveal the full diff — instead of discarding it entirely.
+    //
+    // Only the preview stays in the page. The whole diff - up to 400 rows of
+    // about six elements each - used to stay too, merely clipped by CSS, so a
+    // long turn that applied twenty edits carried tens of thousands of hidden
+    // elements, and the panel stalled for seconds at a time on every update
+    // (logged as STALL ... dom=34000 nodes). The full diff is kept as text and
+    // built only while it is expanded.
+    const fullHtml = body.innerHTML;
+    const previewHtml = [...body.querySelectorAll('.diff-added, .diff-removed')]
+      .slice(0, DIFF_PREVIEW_ROWS).map(r => r.outerHTML).join('');
+    body.innerHTML = previewHtml;
     body.classList.add('preview');
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'expand-btn diff-expand-btn';
     btn.textContent = 'Click to expand';
     btn.addEventListener('click', () => {
-      const collapsed = body.classList.toggle('preview');
-      btn.textContent = collapsed ? 'Click to expand' : 'Collapse';
+      const expanding = body.classList.contains('preview');
+      body.innerHTML = expanding ? fullHtml : previewHtml;
+      body.classList.toggle('preview', !expanding);
+      btn.textContent = expanding ? 'Collapse' : 'Click to expand';
     });
     card.appendChild(btn);
   } else {

@@ -9,6 +9,12 @@
 //   id       — stable identifier (used to diff results across runs)
 //   category — grouping for the report
 //   prompt   — exactly what a user would type
+//   turns    — instead of `prompt`: several turns in one chat, in order, each
+//              { prompt, rejectWrites? }. rejectWrites answers every diff that
+//              turn proposes with Reject.
+//   activeFile — optional: the file open in the editor during the task
+//   answer   — optional: what the user types if the model calls ask_user
+//              (without it the question is cancelled)
 //   files    — seed repo, written before the run
 //   check(c) — async, returns { pass: bool, reason: string }
 //
@@ -20,6 +26,8 @@
 //   c.runNode(f)   { ok, stdout, stderr } — actually executes the file
 //   c.unchanged(f) true if f is byte-identical to its seeded content
 //   c.seed         the original `files` map
+//   c.reply        the last turn's reply; c.replies every turn's, in order
+//   c.proposals    the file name of every diff the user was asked to approve
 
 const TASKS = [
   // ── Does it actually write files at all? ──────────────────────────────────
@@ -486,6 +494,395 @@ const TASKS = [
       // beta is DEFINED but not EXPORTED — claiming it is a grounding failure.
       if (/\bbeta\b/.test(r)) return { pass: false, reason: 'claimed beta is exported — it is defined but not in module.exports' };
       return { pass: true, reason: 'listed exactly the exported names' };
+    },
+  },
+  {
+    // A question whose answer sits three files deep, behind a re-export, with a
+    // decoy that sets a different default. Reading is the whole job here: a
+    // turn pushed to "stop reading and act" after a few files answers from the
+    // decoy or from a guess.
+    id: 'deep-read-question',
+    category: 'grounding',
+    prompt: 'When index.js calls formatPrice with no currency, which currency symbol does the output start with? Trace it through the code and tell me which file sets that default.',
+    files: {
+      'index.js': "const { formatPrice } = require('./lib/format');\nmodule.exports = { formatPrice };\n",
+      'lib/format.js': "// Formatting helpers live under money/.\nmodule.exports = require('./money/currency');\n",
+      'lib/money/currency.js': [
+        "const SYMBOLS = { USD: '$', EUR: '€', GBP: '£' };",
+        "const DEFAULT_CURRENCY = 'GBP';",
+        '',
+        'function formatPrice(amount, currency = DEFAULT_CURRENCY) {',
+        '  return SYMBOLS[currency] + amount.toFixed(2);',
+        '}',
+        '',
+        'module.exports = { formatPrice, SYMBOLS };',
+        '',
+      ].join('\n'),
+      'lib/money/legacy.js': "// Old formatter, no longer used anywhere.\nconst DEFAULT_CURRENCY = 'USD';\nfunction formatLegacy(n) { return '$' + n; }\nmodule.exports = { formatLegacy, DEFAULT_CURRENCY };\n",
+    },
+    async check(c) {
+      const changed = Object.keys(c.seed).filter(f => !c.unchanged(f));
+      if (changed.length) return { pass: false, reason: `changed ${changed.join(', ')} while answering a question` };
+      if (!/£|\bGBP\b/.test(c.reply)) return { pass: false, reason: `did not give £/GBP (got: "${c.reply.slice(0, 160)}")` };
+      if (!/currency\.js/.test(c.reply)) return { pass: false, reason: 'did not name currency.js as where the default is set' };
+      return { pass: true, reason: 'traced the re-export to currency.js and gave £' };
+    },
+  },
+
+  // ── Several edits to one file ─────────────────────────────────────────────
+  {
+    // Every edit after the first lands on line numbers the first one moved.
+    // A model working from stale positions — or one that cannot re-read the
+    // file after editing it — puts the later comments in the wrong place.
+    id: 'several-edits-one-file',
+    category: 'edit-precision',
+    prompt: 'In list.js, add a one-line JSDoc comment (/** ... */) directly above each of the three functions, describing what it returns.',
+    files: {
+      'list.js': [
+        'function first(items) {',
+        '  return items[0];',
+        '}',
+        '',
+        'function last(items) {',
+        '  return items[items.length - 1];',
+        '}',
+        '',
+        'function count(items) {',
+        '  return items.length;',
+        '}',
+        '',
+        'module.exports = { first, last, count };',
+        '',
+      ].join('\n'),
+    },
+    async check(c) {
+      const lines = (c.read('list.js') || '').split('\n');
+      for (const name of ['first', 'last', 'count']) {
+        const at = lines.findIndex(l => new RegExp('^\\s*function ' + name + '\\b').test(l));
+        if (at === -1) return { pass: false, reason: `function ${name} is gone` };
+        let prev = at - 1;
+        while (prev >= 0 && !lines[prev].trim()) prev--;
+        if (prev < 0 || !/\*\/\s*$/.test(lines[prev])) return { pass: false, reason: `no JSDoc comment directly above ${name}()` };
+      }
+      const r = await c.runNode('__probe.js', "const l = require('./list.js'); console.log([l.first([1,2,3]), l.last([1,2,3]), l.count([1,2,3])].join(','));");
+      if (!r.ok) return { pass: false, reason: 'list.js broken: ' + r.stderr.slice(0, 200) };
+      if (r.stdout.trim() !== '1,3,3') return { pass: false, reason: `expected "1,3,3", got "${r.stdout.trim()}"` };
+      return { pass: true, reason: 'a comment above each function, and all three still work' };
+    },
+  },
+
+  // ── The open file ─────────────────────────────────────────────────────────
+  {
+    // The request names a different file from the one open in the editor.
+    id: 'open-file-is-not-the-target',
+    category: 'retrieval',
+    activeFile: 'README.md',
+    prompt: 'Fix the bug in calc.js: double(4) should return 8.',
+    files: {
+      'README.md': '# Calc\n\nA tiny calculator.\n',
+      'calc.js': 'function double(n) {\n  return n + 2;\n}\nmodule.exports = { double };\n',
+    },
+    async check(c) {
+      if (!c.unchanged('README.md')) return { pass: false, reason: 'edited the open README.md instead of (or as well as) calc.js' };
+      const r = await c.runNode('__probe.js', "const { double } = require('./calc.js'); console.log([double(4), double(5)].join(','));");
+      if (!r.ok) return { pass: false, reason: 'calc.js broken: ' + r.stderr.slice(0, 200) };
+      if (r.stdout.trim() !== '8,10') return { pass: false, reason: `expected "8,10", got "${r.stdout.trim()}"` };
+      return { pass: true, reason: 'fixed the named file, left the open one alone' };
+    },
+  },
+  {
+    // ...and the other way round: no file named, so "here" is the open one.
+    id: 'open-file-is-the-target',
+    category: 'retrieval',
+    activeFile: 'calc.js',
+    prompt: 'double(4) returns 6 here instead of 8 — fix it.',
+    files: {
+      'calc.js': 'function double(n) {\n  return n + 2;\n}\nmodule.exports = { double };\n',
+      'other.js': 'function triple(n) {\n  return n * 3;\n}\nmodule.exports = { triple };\n',
+    },
+    async check(c) {
+      if (!c.unchanged('other.js')) return { pass: false, reason: 'changed other.js, which was not open or named' };
+      const r = await c.runNode('__probe.js', "const { double } = require('./calc.js'); console.log([double(4), double(5)].join(','));");
+      if (!r.ok) return { pass: false, reason: 'calc.js broken: ' + r.stderr.slice(0, 200) };
+      if (r.stdout.trim() !== '8,10') return { pass: false, reason: `expected "8,10", got "${r.stdout.trim()}"` };
+      return { pass: true, reason: 'took "here" to mean the open file and fixed it' };
+    },
+  },
+
+  // ── A request that is not in English ──────────────────────────────────────
+  {
+    // Navy decides several things from English keywords in the request. The
+    // same small edit, asked in Spanish, has to come out the same.
+    id: 'non-english-request',
+    category: 'language',
+    prompt: 'En limits.js, cambia MAX_RETRIES de 3 a 5. No cambies nada más.',
+    files: {
+      'limits.js': 'const MAX_RETRIES = 3;\nconst TIMEOUT_MS = 30000;\nmodule.exports = { MAX_RETRIES, TIMEOUT_MS };\n',
+    },
+    async check(c) {
+      const r = await c.runNode('__probe.js', "const l = require('./limits.js'); console.log(l.MAX_RETRIES + '|' + l.TIMEOUT_MS);");
+      if (!r.ok) return { pass: false, reason: 'limits.js broken: ' + r.stderr.slice(0, 200) };
+      const [retries, timeout] = r.stdout.trim().split('|');
+      if (retries !== '5') return { pass: false, reason: `MAX_RETRIES is ${retries}, expected 5 — the edit never landed` };
+      if (timeout !== '30000') return { pass: false, reason: 'TIMEOUT_MS was altered' };
+      const added = c.list().filter(f => !(f in c.seed) && !f.startsWith('__probe'));
+      if (added.length) return { pass: false, reason: `created ${added.join(', ')}` };
+      return { pass: true, reason: 'made the edit asked for in Spanish, nothing else' };
+    },
+  },
+
+  // ── Debugging: the first plausible patch is not the fix ───────────────────
+  // Each repo has a failing test.js. The checker runs it, refuses an edited
+  // test, and then runs cases the test does not show, so a patch that only
+  // makes the visible test pass - or fixes the symptom in the wrong file -
+  // fails. This is the gap the easy correctness tasks above cannot measure:
+  // a strong model passes those every time.
+  {
+    id: 'debug-root-cause-other-file',
+    category: 'debugging',
+    prompt: 'Running `node test.js` fails. Find the cause and fix it so the tests pass. Do not change test.js.',
+    files: {
+      'discount.js': [
+        '// Applies a percentage discount (pct is 0-100) to a price.',
+        'function applyDiscount(price, pct) {',
+        '  return price - pct;',
+        '}',
+        'module.exports = { applyDiscount };',
+        '',
+      ].join('\n'),
+      'cart.js': [
+        "const { applyDiscount } = require('./discount.js');",
+        '',
+        '// Total of a cart: each item is { price, qty, discountPct }.',
+        'function cartTotal(items) {',
+        '  let total = 0;',
+        '  for (const item of items) {',
+        '    const unit = item.discountPct ? applyDiscount(item.price, item.discountPct) : item.price;',
+        '    total += unit * item.qty;',
+        '  }',
+        '  return Math.round(total * 100) / 100;',
+        '}',
+        'module.exports = { cartTotal };',
+        '',
+      ].join('\n'),
+      'test.js': [
+        "const assert = require('assert');",
+        "const { cartTotal } = require('./cart.js');",
+        'assert.strictEqual(cartTotal([{ price: 10, qty: 2 }]), 20);',
+        'assert.strictEqual(cartTotal([{ price: 200, qty: 1, discountPct: 10 }]), 180);',
+        "console.log('all tests passed');",
+        '',
+      ].join('\n'),
+    },
+    async check(c) {
+      if (!c.unchanged('test.js')) return { pass: false, reason: 'test.js was edited' };
+      const t = await c.runNode('test.js');
+      if (!t.ok) return { pass: false, reason: 'node test.js still fails: ' + (t.stderr || t.stdout).slice(0, 160) };
+      // 200 - 10 = 190 vs 200 * 0.9 = 180 only differ in one place; the hidden
+      // cases separate a real percentage from a patch tuned to that one number.
+      const r = await c.runNode('__probe.js', [
+        "const { applyDiscount } = require('./discount.js');",
+        "const { cartTotal } = require('./cart.js');",
+        'console.log([applyDiscount(80, 25), applyDiscount(50, 0), cartTotal([{ price: 40, qty: 3, discountPct: 50 }, { price: 5, qty: 1 }])].join(","));',
+      ].join('\n'));
+      if (!r.ok) return { pass: false, reason: 'probe failed: ' + r.stderr.slice(0, 160) };
+      if (r.stdout.trim() !== '60,50,65') return { pass: false, reason: `hidden cases: expected "60,50,65", got "${r.stdout.trim()}" — a patch that only fits the visible test` };
+      return { pass: true, reason: 'fixed the percentage in discount.js; visible and hidden cases pass' };
+    },
+  },
+  {
+    id: 'debug-pagination-edges',
+    category: 'debugging',
+    prompt: 'Users say the last page of results is missing items. `node test.js` reproduces it. Fix it without changing test.js.',
+    files: {
+      'paginate.js': [
+        '// page is 1-based. Returns { items, pages }.',
+        'function paginate(all, page, size) {',
+        '  const pages = Math.floor(all.length / size);',
+        '  const start = (page - 1) * size;',
+        '  return { items: all.slice(start, start + size - 1), pages };',
+        '}',
+        'module.exports = { paginate };',
+        '',
+      ].join('\n'),
+      'test.js': [
+        "const assert = require('assert');",
+        "const { paginate } = require('./paginate.js');",
+        'const all = [1, 2, 3, 4, 5, 6, 7, 8, 9];',
+        'assert.deepStrictEqual(paginate(all, 3, 3).items, [7, 8, 9]);',
+        "console.log('all tests passed');",
+        '',
+      ].join('\n'),
+    },
+    async check(c) {
+      if (!c.unchanged('test.js')) return { pass: false, reason: 'test.js was edited' };
+      const t = await c.runNode('test.js');
+      if (!t.ok) return { pass: false, reason: 'node test.js still fails: ' + (t.stderr || t.stdout).slice(0, 160) };
+      // Two bugs, one visible: the slice end AND the page count. Fixing only
+      // what the test shows leaves `pages` wrong.
+      const r = await c.runNode('__probe.js', [
+        "const { paginate } = require('./paginate.js');",
+        'const all = [1, 2, 3, 4, 5, 6, 7];',
+        'const a = paginate(all, 1, 3), b = paginate(all, 2, 3), d = paginate([1, 2, 3, 4, 5, 6], 2, 3);',
+        'console.log(JSON.stringify([a.items, b.items, a.pages, d.pages, d.items]));',
+      ].join('\n'));
+      if (!r.ok) return { pass: false, reason: 'probe failed: ' + r.stderr.slice(0, 160) };
+      const want = '[[1,2,3],[4,5,6],3,2,[4,5,6]]';
+      if (r.stdout.trim() !== want) return { pass: false, reason: `hidden cases: expected ${want}, got ${r.stdout.trim()} — the page count or another page is still wrong` };
+      return { pass: true, reason: 'fixed both the slice and the page count' };
+    },
+  },
+  {
+    id: 'debug-concurrent-cache',
+    category: 'debugging',
+    prompt: 'Our user cache is supposed to fetch each user only once, but `node test.js` shows it fetching twice. Fix cache.js without changing test.js.',
+    files: {
+      'cache.js': [
+        'const cache = {};',
+        'let fetches = 0;',
+        'async function fetchUser(id) {',
+        '  fetches++;',
+        '  await new Promise(r => setTimeout(r, 10));',
+        '  return { id, name: "user" + id };',
+        '}',
+        'async function getUser(id) {',
+        '  if (cache[id]) return cache[id];',
+        '  const user = await fetchUser(id);',
+        '  cache[id] = user;',
+        '  return user;',
+        '}',
+        'module.exports = { getUser, fetchCount: () => fetches };',
+        '',
+      ].join('\n'),
+      'test.js': [
+        "const assert = require('assert');",
+        "const { getUser, fetchCount } = require('./cache.js');",
+        '(async () => {',
+        '  const [a, b] = await Promise.all([getUser(1), getUser(1)]);',
+        "  assert.strictEqual(a.name, 'user1');",
+        '  assert.strictEqual(b.name, a.name);',
+        '  assert.strictEqual(fetchCount(), 1);',
+        "  console.log('all tests passed');",
+        '})().catch(e => { console.error(e.message); process.exit(1); });',
+        '',
+      ].join('\n'),
+    },
+    async check(c) {
+      if (!c.unchanged('test.js')) return { pass: false, reason: 'test.js was edited' };
+      const t = await c.runNode('test.js');
+      if (!t.ok) return { pass: false, reason: 'node test.js still fails: ' + (t.stderr || t.stdout).slice(0, 160) };
+      const r = await c.runNode('__probe.js', [
+        "const { getUser, fetchCount } = require('./cache.js');",
+        '(async () => {',
+        '  const users = await Promise.all([getUser(2), getUser(2), getUser(3), getUser(2)]);',
+        '  const later = await getUser(3);',
+        "  console.log([fetchCount(), users.map(u => u.name).join('/'), later.name].join(','));",
+        '})();',
+      ].join('\n'));
+      if (!r.ok) return { pass: false, reason: 'probe failed: ' + r.stderr.slice(0, 160) };
+      if (r.stdout.trim() !== '2,user2/user2/user3/user2,user3') return { pass: false, reason: `hidden cases: expected "2,user2/user2/user3/user2,user3", got "${r.stdout.trim()}"` };
+      return { pass: true, reason: 'concurrent callers share one fetch per id' };
+    },
+  },
+  {
+    id: 'debug-fix-without-breaking',
+    category: 'debugging',
+    prompt: '`node test.js` fails. Fix slugify.js so ALL the tests pass, without changing test.js.',
+    files: {
+      'slugify.js': [
+        'function slugify(s) {',
+        "  return s.trim().toLowerCase().replace(/ +/g, '-');",
+        '}',
+        'module.exports = { slugify };',
+        '',
+      ].join('\n'),
+      'test.js': [
+        "const assert = require('assert');",
+        "const { slugify } = require('./slugify.js');",
+        "assert.strictEqual(slugify('  Already Fine  '), 'already-fine');",
+        "assert.strictEqual(slugify('pre-built-slug'), 'pre-built-slug');",
+        "assert.strictEqual(slugify('a - b'), 'a-b');",
+        "assert.strictEqual(slugify('Hello, World!'), 'hello-world');",
+        "console.log('all tests passed');",
+        '',
+      ].join('\n'),
+    },
+    async check(c) {
+      if (!c.unchanged('test.js')) return { pass: false, reason: 'test.js was edited' };
+      const t = await c.runNode('test.js');
+      if (!t.ok) return { pass: false, reason: 'node test.js still fails: ' + (t.stderr || t.stdout).slice(0, 160) };
+      const r = await c.runNode('__probe.js', [
+        "const { slugify } = require('./slugify.js');",
+        "console.log([slugify('What? Is -- this OK?'), slugify('C++ & Rust'), slugify('x')].join('|'));",
+      ].join('\n'));
+      if (!r.ok) return { pass: false, reason: 'probe failed: ' + r.stderr.slice(0, 160) };
+      if (r.stdout.trim() !== 'what-is-this-ok|c-rust|x') return { pass: false, reason: `hidden cases: expected "what-is-this-ok|c-rust|x", got "${r.stdout.trim()}"` };
+      return { pass: true, reason: 'punctuation stripped without breaking the existing cases' };
+    },
+  },
+
+  // ── When the user says no ─────────────────────────────────────────────────
+  {
+    // Every diff this turn proposes is rejected. The right outcome: the file is
+    // untouched, the user is not asked the same thing again, and the reply does
+    // not report the change as made.
+    id: 'rejected-edit-not-repeated',
+    category: 'respects-the-user',
+    turns: [{ prompt: 'In greet.js, change the greeting from "Hello" to "Howdy".', rejectWrites: true }],
+    files: {
+      'greet.js': 'function greet(name) {\n  return "Hello, " + name + "!";\n}\nmodule.exports = greet;\n',
+    },
+    async check(c) {
+      if (!c.unchanged('greet.js')) return { pass: false, reason: 'greet.js changed although every edit was rejected' };
+      const asked = c.proposals.filter(p => p === 'greet.js').length;
+      if (asked > 1) return { pass: false, reason: `asked the user to approve a change to greet.js ${asked} times after they rejected it` };
+      const changedLine = (c.reply.match(/(?:^|\n)\s*\**Changed:?\**:?\s*([^\n]*)/i) || [])[1] || '';
+      if (/greet\.js/.test(changedLine)) return { pass: false, reason: `reported greet.js as changed: "${changedLine.trim()}"` };
+      return { pass: true, reason: `proposed it ${asked} time(s), accepted the rejection, did not claim the change` };
+    },
+  },
+
+  // ── Follow-up turns ───────────────────────────────────────────────────────
+  {
+    // "it" in the second turn only means something because of the first.
+    id: 'followup-keeps-context',
+    category: 'conversation',
+    turns: [
+      { prompt: 'What does total() in pricing.js compute?' },
+      { prompt: 'Make it apply a 10% discount to that result.' },
+    ],
+    files: {
+      'pricing.js': 'function total(items) {\n  return items.reduce((sum, item) => sum + item.price * item.qty, 0);\n}\nmodule.exports = { total };\n',
+      'shipping.js': 'function shipping(weightKg) {\n  return 5 + weightKg * 2;\n}\nmodule.exports = { shipping };\n',
+    },
+    async check(c) {
+      if (!c.unchanged('shipping.js')) return { pass: false, reason: 'changed shipping.js, which neither turn was about' };
+      const r = await c.runNode('__probe.js', "const { total } = require('./pricing.js'); console.log(total([{ price: 100, qty: 2 }]));");
+      if (!r.ok) return { pass: false, reason: 'pricing.js broken: ' + r.stderr.slice(0, 200) };
+      if (Number(r.stdout.trim()) !== 180) return { pass: false, reason: `total of 200 came out as ${r.stdout.trim()}, expected 180 after a 10% discount` };
+      return { pass: true, reason: 'understood "it" from the turn before and applied the discount' };
+    },
+  },
+  {
+    // "thanks!" after a finished task is not a request to do the task again.
+    id: 'small-talk-after-task',
+    category: 'conversation',
+    turns: [
+      { prompt: 'Add the comment "// reviewed" as the first line of a.js.' },
+      { prompt: 'thanks!' },
+    ],
+    files: {
+      'a.js': 'function a() {\n  return 1;\n}\nmodule.exports = a;\n',
+      'b.js': 'function b() {\n  return 2;\n}\nmodule.exports = b;\n',
+    },
+    async check(c) {
+      const text = c.read('a.js') || '';
+      const n = (text.match(/\/\/ reviewed/g) || []).length;
+      if (n === 0) return { pass: false, reason: 'the comment was never added' };
+      if (n > 1) return { pass: false, reason: `the comment appears ${n} times — "thanks!" re-ran the task` };
+      if (!text.includes('return 1;')) return { pass: false, reason: 'a.js code was lost' };
+      if (!c.unchanged('b.js')) return { pass: false, reason: 'b.js was changed' };
+      return { pass: true, reason: 'did the task once, and took "thanks!" as thanks' };
     },
   },
 ];

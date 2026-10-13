@@ -56,7 +56,13 @@ function isOpenAiReasoningModel(model) {
 // Ollama's `think`: gpt-oss wants a level and ignores true/false; the other
 // thinking models take on or off. Undefined means "leave the model's default".
 const OLLAMA_THINKERS = /(qwen3|deepseek-r1|gpt-oss|magistral|smallthinker|exaone-deep|phi4-reasoning)/i;
-function ollamaThink(model, level) {
+// `caps`, when known, is what Ollama itself reports for the model (/api/show,
+// recorded by fetchModelContext): { supported, values, def }. It replaces the
+// name list, which missed every thinking model not on it - deepseek-v4.1-flash
+// offers false/low/high/max, and Navy's Max sent it nothing at all, so it
+// always ran at its default.
+function ollamaThink(model, level, caps) {
+  if (caps) return ollamaThinkFromCaps(level, caps);
   if (!OLLAMA_THINKERS.test(String(model || ''))) return { think: undefined, used: level };
   const l = normalizeThinkingLevel(level);
   if (/gpt-oss/i.test(model)) {
@@ -66,6 +72,32 @@ function ollamaThink(model, level) {
   if (l === 'fast') return { think: false, used: l };
   if (l === 'medium') return { think: undefined, used: l };
   return { think: true, used: isDeep(l) ? 'high' : l };
+}
+
+// Navy's level against the levels the model says it has. Medium leaves the
+// model's own default; Fast takes its lightest; the deeper levels take the
+// deepest it offers that is no deeper than what was asked, and `used` says
+// what that was so a lower level can be reported (noteThinkingLimit).
+function ollamaThinkFromCaps(level, caps) {
+  const l = normalizeThinkingLevel(level);
+  if (!caps.supported) return { think: undefined, used: l };
+  const values = Array.isArray(caps.values) ? caps.values : null;
+  if (l === 'medium') return { think: undefined, used: l };
+  if (!values) {
+    // On or off only.
+    if (l === 'fast') return { think: false, used: l };
+    return { think: true, used: isDeep(l) ? 'high' : l };
+  }
+  if (l === 'fast') {
+    if (values.includes('low')) return { think: 'low', used: l };
+    if (values.includes(false)) return { think: false, used: l };
+    return { think: undefined, used: l };
+  }
+  const prefer = { high: ['high'], xhigh: ['xhigh', 'high'], max: ['max', 'xhigh', 'high'] }[l];
+  for (const v of prefer) if (values.includes(v)) return { think: v, used: v };
+  // Levels named differently, or only on/off listed: thinking on.
+  if (values.includes(true)) return { think: true, used: 'high' };
+  return { think: undefined, used: l };
 }
 
 // Gemini: version 3 takes a thinkingLevel whose deepest is "high"; 2.5 takes a
