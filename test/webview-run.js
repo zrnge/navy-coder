@@ -2014,6 +2014,35 @@ function slashCommandSuite() {
       wPlayMenu.document.querySelector('#prompt').value === '/playthrough '
       && !wPlayMenu.sent.some(m => m.type === 'runPlaythrough'));
     wPlayMenu.close();
+
+    // /reverse routes to the reverse-engineering flow. A path MAY ride along;
+    // without one the extension opens a file picker, so bare /reverse must
+    // still fire (unlike /playthrough, the empty case is valid here too).
+    const wRev = createWebview();
+    type(wRev, '/reverse E:\\bin\\app.exe');
+    wRev.document.querySelector('#chatForm').dispatchEvent(new wRev.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: /reverse <path> routes to the reverse flow with the path',
+      wRev.sent.some(m => m.type === 'runReverseEngineer' && m.arg === 'E:\\bin\\app.exe')
+      && !wRev.sent.some(m => m.type === 'ask'),
+      JSON.stringify(wRev.sent.map(m => m.type)));
+    wRev.close();
+
+    const wRevBare = createWebview();
+    type(wRevBare, '/reverse');
+    wRevBare.document.querySelector('#chatForm').dispatchEvent(new wRevBare.window.Event('submit', { bubbles: true, cancelable: true }));
+    check('slash: bare /reverse still fires (the extension opens a file picker)',
+      wRevBare.sent.some(m => m.type === 'runReverseEngineer' && (m.arg === '' || m.arg == null)));
+    wRevBare.close();
+
+    const wRevMenu = createWebview();
+    type(wRevMenu, '/rever');
+    const revItem = [...wRevMenu.document.querySelectorAll('#slashDropdown .slash-item')].find(i => i.dataset.cmd === '/reverse');
+    check('slash: /reverse appears in the menu', Boolean(revItem));
+    revItem.dispatchEvent(new wRevMenu.window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    check('slash: picking /reverse seeds the sentinel and does not fire yet',
+      wRevMenu.document.querySelector('#prompt').value === '/reverse '
+      && !wRevMenu.sent.some(m => m.type === 'runReverseEngineer'));
+    wRevMenu.close();
   }
 
   // ── Live transcript trimming ──────────────────────────────────────────────
@@ -3551,6 +3580,23 @@ function planCardSuite() {
   check('…and moves the steps to their new states',
     steps()[1].state === 'done' && steps()[2].state === 'active');
   check('…and the header follows', /2\/3 done/.test(d.querySelector('.plan-card-header').textContent));
+
+  // A verify step marked done with no passing check after the last edit.
+  w.post({ type: 'planUpdate', steps: [
+    { step: 'Read the auth module', status: 'done' },
+    { step: 'Patch the retry', status: 'done' },
+    { step: 'Run the tests', status: 'done', unverified: true },
+  ] });
+  const lastStep = () => d.querySelectorAll('.plan-step')[2];
+  check('an unverified step is labelled so',
+    lastStep().classList.contains('unverified') && /unverified/.test(lastStep().querySelector('.plan-step-unverified')?.textContent || ''));
+  check('…and only that one', d.querySelectorAll('.plan-step-unverified').length === 1);
+  w.post({ type: 'planUpdate', steps: [
+    { step: 'Read the auth module', status: 'done' },
+    { step: 'Patch the retry', status: 'done' },
+    { step: 'Run the tests', status: 'in_progress' },
+  ] });
+  check('the label goes once the step is no longer flagged', d.querySelectorAll('.plan-step-unverified').length === 0);
 
   // The iteration counter must not overwrite what the model actually said.
   w.post({ type: 'stepProgress', step: 2, max: 100 });

@@ -19,6 +19,7 @@ const { COMMAND_METHODS, looksLikeContainerPullError } = require('./commands.js'
 const { UNTRUSTED_REFUSAL } = require('./trust.js');
 const { PLAN_METHODS } = require('./plan.js');
 const { SLASH_COMMAND_METHODS } = require('./slash-commands.js');
+const { REVERSE_ENGINEER_METHODS } = require('./reverse-engineer.js');
 const { SKILL_METHODS } = require('./skills.js');
 const vscode = require('vscode');
 const path = require('path');
@@ -263,7 +264,7 @@ function contextWindowOptions(max) {
 // Promise.all gate in _askNavyTurn) and the full set a delegate_research
 // sub-agent is permitted to call (see toolDelegateResearch). One shared
 // definition so the two notions of "read-only" can't drift apart.
-const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
+const READ_ONLY = new Set(['read_file','read_lines','list_files','search_files','search_codebase','git',
   'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame','get_diagnostics',
   'check_syntax','find_symbol','find_references',
   // activate_skill only reads a file the user installed. What a skill then
@@ -501,6 +502,35 @@ const REASONING_MODEL_NAMES = /(deepseek-(?:r1|v3\.[1-9]|v4)|qwq|qwen3|gpt-oss|m
 // How many times one turn may have its reasoning stopped for looping before
 // Navy ends the turn rather than retrying.
 const REASONING_LOOP_RETRIES = 1;
+// Language-neutral signals about a request, for the decisions that used to
+// hang on English words alone (see _promptRequestsFileAction and the open-file
+// and retrieval gates in _askNavyTurn). File names and identifiers are written
+// the same whatever language the request is in.
+const FILE_NAME_RE = /[\w-]+\.(?:js|jsx|ts|tsx|mjs|cjs|json|py|rb|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|swift|vue|svelte|html|css|scss|md|yml|yaml|toml|sh|sql)\b/i;
+const wordCount = (s) => String(s || '').trim().split(/\s+/).filter(Boolean).length;
+// A file name, or an identifier shaped like code: camelCase, snake_case, a
+// call like foo() or a dotted member like obj.method.
+const namesCode = (s) => FILE_NAME_RE.test(s)
+  || /\b[a-z]+[A-Z]\w*\b|\b\w+_\w+\b|\b\w+\(\)|\b[a-zA-Z]\w*\.[a-zA-Z]\w*\b/.test(String(s || ''));
+// How much of a turn's diff the self-review shows the model. A turn that
+// changed more than this is reviewed on what fits, and told the rest exists.
+const SELF_REVIEW_DIFF_CHARS = 12000;
+// The largest file a repeated read_file sends again rather than a stub.
+const REPEAT_READ_MAX_CHARS = 6000;
+// A provider error that means "this model takes no images".
+const isImageRejection = (msg) => /does not support image|image input|images? (?:are|is) not supported|vision (?:is )?not supported|multimodal|no(?:t)? support(?:s)? images/i.test(String(msg || ''));
+// Takes every image out of the conversation, leaving the text and a note.
+// Returns how many messages it changed.
+function stripImages(messages) {
+  let n = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m.content) || !m.content.some(p => p.type === 'image_url')) continue;
+    const text = m.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+    m.content = (text ? text + '\n' : '') + '[An image was here; this model cannot take images, so it was removed.]';
+    n++;
+  }
+  return n;
+}
 const CARD_RESULT_MAX = 400;         // enough for any preview line the cards show
 const CARD_TERM_RESULT_MAX = 4000;   // run_command/run_tests print real output in the card
 // The only argument keys the cards actually display (addToolCallCard). Anything
@@ -1075,6 +1105,9 @@ class NavyCoderViewProvider {
           break;
         case 'runPlaythrough':
           await this.runPlaythrough(String(message.url || ''), message.queueId || '');
+          break;
+        case 'runReverseEngineer':
+          await this.runReverseEngineer(String(message.arg || ''), message.queueId || '');
           break;
         case 'reviewSlashCommand': {
           // Approving runs it immediately: the user typed the command, read the
@@ -2786,22 +2819,19 @@ class NavyCoderViewProvider {
   // reply and a ledger line saying it "wrote cart.js": not WHAT it changed, so
   // it could make the same failed change again, or undo the one that helped.
   // Bounded, and only the turn just before this one.
-  _previousTurnRecord() {
-    const prev = [...this.messages].reverse().find(m => m.role === 'assistant');
-    const cards = Array.isArray(prev?.cards) ? prev.cards : [];
-    const BUDGET = 3500;
+  // A turn's net change, one diff per file it wrote, from the undo checkpoints:
+  // each file's text before the turn's first write to it, against the file now.
+  // Recorded however Navy runs - the diff cards exist only where the panel
+  // records them. Bounded by `budget` characters; past it, the rest is named.
+  _turnDiffs(turnId, budget) {
     let used = 0;
     const diffs = [];
     const add = (name, body) => {
       const text = `--- ${name}\n${body}`;
-      if (used + text.length > BUDGET) { if (!diffs.at(-1)?.startsWith('(and more')) diffs.push('(and more changes, not shown)'); return; }
+      if (used + text.length > budget) { if (!diffs.at(-1)?.startsWith('(and more')) diffs.push('(and more changes, not shown)'); return; }
       diffs.push(text);
       used += text.length;
     };
-    // From the undo checkpoints first: each file's text before the turn's first
-    // write to it, against the file now - the turn's net change, and recorded
-    // however Navy runs (the diff cards are recorded only by the panel).
-    const turnId = prev?.meta?.turnId;
     const before = new Map();
     for (const cp of (turnId && this.checkpoints) || []) {
       if (cp.turnId === turnId && cp.kind === 'edit' && typeof cp.originalText === 'string' && !before.has(cp.filePath)) {
@@ -2813,11 +2843,18 @@ class NavyCoderViewProvider {
       let now = null;
       try { now = fs.readFileSync(filePath, 'utf8'); } catch { /* deleted since */ }
       const name = root ? path.relative(root, filePath) : path.basename(filePath);
-      if (now === null) { add(name, '(deleted since)'); continue; }
-      const d = unifiedDiff(original, now, { maxLines: 120 });
+      if (now === null) { add(name, '(deleted)'); continue; }
+      const d = unifiedDiff(original, now, { maxLines: 160 });
       add(name, !d ? '(rewritten in full - too much changed to show line by line)' : d.text || '(no net change)');
     }
-    if (!before.size) {
+    return { diffs, add, files: before.size };
+  }
+
+  _previousTurnRecord() {
+    const prev = [...this.messages].reverse().find(m => m.role === 'assistant');
+    const cards = Array.isArray(prev?.cards) ? prev.cards : [];
+    const { diffs, add, files } = this._turnDiffs(prev?.meta?.turnId, 3500);
+    if (!files) {
       for (const c of cards) {
         if (c.kind !== 'diff' || c.status !== 'applied') continue;
         add(c.path, c.rewritten ? '(rewritten in full - too much changed to show line by line)'
@@ -2851,6 +2888,7 @@ class NavyCoderViewProvider {
     if (!this._ollamaThinking) this._ollamaThinking = new Map();
     this._ollamaThinking.set(model, {
       supported: caps.includes('thinking'),
+      vision: caps.includes('vision'),
       values: Array.isArray(info?.values) ? info.values : null,
       def: info?.default,
     });
@@ -3490,12 +3528,17 @@ class NavyCoderViewProvider {
   // result plus { usedProvider, usedModel } so the caller can tag rawBlocks/
   // cost/meta with whichever provider ACTUALLY served this call, not
   // whatever's configured as primary.
-  async _streamWithFallback(host, model, messages, temperature, toolsApiOverride = null) {
+  // `primary`, when given, is { model, provider } to run this call on instead of
+  // the configured model - the escalation model (navy.escalationModel). A null
+  // provider means the configured one, keeping its own API base and host.
+  async _streamWithFallback(host, model, messages, temperature, toolsApiOverride = null, primary = null) {
     const config = vscode.workspace.getConfiguration('navy');
-    const primaryProvider = config.get('provider', 'ollama');
+    const primaryProvider = primary?.provider || config.get('provider', 'ollama');
+    const primaryModel = primary?.model || model;
+    const override = primary?.provider ? { aiProvider: primary.provider, apiBase: '' } : null;
     try {
-      const result = await streamAssistant(this, host, model, messages, temperature, this.abortController?.signal, null, null, toolsApiOverride);
-      return { ...result, usedProvider: primaryProvider, usedModel: model };
+      const result = await streamAssistant(this, host, primaryModel, messages, temperature, this.abortController?.signal, null, override, toolsApiOverride);
+      return { ...result, usedProvider: primaryProvider, usedModel: primaryModel };
     } catch (primaryError) {
       if (this.abortController?.signal.aborted) throw primaryError; // never fall back from an intentional Stop
       if (!isTransientProviderError(primaryError.message)) throw primaryError;
@@ -3565,8 +3608,11 @@ class NavyCoderViewProvider {
     // and bounded, so simple chat and huge repos stay fast; failures are non-fatal.
     let relevantBlock = '';
     try {
-      const isCodeTask = /\b(fix|bug|edit|update|change|modify|refactor|implement|add|remove|rename|review|debug|explain|where|find|which|how|trace|test|error|function|class|method|component|endpoint|route|handler|module|import|feature)\b/i.test(prompt);
-      if (root !== 'none' && isCodeTask) {
+      // Any request with some substance - not only one that contains an
+      // English code word. The terms that match are the identifiers and file
+      // names in it, which read the same in any language: "corrige el error
+      // en cartTotal" ranks by cartTotal. A greeting has no terms to match.
+      if (root !== 'none' && wordCount(prompt) >= 3) {
         const terms = this._tokenizeQuery(prompt);
         if (terms.length) {
           const hits = await this._collectRelevance(root, terms, { maxFiles: 800 });
@@ -3809,9 +3855,13 @@ class NavyCoderViewProvider {
     // open. Now only a request that reads like work on code, or that names the
     // file, gets the contents; anything else can read_file it if it turns out
     // to matter.
+    // English words are one signal; what the request contains is the other,
+    // and that one works in any language: it names an identifier or a file, or
+    // it is long enough to be a real request rather than "hi" or "thanks".
     const activeFileRelevant = Boolean(activeFile) && (
       /\b(update|edit|modify|change|fix|refactor|rewrite|replace|add|remove|delete|rename|move|create|make|implement|review|analyse|analyze|explain|check|look|show|describe|summarize|audit|inspect|read|bug|error|test|this|here)\b/i.test(prompt)
-      || prompt.toLowerCase().includes(path.basename(activeFile).toLowerCase()));
+      || prompt.toLowerCase().includes(path.basename(activeFile).toLowerCase())
+      || namesCode(prompt) || wordCount(prompt) >= 5);
 
     const contextText = includeContext ? getEditorContext(maxContextChars) : '';
 
@@ -3973,10 +4023,19 @@ class NavyCoderViewProvider {
           this.abortController?.abort();
         }, 180_000);
       };
+      // Streaming output feeds the same watchdog. The timer means "no progress
+      // for 3 minutes", and a model that is still producing tokens - including
+      // a long reasoning stream - is making progress, not hanging. Without
+      // this, a single thinking stream longer than three minutes (around
+      // 100k characters) was aborted mid-thought and the turn ended as a
+      // timeout, looking like a hard ceiling on how long Navy may reason.
+      // _noteStreamActivity (below) re-arms it on each chunk, throttled.
+      this._armWatchdog = resetWatchdog;
       resetWatchdog();
 
       // Loop-detection state: prevents re-reading the same file repeatedly.
       const seenReadCalls = new Set();
+      const readRepeats = new Map(); // key -> times a cached read was asked for again
       // A change on disk makes every earlier read a picture of the past. The
       // cache used to outlive writes, so a model told by a failed apply_edit to
       // "call read_file first" was answered "content unchanged" — about a file
@@ -3985,6 +4044,7 @@ class NavyCoderViewProvider {
       // workspace and stay cached.
       const forgetReadsAfterChange = () => {
         for (const key of seenReadCalls) if (!key.startsWith('web_search:')) seenReadCalls.delete(key);
+        readRepeats.clear();
       };
       let consecutiveReadOnlyIters = 0;
       const failedCommands = new Map(); // key → consecutive fail count for run_command/run_tests
@@ -4063,14 +4123,25 @@ class NavyCoderViewProvider {
       let falseClaimNudges = 0; // corrections spent on a report that named files it never wrote
       let hallucinationWarned = false; // still claimed success after the nudge — tell the user
       let planContinueCount = 0; // bounded auto-continue when the model quits mid-plan
+      let stallNudges = 0;       // the same, for a model that quits before it has a plan
       let wrapUpSent = false;    // the "N steps left" warning, sent once - see WRAP_UP_STEPS
       let itersSincePlanShown = 0; // rounds since the model last saw its plan - see PLAN_RESTATE_EVERY
       let reasoningLoops = 0;      // model calls stopped for looping reasoning - see REASONING_LOOP_RETRIES
+      // navy.escalationModel: a stronger model that takes over the rest of a
+      // turn once it is stuck - see the escalation step at the top of the loop.
+      const escalation = this._escalationTarget(model);
+      let escalated = false;
+      let stuckReason = '';        // set where Navy notices the turn is stuck
       // The most recent run_command/run_tests: { cmd, exit, editedSince }, and per
       // command how many fixes in a row have left it failing. See the finish gate.
       let lastCheck = null;
       const checkHistory = new Map();
       let verifyNudged = false;    // the finish gate pushes back once per turn
+      // Files whose last write failed Navy's own syntax check, by resolved path
+      // -> the file's name. A turn must not report with one of these left.
+      const brokenFiles = new Map();
+      let brokenNudges = 0;
+      let selfReviewed = false;    // the review of the turn's own diff runs once - see SELF-REVIEW below
       let callTemperature = temperature; // raised for a retry after a reasoning loop
       // Only worth running the hallucination guard at all if the user's request
       // could plausibly have wanted a file created/changed — avoids false
@@ -4190,13 +4261,35 @@ class NavyCoderViewProvider {
         // in a tool result when it has not been seen for a while (below).
         // Measured BEFORE the call, so the sample pairs the exact text sent
         // with the token count the provider reports back for it.
+        // ESCALATION. The turn is stuck - fixes that do not fix, one file
+        // edited over and over, reasoning in circles - and the user has named
+        // a stronger model for exactly this. It takes the rest of the turn; the
+        // next turn starts on the configured model again. Announced and saved
+        // with the turn, like a provider fallback: it may bill another model.
+        if (stuckReason && escalation && !escalated) {
+          escalated = true;
+          const who = (escalation.provider ? providerDisplayName(escalation.provider) + ' ' : '') + escalation.model;
+          this._announceFallback(`Stuck - ${stuckReason}. Handing the rest of this turn to ${who} (navy.escalationModel).`);
+        }
         const promptCharsSent = assembledCharSize(messages);
         let streamed;
         try {
           streamed = await this._streamWithFallback(
             host, model, messages, callTemperature,
-            extraToolsUnlocked ? null : TIER_API[toolTier]);
+            extraToolsUnlocked ? null : TIER_API[toolTier],
+            escalated ? escalation : null);
         } catch (e) {
+          // A provider that turns an image down - a model without vision that
+          // Navy could not know about in advance. The images come out of the
+          // conversation, the model is remembered as one that cannot see them,
+          // and the same step runs again.
+          if (e?.name !== 'ReasoningLoopError' && isImageRejection(e?.message) && stripImages(messages)) {
+            clearTimeout(this._watchdog);
+            if (!this._noVisionModels) this._noVisionModels = new Set();
+            this._noVisionModels.add(lastUsedModel);
+            this.view?.webview.postMessage({ type: 'systemNotice', text: `${lastUsedModel} cannot take images, so Navy removed them from the conversation and carried on without them.` });
+            continue;
+          }
           if (e?.name !== 'ReasoningLoopError') throw e;
           clearTimeout(this._watchdog);
           // The model's reasoning went in circles and llm.js stopped the call
@@ -4220,6 +4313,7 @@ class NavyCoderViewProvider {
               + 'Do not deliberate further. Make the tool call you were about to make now, or, if you cannot, tell the user plainly what is stopping you.]',
           });
           callTemperature = Math.min(1, Math.max(callTemperature, 0.6) + 0.2);
+          stuckReason = stuckReason || 'its reasoning went in circles';
           continue;
         }
         const { text: responseText, nativeToolCalls, tokenCounts, rawBlocks, usedProvider, usedModel } = streamed;
@@ -4382,6 +4476,24 @@ class NavyCoderViewProvider {
         // finish() that FOLLOWED real work is respected (partial is a fact, not an
         // error), as is a stop that asks the user a question. Bounded so it cannot
         // loop.
+        // Finishing with a file Navy's own syntax check says the last edit
+        // broke. The model was told, right after the write, and reported done
+        // anyway - traced on gpt-oss, which pasted diff markers (`+`) into the
+        // code and closed the turn with the file unparseable. Sent back twice;
+        // if it is still broken after that, the footer says so.
+        if (isDone && brokenFiles.size && brokenNudges < 2) {
+          brokenNudges++;
+          stuckReason = stuckReason || `${[...brokenFiles.values()].join(', ')} left with a syntax error`;
+          const names = [...brokenFiles.values()].join(', ');
+          messages.push({
+            role: 'user',
+            content: `[SYSTEM: ${names} still has a syntax error from your last edit - Navy's own check failed after the write. A turn must not end with a broken file. `
+              + 'Read the file and find the broken part: diff markers (+ or -) copied in at the start of lines, unbalanced brackets or quotes, a half-replaced block. '
+              + 'Fix it, and do not report until it parses.]',
+          });
+          continue;
+        }
+
         // Finishing on a check that says the work is not done. A turn that
         // changed files and then ended with its own last check failing - or
         // with edits made after that check, so nothing has checked them - was
@@ -4420,6 +4532,61 @@ class NavyCoderViewProvider {
             messages.push({
               role: 'user',
               content: `[SYSTEM: Your plan still has ${openSteps.length} step(s) not marked done, and ${emptyFinish ? 'you called finish() without writing, deleting or running anything — reading files is not fixing them' : 'you ended the turn without calling finish() or taking any action'}. If work remains, DO IT NOW — call the tools to make the edits and run the checks, and update_plan as you complete each step. If you are genuinely blocked or need a decision from the user, call finish() and state exactly what is blocking you. Do NOT end a turn by only describing what you intend to do.]`,
+            });
+            continue;
+          }
+        }
+
+        // The same stop, before there is a plan to hold it to. The model is told
+        // to read the code before it plans, and some models read three files
+        // and end the turn there, with no reply and nothing changed - on the
+        // hard eval, a whole task lost that way. The open-plan check above
+        // cannot see it, because the plan was never written. Only a turn that
+        // said nothing: a reply, even a short one, is the model's answer, and
+        // the false-claim check above deals with the ones that are not true.
+        if (isDone && stallNudges < 2 && promptRequestsFileAction && usedTools
+            && !String(responseText || '').trim()
+            && !(this._session.plan || []).length
+            && taskChanges.touched.size === 0
+            && taskChanges.deleted.filter(Boolean).length === 0
+            && taskChanges.commands.length === 0
+            && taskChanges.rejected.length === 0) {
+          stallNudges++;
+          messages.push({
+            role: 'user',
+            content: '[SYSTEM: You stopped after reading, without a reply and without changing anything, but the request asks for a change. '
+              + 'If you have read enough, write your plan with update_plan and carry it out. If you need to read more, do. '
+              + 'If something blocks you, say what it is.]',
+          });
+          continue;
+        }
+
+        // SELF-REVIEW. A turn that changed files, about to report, reads its own
+        // complete diff once, as a reviewer would, before the report goes out.
+        // A model edits one hunk at a time and never sees the change whole:
+        // the case a second hunk broke, the caller nobody updated, the debug
+        // line left in, the requirement half done. Reading the diff is how a
+        // careful engineer catches those, and it is one more model call, only
+        // on turns that edited. Off by default: on the hard eval it added a
+        // quarter more prompt tokens and passed no more tasks. navy.selfReview
+        // turns it on.
+        if (isDone && !selfReviewed && taskChanges.touched.size > 0 && !hitCap
+            && vscode.workspace.getConfiguration('navy').get('selfReview', 'off') === 'on') {
+          selfReviewed = true;
+          const { diffs } = this._turnDiffs(this.currentTurnId, SELF_REVIEW_DIFF_CHARS);
+          if (diffs.length) {
+            this.view?.webview.postMessage({ type: 'statusText', text: 'Reviewing its changes…' });
+            messages.push({
+              role: 'user',
+              content: '[SYSTEM: Before you report, review the complete change you made this turn, below, as a careful reviewer would:\n'
+                + '1. Does it do exactly what was asked - nothing missing, nothing extra?\n'
+                + '2. Is the fix general, or does it only cover the case in the report or test? Name the inputs next to that one - the same problem in its other forms, both directions, empty, repeated, at the boundaries - and check each against your change. Then: error paths, off-by-one, ordering and async.\n'
+                + '3. Does every caller and test of what you changed still work? Search for them if you have not.\n'
+                + '4. Does it match the surrounding code: its conventions, naming, error handling? Any leftover debug code or duplication?\n'
+                + '5. Was it checked after your last edit? If the project has tests or a check, run it.\n'
+                + 'If you find a problem, fix it now. If it is right, give your final report. Do not describe this review in your reply. '
+                + 'The + and - at the start of the lines below are diff markers, not code: never copy them into a file.]\n'
+                + '```diff\n' + diffs.join('\n') + '\n```',
             });
             continue;
           }
@@ -4477,6 +4644,11 @@ class NavyCoderViewProvider {
               + '⚠️ **No files were changed this turn.** The summary above lists files as changed, but they were not.'
               + declined + challenged;
           }
+          if (brokenFiles.size) {
+            footer += (footer ? '\n' : '\n\n---\n')
+              + `⚠️ **${[...brokenFiles.values()].map(n => '\`' + n + '\`').join(', ')} ${brokenFiles.size > 1 ? 'do' : 'does'} not parse.** `
+              + 'Navy\'s syntax check failed after the last edit and the model did not fix it. Check before relying on it, or undo the turn.';
+          }
           if (hallucinationWarned) {
             footer += (footer ? '\n' : '\n\n---\n')
               + '⚠️ **No files were actually changed.** The model described a file action above but never called a tool — nothing was saved. Ask it to actually write/apply the change, or apply the code yourself.';
@@ -4512,6 +4684,14 @@ class NavyCoderViewProvider {
         // of toolResults so they can be appended after it — see the push below.
         const imageMessages = [];
         const nonFinish = toolCalls.filter(t => t.name !== 'finish');
+        // A model that takes a real action has broken out of any earlier loop.
+        // reasoningLoops is a budget for CONSECUTIVE loops with no progress
+        // between them, not a count of every loop in the turn - without this
+        // reset a long, productive turn (reverse-engineer a binary, write the
+        // files, 70+ steps) was ended at its second ever loop, dozens of steps
+        // after the first, as if it were stuck on the same one. Acting once
+        // clears it; looping again right away still stops the turn.
+        if (nonFinish.length) reasoningLoops = 0;
 
         const makeToolResult = (tool, result) => makeToolResultMessage(tool, result, nativeToolCalls.length > 0);
 
@@ -4521,7 +4701,7 @@ class NavyCoderViewProvider {
         // fixing it, then re-verifying is the correct workflow, and deduping the
         // second check returns a stale "content unchanged" answer that tells the
         // model its fix didn't land (or that a broken file is still fine).
-        const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase',
+        const DEDUP_TOOLS = new Set(['read_file','read_lines','list_files','search_files','search_codebase','git',
           'find_relevant_files','search_docs','git_status','git_diff','git_log','git_blame',
           'find_symbol','find_references','web_search']);
         // Command tools where repeated failure is tracked.
@@ -4561,7 +4741,21 @@ class NavyCoderViewProvider {
           if (DEDUP_TOOLS.has(tool.name)) {
             const key = tool.name + ':' + JSON.stringify(tool.args || {});
             if (seenReadCalls.has(key)) {
-              const r = '[Already retrieved — content unchanged. Use your existing context and take action now instead of re-reading.]';
+              let r = '[Already retrieved — content unchanged. Use your existing context and take action now instead of re-reading.]';
+              // The first repeat of a small file gets the file again. A model
+              // that asks to read what it already has has usually lost track
+              // of it, and a stub with nothing in it only cost it a step while
+              // leaving it without the code - traced on gpt-oss, which asked
+              // for store.js four times and got the stub three. Later repeats,
+              // and big files, still get the stub: that is what stops a loop.
+              const repeats = (readRepeats.get(key) || 0) + 1;
+              readRepeats.set(key, repeats);
+              if (repeats === 1 && (tool.name === 'read_file' || tool.name === 'read_lines')) {
+                const again = await this.executeTool(tool);
+                if (typeof again === 'string' && again.length <= REPEAT_READ_MAX_CHARS && !/^Error/.test(again)) {
+                  r = '[You already read this and it has not changed since. Here it is again - work from it rather than reading it a third time.]\n' + again;
+                }
+              }
               // Short-circuited calls still get their own visible card, tagged
               // with a unique callId — without this, the webview had no card to
               // attribute the result to and silently overwrote whatever OTHER
@@ -4681,9 +4875,18 @@ class NavyCoderViewProvider {
             // model as a vision message right after the tool result (below). Every
             // provider path in llm.js already converts an image_url content array.
             let imageForModel = null;
+            let imageToModel = true;
             if (result && typeof result === 'object' && result.__image) {
               imageForModel = result.__image;
               result = String(result.text || '[image captured]');
+              // A model that cannot take images is not sent one: Ollama answers
+              // that with HTTP 400, and the whole turn failed at the first
+              // screenshot of a playthrough. It works from the measured checks
+              // that came with the screenshot instead; the user still sees it.
+              if (!this._modelSeesImages(lastUsedModel)) {
+                imageToModel = false;
+                result += `\n\n[${lastUsedModel} cannot see images, so the screenshot itself was not sent to you. Work from the automated checks above, browser_snapshot for what is on the page, and browser_evaluate to measure anything else.]`;
+              }
             }
 
             // Track non-command failures the same way. An "Error:"-prefixed
@@ -4734,6 +4937,7 @@ class NavyCoderViewProvider {
                 lastCheck = { cmd: tool.args?.command || tool.args?.filter || tool.name, exit, editedSince: false };
                 if (exit === 0) {
                   checkHistory.delete(cmdKey);
+                  this._notePlanEvidence('pass');
                 } else {
                   const h = checkHistory.get(cmdKey) || { fails: 0, editedSince: true };
                   if (h.editedSince) h.fails++;
@@ -4744,9 +4948,11 @@ class NavyCoderViewProvider {
                   // the point at which another patch on the same guess is the
                   // pattern behind "it keeps editing and nothing gets fixed".
                   if (h.fails >= 3 && h.fails % 2 === 1) {
+                    stuckReason = stuckReason || `${h.fails - 1} fixes in a row left \`${tool.args?.command || tool.args?.filter || tool.name}\` failing`;
                     result += `\n\n[SYSTEM: ${h.fails - 1} fixes in a row have left this check failing. Stop patching. `
                       + 'Read this output again for what it says that you did not expect, write down the cause you now believe and why the earlier fixes missed it, '
-                      + 'and undo any change that did not help. Only then make one change, aimed at that cause.]';
+                      + 'and undo any change that did not help. Replace your plan with update_plan so its steps follow that cause, not the guess it was written on. '
+                      + 'Only then make one change, aimed at that cause.]';
                   }
                 }
               }
@@ -4764,7 +4970,15 @@ class NavyCoderViewProvider {
               || (tool.name === 'delete_file' && resultText.startsWith('Deleted'))
               || ((tool.name === 'rename_file' || tool.name === 'rename_symbol') && resultText.startsWith('Renamed'));
             if (COMMAND_TOOLS.has(tool.name) || changedFiles) forgetReadsAfterChange();
+            // What a plan's verify step can stand on: the parser accepting the
+            // file, or looking at the result in the browser. (A passing
+            // command is noted with the exit code above.)
+            if ((tool.name === 'check_syntax' && resultText.startsWith('VALID'))
+              || (/^browser_(?:screenshot|snapshot|console)$/.test(tool.name) && resultText && !/^Error\b/.test(resultText))) {
+              this._notePlanEvidence('pass');
+            }
             if (changedFiles) {
+              this._notePlanEvidence('edit');
               // A change to the code is exactly what makes re-running a failed
               // check worth doing. The repeat-failure block used to survive
               // edits: fail, fix, fail, fix, and the third run of the test was
@@ -4788,19 +5002,28 @@ class NavyCoderViewProvider {
                   // Normal case: fresh diagnostics help the model verify its own edit.
                   result += await this._diagnosticsAfterWrite(p);
                 } else if (editCount === FILE_EDIT_SOFT_CAP) {
+                  stuckReason = stuckReason || `${path.basename(p)} edited ${editCount} times without settling`;
                   // Stop feeding diagnostics from here — if the model has edited this
                   // file 5 times already, more of the same feedback is very likely
                   // what's DRIVING the loop rather than helping end it.
                   // Rethink, not wrap up. This used to say "make ONE decisive
                   // final edit, then call finish()" - pushing a model that had
                   // not found the cause to stop looking for it and report.
-                  result += `\n\n[SYSTEM: You have edited ${p} ${editCount} times this turn, which usually means the edits are aimed at a symptom. Before editing it again: re-read the file as it is now and the latest error, state the cause in one sentence, and check that your next change addresses that cause rather than adding another patch. If you cannot find it, say so plainly instead of continuing to edit. Diagnostics will not be shown for further edits to this file this turn - run the project's own check to verify instead.]`;
+                  result += `\n\n[SYSTEM: You have edited ${p} ${editCount} times this turn, which usually means the edits are aimed at a symptom. Before editing it again: re-read the file as it is now and the latest error, state the cause in one sentence, replace your plan with update_plan if that cause is not the one it was written for, and check that your next change addresses that cause rather than adding another patch. If you cannot find it, say so plainly instead of continuing to edit. Diagnostics will not be shown for further edits to this file this turn - run the project's own check to verify instead.]`;
                 }
                 // editCount > SOFT_CAP: no diagnostics, no repeated nudge — silence
                 // itself discourages continuing, and the hard cap above is the backstop.
+                // Whether the file parses is still tracked past that point: a turn
+                // must not report with a file its own check says it broke.
+                const resolved = this.resolveWorkspacePath(p);
+                const verdict = editCount < FILE_EDIT_SOFT_CAP ? String(result)
+                  : await this._syntaxVerdictAfterWrite(resolved).catch(() => '');
+                if (/POST-EDIT SYNTAX CHECK FAILED/.test(verdict)) brokenFiles.set(resolved, path.basename(p));
+                else brokenFiles.delete(resolved);
               }
             }
             if (tool.name === 'delete_file' && typeof result === 'string' && result.startsWith('Deleted')) {
+              brokenFiles.delete(this.resolveWorkspacePath(tool.args?.path || ''));
               taskChanges.deleted.push(tool.args?.path || '');
             }
             if (tool.name === 'rename_file' && typeof result === 'string' && result.startsWith('Renamed')) {
@@ -4823,7 +5046,7 @@ class NavyCoderViewProvider {
             // converter folds later tool results into whichever user block is
             // open — which would leave tool_result blocks sitting after the image
             // instead of at the start of the turn, where that API wants them.
-            if (imageForModel) {
+            if (imageForModel && imageToModel) {
               imageMessages.push({ role: 'user', content: [
                 { type: 'text', text: imageForModel.caption || `[Screenshot from ${tool.name} — analyze it for visual bugs: layout, overlap, cut-off or overflowing text, contrast, broken images, and anything a human tester would notice.]` },
                 { type: 'image_url', image_url: { url: `data:${imageForModel.mediaType};base64,${imageForModel.data}` } },
@@ -4969,7 +5192,8 @@ class NavyCoderViewProvider {
   _describeReadCall(tool) {
     const a = tool.args || {};
     switch (tool.name) {
-      case 'read_file': return a.path ? 'read_file(' + a.path + ')' : '';
+      case 'read_file': return a.path ? (a.start != null ? `read_file(${a.path}:${a.start}-${a.end ?? '?'})` : 'read_file(' + a.path + ')') : '';
+      case 'git': return 'git(' + (a.action || '?') + (a.path ? ' ' + a.path : '') + ')';
       case 'read_lines': return a.path ? `read_lines(${a.path}:${a.start ?? '?'}-${a.end ?? '?'})` : '';
       case 'list_files': return 'list_files(' + (a.path || '.') + ')';
       case 'search_files': return a.query ? `search_files("${a.query.slice(0, 40)}")` : '';
@@ -5519,7 +5743,46 @@ class NavyCoderViewProvider {
     if (opts.continues && this.messages.some(m => seededInstruction(m).startsWith(PLAYTHROUGH_PREFIX))) return true;
     if (this._session.browser?.running) return true;
     return /\b(browser|playthrough|screenshot|web ?page|click(?:ing)? through)\b/i.test(text)
-      || /\b(?:localhost|127\.0\.0\.1)(?::\d+)?\b/i.test(text);
+      || /\b(?:localhost|127\.0\.0\.1)(?::\d+)?\b/i.test(text)
+      || /https?:\/\//i.test(text);
+  }
+
+  // What navy.escalationModel names, as { model, provider } for
+  // _streamWithFallback, or null when it is unset or is the model already in
+  // use. provider is null for the configured provider (keeping its API base
+  // and host), or the id of another one, whose own saved key is used.
+  _escalationTarget(currentModel) {
+    const config = vscode.workspace.getConfiguration('navy');
+    const model = String(config.get('escalationModel', '') || '').trim();
+    if (!model) return null;
+    const configured = config.get('provider', 'ollama');
+    const other = String(config.get('escalationProvider', '') || '').trim();
+    const provider = other && other !== configured ? other : null;
+    if (!provider && model === currentModel) return null;
+    return { model, provider };
+  }
+
+  // Whether `model` can be sent images: not if Ollama reported it without the
+  // vision capability, or a provider already turned an image down for it this
+  // session. Unknown means yes - most hosted models take images, and one that
+  // does not is caught by the rejection and remembered.
+  _modelSeesImages(model) {
+    if (this._noVisionModels?.has(model)) return false;
+    const caps = this._ollamaThinking?.get(model);
+    return !(caps && caps.vision === false);
+  }
+
+  // Called from the stream (thinking and content chunks) to tell the watchdog
+  // the call is still producing output, so a long-but-active reasoning stream
+  // is not mistaken for a hang. Throttled to at most once every 2s: a chunk
+  // can arrive thousands of times per call, and re-arming a timer that often
+  // is pointless. Does nothing outside a turn (no watchdog armed).
+  _noteStreamActivity() {
+    if (!this._armWatchdog) return;
+    const now = Date.now();
+    if (this._lastWatchdogPoke && now - this._lastWatchdogPoke < 2000) return;
+    this._lastWatchdogPoke = now;
+    this._armWatchdog();
   }
 
   // Local Ollama or LM Studio — where small models actually run. Ollama Cloud
@@ -5552,7 +5815,11 @@ class NavyCoderViewProvider {
     // world to hello job!" (names WHAT to change, not the word "file"). A false
     // positive here only costs one harmless internal nudge; a false negative
     // lets a fabricated "it's done" claim reach the user unchecked.
-    return /\b(write|create|generate|make|add|implement|build|fix|edit|update|modify|refactor|rewrite|change|save|apply|delete|remove|rename)\b/i.test(prompt);
+    // ...or, in any language, a request that names a file or carries code:
+    // "corrige el error en auth.js" has no English verb, but it names what is
+    // to change.
+    return /\b(write|create|generate|make|add|implement|build|fix|edit|update|modify|refactor|rewrite|change|save|apply|delete|remove|rename)\b/i.test(prompt)
+      || FILE_NAME_RE.test(prompt) || /```/.test(prompt);
   }
 
   // Normalize native tool calls to the exact OpenAI shape before they go into the
@@ -5669,7 +5936,11 @@ class NavyCoderViewProvider {
         return await this.mcp.call(tool.name, tool.args);
       }
       switch (tool.name) {
-        case 'read_file': return await this.toolReadFile(tool.args.path);
+        // A range turns read_file into what read_lines was - one reading tool
+        // instead of two (read_lines is still understood, just not offered).
+        case 'read_file': return (tool.args.start != null || tool.args.end != null)
+          ? await this.toolReadLines(tool.args.path, tool.args.start ?? 1, tool.args.end)
+          : await this.toolReadFile(tool.args.path);
         case 'remember': return await this.toolRemember(tool.args.fact);
         case 'forget': return await this._modelForget(tool.args.query);
         case 'read_lines': return await this.toolReadLines(tool.args.path, tool.args.start, tool.args.end);
@@ -5696,6 +5967,17 @@ class NavyCoderViewProvider {
         case 'update_plan': return await this.toolUpdatePlan(tool.args.steps);
         case 'list_mcp_resources': return this.toolListMcpResources();
         case 'read_mcp_resource': return await this.toolReadMcpResource(tool.args.uri);
+        // One git tool for the four read-only ones (still understood by name).
+        case 'git': {
+          const g = tool.args || {};
+          switch (g.action) {
+            case 'status': return await this.toolGitStatus();
+            case 'diff': return await this.toolGitDiff(g.path, g.staged);
+            case 'log': return await this.toolGitLog(g.count);
+            case 'blame': return g.path ? await this.toolGitBlame(g.path, g.startLine, g.endLine) : 'Error: git blame needs a path.';
+            default: return 'Error: git action must be one of status, diff, log, blame.';
+          }
+        }
         case 'git_status': return await this.toolGitStatus();
         case 'git_diff': return await this.toolGitDiff(tool.args.path, tool.args.staged);
         case 'git_log': return await this.toolGitLog(tool.args.count);
@@ -6770,6 +7052,12 @@ class NavyCoderViewProvider {
     // shell involved at all, so `filter` needs no escaping and can't be
     // reinterpreted as anything other than one literal argument.
     const binaryChecks = [
+      // A plain test script run with node - no framework, no package.json
+      // script. Detection used to stop at the frameworks and answer "Could not
+      // detect test framework", leaving the model to guess `node test.js`.
+      [path.join(root, 'test.js'),        'node',   ['test.js']],
+      [path.join(root, 'tests.js'),       'node',   ['tests.js']],
+      [path.join(root, 'test', 'run.js'), 'node',   [path.join('test', 'run.js')]],
       [path.join(root, 'pytest.ini'),     'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
       [path.join(root, 'setup.py'),       'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
       [path.join(root, 'pyproject.toml'), 'python', ['-m', 'pytest', ...(filter ? ['-k', filter] : []), '-v']],
@@ -6780,7 +7068,7 @@ class NavyCoderViewProvider {
     for (const [file, bin, args] of binaryChecks) {
       try { await fs.promises.access(file); matched = { bin, args }; break; } catch {}
     }
-    if (!matched) return 'Could not detect test framework. Tried npm test, pytest, cargo test, go test.';
+    if (!matched) return 'Could not detect test framework. Tried npm test, node test.js, pytest, cargo test, go test.';
 
     const result = await this._runTestBinary(matched.bin, matched.args, root, 60000, streamId);
     return result.slice(0, 8000);
@@ -7504,7 +7792,7 @@ class NavyCoderViewProvider {
 
 Project root: ${root}
 
-You may call READ-ONLY tools to investigate: read_file, read_lines, list_files, search_files, search_codebase, find_relevant_files, find_symbol, find_references, search_docs, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, web_search, fetch_url. You CANNOT write, delete, rename files, run commands, or delegate further — any such attempt will be refused. When you have enough to answer, respond in PLAIN TEXT with a clear, well-organized report the delegating agent can act on directly — do not call finish(), just stop calling tools once you're done.
+You may call READ-ONLY tools to investigate: read_file (pass start/end for a range), list_files, search_codebase, find_relevant_files, find_symbol, find_references, git (status, diff, log, blame), get_diagnostics, check_syntax, web_search, fetch_url. You CANNOT write, delete, rename files, run commands, or delegate further — any such attempt will be refused. When you have enough to answer, respond in PLAIN TEXT with a clear, well-organized report the delegating agent can act on directly — do not call finish(), just stop calling tools once you're done.
 
 Investigation task:
 ${task.trim()}`;
@@ -8337,6 +8625,7 @@ mixinPrototype(NavyCoderViewProvider.prototype, PLAN_METHODS);
 mixinPrototype(NavyCoderViewProvider.prototype, QuestionMethods.prototype);
 mixinPrototype(NavyCoderViewProvider.prototype, SupplyChainScanMethods.prototype);
 Object.assign(NavyCoderViewProvider.prototype, SLASH_COMMAND_METHODS);
+Object.assign(NavyCoderViewProvider.prototype, REVERSE_ENGINEER_METHODS);
 Object.assign(NavyCoderViewProvider.prototype, SKILL_METHODS);
 
 function deactivate() {}

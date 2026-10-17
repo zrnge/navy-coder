@@ -83,8 +83,14 @@ async function fetchWithRetry(url, init) {
     }
     const guard = new ReasoningLoopGuard(() => call.abort());
     callGuards.set(call.signal, { guard, model });
+    // Every content chunk is also progress for the turn watchdog, so a long
+    // answer (like a long reasoning stream) is not aborted as a hang. Thinking
+    // chunks poke it from emitThinking; this covers the visible output.
+    const watched = onChunk
+      ? (t) => { provider._noteStreamActivity?.(); return onChunk(t); }
+      : onChunk;
     try {
-      const result = await streamAssistantCall(provider, host, model, messages, temperature, call.signal, onChunk, override, toolsApiOverride);
+      const result = await streamAssistantCall(provider, host, model, messages, temperature, call.signal, watched, override, toolsApiOverride);
       // The loop can be spotted in the last piece of a stream that has already
       // been read to the end, so the abort had nothing left to stop: the
       // response is still the looping one, and is not used.
@@ -105,6 +111,9 @@ async function fetchWithRetry(url, init) {
   function emitThinking(provider, signal, text) {
     if (!text) return;
     provider.view?.webview.postMessage({ type: 'thinkingChunk', text });
+    // Reasoning is progress too: keep the turn watchdog from killing a long
+    // but active thinking stream (see _noteStreamActivity).
+    provider._noteStreamActivity?.();
     const entry = signal && callGuards.get(signal);
     if (!entry) return;
     provider._noteReasoningModel?.(entry.model);

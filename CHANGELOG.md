@@ -1,5 +1,170 @@
 # Changelog
 
+## [0.4.0] - 2026-10-17
+
+Navy writes plans that name real files and says when its work is unverified,
+has fewer and clearer tools, no longer cuts off long reasoning, adds `/reverse`
+for clean-room reverse engineering, and has a harder eval to measure whether it
+is getting smarter. On that eval, gpt-oss:120b passes 15 of 21 runs, up from
+10 of 23 on 0.3.9.
+
+### Added
+
+- **`/reverse` — clean-room reverse engineering.** A built-in command that
+  reimplements what a binary or app does without copying its code. It asks for
+  the target (a path typed after the command, or a file picker), the target
+  type (native ELF/PE/Mach-O, .NET, Electron/.asar, APK, website, or
+  auto-detect), the language to build in, and which behaviour to reproduce;
+  then it seeds one brief and runs the normal agent loop. The brief is strict:
+  lawful-use is confirmed up front (and the command gates on it with a native
+  prompt that a weak model cannot skip), analysis is static — the target is
+  read by disassemblers, never executed, without an explicit go — and the work
+  is clean-room, learning *what* the target does, writing a behavioural
+  SPEC.md, then fresh source under `./my-version`, with tests derived from the
+  behaviour and checked against a deliberately wrong answer. No external
+  decompiler is needed — not Ghidra, radare2, ilspycmd, the asar CLI or JADX,
+  and nothing to install. It parses the target itself in Node (which the
+  environment already runs on): PE/ELF/Mach-O headers and section, import and
+  export tables; .NET metadata and IL; the .asar archive directory; an APK's
+  ZIP entries via built-in zlib; web assets as plain text — all through small
+  scripts it writes and runs with the tools already present (run_command,
+  write_file, read_file, update_plan). Where static parsing genuinely cannot
+  reach a behaviour, it says so in the unknowns rather than reaching for an
+  outside tool.
+
+- **Navy can review its own changes (opt-in).** With `navy.selfReview` on,
+  before a turn that changed files reports, Navy shows the model the turn's
+  complete diff, once, and asks it to review the
+  change as a careful reviewer would: does it do exactly what was asked, are
+  there edge cases or broken callers, does it match the surrounding code, is
+  there debug code left in, was it checked after the last edit. Whatever it
+  finds, it fixes before reporting. A model edits one piece at a time and never
+  otherwise sees the change whole. Off by default: on the hard eval it added
+  about a quarter more prompt tokens and passed no more tasks (16 of 21 runs
+  with it, 19 of 21 without, on gpt-oss:120b).
+- **Browser QA measures what a person sees at a glance.** Every screenshot now
+  comes with layout checks measured from the page itself: text drawn over other
+  text, text cut off by its box, images that failed to load, text all but
+  invisible against its background, a page that scrolls sideways, and how much
+  of the page lies below the window. Probed on a shop page with four such bugs,
+  deepseek-v4.1-flash read the overlapping price as "garbled text", the cut-off
+  heading as "a stray backtick" and did not see the white-on-white text at all;
+  with the checks, it and gpt-oss both report all four, precisely. The
+  playthrough brief now treats the findings as facts and has the model scroll
+  through the whole page, a window at a time.
+- **A stronger model when Navy is stuck.** Set `navy.escalationModel` (and
+  `navy.escalationProvider` if it lives elsewhere) and Navy hands a turn to it
+  when the turn stops converging: two fixes in a row leaving the same check
+  failing, one file edited five times without settling, or reasoning going in
+  circles. It takes the rest of that turn, and the next turn starts on your
+  usual model again. The switch is announced in the chat and kept with the
+  turn, since it may cost more. Off until a model is set.
+- **A hard eval tier.** `npm run eval -- --suite hard`: eight small multi-file
+  projects where the work is understanding - a failed order that leaks reserved
+  stock, a new CLI command that has to follow the existing ones, a vague
+  time-zone report, events applied out of order, a CSV parser, two bugs behind
+  one wrong total, a fix whose obvious place breaks another module, and a spec
+  to follow exactly. Each checker runs the project's tests and cases they do
+  not show. The core suite could not tell whether a change made Navy smarter: a
+  strong model passes nearly all of it.
+
+- **`--trace` for the eval.** Prints every tool call, a line of each result
+  and the final reply, so a failed task says why it failed and not only that it
+  did.
+
+### Changed
+
+- **Fewer, clearer tools.** The model was offered three ways to read a file,
+  four to edit (three by line number, which go stale as soon as one edit moves
+  the lines), three to search and four for git. Each is folded into one:
+  `read_file` takes an optional line range, `apply_edit` and `write_file` do
+  every edit, `search_codebase` covers the docs too, and a single `git` tool
+  takes an action. `get_terminal_output`, which could never read a terminal,
+  is gone. Outside browser work the model now chooses from 28 tools instead of
+  38; small models from 15. The retired names are still understood, so older
+  chats and models that use them keep working.
+- **Requests in any language get the same help.** Several decisions hung on
+  English words in the request: whether to look up the likely relevant files,
+  whether to include the open file, whether the request asked for a change (and
+  so whether to check for invented ones). A request in Spanish lost all three.
+  They now also go by what the request contains - a file name, an identifier,
+  some code, or simply enough words to be a real request - which reads the same
+  in any language. A pasted web address now brings the browser tools too.
+- **Plans name the real files, and are kept true.** Across 54 saved turns with
+  a plan, most steps were generic ("Investigate", "Fix", "Test"), and not one
+  plan was ever revised, even when the fix it described failed. The plan still
+  comes before the first change, but after a quick look at the files the
+  request is about, so its steps can name the files and functions involved;
+  and the model is asked to replace it when what it learns changes the
+  approach. (Asking for the plan only after a full investigation was tried and
+  dropped: gpt-oss then skipped the plan altogether and its hard-eval score
+  fell from 19 of 21 runs to 12 of 22.) When two fixes in a row leave a check
+  failing, or one file has been edited five times, the nudge to rethink now also asks for a new
+  plan that follows the cause it believes now. Steps no longer need marking
+  "in progress" before "done", which was a tool call per step spent on
+  bookkeeping.
+- **"Done" on a verify step has to be earned.** Every plan that reached its end
+  had the verify step marked done, whether or not anything was checked after
+  the last edit. Now, if files were changed and nothing passed since (a command
+  or test that exited 0, `check_syntax`, or a look at the page in the
+  browser), the step shows as **unverified** on the plan card, the model is
+  told what to run, and the reply ends by saying so. A check that passes later
+  clears it.
+
+### Fixed
+
+- **A long reasoning stream is no longer cut off as a timeout.** Each model
+  call has a 3-minute watchdog meant to abort a call that hangs, but nothing
+  re-armed it while the model was streaming — so a single thinking stream over
+  three minutes long (around 100k characters) was aborted mid-thought and the
+  turn ended, looking like a hard ceiling on how long Navy may reason. Streamed
+  output, reasoning included, now re-arms the watchdog, so it fires only on a
+  genuine stall (no output for 3 minutes) and never on a model that is still
+  thinking.
+- **A long, productive turn is no longer killed by a second, unrelated loop.**
+  Navy stops a model whose reasoning goes in circles, nudges it to act, and
+  ends the turn if it loops straight back. But the "loop again → stop" count
+  ran for the whole turn, so two loops dozens of steps apart — a reverse-
+  engineering turn that did 70-plus steps of real work, for one — were treated
+  as the same loop twice and the turn was thrown away near the end. The count
+  now resets whenever the model takes a real action, so it means "looping with
+  no progress between," not "looped twice this turn."
+- **A turn no longer ends silently after reading.** Some models read the files
+  a change needs and then stop: no reply, nothing changed. If no plan had been
+  written yet, nothing noticed. Navy now sends such a turn back, up to twice,
+  to write its plan and do the work, or to say what blocks it.
+
+- **A model without vision crashed the playthrough.** Every screenshot was
+  sent to the model, and one that cannot take images - gpt-oss, for one - got
+  an HTTP 400 from Ollama on the next step, ending the turn at its first
+  screenshot. Navy now reads Ollama's vision capability and does not send
+  images to a model without it: the model works from the measured layout
+  checks, the page outline and script instead, and you still see the
+  screenshot. If any provider turns an image down anyway, Navy takes the images
+  out, remembers that model, and carries on.
+- **A turn could end with a file that does not parse.** Navy checks a
+  JavaScript or JSON file's syntax right after each edit and tells the model when
+  it broke one - but nothing stopped the turn reporting "done" with the file
+  still broken. Traced on gpt-oss, which pasted diff markers (`+`) into the code
+  and closed the turn. A turn is now sent back, up to twice, while a file its
+  own check says it broke is still broken, and if it still does not parse, the
+  reply says so plainly. The self-review also says the `+` and `-` at the start
+  of its diff are markers, not code.
+- **`run_tests` did not find a plain test script.** A project whose tests run
+  with `node test.js` - no framework, no npm script - got "Could not detect
+  test framework", and every model had to work out the command itself. A
+  `test.js`, `tests.js` or `test/run.js` is now run with node.
+- **Reading a file again returned nothing.** Repeat reads in a turn get a short
+  "already retrieved" reply, to stop a model looping - but a model that asks to
+  read a file again has usually lost track of it, and the stub left it without
+  the code. Traced on gpt-oss, which asked for the same file four times. The
+  first repeat of a small file now returns it again, marked unchanged; after
+  that, and for large files, the short reply stands.
+- **An eval run against a provider that was down scored as failed tasks.** A
+  provider error reaches the panel as an error message, not reply text, and the
+  eval only read the text: an outage looked like a model that could do nothing.
+  It is now reported as errors, and the run as incomplete.
+
 ## [0.3.9] - 2026-10-13
 
 Long chats no longer slow down with every message, each round of thinking shows

@@ -5,6 +5,7 @@
 - **Nothing happens without you** — every file change is a diff you approve, and every command, dev server, MCP call and browser launch asks first, behind a gate of its own. Optional sandboxing (Docker, WSL containers, or the OS's own sandbox) adds a second layer underneath.
 - **`/audit`** scans your own project for what a supply-chain attack actually looks like: install hooks that pipe `curl | sh`, code that reads your SSH or cloud credentials, obfuscated payloads, build files that download and run.
 - **`/playthrough`** tests your web app in a real Chrome the way a human tester would, checks each screen for accessibility problems, and compares it against a saved baseline. Every screenshot it takes appears in the chat, click to enlarge.
+- **`/reverse`** reimplements what a binary or app does, clean-room: it reads the target statically, writes a behavioural spec, then builds fresh source in the language you choose. No decompiler to install.
 - **Made for local models too** — a small model gets a reduced tool set, so the tool list doesn't swallow its context window.
 - **In CI as well** — `navy audit` and `navy playthrough` run headless from the command line or as a GitHub Action, with exit codes a pipeline can act on. See [Command line and CI](#command-line-and-ci).
 
@@ -24,7 +25,7 @@
 - **Running cost estimate** — a cumulative token counter with an approximate $ cost for well-known hosted models, priced per turn using whichever provider actually served it; local models always show $0, and `navy.modelPricing` prices anything the built-in table has never heard of rather than making you wait for a release
 - **A search that admits when it is degraded** — `search_files` uses VS Code's bundled ripgrep when it can find it. When it can't, the JavaScript fallback labels every answer it gives, because "No matches" from a bounded walk reads exactly like "No matches" from a full-tree search — and the model would otherwise conclude the string is absent and reason from that
 - **Retrieval that scales to large codebases** — `find_relevant_files` ranks every source file in the project from a local index: BM25, so a rare identifier outweighs a word every file uses; built in the background and kept current as files change; and each hit names the line that defines what was asked about. On a 7,400-file codebase it put the defining file first for 59.5% of plain-word queries and in the top five for 86.5%, against 3% and 5.5% for the bounded walk it replaced, at about a millisecond a query. Semantic embeddings (chunked per file) and real LSP symbol matches blend in on top, and the repository map the model sees carries a one-line function/class outline per file
-- **Reduced tool set for small models** (`navy.reducedToolset`) — the full ~37 tool schemas ride on every request, which is a real tax on a 7B local model's context and measurably worsens its tool choice; a small local model (Ollama/LM Studio, ≤9B-named or ≤16k effective window) is instead offered a lean core covering read → edit → verify, and unlocks the full set mid-turn with one `request_more_tools` call when the task needs it — a context optimization, never a permission change
+- **Reduced tool set for small models** (`navy.reducedToolset`) — the full ~28 tool schemas ride on every request, which is a real tax on a 7B local model's context and measurably worsens its tool choice; a small local model (Ollama/LM Studio, ≤9B-named or ≤16k effective window) is instead offered a lean core covering read → edit → verify, and unlocks the full set mid-turn with one `request_more_tools` call when the task needs it — a context optimization, never a permission change
 - **`delegate_research`** — the model can spin off an isolated, read-only sub-agent for a broad investigation, getting back only the written conclusion instead of filling the main conversation with every file it looked at
 - **Opt-in sandboxing, three backends** (`navy.sandboxMode`) — a second layer of isolation under the approval gate. `docker` runs commands inside a container built from the project's own `.devcontainer`/`Dockerfile` (or `navy.sandboxImage`), on any OS. `wsl` gives Windows the same container isolation through WSL Containers (`wslc`), with no Docker Desktop (needs WSL 2.9.3+). `native` uses the OS's own sandbox with nothing to install — `sandbox-exec` on macOS, `bubblewrap` on Linux — confining writes to the project and temp, and blocking reads of SSH and cloud credential stores. None of them ever falls back to running unsandboxed: if it can't proceed it refuses and says why. The network is not restricted under `native` — see [Safety](#safety)
 - **Opt-in persistent background processes** (`navy.persistBackgroundProcesses`) — let a dev server survive a window reload instead of being killed, with its output logged to a file and Navy offering to stop it if you reopen the project with one still running
@@ -138,7 +139,7 @@ Every file-mutating tool goes through the diff approval gate (unless `navy.appro
 
 ## Slash Commands
 
-Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/problems` (everything the Problems panel and the project's own checker report), `/security`, `/audit` (supply-chain scan), `/playthrough` (visual browser test), `/commit` and a dozen more.
+Type `/` in the composer for the built-in prompts — `/fix`, `/review`, `/test`, `/problems` (everything the Problems panel and the project's own checker report), `/security`, `/audit` (supply-chain scan), `/playthrough` (visual browser test), `/reverse` (clean-room reverse engineering), `/commit` and a dozen more.
 
 **You can add your own.** A command is a markdown file: the filename is what you type, the body is the prompt.
 
@@ -277,6 +278,9 @@ Open via **File → Preferences → Settings** and search for `navy`, or click t
 | `navy.editFormat` | `search-replace` | `search-replace` for surgical edits; `whole-file` to rewrite the entire file |
 | `navy.maxToolIterations` | `100` | Maximum agent loop iterations per turn |
 | `navy.fileEditSoftCap` | `5` | Writes to the same file in one turn before Navy stops feeding back fresh diagnostics and nudges the model to wrap up |
+| `navy.selfReview` | `off` | `on` shows the model the turn's whole diff once to review before a turn that edited files reports. Off by default: on the hard eval it cost about a quarter more tokens and passed no more tasks |
+| `navy.escalationModel` | *(empty)* | A stronger model that takes over the rest of a turn once it is stuck (fixes that do not fix, one file edited five times, reasoning in circles). Announced in the chat. Empty: never switch |
+| `navy.escalationProvider` | *(empty)* | The provider `navy.escalationModel` runs on. Empty: the same as `navy.provider` |
 | `navy.fileEditHardCap` | `10` | Writes to the same file in one turn after which further writes to it are refused — the backstop against an edit loop |
 | `navy.sandboxMode` | `off` | `off`, `docker`, `wsl` (Windows, no Docker Desktop) or `native` — see [Safety](#safety) |
 | `navy.persistBackgroundProcesses` | `false` | Let `run_project`/`start_process` survive a window reload instead of being stopped |

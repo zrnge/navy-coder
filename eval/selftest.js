@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { TASKS } = require('./tasks.js');
+const { HARD_TASKS } = require('./tasks-hard.js');
 
 let passed = 0;
 const failures = [];
@@ -260,6 +261,27 @@ async function main() {
   // Every task must have a scenario, or it silently goes unvalidated.
   const missing = TASKS.filter(t => !SCENARIOS[t.id]).map(t => t.id);
   check('every task has a self-test scenario', missing.length === 0, missing.join(', '));
+
+  // The hard tier carries its scenarios with each task, and one more rule:
+  // the project exactly as seeded must FAIL - a task its starting code
+  // already passes measures nothing.
+  for (const task of HARD_TASKS) {
+    const sc = task.selftest;
+    check(`${task.id}: has a self-test scenario`, Boolean(sc?.solve && sc?.breakIt));
+    if (!sc) continue;
+    for (const [label, mutate, want] of [['as seeded', () => {}, false], ['a correct fix', sc.solve, true], ['a plausible wrong fix', sc.breakIt, false]]) {
+      const dir = seedRepo(task);
+      try {
+        await mutate(dir, W);
+        const v = await task.check(makeCheckContext(dir, task, ''));
+        check(`${task.id}: ${want ? 'passes' : 'fails'} on ${label}`, v.pass === want, v.reason);
+      } catch (e) {
+        check(`${task.id}: ${want ? 'passes' : 'fails'} on ${label}`, false, 'threw: ' + e.message);
+      } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      }
+    }
+  }
 
   for (const task of TASKS) {
     const sc = SCENARIOS[task.id];

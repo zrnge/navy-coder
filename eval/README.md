@@ -21,6 +21,7 @@ npm run eval -- --compare eval/results/baseline.json  # diff vs a saved run
 npm run eval -- --keep                                # keep temp repos to inspect
 npm run eval -- --config reducedToolset=off           # pin any navy.* setting (repeatable)
 npm run eval -- --label full-tools                    # tag the saved results file
+npm run eval -- --suite hard                         # the hard tier (eval/tasks-hard.js); --suite all runs both
 npm run eval -- --help
 ```
 
@@ -94,6 +95,27 @@ mv eval/results/ollama_..._2026-01-01.json eval/results/baseline-ollama-7b.json
 | `respects-the-user` | Re-proposing an edit the user rejected, or reporting it as made. |
 | `conversation` | Follow-up turns: "make it…" losing what "it" was; "thanks!" re-running the task. |
 
+## The hard tier
+
+`npm run eval -- --suite hard` runs `eval/tasks-hard.js`: small multi-file
+projects where the work is understanding rather than typing. A cause in a
+different file from the symptom, a new command that has to follow the
+existing ones, a vague bug report, two bugs behind one wrong total, a fix that
+must not break a sibling module, a spec to follow exactly.
+
+The core suite cannot measure whether Navy got smarter: a strong model passes
+nearly all of it. These are meant to be failed, sometimes, by a good model -
+that is what lets a change show up as a number. Each checker runs the
+project's own tests and then cases those tests do not show, so a patch fitted
+to the visible test fails.
+
+They are noisy, being few and hard: compare runs with `--repeat 3`, which
+reports each task's majority outcome and flags the ones that disagree with
+themselves.
+
+`--config selfReview=on` turns on Navy's review of its own diff (off as Navy
+ships), for measuring what it is worth.
+
 ## Validating the checkers themselves
 
 ```bash
@@ -105,7 +127,8 @@ makes a good model look broken; one that can never fail makes a bad model look
 fine. The self-test simulates the ideal outcome for every task (checker must
 PASS) *and* a plausible wrong outcome (checker must FAIL), so a checker that
 can't actually detect failure is caught immediately. Run this after adding or
-editing any task.
+editing any task. For the hard tier it also checks that the project as seeded FAILS -
+a task its starting code already passes measures nothing.
 
 ## Adding a task
 

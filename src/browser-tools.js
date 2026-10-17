@@ -16,6 +16,23 @@ const fs = require('fs');
 const path = require('path');
 const png = require('./png.js');
 
+// The layout check (browser.js layoutCheckScript) as text for the model, after
+// a screenshot. Says what was found, or that nothing was, and how much of the
+// page the screenshot covers - a page longer than the window has more below
+// that no screenshot of the top will ever show.
+function formatLayoutCheck(res) {
+  if (!res || !Array.isArray(res.findings)) return '';
+  const lines = ['', '', 'Automated layout checks on this screen (measured from the page, not guessed from the image):'];
+  if (res.findings.length) for (const f of res.findings) lines.push('- [' + f.kind + '] ' + f.text);
+  else lines.push('- no overlapping text, cut-off text, broken images, invisible text or sideways scrolling found.');
+  const winH = res.window?.height || 0, pageH = res.page?.height || 0, y = res.page?.scrollY || 0;
+  if (winH && pageH > winH + 1) {
+    const below = Math.max(0, pageH - (y + winH));
+    lines.push(`- This screenshot shows ${y}-${y + winH}px of a ${pageH}px-tall page${below ? `; ${below}px below it are not in view - scroll and screenshot again to check them` : ''}.`);
+  }
+  return lines.join('\n');
+}
+
 // How many changed pixels still count as "the same screen". A text caret that
 // blinked between two captures is about 16 pixels; a genuine change is at least
 // a glyph. A percentage would be the wrong measure here: one changed word on a
@@ -104,9 +121,15 @@ class BrowserToolMethods {
     try {
       const data = await this._session.browser.screenshot();
       if (!data) return 'Error: screenshot failed (empty capture).';
+      // Measured facts go with the picture: a model reading a screenshot
+      // misses or misreads the obvious (see layoutCheckScript), and one that
+      // cannot see images gets only these. Best effort - a page that blocks
+      // script still gets its screenshot.
+      let checks = '';
+      try { checks = formatLayoutCheck(await this._session.browser.layoutCheck()); } catch { /* script blocked */ }
       // Structured result: the turn loop pulls __image out and feeds it to the
       // model as a vision message, and shows `text` on the tool card.
-      return { __image: { mediaType: 'image/png', data }, text: 'Screenshot captured — inspect it for layout, styling, overlap, cut-off text, and anything only visible by looking.' };
+      return { __image: { mediaType: 'image/png', data }, text: 'Screenshot captured — inspect it for layout, styling, overlap, cut-off text, and anything only visible by looking.' + checks };
     } catch (e) { return 'Error: ' + e.message; }
   }
 
@@ -548,7 +571,7 @@ class BrowserToolMethods {
 Tools available to you (a real Chrome window opens on the first browser_navigate). If the browser_* tools are not in your tool list yet, call request_more_tools first — it loads them:
 - browser_navigate(url) — go to a page.
 - browser_snapshot() — numbered outline of interactive elements + headings + alerts, across every frame (rows inside an iframe say so); the [ref] numbers feed click/type/hover. Re-snapshot after every navigation or page change (refs go stale). Anything it does not list — a drop zone, a plain-div menu, a canvas — can be addressed by CSS selector instead of a ref on any of these tools.
-- browser_screenshot() — SEE the page as an image. Take one on each important screen and actually look: layout, alignment, overlap, cut-off/overflowing text, contrast, broken images, responsiveness. (If you cannot see images, say so and lean on snapshot + evaluate.)
+- browser_screenshot() — SEE the page as an image, with automated layout checks measured from the page: overlapping text, text cut off by its box, broken images, invisible text, sideways scrolling, and how much of the page lies below the window. Treat every check finding as a fact to report. Then look at the image for what measuring cannot catch: alignment, spacing, things that look wrong or unfinished. A screenshot shows only the window — scroll and take another until you have seen the whole page. (If you cannot see images, you still get the checks; lean on them, snapshot and evaluate.)
 - browser_click(ref), browser_type(ref, text, submit) — interact. Use realistic input; set submit=true to send a form/search. browser_click takes button="right" and clicks=2; browser_type on a <select> chooses the option.
 - browser_hover(ref) — open a menu, tooltip or toolbar that only exists under the pointer, then snapshot to reach what appeared.
 - browser_press(key) — "Escape", "Tab", "Shift+Tab", "ArrowDown", "Control+k". The keyboard-only paths, and whether the page answers them at all.
@@ -567,7 +590,7 @@ Tools available to you (a real Chrome window opens on the first browser_navigate
 - browser_back(), browser_forward(), browser_close().
 
 Once the page is open:
-- Screenshot + snapshot + console to establish the baseline.
+- Screenshot + snapshot + console to establish the baseline. Scroll down the whole page, screenshotting each window's worth, before moving on.
 - Walk the main user journeys: click primary actions, fill and submit at least one form if present, follow key links. After each meaningful step: screenshot, snapshot, and check console.
 - Probe for problems a human would catch: broken/missing images, dead or 404 links, layout that overlaps or overflows, forms that accept bad input or give no feedback, obvious accessibility gaps, and any visible security smell (secrets in page/console, mixed content, missing auth checks, sensitive data in the DOM).
 - Use the whole toolset where the site calls for it: hover the menus, press Escape on a modal and Tab through a form, upload a file if there is a file input, choose real options in dropdowns, and take at least one pass at phone width (browser_viewport 390x844) — responsive breakage is one of the commonest real defects.
@@ -617,4 +640,4 @@ Begin now with the web-project check.`;
   }
 }
 
-module.exports = { BROWSER_TOOL_METHODS: BrowserToolMethods.prototype };
+module.exports = { BROWSER_TOOL_METHODS: BrowserToolMethods.prototype, formatLayoutCheck };

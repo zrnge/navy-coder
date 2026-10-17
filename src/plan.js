@@ -102,9 +102,50 @@ function normalizePlan(rawSteps) {
 }
 
 // One line per step, in the shape the model reads back on later iterations.
+// "[x?]" is a verify step marked done with nothing to show for it.
 function renderPlan(steps) {
   const mark = { done: '[x]', in_progress: '[>]', pending: '[ ]' };
-  return steps.map((s, i) => `${mark[s.status] || '[ ]'} ${i + 1}. ${s.step}`).join('\n');
+  return steps.map((s, i) => `${s.status === 'done' && s.unverified ? '[x?]' : mark[s.status] || '[ ]'} ${i + 1}. ${s.step}`).join('\n');
+}
+
+// "Done" on a verify step is a claim that a check passed. In the saved chats
+// every plan that reached the end had its verify step marked done, whether or
+// not anything had been run after the last edit - so the plan card, the one
+// place the user looks to see how far the work got, said "verified" about
+// work nobody had checked. Navy knows whether a check passed since the last
+// edit, so it says so next to the step instead of taking the model's word.
+const VERIFY_STEP_RE = /\b(?:verif\w*|tests?|testing|check(?:s|ing)?|confirm\w*|validat\w*|lint\w*|build|compile|run(?:s|ning)?)\b/i;
+const EDIT_STEP_RE = /\b(?:fix\w*|edit\w*|chang\w*|add\w*|updat\w*|implement\w*|writ\w*|replac\w*|remov\w*|refactor\w*|renam\w*|creat\w*|patch\w*|delet\w*|mov(?:e|ing))\b/i;
+
+// Which steps are verification: the ones that read like a check AND come
+// after the first step that changes something. "Check how parse() is called"
+// at the top of a plan is investigation, not a claim that the work holds up.
+// A plan with no editing step at all: only its last step, if it reads like one.
+function verifyStepIndexes(steps) {
+  const firstEdit = steps.findIndex(s => EDIT_STEP_RE.test(s.step));
+  const out = [];
+  steps.forEach((s, i) => {
+    if (!VERIFY_STEP_RE.test(s.step)) return;
+    if (firstEdit >= 0 ? i > firstEdit : i === steps.length - 1) out.push(i);
+  });
+  return out;
+}
+
+// Flags verify steps marked done while files were changed and nothing has
+// passed since. A step that was already done - and believed - in the previous
+// plan keeps its standing: the model re-sending the plan is not new evidence
+// either way. Mutates and returns the 1-based numbers of the flagged steps.
+function flagUnverified(steps, previous, evidence) {
+  const unproven = !!(evidence && evidence.edited && !evidence.verified);
+  const flagged = [];
+  for (const i of verifyStepIndexes(steps)) {
+    const s = steps[i];
+    if (s.status !== 'done') continue;
+    const p = previous[i];
+    const stood = p && p.step === s.step && p.status === 'done' && !p.unverified;
+    if (!stood && unproven) { s.unverified = true; flagged.push(i + 1); }
+  }
+  return flagged;
 }
 
 function planProgress(steps) {
@@ -122,6 +163,7 @@ class PlanMethods {
     if (result.error) return 'Error: ' + result.error;
 
     const previous = this._session.plan || [];
+    const flagged = flagUnverified(result.steps, previous, this._session.planEvidence);
     this._session.plan = result.steps;
     // Which turn the plan belongs to, so the webview updates ONE card per turn
     // instead of appending a new one on every revision.
@@ -135,8 +177,27 @@ class PlanMethods {
     const { done, total } = planProgress(result.steps);
     const changed = previous.length !== result.steps.length
       || previous.some((p, i) => p.step !== result.steps[i].step || p.status !== result.steps[i].status);
+    const warning = flagged.length
+      ? `\n\nStep ${flagged.join(', ')} is marked done, but you have changed files and no check has passed since, so the user sees it as unverified. `
+        + 'Run the check (run_tests, run_command, check_syntax, or look at it in the browser); once it passes the step counts as verified.'
+      : '';
     return (changed ? 'Plan updated' : 'Plan unchanged')
-      + ` (${done}/${total} done):\n${renderPlan(result.steps)}`;
+      + ` (${done}/${total} done):\n${renderPlan(result.steps)}${warning}`;
+  }
+
+  // What the turn loop reports as evidence: 'edit' when files changed, 'pass'
+  // when a check passed after that. A pass clears the flag on steps the model
+  // already marked done, so a plan updated before the test ran does not stay
+  // "unverified" once the test has passed.
+  _notePlanEvidence(kind) {
+    const ev = this._session.planEvidence || (this._session.planEvidence = { edited: false, verified: false });
+    if (kind === 'edit') { ev.edited = true; ev.verified = false; return; }
+    if (kind !== 'pass' || !ev.edited) return;
+    ev.verified = true;
+    const steps = this._session.plan || [];
+    if (!steps.some(s => s.unverified)) return;
+    for (const s of steps) delete s.unverified;
+    this.view?.webview.postMessage({ type: 'planUpdate', turnId: this._session.planTurnId, steps });
   }
 
   // What the model is shown at the top of every iteration. Without this the
@@ -147,7 +208,7 @@ class PlanMethods {
     if (!steps.length) return '';
     const { done, total } = planProgress(steps);
     return `\n\n## YOUR CURRENT PLAN (${done}/${total} done)\n${renderPlan(steps)}\n`
-      + 'Keep this current with update_plan as you go: mark a step "in_progress" when you start it and "done" the moment it is finished. If the plan turns out to be wrong, replace it — a stale plan is worse than none.';
+      + 'Keep this current with update_plan as you go: mark a step "done" when it is finished, and replace the plan whenever what you have learned changes the approach — a stale plan is worse than none.';
   }
 
   // Called once when a turn ends. A plan left with open steps is not an error —
@@ -157,7 +218,12 @@ class PlanMethods {
     const steps = this._session.plan || [];
     if (!steps.length) return '';
     const { done, total, open } = planProgress(steps);
-    if (!open.length) return '';
+    if (!open.length) {
+      const unverified = steps.filter(s => s.status === 'done' && s.unverified);
+      return unverified.length
+        ? `\n\n_Not verified: ${unverified.map(s => s.step).join('; ')} — no check passed after the last change._`
+        : '';
+    }
     const names = open.slice(0, 3).map(s => s.step);
     const more = open.length > 3 ? `, and ${open.length - 3} more` : '';
     return `\n\n_Plan incomplete — ${done}/${total} steps done. Still open: ${names.join('; ')}${more}._`;
@@ -168,11 +234,12 @@ class PlanMethods {
   _resetPlan() {
     this._session.plan = [];
     this._session.planTurnId = null;
+    this._session.planEvidence = { edited: false, verified: false };
   }
 }
 
 module.exports = {
   PLAN_METHODS: PlanMethods.prototype,
-  normalizePlan, renderPlan, planProgress,
+  normalizePlan, renderPlan, planProgress, verifyStepIndexes, flagUnverified,
   MAX_PLAN_STEPS, MAX_STEP_CHARS,
 };

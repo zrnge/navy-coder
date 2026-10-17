@@ -534,6 +534,130 @@ function analyzeFocusStops(stops) {
   return { sequence, traps, invisible, noIndicator, complete };
 }
 
+// ── Layout checks ────────────────────────────────────────────────────────────
+// What a person sees at a glance and a model reading a screenshot misses or
+// misreads: probed on deepseek-v4.1-flash, a price overlapping a product name
+// came back as "garbled text", a heading cut off by its box as "a stray
+// backtick", and white text on white not at all. These are measured from the
+// page instead, so every model gets them as facts - including one that cannot
+// see images at all. Runs with every browser_screenshot.
+//   overlap     two pieces of text drawn over each other
+//   clipped     text cut off by its own box (overflow hidden), or ellipsised
+//   image       an image that failed to load
+//   invisible   text with almost no contrast against its background
+//   sideways    the page wider than the window, so it scrolls sideways
+// Plus the page's height against the window's, so the model knows how much
+// of the page the screenshot does not show.
+function layoutCheckScript(max = 25) {
+  return `(() => {
+    ${parseCssColor.toString()}
+    ${blendOver.toString()}
+    ${relativeLuminance.toString()}
+    ${contrastRatio.toString()}
+    const MAX = ${Math.max(1, Number(max) || 25)};
+    const findings = [];
+    const add = (f) => { if (findings.length < MAX) findings.push(f); };
+    const short = (s, n = 50) => { const t = String(s || '').replace(/\\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+    const where = (el) => {
+      const tag = el.tagName.toLowerCase();
+      const cls = (el.className && typeof el.className === 'string') ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.') : '';
+      return tag + (el.id ? '#' + el.id : '') + cls;
+    };
+    const shown = (el) => {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const ownText = (el) => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').replace(/\\s+/g, ' ').trim();
+
+    // Elements that draw text themselves.
+    const texts = [];
+    for (const el of document.body ? document.body.querySelectorAll('*') : []) {
+      if (texts.length >= 400) break;
+      if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(el.tagName)) continue;
+      const t = ownText(el);
+      if (!t || !shown(el)) continue;
+      texts.push({ el, t, r: el.getBoundingClientRect() });
+    }
+
+    // Overlap: two text boxes drawn over each other, neither inside the other.
+    for (let i = 0; i < texts.length; i++) {
+      for (let j = i + 1; j < texts.length; j++) {
+        const a = texts[i], b = texts[j];
+        if (a.el.contains(b.el) || b.el.contains(a.el)) continue;
+        const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
+        const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+        if (w <= 2 || h <= 2) continue;
+        const smaller = Math.min(a.r.width * a.r.height, b.r.width * b.r.height);
+        if (w * h < 40 || w * h < smaller * 0.25) continue;
+        add({ kind: 'overlap', text: '"' + short(a.t, 30) + '" (' + where(a.el) + ') and "' + short(b.t, 30) + '" (' + where(b.el) + ') are drawn over each other' });
+      }
+    }
+
+    // Clipped: text cut off by its own box.
+    for (const el of document.body ? document.body.querySelectorAll('*') : []) {
+      if (findings.length >= MAX) break;
+      if (!shown(el) || !el.textContent.trim()) continue;
+      const cs = getComputedStyle(el);
+      const hidesX = ['hidden', 'clip'].includes(cs.overflowX), hidesY = ['hidden', 'clip'].includes(cs.overflowY);
+      const cutX = hidesX && el.scrollWidth > el.clientWidth + 1;
+      const cutY = hidesY && el.scrollHeight > el.clientHeight + 1;
+      if (!cutX && !cutY) continue;
+      const ellipsis = cs.textOverflow === 'ellipsis';
+      const shownPct = cutX ? Math.round(100 * el.clientWidth / el.scrollWidth) : Math.round(100 * el.clientHeight / el.scrollHeight);
+      add({ kind: 'clipped', text: '"' + short(el.textContent, 60) + '" (' + where(el) + ') is cut off by its box' + (ellipsis ? ' with an ellipsis' : '') + ' - about ' + shownPct + '% of it shows' });
+    }
+
+    // Broken images.
+    for (const img of document.images) {
+      if (findings.length >= MAX) break;
+      if (img.complete && img.naturalWidth === 0 && shown(img)) {
+        add({ kind: 'image', text: 'Image failed to load: ' + short(img.getAttribute('src') || img.currentSrc || '(no src)', 80) + ' (' + where(img) + ')' });
+      }
+    }
+
+    // Invisible text: next to no contrast with what is behind it.
+    const bgOf = (el) => {
+      let color = [255, 255, 255, 1];
+      const chain = [];
+      for (let n = el; n && n.nodeType === 1; n = n.parentElement) chain.push(n);
+      for (const n of chain.reverse()) {
+        const cs = getComputedStyle(n);
+        if (cs.backgroundImage && cs.backgroundImage !== 'none') return null;
+        const c = parseCssColor(cs.backgroundColor);
+        if (c && c[3] > 0) color = blendOver(c, color);
+      }
+      return color;
+    };
+    for (const { el, t } of texts) {
+      if (findings.length >= MAX) break;
+      const fg = parseCssColor(getComputedStyle(el).color);
+      const bg = bgOf(el);
+      if (!fg || !bg) continue;
+      const ratio = contrastRatio(blendOver(fg, bg), bg);
+      if (ratio < 1.3) add({ kind: 'invisible', text: '"' + short(t, 50) + '" (' + where(el) + ') is all but invisible - contrast ' + ratio.toFixed(2) + ':1 against its background' });
+    }
+
+    // Sideways scrolling.
+    const docW = document.documentElement.scrollWidth, winW = window.innerWidth;
+    if (docW > winW + 1) {
+      let widest = null;
+      for (const el of document.body ? document.body.querySelectorAll('*') : []) {
+        const r = el.getBoundingClientRect();
+        if (r.right > winW + 1 && shown(el) && (!widest || r.right > widest.r.right)) widest = { el, r };
+      }
+      add({ kind: 'sideways', text: 'The page is ' + docW + 'px wide in a ' + winW + 'px window, so it scrolls sideways' + (widest ? ' - widest: ' + where(widest.el) : '') });
+    }
+
+    return {
+      findings,
+      window: { width: window.innerWidth, height: window.innerHeight },
+      page: { height: document.documentElement.scrollHeight, scrollY: Math.round(window.scrollY) },
+    };
+  })()`;
+}
+
 class Browser {
   constructor(opts = {}) {
     this.chromePath = opts.chromePath || null;
@@ -1428,6 +1552,11 @@ class Browser {
     return this.evaluate(a11yAuditScript(max));
   }
 
+  // See layoutCheckScript.
+  async layoutCheck(max = 25) {
+    return this.evaluate(layoutCheckScript(max));
+  }
+
   // Press Tab through the page the way a keyboard user would, from the top, and
   // report what focus did. Real key events, not element.focus(): only real Tab
   // presses exercise the page's own tab order, its focus traps and its
@@ -1544,5 +1673,5 @@ class Browser {
 module.exports = {
   Browser, chromeCandidates, firstExisting, launchArgs, drainFrames, snapshotScript, INTERACTIVE_TAGS,
   quadArea, keySpec, KEYS, describeTarget, missingTarget,
-  parseCssColor, blendOver, relativeLuminance, contrastRatio, a11yAuditScript, FOCUS_DESCRIBE_SCRIPT, analyzeFocusStops,
+  parseCssColor, blendOver, relativeLuminance, contrastRatio, a11yAuditScript, layoutCheckScript, FOCUS_DESCRIBE_SCRIPT, analyzeFocusStops,
 };

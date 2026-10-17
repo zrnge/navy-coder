@@ -28,6 +28,7 @@ const { spawn } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const { createVscodeMock, installVscodeMock, uninstallVscodeMock } = require(path.join(ROOT, 'test', 'vscode-mock.js'));
 const { TASKS } = require('./tasks.js');
+const { HARD_TASKS } = require('./tasks-hard.js');
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
@@ -38,11 +39,13 @@ function parseArgs(argv) {
     else if (a === '--model')    out.model = argv[++i];
     else if (a === '--task')     out.task = argv[++i];
     else if (a === '--category') out.category = argv[++i];
+    else if (a === '--suite')    out.suite = argv[++i];
     else if (a === '--compare')  out.compare = argv[++i];
     else if (a === '--fail-on-regression') out.failOnRegression = true;
     else if (a === '--timeout')  out.timeout = parseInt(argv[++i], 10) * 1000;
     else if (a === '--host')     out.host = argv[++i];
     else if (a === '--keep')     out.keep = true;
+    else if (a === '--trace')    out.trace = true;
     else if (a === '--label')    out.label = argv[++i];
     else if (a === '--repeat')   out.repeat = Math.max(1, parseInt(argv[++i], 10) || 1);
     else if (a === '--config') {
@@ -68,12 +71,14 @@ Navy eval runner
   npm run eval -- --provider ollama --model qwen2.5-coder:7b
   npm run eval -- --task <id>                    run one task
   npm run eval -- --category edit-precision      run one category
+  npm run eval -- --suite hard                   the hard tier (eval/tasks-hard.js); 'all' runs both
   npm run eval -- --compare <results.json>       diff against a previous run
   npm run eval -- --fail-on-regression           exit non-zero ONLY for a task that
                                                  used to pass and now doesn't (needs
                                                  --compare; for scheduled CI)
   npm run eval -- --timeout 240                  per-task timeout in seconds
   npm run eval -- --keep                         keep temp repos for inspection
+  npm run eval -- --trace                        print each tool call, result and the reply
   npm run eval -- --config <key>=<value>         set any navy.* setting for the run (repeatable)
   npm run eval -- --label <name>                 tag the saved results file (e.g. an A/B arm)
   npm run eval -- --repeat 3                     run every task N times and report the majority
@@ -174,6 +179,12 @@ async function runTask(task, cfg, vscodeMock) {
     provider._wslCache = { available: false };
 
     let chunks = [];
+    // Errors the turn showed the user. A provider failure - server down,
+    // bad key, rate limit - arrives as an `error` message, not reply text,
+    // so a run against a dead server used to score every task FAIL (the
+    // repo untouched) instead of ERROR: an outage read as a model that
+    // could do nothing.
+    let turnErrors = [];
     // Token accounting rides on the same tokenCount messages the cost gauge
     // uses — prompt tokens across a whole task is the direct measure of what a
     // config change (e.g. the reduced tool set) actually saves, where pass/fail
@@ -184,7 +195,17 @@ async function runTask(task, cfg, vscodeMock) {
     // the task is about what happens after they say no.
     const proposals = [];
     provider.view = { webview: { postMessage: (m) => {
+      // --trace: what the turn did, as it happens - the only way to see WHY a
+      // task failed, when the score says only that it did.
+      if (cfg.trace) {
+        const one = (v) => String(v ?? '').replace(/\s+/g, ' ').slice(0, 160);
+        if (m.type === 'toolCall') console.log(`      → ${m.tool} ${one(JSON.stringify(m.args || {}))}`);
+        else if (m.type === 'toolResult') console.log(`        ← ${one(m.result)}`);
+        else if (m.type === 'pendingQuestion') console.log(`      ? ask_user: ${one(m.question)}`);
+        else if (m.type === 'systemNotice' || m.type === 'error') console.log(`      ! ${m.type}: ${one(m.text || m.message)}`);
+      }
       if (m.type === 'chunk' && m.text) chunks.push(m.text);
+      else if (m.type === 'error') turnErrors.push(String(m.message || m.text || 'error'));
       else if (m.type === 'pendingDiff') proposals.push(String(m.path || '').replace(/\\/g, '/').replace(/^.*\//, ''));
       // Nobody is at the panel to click an answer, and an unanswered ask_user
       // would hold the turn until it timed out. A task can say what the person
@@ -211,6 +232,8 @@ async function runTask(task, cfg, vscodeMock) {
       embeddingModel: cfg.embeddingModel || '',
       apiBase: '',
       systemPrompt: '',
+      // As Navy ships. --config selfReview=on to measure the review.
+      selfReview: 'off',
       // --config overrides land LAST so they win over the harness defaults.
       ...cfg.config,
     });
@@ -248,6 +271,7 @@ async function runTask(task, cfg, vscodeMock) {
       Object.assign(vscodeMock.ctrl.config, { approvalMode: turn.rejectWrites ? 'ask-always' : 'auto-approve' });
       vscodeMock.ctrl.nextInfo = turn.rejectWrites ? 'Reject' : undefined;
       chunks = [];
+      turnErrors = [];
       let timedOut = false;
       const timer = setTimeout(() => { timedOut = true; provider.abortController?.abort(); }, cfg.timeout);
       let turnError = null;
@@ -263,6 +287,9 @@ async function runTask(task, cfg, vscodeMock) {
       if (turnError) return { id: task.id, category: task.category, status: 'ERROR', reason: 'turn threw: ' + turnError.message, ms: Date.now() - started };
 
       const turnReply = chunks.join('');
+      if (turnErrors.length) {
+        return { id: task.id, category: task.category, status: 'ERROR', reason: 'provider: ' + turnErrors[0].replace(/\s+/g, ' ').slice(0, 160), ms: Date.now() - started };
+      }
       // A provider-level failure surfaces as an error message in the transcript
       // rather than a throw — classify it as ERROR so a bad API key or a rate
       // limit is never scored as "the model failed the task".
@@ -273,6 +300,7 @@ async function runTask(task, cfg, vscodeMock) {
       replies.push(turnReply);
     }
     const reply = replies[replies.length - 1] || '';
+    if (cfg.trace) console.log('      reply: ' + reply.replace(/\s+/g, ' ').slice(0, 600));
 
     const ctx = makeCheckContext(dir, task, reply, { replies, proposals });
     let verdict;
@@ -400,6 +428,7 @@ async function main() {
     host: args.host || 'http://localhost:11434',
     timeout: args.timeout,
     keep: args.keep,
+    trace: args.trace,
     config: args.config || {},
     label: args.label || '',
     repeat: args.repeat || 1,
@@ -421,11 +450,21 @@ async function main() {
     return;
   }
 
-  let tasks = TASKS;
+  // The core suite by default, so a scheduled run keeps comparing against the
+  // same tasks its baseline was made from. --task finds a task in either.
+  const suite = args.suite || 'core';
+  if (!['core', 'hard', 'all'].includes(suite)) {
+    console.error(`\n  Unknown --suite "${suite}". Use core, hard or all.\n`);
+    process.exitCode = 1;
+    uninstallVscodeMock();
+    return;
+  }
+  let tasks = args.task ? [...TASKS, ...HARD_TASKS]
+    : suite === 'hard' ? HARD_TASKS : suite === 'all' ? [...TASKS, ...HARD_TASKS] : TASKS;
   if (args.task)     tasks = tasks.filter(t => t.id === args.task);
   if (args.category) tasks = tasks.filter(t => t.category === args.category);
   if (!tasks.length) {
-    console.error(`\n  No tasks matched. Known ids:\n${TASKS.map(t => '    ' + t.id).join('\n')}\n`);
+    console.error(`\n  No tasks matched. Known ids:\n${[...TASKS, ...HARD_TASKS].map(t => '    ' + t.id).join('\n')}\n`);
     process.exitCode = 1;
     uninstallVscodeMock();
     return;

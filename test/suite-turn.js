@@ -976,16 +976,32 @@ async function hallucinationSuite() {
     check('reading a file back after writing it returns the new content, not "already retrieved"',
       /after/.test(readBack) && !/Already retrieved/.test(readBack), readBack.slice(0, 200));
 
-    // ...while a repeat read with nothing changed in between is still caught.
+    // ...while a repeat read with nothing changed in between is still caught:
+    // the first repeat of a small file gets it again, marked unchanged (a model
+    // that asks again has usually lost track of it); after that, the stub.
     const dupCap = [];
     global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
       { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
       { toolCalls: [{ name: 'read_file', args: { path: 'stale.js' } }] },
       { text: 'It says after.' },
     ], dupCap);
     await provider.askNavy('what is in stale.js?', false, null, [], []);
-    check('an unchanged file read twice is still answered from the cache',
-      /Already retrieved/.test(toolMsgs(dupCap[2]).pop() || ''));
+    const firstRepeat = toolMsgs(dupCap[2]).pop() || '';
+    check('a repeat read of an unchanged small file gets it again, marked unchanged',
+      /already read this and it has not changed/.test(firstRepeat) && /after/.test(firstRepeat), firstRepeat.slice(0, 120));
+    check('...and asking a third time gets the stub, which is what stops a loop',
+      /Already retrieved/.test(toolMsgs(dupCap[3]).pop() || ''));
+
+    // run_tests finds a plain node test script, not only test frameworks.
+    fs.writeFileSync(path.join(tmp, 'test.js'), "console.log('plain tests ran');\n");
+    const savedCmd2 = ctrl.config.commandApproval;
+    ctrl.config.commandApproval = 'auto-approve';
+    const plain = await provider.executeTool({ name: 'run_tests', args: {} });
+    ctrl.config.commandApproval = savedCmd2;
+    fs.rmSync(path.join(tmp, 'test.js'));
+    check('run_tests: a project with a plain test.js runs it with node',
+      /plain tests ran/.test(plain) && !/Could not detect/.test(plain), String(plain).slice(0, 160));
 
     // ── A rejected edit is the user's answer. The false-claim guard used to see
     // "Changed: x" with nothing written and send the model back to "call
@@ -1093,6 +1109,33 @@ async function hallucinationSuite() {
     check('the open file is no longer announced as THE file to edit',
       !/THE FILE YOU SHOULD EDIT/.test(userOf(fixCap[0])));
 
+    // ── Requests in any language. Several decisions hung on English words alone,
+    // so a request in Spanish lost the relevant-files hint, the open file, and
+    // the check for invented changes. File names and identifiers read the same
+    // in any language, and now count too.
+    check('any language: a request naming a file counts as asking for a change',
+      provider._promptRequestsFileAction('corrige el error en auth.js') === true);
+    check('any language: ...and one carrying code does too',
+      provider._promptRequestsFileAction('cambia esto:\n```js\nconst a = 1;\n```') === true);
+    check('any language: a plain question without code does not',
+      provider._promptRequestsFileAction('¿qué hace este proyecto?') === false);
+    check('any language: a pasted web address is a browser turn', provider._isBrowserTurn('prueba https://ejemplo.com por favor', {}) === true);
+    fs.writeFileSync(path.join(tmp, 'pago.js'), 'function calcularTotal(items) { return items.length; }\nmodule.exports = { calcularTotal };\n// ES_MARKER\n');
+    vscode.window.activeTextEditor = { document: { fileName: path.join(tmp, 'pago.js'), languageId: 'javascript', uri: { fsPath: path.join(tmp, 'pago.js') } } };
+    const esCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'Mirando.' }], esCap);
+    await provider.askNavy('la función calcularTotal devuelve un valor incorrecto', false, null, [], []);
+    vscode.window.activeTextEditor = undefined;
+    check('any language: a Spanish request naming an identifier gets the relevant-files hint',
+      /Likely relevant files[\s\S]*pago\.js/.test(userOf(esCap[0])), userOf(esCap[0]).slice(0, 200));
+    check('any language: ...and the open file\'s contents', /ES_MARKER/.test(userOf(esCap[0])));
+    const hiCap2 = [];
+    vscode.window.activeTextEditor = { document: { fileName: path.join(tmp, 'pago.js'), languageId: 'javascript', uri: { fsPath: path.join(tmp, 'pago.js') } } };
+    global.fetch = queueOllamaFetch([{ text: '¡Hola!' }], hiCap2);
+    await provider.askNavy('hola', false, null, [], []);
+    vscode.window.activeTextEditor = undefined;
+    check('any language: a greeting still gets neither', !/ES_MARKER|Likely relevant files/.test(userOf(hiCap2[0])));
+
     // ── Repository rule files are not obeyed in an untrusted workspace — the
     // same line workspace skills already had.
     fs.writeFileSync(path.join(tmp, 'AGENTS.md'), 'RULES_MARKER: always do X.');
@@ -1166,9 +1209,9 @@ async function hallucinationSuite() {
     const fixLoopCap = [];
     global.fetch = queueOllamaFetch([
       { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
-      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: 'attempt 1' } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: '// attempt 1' } }] },
       { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
-      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: 'attempt 2' } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'fix.js', content: '// attempt 2' } }] },
       { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
       { text: 'I could not make it pass: the check still fails.' },
     ], fixLoopCap);
@@ -1179,6 +1222,66 @@ async function hallucinationSuite() {
       JSON.stringify(runResults.map(t => t.slice(0, 40))));
     check('fixing: two fixes that leave the check failing bring a rethink, not another patch',
       /2 fixes in a row have left this check failing. Stop patching/.test(runResults[2] || '') && !/fixes in a row/.test(runResults[1] || ''));
+    check('fixing: …and the rethink asks for a plan that follows the new cause',
+      /Replace your plan with update_plan/.test(runResults[2] || ''));
+
+    // ── Escalation: a stuck turn is handed to navy.escalationModel. ──────
+    ctrl.config.escalationModel = 'big-model';
+    provider.messages = [];
+    posted.length = 0;
+    const escCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'esc.js', content: '// attempt 1' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { toolCalls: [{ name: 'write_file', args: { path: 'esc.js', content: '// attempt 2' } }] },
+      { toolCalls: [{ name: 'run_command', args: { command: FAIL } }] },
+      { text: 'Found it: the real cause is elsewhere. It still fails, though.' },
+    ], escCap);
+    await provider.askNavy('fix the failing check', false, 'small-model', [], []);
+    const models = escCap.map(r => r.model);
+    check('escalation: the turn runs on the configured model until it is stuck',
+      models.slice(0, 5).every(m => m === 'small-model'), models.join(','));
+    check('escalation: ...then, after two fixes leave the check failing, on navy.escalationModel',
+      models[5] === 'big-model', models.join(','));
+    check('escalation: the switch is announced in the chat and saved with the turn',
+      posted.some(m => m.type === 'chunk' && /Handing the rest of this turn to big-model/.test(m.text || ''))
+        && /Handing the rest of this turn to big-model/.test(provider.messages[provider.messages.length - 1]?.text || ''));
+    const nextCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'ok' }], nextCap);
+    await provider.askNavy('and now something else', false, 'small-model', [], []);
+    check('escalation: the next turn starts on the configured model again', nextCap[0]?.model === 'small-model');
+    check('escalation: unset, or the model already in use, means no switch',
+      (() => { ctrl.config.escalationModel = ''; const a = provider._escalationTarget('small-model');
+        ctrl.config.escalationModel = 'small-model'; const b = provider._escalationTarget('small-model');
+        ctrl.config.escalationModel = 'claude-x'; ctrl.config.escalationProvider = 'anthropic'; const c = provider._escalationTarget('small-model');
+        ctrl.config.escalationProvider = ''; ctrl.config.escalationModel = '';
+        return a === null && b === null && c?.provider === 'anthropic' && c?.model === 'claude-x'; })());
+
+    // ── A turn does not report with a file its own syntax check says it broke.
+    provider.messages = [];
+    const brokeCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'broke.js', content: 'function f() {\n+  return 1;\n' } }] },
+      { text: '**Done:** wrote broke.js\n**Changed:** broke.js' },
+      { toolCalls: [{ name: 'write_file', args: { path: 'broke.js', content: 'function f() {\n  return 1;\n}\nmodule.exports = f;\n' } }] },
+      { text: 'Fixed the syntax error; done.' },
+    ], brokeCap);
+    await provider.askNavy('create broke.js with f() returning 1', false, null, [], []);
+    check('broken file: a turn reporting with a file that does not parse is sent back',
+      brokeCap.length === 4 && /still has a syntax error from your last edit/.test(JSON.stringify(brokeCap[2]?.messages || [])), 'requests=' + brokeCap.length);
+    check('broken file: ...and once fixed, it finishes with no warning',
+      !/does not parse/.test(provider.messages[provider.messages.length - 1]?.text || ''));
+    provider.messages = [];
+    posted.length = 0;
+    const stillCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'broke2.js', content: 'const x = (;\n' } }] },
+      { text: 'Done.' }, { text: 'Done.' }, { text: 'Done, really.' },
+    ], stillCap);
+    await provider.askNavy('create broke2.js', false, null, [], []);
+    check('broken file: pushed back twice at most, then the user is told plainly',
+      stillCap.length === 4 && posted.some(m => m.type === 'chunk' && /`broke2\.js` does not parse/.test(m.text || '')), 'requests=' + stillCap.length);
 
     // ── Finishing on a failing check gets one push back. ─────────────────
     provider.messages = [];
@@ -1251,6 +1354,114 @@ async function hallucinationSuite() {
     check('think: Navy actually sends think:"max" for it — before, it sent nothing and the model ran at its default',
       thinkCap[0]?.think === 'max', JSON.stringify(thinkCap[0]?.think));
 
+    // ── Screenshots: measured layout facts go with the picture, and a model that
+    // cannot see images is not sent one (Ollama answers that with HTTP 400).
+    const { formatLayoutCheck } = require('../src/browser-tools.js');
+    const fmt = formatLayoutCheck({ findings: [{ kind: 'overlap', text: '"A" and "B" are drawn over each other' }],
+      window: { width: 1264, height: 705 }, page: { height: 2000, scrollY: 0 } });
+    check('screenshot: layout findings are listed as measured facts',
+      /Automated layout checks/.test(fmt) && /\[overlap\] "A" and "B" are drawn over each other/.test(fmt));
+    check('screenshot: ...with how much of the page lies below the window',
+      /shows 0-705px of a 2000px-tall page; 1295px below it are not in view/.test(fmt), fmt);
+    check('screenshot: ...and a clean screen says so',
+      /no overlapping text, cut-off text, broken images/.test(formatLayoutCheck({ findings: [], window: { height: 700 }, page: { height: 700 } })));
+
+    const realShot = provider.toolBrowserScreenshot;
+    provider.toolBrowserScreenshot = async () => ({ __image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' }, text: 'Screenshot captured.\n- [overlap] price over name' });
+    const imagesIn = (req) => (req?.messages || []).some(m => Array.isArray(m.images) && m.images.length);
+    provider._recordOllamaThinking('blind-model', { capabilities: ['completion', 'tools'] });
+    provider.messages = [];
+    const blindCap = [];
+    global.fetch = queueOllamaFetch([{ toolCalls: [{ name: 'browser_screenshot', args: {} }] }, { text: 'Price overlaps the name.' }], blindCap);
+    await provider.askNavy('look at the page', false, 'blind-model', [], []);
+    check('screenshot: a model Ollama says cannot see is not sent the image',
+      blindCap.length === 2 && !imagesIn(blindCap[1]));
+    check('screenshot: ...it gets the measured checks and is told why there is no picture',
+      /price over name/.test(toolMsgs(blindCap[1]).pop() || '') && /cannot see images, so the screenshot itself was not sent/.test(toolMsgs(blindCap[1]).pop() || ''));
+    provider._recordOllamaThinking('eyes-model', { capabilities: ['completion', 'tools', 'vision'] });
+    provider.messages = [];
+    const eyesCap = [];
+    global.fetch = queueOllamaFetch([{ toolCalls: [{ name: 'browser_screenshot', args: {} }] }, { text: 'ok' }], eyesCap);
+    await provider.askNavy('look at the page', false, 'eyes-model', [], []);
+    check('screenshot: a model with vision gets the image as well as the checks', imagesIn(eyesCap[1]));
+
+    // A provider that turns an image down: images out, model remembered, step again.
+    provider.messages = [];
+    const rejCap2 = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'browser_screenshot', args: {} }] },
+      { fail: { status: 400, text: '{"error":"this model does not support image input"}' } },
+      { text: 'Working from the checks: the price overlaps the name.' },
+    ], rejCap2);
+    await provider.askNavy('look at the page', false, 'unknown-model', [], []);
+    check('screenshot: a provider rejecting an image does not end the turn — images removed, step retried',
+      rejCap2.length === 3 && imagesIn(rejCap2[1]) && !imagesIn(rejCap2[2])
+        && /overlaps the name/.test(provider.messages[provider.messages.length - 1]?.text || ''), 'requests=' + rejCap2.length);
+    check('screenshot: ...and that model is not sent images again', provider._modelSeesImages('unknown-model') === false);
+    provider.toolBrowserScreenshot = realShot;
+
+    // ── Folded tools: one way to read, one git tool; the retired names still run.
+    fs.writeFileSync(path.join(tmp, 'lines.js'), 'one\ntwo\nthree\nfour\n');
+    const ranged = await provider.executeTool({ name: 'read_file', args: { path: 'lines.js', start: 2, end: 3 } });
+    check('tools: read_file with start/end reads just those lines',
+      /two/.test(ranged) && /three/.test(ranged) && !/\bone\b/.test(ranged) && !/four/.test(ranged), ranged.slice(0, 120));
+    const whole = await provider.executeTool({ name: 'read_file', args: { path: 'lines.js' } });
+    check('tools: ...and without them, the whole file', /one/.test(whole) && /four/.test(whole));
+    const oldRead = await provider.executeTool({ name: 'read_lines', args: { path: 'lines.js', start: 4, end: 4 } });
+    check('tools: the retired read_lines is still understood', /four/.test(oldRead) && !/two/.test(oldRead));
+    const oldEdit = await provider.executeTool({ name: 'edit_line', args: { path: 'lines.js', line: 1, content: 'ONE' } });
+    check('tools: ...and so is the retired edit_line', /^Applied/.test(oldEdit) && fs.readFileSync(path.join(tmp, 'lines.js'), 'utf8').startsWith('ONE\n'), oldEdit);
+    const gitStatus = await provider.executeTool({ name: 'git', args: { action: 'status' } });
+    const gitBad = await provider.executeTool({ name: 'git', args: { action: 'push' } });
+    check('tools: git runs its action, and refuses one it does not have',
+      typeof gitStatus === 'string' && !/Unknown tool|git action must be/.test(gitStatus) && /git action must be one of status, diff, log, blame/.test(gitBad),
+      String(gitStatus).slice(0, 80));
+
+    // ── Self-review: a turn that edited reads its own diff once before reporting.
+    ctrl.config.selfReview = 'on';
+    fs.writeFileSync(path.join(tmp, 'rev.js'), 'function total(xs) {\n  return xs.length;\n}\n');
+    provider.messages = [];
+    const revCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'apply_edit', args: { path: 'rev.js', search: '  return xs.length;', replace: '  return xs.reduce((a, b) => a + b, 0);' } }] },
+      { text: '**Done:** total now sums.\n**Changed:** rev.js\n**Result:** succeeded' },
+      { text: '**Done:** total now sums the values; reviewed.\n**Changed:** rev.js\n**Result:** succeeded' },
+    ], revCap);
+    await provider.askNavy('make total() sum the values in rev.js', false, null, [], []);
+    const reviewMsg = JSON.stringify(revCap[2]?.messages || []);
+    check('self-review: a turn that edited is shown its own diff before it reports',
+      revCap.length === 3 && /review the complete change you made this turn/.test(reviewMsg)
+        && /-  return xs\.length;/.test(reviewMsg) && /\+  return xs\.reduce/.test(reviewMsg), 'requests=' + revCap.length);
+    check('self-review: ...and the report that is kept is the one written after it',
+      /reviewed\./.test(provider.messages[provider.messages.length - 1]?.text || ''));
+
+    provider.messages = [];
+    const noEditCap = [];
+    global.fetch = queueOllamaFetch([{ text: 'It counts the items.' }], noEditCap);
+    await provider.askNavy('what does total() in rev.js do?', false, null, [], []);
+    check('self-review: a turn that edited nothing is not reviewed', noEditCap.length === 1, 'requests=' + noEditCap.length);
+
+    provider.messages = [];
+    const fixCap2 = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'rev2.js', content: 'console.log("debug");\nmodule.exports = 1;\n' } }] },
+      { text: 'Done.' },
+      { toolCalls: [{ name: 'write_file', args: { path: 'rev2.js', content: 'module.exports = 1;\n' } }] },
+      { text: 'Removed a leftover debug line; done.' },
+    ], fixCap2);
+    await provider.askNavy('create rev2.js exporting 1', false, null, [], []);
+    check('self-review: a fix made during the review is not reviewed again', fixCap2.length === 4, 'requests=' + fixCap2.length);
+
+    ctrl.config.selfReview = 'off';
+    provider.messages = [];
+    const offCap = [];
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'rev3.js', content: 'x' } }] },
+      { text: 'Done.' },
+    ], offCap);
+    await provider.askNavy('create rev3.js', false, null, [], []);
+    check('self-review: navy.selfReview off skips it', offCap.length === 2, 'requests=' + offCap.length);
+
     // A reasoning model the name list misses is recognised once it reasons.
     provider.thinkingLevel = 'max';
     check('temperature: an unknown model starts at navy.temperature', provider._turnTemperature('mystery-model:cloud') === 0.2);
@@ -1280,6 +1491,22 @@ async function hallucinationSuite() {
     const guard = new ReasoningLoopGuard(() => trips++);
     for (let i = 0; i < LOOP.length; i += 40) guard.feed(LOOP.slice(i, i + 40));
     check('loop: the guard trips while it streams, and only once', guard.tripped && trips === 1);
+
+    // Streaming activity re-arms the turn watchdog, so a long but active
+    // reasoning stream is not aborted as a hang after 3 minutes.
+    let armed = 0;
+    provider._armWatchdog = () => { armed++; };
+    provider._lastWatchdogPoke = 0;
+    provider._noteStreamActivity();
+    check('watchdog: a stream chunk re-arms the watchdog', armed === 1);
+    provider._noteStreamActivity();
+    check('watchdog: ...but rapid chunks are throttled, not re-armed every time', armed === 1);
+    provider._lastWatchdogPoke = Date.now() - 3000;
+    provider._noteStreamActivity();
+    check('watchdog: ...and it re-arms again once the throttle window has passed', armed === 2);
+    provider._armWatchdog = null;
+    provider._noteStreamActivity();
+    check('watchdog: outside a turn (no watchdog armed) it does nothing', armed === 2);
 
     const thinkingEvent = (thinking, content = '') =>
       ({ message: { role: 'assistant', content, thinking }, done: true, prompt_eval_count: 5, eval_count: 5 });
@@ -1314,6 +1541,29 @@ async function hallucinationSuite() {
       twiceCap.length === 2, 'requests=' + twiceCap.length);
     check('loop: ...and says so in the reply that is saved',
       /went in circles again/.test(provider.messages[provider.messages.length - 1]?.text || ''));
+
+    // A loop, then a real action, then a loop much later is NOT the same loop
+    // twice: acting cleared the budget, so the turn survives the second one.
+    // Without the reset, a long productive turn (many steps) was killed at its
+    // second ever loop, however far apart the two were.
+    const toolEvent = (name, args) => ({ message: { role: 'assistant', content: '',
+      tool_calls: [{ function: { name, arguments: JSON.stringify(args || {}) } }] }, done: true, prompt_eval_count: 5, eval_count: 5 });
+    provider.messages = [];
+    posted.length = 0;
+    const spacedCap = [];
+    global.fetch = scripted([
+      thinkingEvent(LOOP),                               // loop #1 → stopped, retried
+      toolEvent('list_files', { path: '' }),             // acts → budget clears
+      toolEvent('list_files', { path: 'src' }),          // keeps working
+      thinkingEvent(LOOP),                               // loop #2, much later → stopped, retried again
+      thinkingEvent('Now I will answer.', 'All done.'),  // recovers and finishes
+    ], spacedCap);
+    await provider.askNavy('do a long job', false, null, [], []);
+    check('loop: acting between two loops keeps the turn alive, it is not "again"',
+      !/went in circles again/.test(provider.messages[provider.messages.length - 1]?.text || ''),
+      provider.messages[provider.messages.length - 1]?.text?.slice(-120));
+    check('loop: ...and the turn still reaches the real answer',
+      /All done\./.test(provider.messages[provider.messages.length - 1]?.text || ''));
   } catch (e) {
     check('hallucination suite ran', false, e.stack || e.message);
   } finally {
@@ -1891,7 +2141,7 @@ async function planSuite() {
   console.log('\ntask plans (declared, not inferred):');
   const os = require('os');
   const { ctrl } = sharedMock();
-  const { normalizePlan, renderPlan, MAX_PLAN_STEPS } = require('../src/plan.js');
+  const { normalizePlan, renderPlan, MAX_PLAN_STEPS, verifyStepIndexes, flagUnverified } = require('../src/plan.js');
   let provider, tmp;
   const realFetch = global.fetch;
   try {
@@ -1991,6 +2241,90 @@ async function planSuite() {
     provider._resetPlan();
     check('plan: no plan produces no note', provider._planCompletionNote() === '');
 
+    // ── "Done" on a verify step has to be earned. ────────────────────────
+    check('verify steps: a check after the first edit step counts',
+      JSON.stringify(verifyStepIndexes([{ step: 'Read parse()' }, { step: 'Fix the off-by-one in parse()' }, { step: 'Run the tests' }])) === '[2]');
+    check('verify steps: "check how X is used" before any edit is investigation, not verification',
+      JSON.stringify(verifyStepIndexes([{ step: 'Check how parse() is called' }, { step: 'Fix parse()' }, { step: 'Run npm test' }])) === '[2]');
+    check('verify steps: a plan with no edit step only counts its last step',
+      JSON.stringify(verifyStepIndexes([{ step: 'Check the logs' }, { step: 'Confirm the cause' }])) === '[1]');
+    const planned = () => [{ step: 'Fix parse()', status: 'done' }, { step: 'Run the tests', status: 'done' }];
+    let fs1 = planned();
+    check('flag: done after an edit with nothing passed since is unverified',
+      JSON.stringify(flagUnverified(fs1, [], { edited: true, verified: false })) === '[2]' && fs1[1].unverified === true && !fs1[0].unverified);
+    fs1 = planned();
+    check('flag: …not once a check has passed', flagUnverified(fs1, [], { edited: true, verified: true }).length === 0 && !fs1[1].unverified);
+    fs1 = planned();
+    check('flag: …nor when nothing was edited', flagUnverified(fs1, [], { edited: false, verified: false }).length === 0);
+    fs1 = planned();
+    check('flag: a step that already stood as done keeps its standing on a resend',
+      flagUnverified(fs1, planned(), { edited: true, verified: false }).length === 0);
+    check('render: an unverified done step reads [x?]',
+      renderPlan([{ step: 'Run the tests', status: 'done', unverified: true }]) === '[x?] 1. Run the tests');
+
+    provider._resetPlan();
+    provider._notePlanEvidence('edit');
+    const flaggedRes = await provider.toolUpdatePlan(planned());
+    check('update_plan: tells the model the verify step is unverified and what to run',
+      /Step 2 is marked done.*no check has passed/.test(flaggedRes) && /\[x\?\] 2\. Run the tests/.test(flaggedRes), flaggedRes);
+    check('plan: a finished plan with an unverified step says so at the end',
+      /Not verified: Run the tests/.test(provider._planCompletionNote()), provider._planCompletionNote());
+    posted.length = 0;
+    provider._notePlanEvidence('pass');
+    check('evidence: a pass clears the flag and updates the card',
+      !provider.plan[1].unverified && posted.some(m => m.type === 'planUpdate' && !m.steps[1].unverified));
+    check('evidence: …and the closing note goes away', provider._planCompletionNote() === '');
+    provider._notePlanEvidence('edit');
+    check('evidence: an edit after the pass leaves the earlier verdict alone but resets the evidence',
+      provider._session.planEvidence.verified === false && !provider.plan[1].unverified);
+    provider._resetPlan();
+    check('evidence: a new plan starts with no evidence either way',
+      provider._session.planEvidence.edited === false && provider._session.planEvidence.verified === false);
+
+    // Through a real turn: an edit, the verify step marked done without a
+    // check, then the end of the turn.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'calc.js', content: 'module.exports = (a, b) => a + b;\n' } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'Fix add() in calc.js', status: 'done' }, { step: 'Verify add() works', status: 'done' }] } }] },
+      { text: 'Fixed add().' },
+    ]);
+    await provider.askNavy('fix add in calc.js', false, null, [], []);
+    const unv = provider.messages[provider.messages.length - 1];
+    check('turn: an unchecked verify step is saved as unverified with the turn', unv.meta?.plan?.[1]?.unverified === true, JSON.stringify(unv.meta?.plan));
+    check('turn: …and the reply says it was not verified', /Not verified: Verify add\(\) works/.test(unv.text), unv.text.slice(-200));
+
+    // The same, with check_syntax run after the plan was marked done.
+    posted.length = 0;
+    global.fetch = queueOllamaFetch([
+      { toolCalls: [{ name: 'write_file', args: { path: 'calc.js', content: 'module.exports = (a, b) => a + b;\n' } }] },
+      { toolCalls: [{ name: 'update_plan', args: { steps: [{ step: 'Fix add() in calc.js', status: 'done' }, { step: 'Verify add() works', status: 'done' }] } }] },
+      { toolCalls: [{ name: 'check_syntax', args: { path: 'calc.js' } }] },
+      { text: 'Fixed add().' },
+    ]);
+    await provider.askNavy('fix add in calc.js again', false, null, [], []);
+    const ver = provider.messages[provider.messages.length - 1];
+    check('turn: a passing check after the plan was marked done clears the flag',
+      ver.meta?.plan?.length === 2 && !ver.meta.plan[1].unverified && !/Not verified/.test(ver.text), JSON.stringify(ver.meta?.plan));
+    provider._resetPlan();
+
+    // A model that reads, then ends the turn with no reply and nothing done,
+    // before it has written a plan the open-steps check could hold it to.
+    let stallReq = 0;
+    const stallQueue = queueOllamaFetch([
+      { toolCalls: [{ name: 'read_file', args: { path: 'calc.js' } }] },
+      { text: '' },
+      { toolCalls: [{ name: 'write_file', args: { path: 'calc.js', content: 'module.exports = (a, b) => a + b; // fixed\n' } }] },
+      { text: 'Fixed add() in calc.js.' },
+    ]);
+    global.fetch = (...a) => { stallReq++; return stallQueue(...a); };
+    await provider.askNavy('fix the bug in calc.js', false, null, [], []);
+    check('stall: a silent stop after reading is sent back to do the work',
+      fs.readFileSync(path.join(tmp, 'calc.js'), 'utf8').includes('// fixed'), 'requests=' + stallReq);
+    const stallTurn = provider.messages[provider.messages.length - 1];
+    check('stall: …and the turn ends with the real reply', /Fixed add\(\)/.test(stallTurn.text), stallTurn.text);
+    provider._resetPlan();
+
     // ── End to end through a real turn. ──────────────────────────────────
     // The model that genuinely will not continue is nudged a bounded number of
     // times first (see the plan auto-continue); stating the incomplete plan is
@@ -2061,7 +2395,11 @@ async function planSuite() {
     check('update_plan is in the core tier — small models drift most on long tasks',
       toolsMod.CORE_TOOL_NAMES.has('update_plan'));
     check('rule 13 asks for update_plan, not a prose heading',
-      /13\. PLANNING: .*update_plan FIRST/.test(toolsMod.TOOL_PROMPT) && !/\*\*Plan:\*\* heading/.test(toolsMod.TOOL_PROMPT));
+      /13\. PLANNING .*call update_plan BEFORE your first edit/.test(toolsMod.TOOL_PROMPT) && !/\*\*Plan:\*\* heading/.test(toolsMod.TOOL_PROMPT));
+    check('rule 13: the plan comes before the first change, after a quick look so it can name real files',
+      /call update_plan BEFORE your first edit/.test(toolsMod.TOOL_PROMPT) && /name real files and functions/.test(toolsMod.TOOL_PROMPT));
+    check('rule 13: replace the plan when what you learn changes the approach',
+      /REPLACE the plan whenever what you learn changes the approach/.test(toolsMod.TOOL_PROMPT));
     check('update_plan is listed among the available tools', /web_search, update_plan, delegate_research/.test(toolsMod.TOOL_PROMPT));
 
     // A sub-agent must not be able to rewrite the delegating turn's plan.
@@ -2273,4 +2611,75 @@ async function compactContextSuite() {
   }
 }
 
-module.exports = { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite, compactContextSuite };
+// ── /reverse: the clean-room reverse-engineering command ─────────────────────
+// Drives the dialog flow through the mock (authorisation, type, language,
+// feature) and checks the seeded brief reaches the turn — not just that the
+// prompt builder is correct (that is in suite-pure).
+async function reverseCommandSuite() {
+  console.log('\n/reverse command wiring:');
+  const os = require('os');
+  const { ctrl } = sharedMock();
+  let provider, tmp;
+  const realFetch = global.fetch;
+  try {
+    const { NavyCoderViewProvider } = require('../src/extension.js');
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'navy-rev-'));
+    provider = new NavyCoderViewProvider(makeContext(tmp));
+    provider.projectRoot = tmp;
+    provider._wslCache = { available: false };
+    const posted = [];
+    provider.view = { webview: { postMessage: (m) => { posted.push(m); return Promise.resolve(true); } } };
+
+    const target = path.join(tmp, 'cmd-copy.exe');
+    fs.writeFileSync(target, 'MZ\x00\x00binary');
+
+    // The happy path: grounds confirmed, native target, C, a named feature.
+    ctrl.nextWarning = 'I have grounds — continue';
+    ctrl.nextQuickPick = (items) => items.find(i => i.id === 'native');
+    ctrl.nextInputBox = (opts) => /language/i.test(opts.title) ? 'C' : 'the command parser';
+    global.fetch = queueOllamaFetch([{ text: 'Authorisation first: do you own this binary?' }]);
+    posted.length = 0;
+    await provider.runReverseEngineer(target, 'qrev1');
+
+    check('reverse: the person\'s message is drawn as /reverse <path>',
+      posted.some(m => m.type === 'seededPrompt' && m.text === `/reverse ${target}` && m.queueId === 'qrev1'),
+      JSON.stringify(posted.filter(m => m.type === 'seededPrompt')));
+    const turn = provider.messages.find(m => m.role === 'user' && /CLEAN-ROOM/.test(m.instruction || ''));
+    check('reverse: the clean-room brief is seeded as the turn\'s instruction, not the user\'s words',
+      Boolean(turn) && turn.text === `/reverse ${target}`);
+    check('reverse: the brief carries the collected inputs',
+      /cmd-copy\.exe/.test(turn.instruction) && /Build the reimplementation in: C\b/.test(turn.instruction) && /the command parser/.test(turn.instruction));
+    check('reverse: the brief tells the model to parse the binary in Node, no external tool',
+      /no external decompiler/i.test(turn.instruction) && /PE\/ELF\/Mach-O header/.test(turn.instruction));
+
+    // Declining authorisation stops before anything is seeded or run.
+    ctrl.nextWarning = undefined;
+    provider.messages = [];
+    posted.length = 0;
+    await provider.runReverseEngineer(target, 'qrev2');
+    check('reverse: declining authorisation runs nothing', posted.length === 0 && provider.messages.length === 0);
+
+    // A path that does not exist is refused with a clear error, no turn.
+    ctrl.nextWarning = 'I have grounds — continue';
+    posted.length = 0;
+    await provider.runReverseEngineer(path.join(tmp, 'nope.bin'), 'qrev3');
+    check('reverse: a missing target is refused, not analysed',
+      posted.some(m => m.type === 'error' && /can't find/.test(m.message)) && provider.messages.length === 0);
+
+    // Cancelling a dialog midway (no type chosen) aborts cleanly.
+    ctrl.nextWarning = 'I have grounds — continue';
+    ctrl.nextQuickPick = undefined;
+    posted.length = 0;
+    await provider.runReverseEngineer(target, 'qrev4');
+    check('reverse: cancelling the type picker aborts with nothing seeded',
+      !posted.some(m => m.type === 'seededPrompt') && provider.messages.length === 0);
+  } catch (e) {
+    check('reverse command suite ran', false, e.stack || e.message);
+  } finally {
+    global.fetch = realFetch;
+    try { provider?.dispose?.(); } catch {}
+    try { if (tmp) fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+module.exports = { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite, compactContextSuite, reverseCommandSuite };

@@ -17,7 +17,7 @@ const { undoRedoSuite, missingPathHintSuite, syntaxCheckSuite, cardRecordSuite, 
 const { retrievalSuite, semanticSearchSuite, retrievalUpgradesSuite, embedIndexSuite, contextBudgetSuite, contextBudgetLearningSuite } = require('./suite-retrieval.js');
 const { sandboxSuite, persistentBgProcessSuite, shellSelectionSuite, nativeSandboxSuite, sandboxImageSuite } = require('./suite-process.js');
 const { multiRootSuite, sessionIsolationSuite, sessionTaggingSuite, projectCacheEvictionSuite, sessionCacheEvictionSuite, projectRulesSuite, projectFolderSuite, globalProjectCatalogSuite, fileWatcherSuite, chatPersistenceSuite } = require('./suite-session.js');
-const { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite, compactContextSuite } = require('./suite-turn.js');
+const { robustnessSuite, queueCancelSuite, writeLoopGuardSuite, reducedToolsetSuite, hallucinationSuite, toolLedgerSuite, historyDigestSuite, delegateResearchSuite, delegationFanOutSuite, toolBatchingSuite, planSuite, compactContextSuite, reverseCommandSuite } = require('./suite-turn.js');
 const { costEstimateSuite, providerFallbackSuite, cachingFallbackSuite, adaptiveThinkingFallbackSuite, geminiSuite, providerSelfTestSuite, providerEndpointSuite, pricingSuite } = require('./suite-providers.js');
 const { mcpSuite, mcpHttpSuite, mcpExtrasSuite } = require('./suite-mcp.js');
 const { approvalCancelSuite, approvalScopeSuite, settingsDefaultsSuite, diagnosticsSuite } = require('./suite-approval.js');
@@ -96,6 +96,7 @@ undoRedoSuite()
   .then(delegationFanOutSuite)
   .then(settingsDefaultsSuite)
   .then(planSuite)
+  .then(reverseCommandSuite)
   .then(rewindSuite)
   .then(mcpExtrasSuite)
   .then(browserSuite)

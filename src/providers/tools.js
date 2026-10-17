@@ -23,11 +23,13 @@ const TOOLS = [
   },
   {
     name: 'read_file',
-    description: 'Read the full contents of a file. Always call this before editing a file you have not seen yet.',
+    description: 'Read a file. Always call this before editing a file you have not seen yet. Without start/end it returns the whole file (a very large one is truncated, and says so); pass start and end (1-indexed, inclusive) to read just those lines - for a big file, or to continue after a truncated read. Read in large ranges (500-1500 lines): every call is a round trip.',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute or workspace-relative file path.' }
+        path: { type: 'string', description: 'Absolute or workspace-relative file path.' },
+        start: { type: 'number', description: 'Optional: first line to read (1-indexed, inclusive).' },
+        end: { type: 'number', description: 'Optional: last line to read (inclusive). Omit to read to the end.' }
       },
       required: ['path']
     }
@@ -145,7 +147,7 @@ const TOOLS = [
   },
   {
     name: 'apply_edit',
-    description: 'Apply a precise SEARCH/REPLACE edit to a file. The search string must match the file content exactly (character-for-character, including whitespace and line endings). Keep search as SHORT as possible — only the exact lines that change plus the minimum surrounding context needed to make the match unique. Never pass an entire function or file as the search string when just a few lines actually change. Use edit_line for a single-line change, or write_file only when you truly need to replace most of the file.',
+    description: 'Apply a precise SEARCH/REPLACE edit to a file. The search string must match the file content exactly (character-for-character, including whitespace and line endings). Keep search as SHORT as possible — only the exact lines that change plus the minimum surrounding context needed to make the match unique. Never pass an entire function or file as the search string when just a few lines actually change. Use write_file only when you truly need to replace most of the file.',
     parameters: {
       type: 'object',
       properties: {
@@ -166,6 +168,22 @@ const TOOLS = [
         timeout: { type: 'number', description: 'Timeout in milliseconds (default 30000).' }
       },
       required: ['command']
+    }
+  },
+  {
+    name: 'git',
+    description: 'Read the git state of the project. action "status": staged, unstaged and untracked files. "diff": the working-tree diff (path to limit it to one file, staged=true for the index). "log": the last `count` commits (default 10). "blame": who last changed each line of `path` (startLine/endLine to limit it). Read-only.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['status', 'diff', 'log', 'blame'], description: 'What to read.' },
+        path: { type: 'string', description: 'For diff (optional) and blame (required): the file.' },
+        staged: { type: 'boolean', description: 'For diff: the staged (index) diff instead of the working tree.' },
+        count: { type: 'number', description: 'For log: how many commits (default 10).' },
+        startLine: { type: 'number', description: 'For blame: first line (1-indexed).' },
+        endLine: { type: 'number', description: 'For blame: last line.' }
+      },
+      required: ['action']
     }
   },
   {
@@ -247,7 +265,7 @@ const TOOLS = [
   },
   {
     name: 'search_codebase',
-    description: 'Search the entire codebase for a term, symbol, or pattern. Returns file paths, line numbers, and surrounding context lines. Better than search_files for finding where a symbol is defined or used.',
+    description: 'Search the entire codebase for a term, symbol, or pattern. Returns file paths, line numbers, and surrounding context lines. Use it to find where a symbol is defined or used, or any text. To search the project documentation, pass filePattern "*.md".',
     parameters: { type: 'object', properties: {
       query: { type: 'string', description: 'Text or regex to search for.' },
       filePattern: { type: 'string', description: 'Optional glob to restrict search, e.g. "*.ts" or "src/**".' },
@@ -401,7 +419,7 @@ const TOOLS = [
   },
   {
     name: 'update_plan',
-    description: 'Record or revise your plan for the current task, as structured steps the user can see progress against. Send the WHOLE plan every time — this replaces the previous one, it does not patch it. Call it once before you start any task needing three or more tool calls, then again each time a step finishes or the plan changes. Exactly one step may be "in_progress". Do NOT use it for a one-step task, and do not write the plan out in your reply as well — the user already sees it.',
+    description: 'Record or revise your plan for the current task, as structured steps the user can see progress against. Send the WHOLE plan every time — this replaces the previous one, it does not patch it. Call it before your first edit — after a quick look at the files the request is about, so the steps can name real files and functions — then again when a step finishes, and replace it whenever what you learn changes the approach. A verify step counts as done only if the check passed after your last edit. Exactly one step may be "in_progress". Do NOT use it for a one-step task, and do not write the plan out in your reply as well — the user already sees it.',
     parameters: {
       type: 'object',
       properties: {
@@ -699,8 +717,22 @@ const TOOLS = [
 //   request_more_tools — meaningless on the full tier, where nothing is
 //     withheld; TOOLS_API_CORE adds it back for the tier that needs it.
 const NEVER_OFFERED = new Set(['finish', 'request_more_tools']);
+
+// Retired from what the model is offered, still understood when called - so a
+// model that learnt them, or a transcript that used them, keeps working.
+// Overlapping tools make the choice harder for every model and measurably so
+// for small ones: three ways to read, four to edit (three by line number,
+// which went stale as soon as one edit moved the lines), three to search and
+// four for git. Each folded into one: read_file takes a range, apply_edit and
+// write_file do every edit, search_codebase searches docs too, and git takes
+// an action. get_terminal_output could never read a terminal at all.
+const RETIRED_TOOLS = new Set([
+  'read_lines', 'edit_line', 'delete_line', 'insert_after_line',
+  'search_files', 'search_docs', 'get_terminal_output',
+  'git_status', 'git_diff', 'git_log', 'git_blame',
+]);
 const toApiSchema = (tools) => tools
-  .filter(t => !NEVER_OFFERED.has(t.name))
+  .filter(t => !NEVER_OFFERED.has(t.name) && !RETIRED_TOOLS.has(t.name))
   .map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
 
 const TOOLS_API = toApiSchema(TOOLS);
@@ -728,9 +760,9 @@ const CORE_TOOL_NAMES = new Set([
   // tool that pulls them back — its schema is small enough that withholding it
   // would save almost nothing.
   'update_plan',
-  'read_file', 'read_lines', 'write_file', 'list_files', 'apply_edit', 'edit_line',
+  'read_file', 'write_file', 'list_files', 'apply_edit',
   'search_codebase', 'find_relevant_files', 'run_command', 'run_tests',
-  'get_diagnostics', 'check_syntax', 'git_status', 'git_diff',
+  'get_diagnostics', 'check_syntax', 'git',
   'activate_skill', 'remember', 'request_more_tools', 'finish',
 ]);
 
@@ -747,7 +779,7 @@ const REQUEST_MORE_TOOLS_API = {
     TOOLS.find(t => t.name === 'request_more_tools')),
 };
 const TOOLS_API_CORE = toApiSchema(TOOLS_CORE).concat(REQUEST_MORE_TOOLS_API);
-const WITHHELD_TOOLS = TOOLS.filter(t => !CORE_TOOL_NAMES.has(t.name));
+const WITHHELD_TOOLS = TOOLS.filter(t => !CORE_TOOL_NAMES.has(t.name) && !RETIRED_TOOLS.has(t.name));
 
 // ── Browser tools only on turns that drive a browser ─────────────────────────
 // The browser_* schemas are a third of everything sent with every request
@@ -756,8 +788,12 @@ const WITHHELD_TOOLS = TOOLS.filter(t => !CORE_TOOL_NAMES.has(t.name));
 // request_more_tools to load them should it turn out to need a browser after
 // all. Like the core tier, a context saving and never a permission boundary.
 const BROWSER_TOOL_NAMES = new Set(TOOLS.filter(t => t.name.startsWith('browser_')).map(t => t.name));
-const TOOLS_STANDARD = TOOLS.filter(t => !BROWSER_TOOL_NAMES.has(t.name));
+const TOOLS_STANDARD = TOOLS.filter(t => !BROWSER_TOOL_NAMES.has(t.name) && !RETIRED_TOOLS.has(t.name));
 const TOOLS_API_STANDARD = toApiSchema(TOOLS_STANDARD).concat(REQUEST_MORE_TOOLS_API);
+
+// Every tool the model is offered on the full tier, in definition order -
+// generated, so the prompt can never list a tool that is not offered.
+const OFFERED_NAMES = TOOLS.filter(t => !NEVER_OFFERED.has(t.name) && !RETIRED_TOOLS.has(t.name)).map(t => t.name);
 
 const TOOL_PROMPT = `You are Navy Coder, an expert AI coding assistant embedded inside VS Code. You have DIRECT ACCESS to the user's project files through tools — you do NOT need the user to paste any code.
 
@@ -772,14 +808,14 @@ When the user DOES ask to review, fix, explain, or improve code, START by readin
 
 Call tools through the function-calling interface you are given, and wait for a result before doing anything that depends on it. Only if you have no function-calling interface, write each call as <tool name="read_file">{"path": "src/app.js"}</tool> — the tool name, then its arguments as a JSON object.
 
-Available tools: read_file, read_lines, write_file, delete_file, rename_file, list_files, search_files, search_codebase, search_docs, find_relevant_files, find_symbol, find_references, rename_symbol, apply_edit, edit_line, delete_line, insert_after_line, run_command, run_project, start_process, read_process_output, kill_process, get_terminal_output, run_tests, git_status, git_diff, git_log, git_blame, get_diagnostics, check_syntax, fetch_url, web_search, update_plan, delegate_research, ask_user, browser_navigate, browser_snapshot, browser_screenshot, browser_click, browser_type, browser_hover, browser_press, browser_upload, browser_drag, browser_tabs, browser_wait, browser_viewport, browser_network, browser_dialog, browser_scroll, browser_evaluate, browser_console, browser_back, browser_forward, browser_close, browser_accessibility, browser_visual_check, remember, forget, finish.
+Available tools: ${OFFERED_NAMES.join(', ')}, finish.
 
 ## Workflow rules
 1. Review / analyse requests → on an unfamiliar or large project, call find_relevant_files with the user's request FIRST to get a ranked shortlist, then read_file on the top hits. On a tiny project, list_files then read_file is fine.
-2. Edit requests → read_file first, then edit with the SMALLEST tool that does the job: edit_line for one line, apply_edit for a few contiguous lines (search string must match the file exactly — include ONLY the lines that actually change plus the minimum context needed to make the match unique, never the whole function or file), write_file only when most of the file's content is genuinely changing. If you find yourself putting more than ~10-15 unchanged lines into a search block just to "be safe," stop — narrow it to the real change.
+2. Edit requests → read_file first, then edit with apply_edit (search string must match the file exactly — include ONLY the lines that actually change plus the minimum context needed to make the match unique, never the whole function or file), write_file only when most of the file's content is genuinely changing. If you find yourself putting more than ~10-15 unchanged lines into a search block just to "be safe," stop — narrow it to the real change.
 3. New file requests → use write_file with the full content.
 4. Never use run_command to write files.
-5. BATCHING: emit independent READ-ONLY calls TOGETHER in one response — several read_file / search_codebase / find_symbol / git_* calls at once come back as one set of results, and they are executed concurrently, so a batch of five costs about what one costs. Two conditions, both required: every call in the batch only reads, and none of them needs an earlier one's result to know what to ask for. Anything that writes a file, runs a command, or depends on a result you do not have yet goes on its own — emit it alone and wait for the result before continuing.
+5. BATCHING: emit independent READ-ONLY calls TOGETHER in one response — several read_file / search_codebase / find_symbol / git calls at once come back as one set of results, and they are executed concurrently, so a batch of five costs about what one costs. Two conditions, both required: every call in the batch only reads, and none of them needs an earlier one's result to know what to ask for. Anything that writes a file, runs a command, or depends on a result you do not have yet goes on its own — emit it alone and wait for the result before continuing.
 6. When the task is fully complete, write your final reply and stop calling tools. (If finish is among your tools, call it after that reply.)
 7. Call remember() whenever you discover a durable project fact: tech stack, key file locations, conventions, architectural decisions, or anything a future session should know. Be proactive — do this as you learn, not only when asked.
 8. When a task asked you to change, create, fix, or run something, end your final reply with a structured task report in this format:
@@ -791,10 +827,10 @@ Available tools: read_file, read_lines, write_file, delete_file, rename_file, li
 10. Don't re-read a file you already have unless it has changed since — after your own edit, reading it back is fine. Read what the task needs and no more: for a change, a few targeted reads are usually enough, then act; for an explanation or review, read until you can answer accurately, then answer.
 11. If a command fails (non-zero exit code), NEVER run the same command again unchanged. Read the error output, identify the root cause, change the code, THEN run it again to check. Repeating a failing command without a change accomplishes nothing.
 12. ONE dev server per project. Start it once — with run_project OR start_process, never both — and use that running server for all later testing. Before starting one, if you may have started it earlier, check with read_process_output; starting the same command again is refused and tells you which process is already running it.
-13. PLANNING: For any task that will need 3 or more tool calls, call update_plan FIRST — before the first real tool call — with 3-6 one-line steps. Then work through them in order, calling update_plan again each time you start a step (status "in_progress") and each time one finishes ("done"). Send the whole plan every time; it replaces the previous one. The user sees this as live progress, so do NOT also write the plan out in your reply, and do not leave a finished step marked pending. If the plan turns out to be wrong, replace it — a stale plan is worse than none. Simple one-tool questions need no plan at all.
+13. PLANNING — plan before you change anything, then keep the plan true. For a task needing 3 or more tool calls, call update_plan BEFORE your first edit or command that changes anything. A quick look first is fine — list the files, read the one or two the request is about — so the plan can name real files and functions instead of guessing; then write 3-6 steps, ending with how you will verify the result. Mark a step done when it is finished (no need to mark it in_progress first). REPLACE the plan whenever what you learn changes the approach: a fix that did not work, a cause that turned out to be somewhere else. A verify step is done only when the check actually passed after your last edit. The user sees the plan live, so do not also write it out in your reply. A one-tool question needs no plan.
 14. VERIFICATION: Tool results after each file edit include fresh diagnostics for that file. If an edit introduced Errors, fix them immediately — never call finish() while your own edits have unresolved Errors. IMPORTANT: an empty/absent diagnostics report does NOT prove the file is valid — it usually means the user has no language extension installed for that file type. When a write reports "[SYNTAX UNVERIFIED]", or you edited a JSON/config file, or you need certainty before finishing, call check_syntax on the file: it runs a real parser and tells you definitively "valid", "syntax error at line N", or "could not verify". Never claim a file is correct on the basis of silence alone.
 15. CRITICAL — DO NOT HALLUCINATE FILE ACTIONS: Writing code in your reply text does NOT save it anywhere — it only appears in the chat. If the user asked you to create, write, save, or edit a file, you MUST call the write_file or apply_edit tool and see its result before saying it succeeded. NEVER say "created", "saved", "written", "done", or similar unless you actually called that tool THIS turn and it returned success. If you are only showing an example or discussing code without being asked to save it, say so explicitly instead of claiming completion.
-16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — call search_docs first. The project's own README/docs may already answer it; don't make the user repeat what's already written down.
+16. Before guessing at project conventions, setup/run instructions, or "why was this built this way" — search the project's docs first (search_codebase with filePattern "*.md"). The project's own README/docs may already answer it; don't make the user repeat what's already written down.
 17. COMMAND ACCURACY — check before assuming: run_command executes through the exact shell named in CURRENT ENVIRONMENT above, which is configurable and is NOT always the platform default — write commands in THAT dialect, not whatever you'd default to. Its own builtins always exist and need no checking (cmd.exe: dir, cd, type, del, copy, move, mkdir, echo, set; sh/bash: ls, cd, cat, rm, cp, mv, mkdir, echo, export; PowerShell: Get-ChildItem, Set-Location, Get-Content, Remove-Item, Copy-Item, Move-Item, New-Item, Write-Output, $env:). A third-party CLI (git, node, npm, python, rg, jq, docker, etc.) may or may not be installed or on PATH — if you haven't already confirmed it works earlier this turn, check it first with the probe your shell uses — "where <tool>" (cmd.exe), "command -v <tool>" (sh/bash), or "Get-Command <tool>" (PowerShell) — before depending on it, so a failure tells you "not installed" instead of wasting an attempt on a guess. If a command still fails with "not recognized"/"command not found", that means the tool isn't available — don't retry the same command, find or install an alternative.
 18. WSL FALLBACK (Windows only): some tools genuinely have no native Windows build (gcc, make, and other Unix-toolchain staples are the common case) — CURRENT ENVIRONMENT states whether WSL is available and which distros. If a build/compile tool is missing from the Windows shell per rule 17, and WSL is available, try it there before telling the user it's unavailable: prefix the command with "wsl ", e.g. "wsl gcc file.c -o file.out". Windows paths must be converted for WSL first (C:\foo\bar → /mnt/c/foo/bar — or run "wsl wslpath 'C:\foo\bar'" to convert one). If WSL is not available, say so plainly rather than retrying Windows-native variants of the same missing tool.
 19. ASK WHEN IT REALLY IS AMBIGUOUS: if the request could mean two different things and they lead to different work — which component, which approach, which of several matching files — call ask_user with 2-4 concrete options and mark the one you recommend, instead of picking one silently and spending the turn on it. It is a real question with real options, not "shall I proceed?". Ask ONCE, act on the answer, and do not ask about anything you could settle yourself by reading the code, or for permission to do the work you were already asked to do. If nobody answers, choose the most reasonable option, say which and why, and carry on.
@@ -838,6 +874,7 @@ const TOOL_PROMPT_STANDARD = TOOL_PROMPT.replace(
 The tools that drive a real Chrome window — ${[...BROWSER_TOOL_NAMES].join(', ')} — are left out of this turn to save context. If the task needs a browser (opening a page, clicking through a site, taking a screenshot of it), call request_more_tools first; it loads them for the rest of the turn.`;
 
 module.exports = {
+  RETIRED_TOOLS, OFFERED_NAMES,
   TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_CORE, TOOLS_API_CORE, TOOL_PROMPT_CORE, CORE_TOOL_NAMES, WITHHELD_TOOLS,
   BROWSER_TOOL_NAMES, TOOLS_API_STANDARD, TOOL_PROMPT_STANDARD,
 };

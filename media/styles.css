@@ -3999,6 +3999,14 @@ textarea:focus-visible,
   transform: rotate(45deg);
 }
 .plan-step.done .plan-step-text { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--border-hover); }
+.plan-step.done.unverified .plan-step-icon { border-color: var(--gold); background: transparent; }
+.plan-step.done.unverified .plan-step-icon::after { border-color: var(--gold); }
+.plan-step-unverified {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: var(--fs-sm);
+  color: var(--gold);
+}
 
 @media (prefers-reduced-motion: reduce) {
   .plan-step.active .plan-step-icon { animation: none; border-top-color: var(--gold); }

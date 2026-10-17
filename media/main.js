@@ -2356,6 +2356,7 @@ const SLASH_COMMANDS = [
   { cmd: '/search',          label: 'Web Search',    iconName: 'web', desc: 'Search the web for an answer',            prompt: 'Search the web for: ' },
   { cmd: '/run',             label: 'Run Project',   iconName: 'run',  desc: 'Start this project locally in background', prompt: 'Detect and run this project using the run_project tool. Tell me the URL so I can open it.' },
   { cmd: '/playthrough',     label: 'Playthrough',   iconName: 'web',  desc: 'Visually test this project in Chrome', hint: 'or pass a URL', prompt: '/playthrough ' },
+  { cmd: '/reverse',         label: 'Reverse',       iconName: 'debug', desc: 'Clean-room reverse-engineer a binary or app', hint: 'or pass a path', prompt: '/reverse ' },
   { cmd: '/bg',              label: 'Background',    iconName: 'background', desc: 'Run a task in background (non-blocking)',  prompt: '/bg ' },
 ];
 
@@ -2867,6 +2868,20 @@ function sendPrompt() {
     promptInput.style.height = 'auto';
     updateSendButton();
     vscode.postMessage({ type: 'runPlaythrough', url, queueId });
+    return;
+  }
+
+  // /reverse drives a clean-room reverse-engineering turn (the brief lives in
+  // the extension, which also collects the target type, language and feature
+  // through native dialogs). A path MAY be typed after it; without one, the
+  // extension opens a file picker. Seeded like /playthrough, not a template.
+  if (prompt === '/reverse' || prompt.startsWith('/reverse ')) {
+    const arg = prompt.slice('/reverse'.length).trim();
+    const queueId = 'q' + (++queueSeq) + '_' + Date.now();
+    promptInput.value = '';
+    promptInput.style.height = 'auto';
+    updateSendButton();
+    vscode.postMessage({ type: 'runReverseEngineer', arg, queueId });
     return;
   }
 
@@ -4075,6 +4090,16 @@ function renderAuthoritativePlan(steps, container) {
     label.textContent = s.step;
     li.appendChild(icon);
     li.appendChild(label);
+    // Marked done, but nothing passed after the last change - Navy's word,
+    // not the model's.
+    if (s.status === 'done' && s.unverified) {
+      li.classList.add('unverified');
+      const tag = document.createElement('span');
+      tag.className = 'plan-step-unverified';
+      tag.textContent = 'unverified';
+      tag.title = 'Marked done, but no check passed after the last change';
+      li.appendChild(tag);
+    }
     list.appendChild(li);
   }
 }
@@ -5851,7 +5876,7 @@ const TOOL_VERB = {
   run_command: 'Running', run_tests: 'Running tests',
   update_plan: 'Planning',
   start_process: 'Starting', read_process_output: 'Reading output', kill_process: 'Stopping process',
-  git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_blame: 'Git blame',
+  git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_blame: 'Git blame', git: 'Git',
   get_diagnostics: 'Checking diagnostics',
   remember: 'Remembering', forget: 'Forgetting', finish: 'Done',
   browser_navigate: 'Browsing', browser_snapshot: 'Reading page', browser_screenshot: 'Screenshotting',
@@ -6122,7 +6147,10 @@ function addToolCallCard(tool, args, callId) {
     if (placeholder) placeholder.remove();
   }
 
-  const verb   = TOOL_VERB[tool] || tool;
+  // `git` is one tool with an action; it reads as the action it ran -
+  // "Git log", "Git diff" - and its result preview is that action's too.
+  const display = tool === 'git' ? 'git_' + (args?.action || 'status') : tool;
+  const verb   = TOOL_VERB[display] || TOOL_VERB[tool] || tool;
   const base   = (p) => String(p).replace(/^.*[\\/]/, '');
   const target = (args.from && args.to ? args.from + ' → ' + args.to : '')
     || args.path || args.directory || args.query || args.command || args.id || args.url || args.fact || args.name
@@ -6147,6 +6175,7 @@ function addToolCallCard(tool, args, callId) {
     `<span class="act-result"></span>`;
 
   row.dataset.tool = tool; // lets a result with no id find its own row — see below
+  if (display !== tool) row.dataset.display = display;
   log.appendChild(row);
   currentActivityRowEl = row;
   if (callId) activityRowsById.set(callId, row);
@@ -6180,7 +6209,7 @@ function addToolResultCard(tool, result, callId, full) {
   const iconEl = row.querySelector('.act-icon');
   if (iconEl) iconEl.innerHTML = isError ? `<span class="act-x">${icon('close')}</span>` : `<span class="act-check">${icon('check')}</span>`;
 
-  const preview = buildResultPreview(tool, String(result || ''), full);
+  const preview = buildResultPreview(row.dataset.display || tool, String(result || ''), full);
   if (preview) {
     const resultEl = row.querySelector('.act-result');
     if (resultEl) resultEl.textContent = preview;

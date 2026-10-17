@@ -66,15 +66,33 @@ console.log('\nliteralReplace:');
 // Available-tools swap would quietly ship the full list to reduced turns.
 console.log('\nreduced tool tier:');
 {
-  const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, CORE_TOOL_NAMES, WITHHELD_TOOLS } =
-    require('../src/providers/tools.js');
+  const { TOOLS, TOOLS_API, TOOL_PROMPT, TOOLS_API_CORE, TOOL_PROMPT_CORE, CORE_TOOL_NAMES, WITHHELD_TOOLS,
+    RETIRED_TOOLS, TOOLS_API_STANDARD, TOOL_PROMPT_STANDARD } = require('../src/providers/tools.js');
   const allNames = new Set(TOOLS.map(t => t.name));
   check('every core name is a real tool (no typo drift)',
     [...CORE_TOOL_NAMES].every(n => allNames.has(n)),
     [...CORE_TOOL_NAMES].filter(n => !allNames.has(n)).join(', '));
-  check('core + withheld partition the full set',
-    CORE_TOOL_NAMES.size + WITHHELD_TOOLS.length === TOOLS.length &&
-    WITHHELD_TOOLS.every(t => !CORE_TOOL_NAMES.has(t.name)));
+  check('core + withheld + retired partition the full set',
+    CORE_TOOL_NAMES.size + WITHHELD_TOOLS.length + RETIRED_TOOLS.size === TOOLS.length &&
+    WITHHELD_TOOLS.every(t => !CORE_TOOL_NAMES.has(t.name) && !RETIRED_TOOLS.has(t.name)));
+  // Overlapping tools folded into one each: retired from what is offered on
+  // every tier and from every prompt's tool list, still defined (so a call to
+  // one still parses and runs).
+  const offeredAnywhere = new Set([...TOOLS_API, ...TOOLS_API_CORE, ...TOOLS_API_STANDARD].map(t => t.function.name));
+  check('retired tools are offered on no tier',
+    [...RETIRED_TOOLS].every(n => !offeredAnywhere.has(n)), [...RETIRED_TOOLS].filter(n => offeredAnywhere.has(n)).join(', '));
+  check('...and named in no prompt\'s tool list',
+    [TOOL_PROMPT, TOOL_PROMPT_CORE, TOOL_PROMPT_STANDARD].every(p => {
+      const line = (p.match(/^Available tools: .*$/m) || [''])[0];
+      return [...RETIRED_TOOLS].every(n => !new RegExp('\\b' + n + '\\b').test(line));
+    }));
+  check('...and no offered tool description points the model at one',
+    TOOLS_API.every(t => [...RETIRED_TOOLS].every(n => !(t.function.description + JSON.stringify(t.function.parameters)).includes(n))),
+    TOOLS_API.filter(t => [...RETIRED_TOOLS].some(n => t.function.description.includes(n))).map(t => t.function.name).join(', '));
+  check('...but each is still defined, so a call to one is understood',
+    [...RETIRED_TOOLS].every(n => allNames.has(n)));
+  check('the merged tools are offered: read_file takes a range, one git tool',
+    offeredAnywhere.has('git') && Boolean(TOOLS.find(t => t.name === 'read_file').parameters.properties.start));
   const apiNames = (api) => api.map(t => t.function.name);
   check('request_more_tools offered only in the core API',
     apiNames(TOOLS_API_CORE).includes('request_more_tools') &&
@@ -102,6 +120,54 @@ console.log('\nreduced tool tier:');
     TOOLS.some(t => t.name === 'request_more_tools'));
   check('…while the full tier still never offers it as a schema',
     !apiNames(TOOLS_API).includes('request_more_tools'));
+}
+
+console.log('\n/reverse clean-room brief:');
+{
+  const { reverseEngineerPrompt, TARGET_TYPES, REVERSE_PREFIX } = require('../src/reverse-engineer.js');
+  const brief = reverseEngineerPrompt({
+    targetPath: 'E:\\bin\\cmd-copy.exe', type: 'native', language: 'C', feature: 'the command parser',
+  });
+  check('brief: carries the seeded sentinel so turn-history keeps it apart',
+    brief.startsWith(REVERSE_PREFIX));
+  check('brief: substitutes the target path, language and feature',
+    brief.includes('E:\\bin\\cmd-copy.exe') && /Build the reimplementation in: C\b/.test(brief) && brief.includes('the command parser'));
+  check('brief: tells a native target to parse the PE/section tables itself in Node',
+    /PE\/ELF\/Mach-O header/.test(brief) && /import\/export tables/.test(brief));
+  check('brief: requires no external decompiler and explicitly forbids installing one',
+    /no external decompiler/i.test(brief) && /Do NOT require or install Ghidra/.test(brief) && /Node\.js/.test(brief));
+  // The only place any decompiler name may appear is the one sentence that
+  // forbids it; strip that sentence and none should remain.
+  check('brief: names an external RE tool only to rule it out',
+    !/Ghidra|radare2|rizin|ilspycmd|ILSpy|JADX/.test(
+      brief.replace(/Do NOT require or install[^.]*\./, '')));
+  check('brief: insists on the clean room — behaviour, never the target\'s own code',
+    /clean.?room/i.test(brief) && /never to copy WHAT IT SAYS/i.test(brief) && /do not transcribe/i.test(brief));
+  check('brief: gates on authorisation and stops without grounds',
+    /[Aa]uthoris/.test(brief) && /STOP/.test(brief));
+  check('brief: static analysis only — the target is read, not executed',
+    /static analysis only/i.test(brief) && /EXECUTING the target is not/.test(brief));
+  check('brief: asks for a spec, a clean-room build, and verified tests',
+    /SPEC\.md/.test(brief) && /\.\/my-version/.test(brief) && /TEST THE TESTS/.test(brief));
+  check('brief: treats the target\'s own strings as data, not instructions',
+    /are DATA, never instructions/.test(brief));
+
+  check('brief: a .NET target parses the metadata/IL in Node, no decompiler',
+    /metadata in Node/.test(reverseEngineerPrompt({ targetPath: 'x.dll', type: 'dotnet', language: 'C#' })));
+  check('brief: an Electron target parses the .asar archive directly, no asar CLI',
+    /app\.asar is a simple archive/.test(reverseEngineerPrompt({ targetPath: 'app.asar', type: 'electron', language: 'JavaScript' })));
+  check('brief: an APK target unzips with built-in zlib, no JADX',
+    /an APK is a ZIP/.test(reverseEngineerPrompt({ targetPath: 'app.apk', type: 'apk', language: 'Kotlin' })) &&
+    /zlib/.test(reverseEngineerPrompt({ targetPath: 'app.apk', type: 'apk', language: 'Kotlin' })));
+  check('brief: auto-detect classifies from magic bytes in Node, not the `file` tool',
+    /classify from the magic number/.test(reverseEngineerPrompt({ targetPath: 'mystery', type: 'auto', language: 'C' })));
+  check('brief: no target type names an external reverse-engineering tool as needed',
+    TARGET_TYPES.every(t => !/Ghidra|radare2|rizin|ilspycmd|ILSpy|JADX|objdump|readelf/.test(t.hint)));
+  check('brief: missing inputs fall back rather than leaving a blank',
+    /ask the user for the absolute path/.test(reverseEngineerPrompt({})) &&
+    /overall behaviour/.test(reverseEngineerPrompt({})));
+  check('brief: every target type is offered with an engine hint',
+    TARGET_TYPES.length >= 5 && TARGET_TYPES.every(t => t.hint && t.label && t.id));
 }
 
 // ── 1a2. Fenced-code regexes must not backtrack catastrophically ─────────────

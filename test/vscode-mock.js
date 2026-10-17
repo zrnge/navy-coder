@@ -24,6 +24,10 @@ function createVscodeMock() {
       maxToolIterations: 50,
       maxContextChars: 12000,
       temperature: 0.2,
+      // Off here: suites script exact sequences of model replies, and the
+      // review adds a call to every turn that edits. Tests that cover it turn it
+      // on; the eval harness sets it on, as Navy ships.
+      selfReview: 'off',
       provider: 'ollama',
       codeLens: true,
       inlineCompletions: false,
@@ -37,6 +41,8 @@ function createVscodeMock() {
     nextOpenDialog: null,             // [fsPath] the next showOpenDialog returns, or null for cancel
     nextQuickPick: undefined,         // what the next showQuickPick resolves to, or a function (items) => answer
     quickPickCalls: [],               // [{ items, options }] — every showQuickPick call
+    nextInputBox: undefined,          // what the next showInputBox resolves to, or a function (options) => answer
+    inputBoxCalls: [],                // [{ options }] — every showInputBox call
     nextWorkspaceSymbols: null,       // [{ name, location: { uri: { fsPath }, range } }] the fake symbol provider returns
     nextDocumentSymbols: null,        // [{name,kind}] for every file, or a Map<fsPath, [...]> for per-file control
     executedCommands: [],             // [{ command, args }] — lets tests assert vscode.openFolder etc.
@@ -184,6 +190,10 @@ function createVscodeMock() {
         ctrl.shown.info.push(msg);
         ctrl.shownInfoCalls.push({ msg, options, items });
         return ctrl.nextInfo;
+      },
+      showInputBox: async (options = {}) => {
+        ctrl.inputBoxCalls.push({ options });
+        return typeof ctrl.nextInputBox === 'function' ? ctrl.nextInputBox(options) : ctrl.nextInputBox;
       },
       showOpenDialog: async () => (ctrl.nextOpenDialog ? ctrl.nextOpenDialog.map(uri) : undefined),
       showQuickPick: async (items, options) => {

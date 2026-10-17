@@ -2,7 +2,7 @@
   "name": "navy-coder",
   "displayName": "Navy AI Coder",
   "description": "Local-first AI coding agent that asks before it acts: approve every diff and command, zero runtime dependencies, /audit supply-chain scans and /playthrough browser QA. Ollama, LM Studio or your own key.",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "publisher": "Zrnge",
   "repository": {
     "type": "git",
@@ -356,6 +356,47 @@
             "Commands run under the OS's own sandbox — sandbox-exec on macOS, bubblewrap on Linux, nothing to install. Writes are confined to the project and temp; SSH and cloud credential stores cannot be read. The network is NOT restricted. Not available on Windows — use wsl or docker there"
           ],
           "markdownDescription": "Isolate `run_command`/`run_tests`/`run_project`/background processes inside a container instead of running them directly on your machine. Two container backends: **docker** (any OS, needs Docker running) and **wsl** — [WSL Containers](https://devblogs.microsoft.com/commandline/wsl-container-is-now-available-for-public-preview/) (`wslc`), Microsoft's Linux-container runtime built into Windows, which gives real isolation on Windows **without Docker Desktop** (needs WSL 2.9.3+: `wsl --update --pre-release`). Both need the project to have a `.devcontainer/devcontainer.json` or `Dockerfile` (or `navy.sandboxImage` set) — Navy refuses to guess at a generic image, since a container that doesn't match the project's real toolchain would be a false sense of safety. There is also **native** (sandbox-exec/bubblewrap on macOS/Linux, nothing to install). This is a second, independent layer on top of the approval dialog and workspace-trust check, not a replacement for either.\n\nWith a container backend on, Navy targets the container rather than the host: commands are written for and run through POSIX `sh` even from a Windows host, since that is what the container actually provides."
+        },
+        "navy.escalationModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "A stronger model to hand a turn to when Navy is stuck: two fixes in a row leaving the same check failing, one file edited five times without settling, or reasoning going in circles. It takes the rest of that turn; the next turn starts on your usual model again. The switch is announced in the chat, since it may cost more. Empty: never switch. Use `#navy.escalationProvider#` if it lives on another provider."
+        },
+        "navy.escalationProvider": {
+          "type": "string",
+          "default": "",
+          "enum": [
+            "",
+            "ollama",
+            "lmstudio",
+            "anthropic",
+            "openai",
+            "deepseek",
+            "gemini",
+            "xai",
+            "zai",
+            "groq",
+            "openrouter",
+            "moonshot",
+            "qwen",
+            "minimax",
+            "mimo",
+            "custom"
+          ],
+          "markdownDescription": "The provider `#navy.escalationModel#` runs on, using that provider's saved API key. Empty: the same provider as `#navy.provider#`."
+        },
+        "navy.selfReview": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "on",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Before a turn that changed files reports, Navy shows the model its complete diff once to review: what was asked, edge cases, callers, leftover debug code, and whether it was checked. Costs one more model call on turns that edit.",
+            "Report straight after the last edit, without the review"
+          ],
+          "description": "Have Navy review its own changes before it reports a turn that edited files."
         },
         "navy.reducedToolset": {
           "type": "string",
